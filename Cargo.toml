@@ -17,6 +17,10 @@ crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 lazy_static = "1"
 
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"
+
 [dev-dependencies]
 rstest = "0.23.0"
 
@@ -31,6 +35,9 @@ lto = "thin"
 [profile.dev]
 opt-level = 0
 debug = 2
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(no_efa)'] }
 
 [features]
 default = []
