@@ -198,14 +198,14 @@ impl EfaContext {
     pub fn shutdown(self);
 }
 
-/// Client-side memory region descriptor. Received during LO.HELLO.
+/// Client-side memory region descriptor. Per-request: client sends rkey + remote_addr with each command. Not stored in session.
 pub struct ClientRegion {
     pub rkey: u64,
     pub remote_addr: u64,
     pub len: u64,
 }
 
-pub struct Session { /* endpoints, AV entries, client regions */ }
+pub struct Session { /* endpoints, AV entries, dest_fi_addr handles */ }
 
 impl Session {
     pub fn new(ctx: &EfaContext, peer_addr: &EfaAddress) -> Result<Self, TransportError>;
@@ -404,7 +404,7 @@ Pros: no ambiguity, no arg-count dispatch. Cons: two commands for the same logic
 | Concurrency | NVMe ops: io_uring with callbacks (CQ poller on module runtime). EFA ops: async functions awaited on module runtime. No thread ever blocks on another subsystem. |
 | Reply mechanism | `BlockClient` with `reply_callback`. `UnblockClient` called from any thread/task. Reply fires on main thread. No ThreadSafeContext needed. |
 | Memory registration | Buffer pool dual-registered with io_uring + EFA once at startup. Same physical pages, no conflicts. Zero per-op registration cost. |
-| rkey model | Client sends 1-8 `ClientRegion` descriptors during LO.HELLO. Per-op specifies `region_idx` + `remote_offset`. |
+| rkey model | Client sends rkey + remote_addr per command. No regions stored in session. Server picks EFA device per-op (least-loaded). |
 | Multi-EFA LB | Internal to `Session`. Best-of-two on in-flight count. Storage/data type unaware. |
 | Buffer ownership | Storage owns PinnedBuffer (Box<[u8]>, 4KB-aligned). Buffer is an owned handle (&'static PinnedBuffer + idx). Holding Buffer = exclusive access. Drop = return to pool. No pin/unpin. |
 | Error handling | Typed errors (`TransportError`, `StorageError`) propagated through callbacks/await to `UnblockClient` → reply callback → client. |

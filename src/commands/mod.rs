@@ -1,11 +1,11 @@
 //! Command Handlers — LO.HELLO, LO.GET, LO.SET
 //!
-//! LO.GET key [region_idx remote_offset]
+//! LO.GET key [rkey remote_addr len]
 //!   NVMe read is the same either way. Branch at completion:
 //!   - EFA: session.write(buf → client GPU)
 //!   - TCP: reply with bulk string from buf
 //!
-//! LO.SET key len [region_idx remote_offset]
+//! LO.SET key len [rkey remote_addr]
 //!   NVMe write is the same either way. Source of bytes differs:
 //!   - EFA: session.read(client GPU → buf) then NVMe write
 //!   - TCP: bytes already inline in RESP, fill buf, then NVMe write
@@ -18,7 +18,7 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
 use crate::storage::{self, Storage};
-use crate::transport::{self, ClientRegion, EfaAddress, Session};
+use crate::transport::{self, EfaAddress, Session};
 
 // ─── Per-Client Session Store ────────────────────────────────────────────────
 
@@ -47,7 +47,7 @@ enum ReplyData {
 // ─── LO.HELLO ────────────────────────────────────────────────────────────────
 
 pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    if args.len() < 3 {
+    if args.len() < 2 {
         return Err(ValkeyError::WrongArity);
     }
 
@@ -66,39 +66,8 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     addr.copy_from_slice(&peer_bytes);
     let peer_addr = EfaAddress(addr);
 
-    let num_regions: usize = args[2]
-        .to_string_lossy()
-        .parse()
-        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_NUM_REGIONS))?;
 
-    let expected_args = 3 + num_regions * 3;
-    if args.len() < expected_args {
-        return Err(ValkeyError::Str(errors::ERR_INSUFFICIENT_REGION_ARGS));
-    }
-
-    let mut regions = Vec::with_capacity(num_regions);
-    for i in 0..num_regions {
-        let base = 3 + i * 3;
-        let rkey: u64 = args[base]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RKEY))?;
-        let remote_addr: u64 = args[base + 1]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
-        let len: u64 = args[base + 2]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REGION_LEN))?;
-        regions.push(ClientRegion {
-            rkey,
-            remote_addr,
-            len,
-        });
-    }
-
-    let session = Session::new(efa_ctx, &peer_addr, regions)
+    let session = Session::new(efa_ctx, &peer_addr)
         .map_err(|e| ValkeyError::String(format!("{}: {}", errors::ERR_SESSION_CREATE, e)))?;
     let server_addrs = session.server_addrs();
 
@@ -132,15 +101,15 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let obj_len = lo_value.len;
 
     let efa_args = if args.len() >= 4 {
-        let region_idx: u32 = args[2]
+        let rkey: u64 = args[2]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REGION_IDX))?;
-        let remote_offset: u64 = args[3]
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RKEY))?;
+        let remote_addr: u64 = args[3]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_OFFSET))?;
-        Some((region_idx, remote_offset))
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
+        Some((rkey, remote_addr))
     } else {
         None
     };
@@ -180,15 +149,15 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                     );
                 }
                 Ok(bytes_read) => {
-                    if let Some((region_idx, remote_offset)) = efa_args {
+                    if let Some((rkey, remote_addr)) = efa_args {
                         // EFA: RDMA write buf → client GPU.
                         // session_arc was cloned before entering this callback — no lock needed.
                         if let Some(session) = session_arc {
                             session.write(
                                 buf,
                                 bytes_read as usize,
-                                region_idx,
-                                remote_offset,
+                                rkey,
+                                remote_addr,
                                 Box::new(move |_buf, write_result| {
                                     let reply = match write_result {
                                         Ok(()) => ReplyData::GetOk { bytes_read },
@@ -247,15 +216,15 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let efa_args = if args.len() >= 5 {
-        let region_idx: u32 = args[3]
+        let rkey: u64 = args[3]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REGION_IDX))?;
-        let remote_offset: u64 = args[4]
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RKEY))?;
+        let remote_addr: u64 = args[4]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_OFFSET))?;
-        Some((region_idx, remote_offset))
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
+        Some((rkey, remote_addr))
     } else {
         None
     };
@@ -279,15 +248,15 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let blocked_client = ctx.block_client();
 
-    if let Some((region_idx, remote_offset)) = efa_args {
+    if let Some((rkey, remote_addr)) = efa_args {
         // EFA: read from client GPU into buf, then NVMe write.
         let key_for_reply = key_name.as_slice().to_vec();
         if let Some(session) = session_arc {
             session.read(
                 buf,
                 obj_len as usize,
-                region_idx,
-                remote_offset,
+                rkey,
+                remote_addr,
                 Box::new(move |buf, read_result| {
                     match read_result {
                         Ok(()) => {
