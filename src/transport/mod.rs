@@ -4,6 +4,7 @@
 //! EFA/libfabric lifecycle, multi-device LB, completion handling.
 //! Transport never calls storage or data type.
 //! Module owns the tokio runtime; transport borrows the handle for CQ poller tasks.
+//!
 
 use std::sync::OnceLock;
 
@@ -17,15 +18,6 @@ use crate::storage::Buffer;
 #[derive(Clone)]
 pub struct EfaAddress(pub [u8; 32]);
 
-/// Client-side memory region descriptor.
-/// Received during LO.HELLO. One per GPU memory pool (1-8 total, NOT per object).
-#[derive(Debug, Clone)]
-pub struct ClientRegion {
-    pub rkey: u64,          // remote key (fi_write takes uint64_t key)
-    pub remote_addr: u64,   // base virtual address of the region on the client
-    pub len: u64,           // total length of the region
-}
-
 // ─── Error Types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -35,7 +27,6 @@ pub enum TransportError {
     SessionCreateFailed,
     WriteFailed { code: i32 },
     ReadFailed { code: i32 },
-    RegionOutOfBounds,
     Timeout,
     SessionClosed,
     Unavailable, // EFA not present on this instance
@@ -49,7 +40,6 @@ impl std::fmt::Display for TransportError {
             Self::SessionCreateFailed => write!(f, "session create failed"),
             Self::WriteFailed { code } => write!(f, "fi_write failed ({})", code),
             Self::ReadFailed { code } => write!(f, "fi_read failed ({})", code),
-            Self::RegionOutOfBounds => write!(f, "region index out of bounds"),
             Self::Timeout => write!(f, "CQ poll timeout"),
             Self::SessionClosed => write!(f, "session closed"),
             Self::Unavailable => write!(f, "EFA unavailable"),
@@ -117,69 +107,70 @@ impl EfaContext {
 // ─── Session ─────────────────────────────────────────────────────────────────
 
 /// Per-client DMA session. Created during LO.HELLO.
+/// Stores only routing state (dest_fi_addr handles) — no memory regions.
 pub struct Session {
-    pub client_regions: Vec<ClientRegion>,
-    // TODO: fi_endpoint per EFA device, AV entries, LB state
+    // TODO: dest_fi_addr handles (one per server EFA device, from fi_av_insert)
+    // TODO: Load balancing state — track in-flight count per device, pick least-loaded for each request
 }
 
 impl Session {
-    /// Create a session: fi_av_insert peer, store client regions.
+    /// Create a session: fi_av_insert peer on ALL server EFA devices.
+    /// No regions stored — client provides rkey + remote_addr per command.
     pub fn new(
         _ctx: &EfaContext,
         _peer_addr: &EfaAddress,
-        client_regions: Vec<ClientRegion>,
     ) -> Result<Self, TransportError> {
-        // TODO: fi_endpoint creation, fi_av_insert(peer_addr)
-        Ok(Self { client_regions })
+        // TODO:
+        //   1. For each EFA device: fi_av_insert(peer_addr) -> dest_fi_addr[i]
+        //   2. Store N dest_fi_addr handles for per-op device selection
+        Ok(Self {})
     }
 
-    /// Server EFA addresses to return in LO.HELLO reply.
+    /// Server EFA addresses to return in LO.HELLO reply (ALL devices).
+    /// Client must fi_av_insert each to accept writes from any server device.
     pub fn server_addrs(&self) -> Vec<EfaAddress> {
-        // TODO: fi_getname() on each endpoint
+        // TODO: fi_getname() on each device's endpoint
         vec![]
     }
 
-    /// DMA write: server buffer → client region.
-    /// Non-blocking. region_idx selects which ClientRegion (resolves to rkey + base addr).
+    /// DMA write: push server buffer → client memory at (rkey, remote_addr).
+    /// Non-blocking. Server picks EFA device (LB: best-of-two on in-flight count).
     /// Takes Buffer ownership during DMA. Returns it in callback.
     pub fn write(
         &self,
         buf: Buffer,
         _len: usize,
-        region_idx: u32,
-        _remote_offset: u64,
+        _rkey: u64,
+        _remote_addr: u64,
         on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
     ) {
-        if region_idx as usize >= self.client_regions.len() {
-            on_complete(buf, Err(TransportError::RegionOutOfBounds));
-            return;
-        }
-        // TODO: Post fi_writemsg, CQ poller fires on_complete.
+        // TODO:
+        //   1. Pick device (best-of-two LB on in-flight count)
+        //   2. fi_write(ep, buf.ptr(), len, desc, dest_fi_addr[device], remote_addr, rkey, ctx)
+        //   3. CQ poller fires on_complete with Buffer returned
         on_complete(buf, Ok(()));
     }
 
-    /// DMA read: client region → server buffer.
+    /// DMA read: pull client memory at (rkey, remote_addr) → server buffer.
     /// Non-blocking. Takes Buffer ownership. Returns it in callback.
     pub fn read(
         &self,
         buf: Buffer,
         _len: usize,
-        region_idx: u32,
-        _remote_offset: u64,
+        _rkey: u64,
+        _remote_addr: u64,
         on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
     ) {
-        if region_idx as usize >= self.client_regions.len() {
-            on_complete(buf, Err(TransportError::RegionOutOfBounds));
-            return;
-        }
-        // TODO: Post fi_readmsg, CQ poller fires on_complete.
+        // TODO:
+        //   1. Pick device (best-of-two LB)
+        //   2. fi_read(ep, buf.ptr(), len, desc, dest_fi_addr[device], remote_addr, rkey, ctx)
+        //   3. CQ poller fires on_complete with Buffer returned
         on_complete(buf, Ok(()));
     }
 
-    /// Tear down session. In-flight ops receive SessionClosed.
+    /// Tear down session. Remove AV entries, cancel in-flight ops.
     pub fn close(self) {
-        // TODO: fi_close endpoints, remove AV entries.
-        // Signal in-flight ops with SessionClosed error.
+        // TODO: fi_av_remove on all devices, signal in-flight ops with SessionClosed.
     }
 }
 

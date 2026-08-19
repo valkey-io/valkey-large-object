@@ -38,7 +38,7 @@ Module OnLoad:
       EC2 instances typically have unlimited memlock.)
 
 LO.HELLO (per client connection):
-  5. Session::new(client_regions)   → create fi_endpoint on each EFA device, insert client AV entries
+  5. Session::new(peer_addr)   → fi_av_insert peer on ALL devices, store dest_fi_addr handles
 
 LO.GET / LO.SET (per operation):
   6. buf = storage.pool_get()      → owned Buffer, exclusive access to pinned memory
@@ -208,29 +208,29 @@ pub struct ClientRegion {
 pub struct Session { /* endpoints, AV entries, client regions */ }
 
 impl Session {
-    pub fn new(ctx: &EfaContext, peer_addr: &EfaAddress, client_regions: &[ClientRegion]) -> Result<Self, TransportError>;
+    pub fn new(ctx: &EfaContext, peer_addr: &EfaAddress) -> Result<Self, TransportError>;
 
     pub fn server_addrs(&self) -> Vec<EfaAddress>;
 
-    /// DMA write: server buffer → client region.
+    /// DMA write: server buffer → client memory at (rkey, remote_addr).
     /// Takes Buffer by value (ownership during DMA). Returns Buffer in callback.
     pub fn write(
         &self,
         buf: Buffer,
         len: usize,
-        region_idx: u32,
-        remote_offset: u64,
+        rkey: u64,
+        remote_addr: u64,
         on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
     );
 
-    /// DMA read: client region → server buffer.
+    /// DMA read: client memory at (rkey, remote_addr) → server buffer.
     /// Takes Buffer by value. Returns Buffer in callback.
     pub fn read(
         &self,
         buf: Buffer,
         len: usize,
-        region_idx: u32,
-        remote_offset: u64,
+        rkey: u64,
+        remote_addr: u64,
         on_complete: Box<dyn FnOnce(Buffer, Result<(), TransportError>) + Send>,
     );
 
@@ -262,8 +262,8 @@ thread_ctx.reply(Ok(ValkeyValue::...));  // unblocks + replies
 ```
 (a) Main thread (command handler):
     key = args[1]
-    region_idx = args[2]
-    remote_offset = args[3]
+    rkey = args[2]
+    remote_addr = args[3]
 
     // Data type layer: read LoValue from Valkey keyspace
     lo_value = OpenKey(key) → ModuleTypeGetValue()
@@ -294,7 +294,7 @@ thread_ctx.reply(Ok(ValkeyValue::...));  // unblocks + replies
             Ok(bytes_read) => {
                 // Transport layer: send to client GPU (module spawns task on its runtime)
                 runtime.spawn(async move {
-                    let result = session.write(buf, bytes_read, region_idx, remote_offset).await;
+                    let result = session.write(buf, bytes_read, rkey, remote_addr).await;
                     storage.unpin(buf);
                     storage.pool_put(buf);
                     UnblockClient(bc, result.into());
@@ -317,8 +317,8 @@ thread_ctx.reply(Ok(ValkeyValue::...));  // unblocks + replies
 (a) Main thread (command handler):
     key = args[1]
     len = args[2]
-    region_idx = args[3]
-    remote_offset = args[4]
+    rkey = args[3]
+    remote_addr = args[4]
 
     // TODO: The alternative is to do an one-off allocation of a custom size, after
     // dual registering it. 
@@ -331,7 +331,7 @@ thread_ctx.reply(Ok(ValkeyValue::...));  // unblocks + replies
 
     // Transport layer: read from client GPU into buf (module spawns task on its runtime)
     runtime.spawn(async move {
-        let read_result = session.read(buf, len, region_idx, remote_offset).await;
+        let read_result = session.read(buf, len, rkey, remote_addr).await;
         match read_result {
             Err(e) => {
                 storage.unpin(buf); storage.pool_put(buf);
@@ -371,11 +371,11 @@ Large objects need to support both RDMA-capable clients (GPU inference with EFA)
 **Current thinking: same command, optional args determine transport.**
 
 ```
-LO.GET key [region_idx remote_offset]
+LO.GET key [rkey remote_addr len]
   - With args:    client has LO.HELLO session → NVMe read → RDMA write to client GPU
   - Without args: no session required → NVMe read → TCP bulk reply
 
-LO.SET key len [region_idx remote_offset]
+LO.SET key len [rkey remote_addr]
   - With args:    client has LO.HELLO session → RDMA read from client GPU → NVMe write
   - Without args: no session required → client sends bytes inline (TCP bulk) → NVMe write
 ```
@@ -386,7 +386,7 @@ Server knows if the connection has a DMA session. Trailing args give the client 
 
 ```
 LO.GET  key                           → always TCP reply
-LO.DGET key region_idx remote_offset  → always RDMA (requires LO.HELLO)
+LO.GET key rkey remote_addr len  → always RDMA (requires LO.HELLO)
 ```
 
 Pros: no ambiguity, no arg-count dispatch. Cons: two commands for the same logical operation.
