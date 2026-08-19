@@ -1,0 +1,120 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  SERVER_VERSION: unstable
+  VALKEY_REPO_URL: https://github.com/valkey-io/valkey.git
+  TEST_FRAMEWORK_REPO: https://github.com/valkey-io/valkey-test-framework
+  TEST_FRAMEWORK_DIR: tests/build/valkeytestframework
+
+jobs:
+  test:
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: build-and-test
+            asan: false
+            cache_key_suffix: normal
+          - name: asan
+            asan: true
+            cache_key_suffix: asan
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo yum install -y clang clang-devel gcc make git python3 python3-pip
+          ${{ matrix.asan && 'sudo yum install -y libasan' || '' }}
+
+      - name: Install Rust
+        run: |
+          if ! command -v cargo &> /dev/null; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          fi
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: cargo fmt check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --profile release --all-targets -- -D warnings
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: Run unit tests
+        run: cargo test --features enable-system-alloc
+
+      - name: Get week number
+        id: week
+        run: echo "week=$(date +%V)" >> $GITHUB_OUTPUT
+
+      - name: Cache valkey-server and test framework
+        id: cache-valkey
+        uses: actions/cache@v4
+        with:
+          path: |
+            tests/build/binaries
+            tests/build/valkeytestframework
+          key: valkey-unstable-arm64-${{ matrix.cache_key_suffix }}-w${{ steps.week.outputs.week }}
+
+      - name: Build valkey-server
+        if: steps.cache-valkey.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p tests/build/binaries/unstable
+          cd tests/build
+          git clone "${{ env.VALKEY_REPO_URL }}"
+          cd valkey
+          git checkout unstable
+          ${{ matrix.asan && 'make distclean && make -j SANITIZER=address' || 'make -j' }}
+          cp src/valkey-server ../binaries/unstable/
+          cd ../..
+          rm -rf valkey
+
+      - name: Set up test framework
+        if: steps.cache-valkey.outputs.cache-hit != 'true'
+        run: |
+          git clone ${{ env.TEST_FRAMEWORK_REPO }}
+          mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}
+          mv valkey-test-framework/src/* ${{ env.TEST_FRAMEWORK_DIR }}/
+          rm -rf valkey-test-framework
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip3 install -r requirements.txt
+
+      - name: Set module path
+        run: echo "MODULE_PATH=$(realpath target/release/libvalkey_largeobj.so)" >> $GITHUB_ENV
+
+      - name: Run integration tests
+        if: ${{ !matrix.asan }}
+        run: python3 -m pytest --cache-clear -v "tests/"
+
+      - name: Run integration tests (ASAN)
+        if: ${{ matrix.asan }}
+        env:
+          ASAN_BUILD: "1"
+        run: |
+          python3 -m pytest --capture=sys --cache-clear -v "tests/" -m "not skip_for_asan" > test_output.tmp 2>&1 || true
+          cat test_output.tmp
+          if grep -q "LeakSanitizer: detected memory leaks" test_output.tmp; then
+            echo "::error::Memory leaks detected by AddressSanitizer"
+            grep -B 2 "LeakSanitizer: detected memory leaks" test_output.tmp | grep ".*\.py::"
+            rm -f test_output.tmp
+            exit 1
+          fi
+          if grep -q "FAILED\|ERROR" test_output.tmp; then
+            rm -f test_output.tmp
+            exit 1
+          fi
+          rm -f test_output.tmp

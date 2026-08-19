@@ -21,9 +21,12 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         module_path = os.getenv('MODULE_PATH')
         # Use absolute path for data-dir so file assertions work regardless of cwd
         data_dir = os.path.abspath(self.testdir)
+        # Disable O_DIRECT in ASAN builds — ASAN tests focus on memory safety,
+        # not I/O bypass correctness. Avoids EINVAL from O_DIRECT alignment edge cases.
+        direct_io = "no" if os.environ.get("ASAN_BUILD") else "yes"
         args = {
             'enable-debug-command': 'yes',
-            'loadmodule': f"{module_path} data-dir {data_dir} pool-buf-size 4096 pool-buf-count 128 bench-mode no",
+            'loadmodule': f"{module_path} data-dir {data_dir} pool-buf-size 4096 pool-buf-count 128 bench-mode no direct-io {direct_io}",
         }
         server_path = f"{os.path.dirname(os.path.realpath(__file__))}/build/binaries/{os.environ['SERVER_VERSION']}/valkey-server"
         self.server, self.client = self.create_server(

@@ -72,6 +72,20 @@ lazy_static::lazy_static! {
     /// Bench mode: LO.GET TCP path replies with size integer instead of bulk value bytes.
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
     static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
+
+    /// Direct I/O mode: when enabled, file opens use O_DIRECT to bypass the kernel page cache.
+    ///
+    /// WHY: Large objects (4KB-50MB) would thrash the page cache if buffered. O_DIRECT ensures
+    /// NVMe reads/writes go straight to/from our pre-aligned pool buffers without kernel copies.
+    /// Our PinnedBuffer allocations are 4KB-aligned, satisfying O_DIRECT alignment requirements.
+    ///
+    /// WHEN TO DISABLE: Set to "no" when O_DIRECT writes fail with EINVAL on the target
+    /// environment. Known case: ASAN builds with GCC standalone toolchains where the sanitizer's
+    /// allocator interacts differently with io_uring O_DIRECT buffer alignment validation.
+    /// Not needed on production (XFS/NVMe instance store) or standard CI (ubuntu-latest).
+    ///
+    /// DEFAULT: yes (production path — always use O_DIRECT on XFS/NVMe instance store).
+    static ref CFG_DIRECT_IO: AtomicBool = AtomicBool::new(true);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -109,13 +123,17 @@ pub fn bench_mode() -> bool {
     CFG_BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+pub fn direct_io() -> bool {
+    CFG_DIRECT_IO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // ─── Config Validators ───────────────────────────────────────────────────────
 
 use valkey_module::configuration::ConfigurationContext;
 use valkey_module::configuration::ConfigurationValue;
 use valkey_module::ValkeyError;
 
-fn validate_pool_buf_size<G, T: ConfigurationValue<i64>>(
+fn validate_pool_buf_size<T: ConfigurationValue<i64>>(
     config_ctx: &ConfigurationContext,
     _name: &str,
     val: &'static T,
@@ -124,7 +142,7 @@ fn validate_pool_buf_size<G, T: ConfigurationValue<i64>>(
     if v < 4096 {
         return Err(ValkeyError::Str("pool-buf-size must be at least 4096"));
     }
-    if v as usize % 4096 != 0 {
+    if !(v as usize).is_multiple_of(4096) {
         return Err(ValkeyError::Str("pool-buf-size must be 4KB aligned"));
     }
     Ok(())
@@ -202,7 +220,7 @@ valkey_module! {
     configurations: [
         i64: [
             ["pool-buf-size", &*CFG_POOL_BUF_SIZE, 4_194_304, 4096, 1_073_741_824,
-             ConfigurationFlags::IMMUTABLE, None, Some(Box::new(validate_pool_buf_size::<ValkeyString, AtomicI64>))],
+             ConfigurationFlags::IMMUTABLE, None, Some(Box::new(validate_pool_buf_size::<AtomicI64>))],
             ["pool-buf-count", &*CFG_POOL_BUF_COUNT, 512, 1, 65536,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-bytes", &*CFG_MAX_BYTES, 0, 0, i64::MAX,
@@ -215,6 +233,7 @@ valkey_module! {
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::DEFAULT, None],
+            ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
         ],
         enum: [],
         module_args_as_configuration: true,

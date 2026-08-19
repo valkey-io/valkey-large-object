@@ -1,13 +1,14 @@
 #!/usr/bin/env sh
 
-# Build valkey-largeobj module and run integration tests.
-# Follows the same pattern as valkey-bloom.
+# Build valkey-largeobj module and run tests.
 #
 # Usage:
-#   ./build.sh              # build + test
-#   ./build.sh build        # build only
-#   ./build.sh test         # test only (assumes already built)
-#   ./build.sh clean        # remove build artifacts
+#   ./build.sh                # fmt + build + unit tests + integration tests
+#   ./build.sh build          # fmt + build + unit tests (no valkey-server needed)
+#   ./build.sh unit-test      # unit tests only (assumes already built)
+#   ./build.sh integ-test     # integration tests only (assumes already built)
+#   ./build.sh test           # unit tests + integration tests (assumes already built)
+#   ./build.sh clean          # remove build artifacts
 #
 # Environment variables:
 #   SERVER_VERSION        valkey branch/tag to build (default: unstable)
@@ -36,16 +37,45 @@ if [ "$1" = "clean" ]; then
     exit 0
 fi
 
+# ─── Unit Tests Only ──────────────────────────────────────────────────────────
+
+if [ "$1" = "unit-test" ]; then
+    echo "Running unit tests..."
+    cargo test --features enable-system-alloc
+    exit 0
+fi
+
 # ─── Build Module ─────────────────────────────────────────────────────────────
 
-if [ "$1" != "test" ]; then
+if [ "$1" != "test" ] && [ "$1" != "integ-test" ]; then
+    echo "Running cargo fmt check..."
+    cargo fmt --check
+    echo ""
+
+    echo "Running cargo clippy..."
+    cargo clippy --profile release --all-targets -- -D warnings
+    echo ""
+
     echo "Running cargo build release..."
     cargo build --release
     echo "Module built: $MODULE_PATH"
+    echo ""
+
+    echo "Running unit tests..."
+    cargo test --features enable-system-alloc
+    echo ""
 fi
 
 if [ "$1" = "build" ]; then
     exit 0
+fi
+
+# ─── Run unit tests if "test" command ─────────────────────────────────────────
+
+if [ "$1" = "test" ]; then
+    echo "Running unit tests..."
+    cargo test --features enable-system-alloc
+    echo ""
 fi
 
 # ─── Valkey Server Binary ─────────────────────────────────────────────────────
@@ -55,7 +85,15 @@ if [ -z "$SERVER_VERSION" ]; then
     export SERVER_VERSION="unstable"
 fi
 
-BINARY_PATH="tests/build/binaries/$SERVER_VERSION/valkey-server"
+# Use separate binary dir for ASAN so normal and ASAN builds don't collide.
+# GIT_VERSION is used for git checkout, SERVER_VERSION is exported for tests.
+GIT_VERSION="$SERVER_VERSION"
+if [ ! -z "${ASAN_BUILD}" ]; then
+    export SERVER_VERSION="${SERVER_VERSION}-asan"
+fi
+BINARY_DIR="tests/build/binaries/${SERVER_VERSION}"
+
+BINARY_PATH="$BINARY_DIR/valkey-server"
 CACHED_VALKEY_PATH="tests/build/valkey"
 
 # Optional: use an externally built valkey-server binary.
@@ -65,7 +103,7 @@ if [ -n "$VALKEY_SERVER_PATH" ]; then
         exit 1
     fi
     echo "Using external valkey-server binary: $VALKEY_SERVER_PATH"
-    mkdir -p "tests/build/binaries/$SERVER_VERSION"
+    mkdir -p "$BINARY_DIR"
     cp "$VALKEY_SERVER_PATH" "$BINARY_PATH"
 fi
 
@@ -73,19 +111,19 @@ if [ -f "$BINARY_PATH" ] && [ -x "$BINARY_PATH" ]; then
     echo "valkey-server binary '$BINARY_PATH' found."
 else
     echo "valkey-server binary '$BINARY_PATH' not found. Building from source..."
-    mkdir -p "tests/build/binaries/$SERVER_VERSION"
+    mkdir -p "$BINARY_DIR"
     rm -rf $CACHED_VALKEY_PATH
     cd tests/build
     git clone "$REPO_URL"
     cd valkey
-    git checkout "$SERVER_VERSION"
+    git checkout "$GIT_VERSION"
     make distclean
     if [ ! -z "${ASAN_BUILD}" ]; then
         make -j SANITIZER=address
     else
         make -j
     fi
-    cp src/valkey-server ../binaries/$SERVER_VERSION/
+    cp src/valkey-server "$SCRIPT_DIR/$BINARY_DIR/"
     cd $SCRIPT_DIR
     rm -rf $CACHED_VALKEY_PATH
 fi
@@ -135,4 +173,4 @@ else
 fi
 
 echo ""
-echo "Build and tests succeeded."
+echo "All tests passed."

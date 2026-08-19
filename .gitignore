@@ -1,5 +1,6 @@
 # Build
 target/
+Cargo.lock
 
 # Test artifacts
 test-data/

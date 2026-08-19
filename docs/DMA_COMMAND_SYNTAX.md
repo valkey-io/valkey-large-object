@@ -1,10 +1,10 @@
 # DMA Command Design: Session Routing + Per-Request Memory Targeting
 
-**Date:** 2026-08-18  **Status:** Option 2 implemented; Option 2 vs 3 decision open  **Author:** karsubba  **Audience:** Module engineers implementing the transport layer
+**Date:** 2026-08-18  **Status:** Option 2 implemented; Option 2 vs 3 decision open  **Author:** @KarthikSubbarao
 
 ---
 
-## Executive Summary
+## Summary
 
 The ValkeyLargeObj module moves large objects (4KB–512MB) between GPU client memory and NVMe storage via EFA RDMA. This document specifies the DMA command syntax — how the GPU client and Valkey server establish an RDMA session and transfer data.
 
@@ -114,14 +114,6 @@ LO.SET <key> <rkey> <remote_addr> <len>
 | 5 | Server | Waits for CQ completion, writes buffer to NVMe, stores key mapping |
 | 6 | Server | Replies OK |
 
-### TCP Fallback
-
-When DMA arguments are omitted, commands use standard TCP/RESP:
-
-```
-LO.GET <key>                    → bulk string reply (object bytes over TCP)
-LO.SET <key> <len> <payload>    → OK (payload inline in RESP)
-```
 
 ### Per-Client State
 

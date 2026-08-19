@@ -73,23 +73,64 @@ pub static LO_TYPE: ValkeyType = ValkeyType::new(
     0,           // encoding version
     raw::RedisModuleTypeMethods {
         version: raw::REDISMODULE_TYPE_METHOD_VERSION as u64,
-        rdb_load: None,             // TODO
-        rdb_save: None,             // TODO
-        aof_rewrite: None,          // TODO
+        rdb_load: None,    // TODO
+        rdb_save: None,    // TODO
+        aof_rewrite: None, // TODO
         free: Some(lo_free),
-        mem_usage: None,            // TODO
-        digest: None,               // TODO
-        aux_load: None,             // TODO
-        aux_save: None,             // TODO
+        mem_usage: None, // TODO
+        digest: None,    // TODO
+        aux_load: None,  // TODO
+        aux_save: None,  // TODO
         aux_save2: None,
         aux_save_triggers: 0,
-        free_effort: None,          // TODO
+        free_effort: None, // TODO
         unlink: None,
-        copy: None,                 // TODO
-        defrag: None,               // TODO
+        copy: None,   // TODO
+        defrag: None, // TODO
         mem_usage2: None,
         free_effort2: None,
         unlink2: None,
         copy2: None,
     },
 );
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_oid_monotonic() {
+        let a = ObjectId::next();
+        let b = ObjectId::next();
+        let c = ObjectId::next();
+        assert!(b.0 > a.0);
+        assert!(c.0 > b.0);
+    }
+
+    #[test]
+    fn test_oid_file_path_format() {
+        let oid = ObjectId(0xff);
+        assert_eq!(oid.file_path("/data"), "/data/00000000000000ff.dat");
+
+        let oid2 = ObjectId(1);
+        assert_eq!(
+            oid2.file_path("/mnt/bigobj"),
+            "/mnt/bigobj/0000000000000001.dat"
+        );
+    }
+
+    #[test]
+    fn test_oid_init_counter() {
+        // init_counter sets the counter to at least the given value.
+        // Subsequent next() calls must return values above it.
+        ObjectId::init_counter(1_000_000);
+        let oid = ObjectId::next();
+        assert!(
+            oid.0 >= 1_000_000,
+            "OID {} should be >= 1000000 after init_counter",
+            oid.0
+        );
+    }
+}

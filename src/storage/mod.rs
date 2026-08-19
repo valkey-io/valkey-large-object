@@ -4,13 +4,21 @@
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
 use crate::data_type::ObjectId;
-use engine::PinnedBuffer;
 pub use buffer::Buffer;
+use engine::PinnedBuffer;
 
-pub mod fd_pool;
 pub mod buffer;
 pub mod engine;
+pub mod fd_pool;
 pub mod uring;
+
+// ─── Callback Type Aliases ────────────────────────────────────────────────────
+
+/// Callback for read completion: (buffer returned, bytes_read or error).
+pub type ReadCallback = Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>;
+
+/// Callback for write completion: (buffer returned, (ObjectId, crc32c) or error).
+pub type WriteCallback = Box<dyn FnOnce(Buffer, Result<(ObjectId, u32), StorageError>) + Send>;
 
 // ─── Error Types ─────────────────────────────────────────────────────────────
 
@@ -37,6 +45,9 @@ impl std::fmt::Display for StorageError {
 /// Implemented by UringNvmeEngine (production) and SyncNvmeEngine (tests).
 pub trait NvmeEngine: Send + Sync {
     fn submit(&self, req: uring::IoRequest);
+    /// Signal the engine to stop accepting work and exit its poller loop.
+    /// Does not block — the poller thread exits asynchronously.
+    fn signal_shutdown(&self);
 }
 
 // ─── Storage Trait (from interface doc) ──────────────────────────────────────
@@ -66,22 +77,11 @@ pub trait Storage: Send + Sync {
     /// Read object from NVMe into buf. Async via io_uring ReadFixed.
     /// Takes Buffer by value (ownership transfers to storage during I/O).
     /// Returns (Buffer, bytes_read) in callback — caller gets buf back.
-    fn read_into(
-        &self,
-        object_id: ObjectId,
-        buf: Buffer,
-        len: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>,
-    );
+    fn read_into(&self, object_id: ObjectId, buf: Buffer, len: u64, on_complete: ReadCallback);
 
     /// Write buf to NVMe as a new object. Async via io_uring.
     /// Takes Buffer by value. Returns (Buffer, ObjectId, crc32c) via callback.
-    fn write_new(
-        &self,
-        buf: Buffer,
-        len: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<(ObjectId, u32), StorageError>) + Send>,
-    );
+    fn write_new(&self, buf: Buffer, len: u64, on_complete: WriteCallback);
 
     /// Delete an object file from NVMe. Called on key deletion or eviction.
     fn delete(&self, object_id: ObjectId);
@@ -118,7 +118,12 @@ pub fn init(buf_size: usize, buf_count: usize, data_dir: &str) {
 /// Shutdown: drain in-flight ops, close fds, clean up files.
 /// Called from module deinit. TODO: implement when shutdown path is built.
 pub fn shutdown() {
-    // Future: UringNvmeEngine::shutdown() drains pending ops.
+    // Signal the io_uring poller thread to drain pending ops and exit.
+    // The poller checks the shutdown AtomicBool on each 100ms tick and exits
+    // when set + no pending ops remain. This allows the process to terminate.
+    if let Some(storage) = STORAGE.get() {
+        storage.signal_shutdown();
+    }
     // Future: FdPool closes all open fds.
     // Future: Orphan reconciliation (delete .dat files with no keyspace entry).
 }

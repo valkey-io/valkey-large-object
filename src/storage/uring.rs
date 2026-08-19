@@ -29,7 +29,7 @@ pub type WriteCallback = Box<dyn FnOnce(Buffer, Result<(), StorageError>) + Send
 pub enum IoRequest {
     Read {
         fd: RawFd,
-        buf: Buffer,        // owned buffer — travels through io_uring pipeline
+        buf: Buffer, // owned buffer — travels through io_uring pipeline
         len: u64,
         on_complete: ReadCallback,
     },
@@ -72,6 +72,9 @@ pub struct UringNvmeEngine {
 impl NvmeEngine for UringNvmeEngine {
     fn submit(&self, req: IoRequest) {
         self.tx.send(req).ok();
+    }
+    fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Relaxed);
     }
 }
 
@@ -121,11 +124,7 @@ impl UringNvmeEngine {
     }
 
     /// The CQ poller loop — owns the io_uring ring.
-    fn poller_loop(
-        rx: Receiver<IoRequest>,
-        shutdown: Arc<AtomicBool>,
-        iovecs: Vec<libc::iovec>,
-    ) {
+    fn poller_loop(rx: Receiver<IoRequest>, shutdown: Arc<AtomicBool>, iovecs: Vec<libc::iovec>) {
         // Initialize io_uring.
         let mut ring = match io_uring::IoUring::new(256) {
             Ok(r) => r,
@@ -167,7 +166,12 @@ impl UringNvmeEngine {
                         next_token += 1;
 
                         let (sqe, op) = match req {
-                            IoRequest::Read { fd, buf, len, on_complete } => {
+                            IoRequest::Read {
+                                fd,
+                                buf,
+                                len,
+                                on_complete,
+                            } => {
                                 let read_len = Self::align_up(len) as u32;
                                 let sqe = if use_fixed {
                                     io_uring::opcode::ReadFixed::new(
@@ -191,7 +195,12 @@ impl UringNvmeEngine {
                                 };
                                 (sqe, PendingOp::Read { buf, on_complete })
                             }
-                            IoRequest::Write { fd, buf, len, on_complete } => {
+                            IoRequest::Write {
+                                fd,
+                                buf,
+                                len,
+                                on_complete,
+                            } => {
                                 let write_len = len as u32;
                                 let sqe = if use_fixed {
                                     io_uring::opcode::WriteFixed::new(
@@ -213,7 +222,14 @@ impl UringNvmeEngine {
                                     .build()
                                     .user_data(token)
                                 };
-                                (sqe, PendingOp::Write { buf, on_complete, len })
+                                (
+                                    sqe,
+                                    PendingOp::Write {
+                                        buf,
+                                        on_complete,
+                                        len,
+                                    },
+                                )
                             }
                         };
 
@@ -260,7 +276,11 @@ impl UringNvmeEngine {
                                 on_complete(buf, Err(StorageError::IoError { code: -result }));
                             }
                         }
-                        PendingOp::Write { buf, on_complete, len } => {
+                        PendingOp::Write {
+                            buf,
+                            on_complete,
+                            len,
+                        } => {
                             if result >= 0 && result as u64 >= len {
                                 on_complete(buf, Ok(()));
                             } else if result < 0 {
@@ -280,10 +300,14 @@ impl UringNvmeEngine {
         loop {
             match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(req) => match req {
-                    IoRequest::Read { buf, on_complete, .. } => {
+                    IoRequest::Read {
+                        buf, on_complete, ..
+                    } => {
                         on_complete(buf, Err(StorageError::IoError { code: -1 }));
                     }
-                    IoRequest::Write { buf, on_complete, .. } => {
+                    IoRequest::Write {
+                        buf, on_complete, ..
+                    } => {
                         on_complete(buf, Err(StorageError::IoError { code: -1 }));
                     }
                 },

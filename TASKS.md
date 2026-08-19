@@ -33,6 +33,7 @@ General Functional Completeness in ValkeyLargeObjModule:
 NVMe optimizations / improvements:
 - tokio-uring evaluation (replace hand-rolled poller)
 - Per-key read coalescing (KeyState/singleflight)
+- Older file version cleanup / garbage collection
 - It is possible to have the fds pregistered. Check IORING_REGISTER_FILES (pre-register fds, benchmark impact)
 - Evaluate Multi-poller (multiple io_uring rings for 16-drive parallelism)
 - Storage Retryable errors

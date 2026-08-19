@@ -3,12 +3,12 @@
 //! Buffer pool: fixed-size, 4KB-aligned, dual-registered (io_uring + EFA).
 //! io_uring: ReadFixed/WriteFixed with registered buffers.
 
+use std::alloc::Layout;
 use std::os::unix::io::RawFd;
 use std::sync::OnceLock;
-use std::alloc::Layout;
 
-use crate::data_type::ObjectId;
 use super::buffer::{Buffer, BufferPool};
+use crate::data_type::ObjectId;
 
 use super::fd_pool::FdPool;
 use super::uring::{IoRequest, UringNvmeEngine};
@@ -36,9 +36,18 @@ impl PinnedBuffer {
         Self { mem }
     }
 
-    pub fn as_mut_ptr(&self) -> *mut u8 { self.mem.as_ptr() as *mut u8 }
-    pub fn len(&self) -> usize { self.mem.len() }
-    pub fn as_slice(&self) -> &[u8] { &self.mem }
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.mem.as_ptr() as *mut u8
+    }
+    pub fn len(&self) -> usize {
+        self.mem.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.mem.is_empty()
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mem
+    }
 }
 
 // ─── StorageEngine ───────────────────────────────────────────────────────────
@@ -58,7 +67,6 @@ pub struct StorageEngine {
     /// Fd pool: ObjectId → pre-opened read fd.
     fd_pool: FdPool,
 }
-
 
 impl StorageEngine {
     pub fn new(buf_size: usize, buf_count: usize, data_dir: &str) -> Self {
@@ -100,19 +108,28 @@ impl StorageEngine {
         self.delete(object_id);
     }
 
-    /// Open a read fd for an object (O_RDONLY | O_DIRECT).
+    /// Signal the io_uring poller thread to exit. Non-blocking.
+    /// The poller drains pending ops then terminates, allowing process exit.
+    pub fn signal_shutdown(&self) {
+        if let Some(engine) = self.uring.get() {
+            engine.signal_shutdown();
+        }
+    }
+
+    /// Open a read fd for an object. Uses O_DIRECT when direct-io config is enabled.
     fn open_read_fd(&self, oid: ObjectId) -> Option<RawFd> {
         let path = oid.file_path(&self.data_dir);
         let c_path = std::ffi::CString::new(path).ok()?;
-        // SAFETY: c_path is a valid null-terminated C string. O_RDONLY|O_DIRECT are valid flags.
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) };
+        let mut flags = libc::O_RDONLY;
+        if crate::direct_io() {
+            flags |= libc::O_DIRECT;
+        }
+        // SAFETY: c_path is a valid null-terminated C string, flags are valid POSIX.
+        let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         if fd >= 0 {
             Some(fd)
         } else {
-            // Fallback without O_DIRECT (e.g., tmpfs for testing).
-            // SAFETY: Same as above, just without O_DIRECT.
-            let fd2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
-            if fd2 >= 0 { Some(fd2) } else { None }
+            None
         }
     }
 }
@@ -138,7 +155,9 @@ impl Storage for StorageEngine {
             .collect();
 
         let engine: Box<dyn NvmeEngine> = Box::new(UringNvmeEngine::new(iovecs));
-        self.uring.set(engine).map_err(|_| StorageError::IoError { code: -1 })?;
+        self.uring
+            .set(engine)
+            .map_err(|_| StorageError::IoError { code: -1 })?;
         Ok(())
     }
 
@@ -152,7 +171,7 @@ impl Storage for StorageEngine {
         object_id: ObjectId,
         buf: Buffer,
         len: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<u64, StorageError>) + Send>,
+        on_complete: super::ReadCallback,
     ) {
         // Get fd from pool (or open if miss).
         let fd = match self.fd_pool.get(object_id) {
@@ -164,10 +183,13 @@ impl Storage for StorageEngine {
                         fd
                     }
                     None => {
-                        on_complete(buf, Err(StorageError::IoError {
-                            // SAFETY: __errno_location returns a valid pointer to thread-local errno.
-                            code: unsafe { *libc::__errno_location() },
-                        }));
+                        on_complete(
+                            buf,
+                            Err(StorageError::IoError {
+                                // SAFETY: __errno_location returns a valid pointer to thread-local errno.
+                                code: unsafe { *libc::__errno_location() },
+                            }),
+                        );
                         return;
                     }
                 }
@@ -193,30 +215,32 @@ impl Storage for StorageEngine {
         engine.submit(req);
     }
 
-    fn write_new(
-        &self,
-        buf: Buffer,
-        len: u64,
-        on_complete: Box<dyn FnOnce(Buffer, Result<(ObjectId, u32), StorageError>) + Send>,
-    ) {
+    fn write_new(&self, buf: Buffer, len: u64, on_complete: super::WriteCallback) {
         let oid = ObjectId::next();
         let final_path = oid.file_path(&self.data_dir);
         let tmp_path = format!("{}.tmp", final_path);
 
-        // Open tmp file for O_DIRECT write.
+        // Open tmp file for write. Uses O_DIRECT when direct-io config is enabled.
+        let mut write_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
+        if crate::direct_io() {
+            write_flags |= libc::O_DIRECT;
+        }
         // SAFETY: CString is valid, flags are standard POSIX, mode 0o644 is safe.
         let fd = unsafe {
             libc::open(
                 std::ffi::CString::new(tmp_path.as_str()).unwrap().as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_DIRECT,
+                write_flags,
                 0o644,
             )
         };
         if fd < 0 {
-            on_complete(buf, Err(StorageError::IoError {
-                // SAFETY: __errno_location returns a valid pointer to thread-local errno.
-                code: unsafe { *libc::__errno_location() },
-            }));
+            on_complete(
+                buf,
+                Err(StorageError::IoError {
+                    // SAFETY: __errno_location returns a valid pointer to thread-local errno.
+                    code: unsafe { *libc::__errno_location() },
+                }),
+            );
             return;
         }
 
