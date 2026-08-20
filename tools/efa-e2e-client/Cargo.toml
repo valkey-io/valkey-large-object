@@ -1,0 +1,14 @@
+[package]
+name = "efa-e2e-client"
+version = "0.1.0"
+edition = "2021"
+description = "EFA-aware E2E test client for ValkeyLargeObj — validates LO.HELLO / LO.SET / LO.GET over hardware RDMA"
+
+[dependencies]
+libc = "0.2"
+eyre = "0.6"
+clap = { version = "4", features = ["derive"] }
+
+[build-dependencies]
+bindgen = "0.72"
+pkg-config = "0.3"

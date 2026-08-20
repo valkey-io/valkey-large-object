@@ -1,33 +1,36 @@
-//! ValkeyLargeObj: Large Object Module + Transport Crate
+//! ValkeyLargeObj: Large Object Module + Multi-Device EFA Transport
 //!
-//! Architecture (from interface doc):
-//!   Data Type (commands, LoValue, keyspace)
-//!       ↓ calls
+//! Architecture:
+//!   Commands (DMA.HELLO, DMA.GET, DMA.SET)
+//!       ↓ submits WorkItem to
+//!   Transport (WorkerPool: N EFA workers, shared MPMC queue)
+//!       ↓ completes, unblocks client
 //!   Storage (buffer pool, io_uring, NVMe files)
-//!       ↓ passes buffers to
-//!   Transport (EFA, fi_write/fi_read)
 //!
-//! Commands: LO.HELLO, LO.GET, LO.SET
+//! Thread Model:
+//!   - Valkey main thread: command parsing, session lookup, work submission
+//!   - N EFA worker threads: one per EFA device, each owns EP+AV+CQ
+//!   - Storage io_uring thread: NVMe async I/O
+//!
+//! Commands: DMA.HELLO, DMA.GET, DMA.SET
 //! Deletion: native Valkey DEL triggers module free callback.
 
 // ─── Initialization Order ────────────────────────────────────────────────────
 //
-// Module init proceeds in strict order. Commands are safe to call ONLY after
-// all steps complete:
+// Module init proceeds in strict order:
 //
-//   1. transport::init()       — discover EFA devices, create fabric/domain.
+//   1. transport::init()       — discover EFA devices, create N endpoints.
 //   2. storage::init(buf_size, buf_count, data_dir)
 //                              — allocate pool buffers, create StorageEngine.
 //                              — scan data_dir for existing .dat files to
-//                                recover OID counter (avoids OID collision).
+//                                recover OID counter.
 //   3. storage::register_buffers()
-//                              — IORING_REGISTER_BUFFERS pins pool pages for
-//                                ReadFixed/WriteFixed zero-copy I/O.
+//                              — IORING_REGISTER_BUFFERS pins pool pages.
 //   4. transport::register_buffers()
-//                              — fi_mr_reg same pool buffers with EFA domains
-//                                for RDMA fi_write/fi_read.
+//                              — fi_mr_reg same pool buffers on all N endpoints.
+//                              — starts N worker threads.
 //
-// After step 4, commands (LO.GET, LO.SET, LO.HELLO) may execute safely.
+// After step 4, commands (DMA.HELLO, DMA.GET, DMA.SET) may execute safely.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::sync::atomic::{AtomicBool, AtomicI64};
@@ -35,8 +38,6 @@ use std::sync::Mutex;
 
 use valkey_module::configuration::ConfigurationFlags;
 use valkey_module::{valkey_module, Context, Status, ValkeyString};
-
-use tokio::runtime::Runtime;
 
 pub mod commands;
 pub mod data_type;
@@ -47,7 +48,7 @@ pub mod transport;
 use crate::data_type::LO_TYPE;
 
 pub const MODULE_NAME: &str = "largeobj";
-pub const MODULE_VERSION: i32 = 1;
+pub const MODULE_VERSION: i32 = 2;
 
 // ─── Module Configurations (ValkeyModule Config API) ─────────────────────────
 
@@ -66,11 +67,11 @@ lazy_static::lazy_static! {
     /// Maximum total bytes on NVMe. 0 = unlimited. Supports memory notation (e.g. "10gb").
     static ref CFG_MAX_BYTES: AtomicI64 = AtomicI64::new(0);
 
-    /// Number of tokio worker threads for transport CQ polling. Immutable after load.
-    static ref CFG_TRANSPORT_THREADS: AtomicI64 = AtomicI64::new(2);
+    /// Number of EFA worker threads (one per EFA device ideally). Immutable after load.
+    /// Default: 1 (single device). Set to 4 on i8ge.48xlarge.
+    static ref CFG_TRANSPORT_THREADS: AtomicI64 = AtomicI64::new(1);
 
-    /// Bench mode: LO.GET TCP path replies with size integer instead of bulk value bytes.
-    /// For benchmarking NVMe read throughput without TCP output buffer overhead.
+    /// Bench mode: DMA.GET TCP path replies with size integer instead of bulk value bytes.
     static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
 
     /// Direct I/O mode: when enabled, file opens use O_DIRECT to bypass the kernel page cache.
@@ -86,15 +87,6 @@ lazy_static::lazy_static! {
     ///
     /// DEFAULT: yes (production path — always use O_DIRECT on XFS/NVMe instance store).
     static ref CFG_DIRECT_IO: AtomicBool = AtomicBool::new(true);
-}
-
-// ─── Global Runtime ──────────────────────────────────────────────────────────
-
-/// Tokio runtime — owned by the module, handle passed to transport crate.
-static RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
-
-pub fn runtime_handle() -> &'static tokio::runtime::Handle {
-    RUNTIME.get().expect("runtime not initialized").handle()
 }
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
@@ -151,27 +143,16 @@ fn validate_pool_buf_size<T: ConfigurationValue<i64>>(
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
 
 fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
-    // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let dir = data_dir();
     if dir.is_empty() {
         ctx.log_warning("largeobj: data-dir is required");
         return Status::Err;
     }
 
-    // Ensure data directory exists.
     if let Err(e) = std::fs::create_dir_all(&dir) {
         ctx.log_warning(&format!("largeobj: failed to create data-dir: {}", e));
         return Status::Err;
     }
-
-    // Step 0: Create tokio runtime (module owns it, transport borrows handle).
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(transport_threads())
-        .thread_name("lo-transport")
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime");
-    RUNTIME.set(rt).ok();
 
     // Step 1: Transport::init() — discover EFA devices (may fail gracefully).
     transport::init();
@@ -180,26 +161,43 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     storage::init(pool_buf_size(), pool_buf_count(), &dir);
     storage::register_buffers();
 
-    // Step 4: Transport::register_buffers() — fi_mr_reg same buffers.
+    // Step 4: Transport::register_buffers() — fi_mr_reg + start worker threads.
     let pinned = storage::pinned_buffers();
     let slices: Vec<&[u8]> = pinned.iter().map(|pb| pb.as_slice()).collect();
     transport::register_buffers(&slices);
 
+    let device_count = transport::worker_pool()
+        .map(|p| p.device_count())
+        .unwrap_or(0);
+    let discovered_devices = transport::worker_pool()
+        .map(|p| p.discovered_device_count())
+        .unwrap_or(0);
+
     ctx.log_notice(&format!(
-        "largeobj: initialized data_dir={} pool={}x{}={:.0}MB transport_threads={}",
+        "largeobj: initialized data_dir={} pool={}x{}={:.0}MB efa_devices={} workers={} ({})",
         dir,
         pool_buf_count(),
         pool_buf_size(),
         (pool_buf_count() * pool_buf_size()) as f64 / (1024.0 * 1024.0),
-        transport_threads(),
+        discovered_devices,
+        device_count,
+        if discovered_devices < device_count {
+            format!(
+                "{} physical + {} CQ-isolation endpoints",
+                discovered_devices,
+                device_count - discovered_devices
+            )
+        } else {
+            format!("{} physical devices", discovered_devices)
+        },
     ));
 
     Status::Ok
 }
 
 fn deinitialize(_ctx: &Context) -> Status {
-    transport::deregister_buffers();
     transport::shutdown();
+    transport::deregister_buffers();
     storage::deregister_buffers();
     storage::shutdown();
     Status::Ok
@@ -213,9 +211,9 @@ valkey_module! {
     init: initialize,
     deinit: deinitialize,
     commands: [
-        ["LO.HELLO", commands::lo_hello, "write", 0, 0, 0],
-        ["LO.GET", commands::lo_get, "readonly", 1, 1, 1],
-        ["LO.SET", commands::lo_set, "write deny-oom", 1, 1, 1],
+        ["DMA.HELLO", commands::dma_hello, "write", 0, 0, 0],
+        ["DMA.GET", commands::dma_get, "readonly", 1, 1, 1],
+        ["DMA.SET", commands::dma_set, "write deny-oom", 1, 1, 1],
     ],
     configurations: [
         i64: [
@@ -225,7 +223,7 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-bytes", &*CFG_MAX_BYTES, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, None],
-            ["transport-threads", &*CFG_TRANSPORT_THREADS, 2, 1, 32,
+            ["transport-threads", &*CFG_TRANSPORT_THREADS, 1, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
         ],
         string: [

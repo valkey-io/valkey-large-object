@@ -1,24 +1,29 @@
-//! Command Handlers — LO.HELLO, LO.GET, LO.SET
+//! Command Handlers — DMA.HELLO, DMA.GET, DMA.SET
 //!
-//! LO.GET key [region_idx remote_offset]
-//!   NVMe read is the same either way. Branch at completion:
-//!   - EFA: session.write(buf → client GPU)
-//!   - TCP: reply with bulk string from buf
+//! Option 2: Per-request rkey with HELLO.
+//!   - DMA.HELLO <client_efa_addr>
+//!     Registers client on all N server EFA devices. Returns all server addresses.
 //!
-//! LO.SET key len [region_idx remote_offset]
-//!   NVMe write is the same either way. Source of bytes differs:
-//!   - EFA: session.read(client GPU → buf) then NVMe write
-//!   - TCP: bytes already inline in RESP, fill buf, then NVMe write
+//!   - DMA.GET <key> <rkey> <remote_addr> <len>
+//!     Reads value from NVMe, fi_writes it into client's registered memory.
+//!
+//!   - DMA.SET <key> <rkey> <remote_addr> <len>
+//!     fi_reads from client's memory into server buffer, writes to NVMe.
+//!
+//! TCP fallback paths remain for non-EFA clients:
+//!   - DMA.GET <key>           → bulk string reply (TCP)
+//!   - DMA.SET <key> <len> <data>  → inline data (TCP)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use valkey_module::server_events::{ClientChangeSubevent, CLIENT_CHANGED_SERVER_EVENTS_LIST};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
 use crate::storage::{self, Storage};
-use crate::transport::{self, ClientRegion, EfaAddress, Session};
+use crate::transport::{self, EfaAddress, RmaOp, Session, WorkItem};
 
 // ─── Per-Client Session Store ────────────────────────────────────────────────
 
@@ -30,7 +35,7 @@ lazy_static::lazy_static! {
 
 enum ReplyData {
     GetOk {
-        bytes_read: u64,
+        bytes_written: u64,
     },
     GetOkTcp {
         data: Vec<u8>,
@@ -44,18 +49,23 @@ enum ReplyData {
     Err(String),
 }
 
-// ─── LO.HELLO ────────────────────────────────────────────────────────────────
+// ─── DMA.HELLO ───────────────────────────────────────────────────────────────
 
-pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    if args.len() < 3 {
+/// DMA.HELLO <client_efa_addr_hex>
+///
+/// Registers the client's EFA address on all N server EFA devices.
+/// Returns: array of all server EFA addresses (one per device).
+///
+/// After HELLO, the client should fi_av_insert all returned addresses so its
+/// NIC accepts incoming RDMA writes from any server device.
+pub fn dma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    if args.len() < 2 {
         return Err(ValkeyError::WrongArity);
     }
 
-    let efa_ctx = transport::efa_context();
-    if !efa_ctx.is_available() {
-        return Err(ValkeyError::Str(errors::ERR_EFA_UNAVAILABLE));
-    }
+    let pool = transport::worker_pool().ok_or(ValkeyError::Str(errors::ERR_EFA_UNAVAILABLE))?;
 
+    // Parse client EFA address (64 hex chars = 32 bytes)
     let peer_hex = args[1].to_string_lossy();
     let peer_bytes =
         hex_decode(&peer_hex).map_err(|_| ValkeyError::Str(errors::ERR_INVALID_PEER_ADDR_HEX))?;
@@ -66,48 +76,19 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     addr.copy_from_slice(&peer_bytes);
     let peer_addr = EfaAddress(addr);
 
-    let num_regions: usize = args[2]
-        .to_string_lossy()
-        .parse()
-        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_NUM_REGIONS))?;
-
-    let expected_args = 3 + num_regions * 3;
-    if args.len() < expected_args {
-        return Err(ValkeyError::Str(errors::ERR_INSUFFICIENT_REGION_ARGS));
-    }
-
-    let mut regions = Vec::with_capacity(num_regions);
-    for i in 0..num_regions {
-        let base = 3 + i * 3;
-        let rkey: u64 = args[base]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RKEY))?;
-        let remote_addr: u64 = args[base + 1]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
-        let len: u64 = args[base + 2]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REGION_LEN))?;
-        regions.push(ClientRegion {
-            rkey,
-            remote_addr,
-            len,
-        });
-    }
-
-    let session = Session::new(efa_ctx, &peer_addr, regions)
+    // Create session: fi_av_insert on ALL N devices
+    let session = Session::new(pool, &peer_addr)
         .map_err(|e| ValkeyError::String(format!("{}: {}", errors::ERR_SESSION_CREATE, e)))?;
-    let server_addrs = session.server_addrs();
 
+    // Store session keyed by client ID
     let client_id = ctx.get_client_id();
     SESSIONS
         .lock()
         .unwrap()
         .insert(client_id, Arc::new(session));
 
+    // Return all server EFA addresses
+    let server_addrs = pool.server_addrs();
     let reply: Vec<ValkeyValue> = server_addrs
         .iter()
         .map(|a| ValkeyValue::BulkString(hex_encode(&a.0)))
@@ -115,9 +96,13 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     Ok(ValkeyValue::Array(reply))
 }
 
-// ─── LO.GET ──────────────────────────────────────────────────────────────────
+// ─── DMA.GET ─────────────────────────────────────────────────────────────────
 
-pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+/// DMA.GET <key> [<rkey> <remote_addr> <len>]
+///
+/// With EFA args: reads value from NVMe, fi_writes into client memory at remote_addr.
+/// Without EFA args: TCP fallback — returns bulk string.
+pub fn dma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 2 {
         return Err(ValkeyError::WrongArity);
     }
@@ -131,24 +116,28 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let object_id = lo_value.object_id;
     let obj_len = lo_value.len;
 
-    let efa_args = if args.len() >= 4 {
-        let region_idx: u32 = args[2]
+    // Parse EFA args: rkey, remote_addr, len (optional — if absent, TCP path)
+    let efa_args = if args.len() >= 5 {
+        let rkey: u64 = args[2]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REGION_IDX))?;
-        let remote_offset: u64 = args[3]
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RKEY))?;
+        let remote_addr: u64 = args[3]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_OFFSET))?;
-        Some((region_idx, remote_offset))
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
+        let len: u64 = args[4]
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REGION_LEN))?;
+        Some((rkey, remote_addr, len))
     } else {
         None
     };
 
     let client_id = ctx.get_client_id();
 
-    // Clone the Arc<Session> BEFORE entering the async callback chain.
-    // This avoids locking SESSIONS inside the io_uring completion callback.
+    // Clone Arc<Session> before entering async path
     let session_arc = if efa_args.is_some() {
         let sessions = SESSIONS.lock().unwrap();
         match sessions.get(&client_id) {
@@ -166,7 +155,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let blocked_client = ctx.block_client();
 
-    // NVMe read — buf moved in, comes back in callback.
+    // NVMe read — then EFA write or TCP reply
     storage.read_into(
         object_id,
         buf,
@@ -180,18 +169,32 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                     );
                 }
                 Ok(bytes_read) => {
-                    if let Some((region_idx, remote_offset)) = efa_args {
-                        // EFA: RDMA write buf → client GPU.
-                        // session_arc was cloned before entering this callback — no lock needed.
+                    if let Some((rkey, remote_addr, _len)) = efa_args {
+                        // EFA path: submit fi_write to worker pool
                         if let Some(session) = session_arc {
-                            session.write(
+                            let pool = match transport::worker_pool() {
+                                Some(p) => p,
+                                None => {
+                                    unblock_client(
+                                        blocked_client,
+                                        ReplyData::Err(errors::ERR_EFA_UNAVAILABLE.to_string()),
+                                    );
+                                    return;
+                                }
+                            };
+
+                            let work_item = WorkItem {
+                                op: RmaOp::Write,
+                                fi_addrs: session.fi_addrs.clone(),
                                 buf,
-                                bytes_read as usize,
-                                region_idx,
-                                remote_offset,
-                                Box::new(move |_buf, write_result| {
-                                    let reply = match write_result {
-                                        Ok(()) => ReplyData::GetOk { bytes_read },
+                                len: bytes_read as usize,
+                                remote_addr,
+                                rkey,
+                                on_complete: Box::new(move |_buf, result| {
+                                    let reply = match result {
+                                        Ok(()) => ReplyData::GetOk {
+                                            bytes_written: bytes_read,
+                                        },
                                         Err(e) => ReplyData::Err(format!(
                                             "{}: {}",
                                             errors::ERR_EFA_WRITE,
@@ -200,7 +203,12 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                                     };
                                     unblock_client(blocked_client, reply);
                                 }),
-                            );
+                            };
+
+                            if pool.submit(work_item).is_err() {
+                                // submit() already called on_complete with error
+                                // and returned the buffer — nothing more to do
+                            }
                         } else {
                             unblock_client(
                                 blocked_client,
@@ -208,12 +216,15 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                             );
                         }
                     } else {
-                        // TCP: copy bytes from buf, release buf, reply with data
-                        // In bench-mode: reply with size only (skips TCP output buffer copy)
+                        // TCP fallback
                         if crate::bench_mode() {
-                            unblock_client(blocked_client, ReplyData::GetOk { bytes_read });
+                            unblock_client(
+                                blocked_client,
+                                ReplyData::GetOk {
+                                    bytes_written: bytes_read,
+                                },
+                            );
                         } else {
-                            // SAFETY: buf.ptr() is valid pool memory, bytes_read <= buf.len.
                             let data = unsafe {
                                 std::slice::from_raw_parts(buf.ptr(), bytes_read as usize).to_vec()
                             };
@@ -228,118 +239,134 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     Ok(ValkeyValue::NoReply)
 }
 
-// ─── LO.SET ──────────────────────────────────────────────────────────────────
+// ─── DMA.SET ─────────────────────────────────────────────────────────────────
 
-pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+/// DMA.SET <key> <rkey> <remote_addr> <len>
+///
+/// With EFA args: fi_reads from client memory, writes to NVMe.
+/// TCP fallback: DMA.SET <key> <len> <data>
+pub fn dma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 3 {
         return Err(ValkeyError::WrongArity);
     }
 
-    let key_name = args[1].clone();
-    let obj_len: u64 = args[2]
-        .to_string_lossy()
-        .parse()
-        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_LEN))?;
-
-    let storage = storage::get();
-    if obj_len > storage.pool_buf_size() as u64 {
-        return Err(ValkeyError::Str(errors::ERR_OBJECT_EXCEEDS_BUF));
-    }
-
-    let efa_args = if args.len() >= 5 {
-        let region_idx: u32 = args[3]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REGION_IDX))?;
-        let remote_offset: u64 = args[4]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_OFFSET))?;
-        Some((region_idx, remote_offset))
-    } else {
-        None
-    };
+    // Determine if this is an EFA path or TCP path.
+    // EFA: DMA.SET <key> <rkey> <remote_addr> <len>  (4 args after command name)
+    // TCP: DMA.SET <key> <len> [<data>]              (2-3 args after command name)
+    //
+    // Heuristic: if we have exactly 5 args and a session exists, it's EFA.
+    // If no session exists or only 3-4 args, it's TCP.
 
     let client_id = ctx.get_client_id();
+    let has_session = SESSIONS.lock().unwrap().contains_key(&client_id);
 
-    // Clone Arc<Session> before entering async path.
-    let session_arc = if efa_args.is_some() {
-        let sessions = SESSIONS.lock().unwrap();
-        match sessions.get(&client_id) {
-            Some(s) => Some(Arc::clone(s)),
-            None => return Err(ValkeyError::Str(errors::ERR_NO_DMA_SESSION)),
+    let is_efa_path = args.len() >= 5 && has_session;
+
+    if is_efa_path {
+        // EFA path: DMA.SET <key> <rkey> <remote_addr> <len>
+        let key_name = args[1].clone();
+        let rkey: u64 = args[2]
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RKEY))?;
+        let remote_addr: u64 = args[3]
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
+        let obj_len: u64 = args[4]
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_LEN))?;
+
+        let storage = storage::get();
+        if obj_len > storage.pool_buf_size() as u64 {
+            return Err(ValkeyError::Str(errors::ERR_OBJECT_EXCEEDS_BUF));
         }
-    } else {
-        None
-    };
 
-    let buf = storage
-        .pool_get()
-        .ok_or(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED))?;
+        let session_arc = {
+            let sessions = SESSIONS.lock().unwrap();
+            Arc::clone(sessions.get(&client_id).unwrap())
+        };
 
-    let blocked_client = ctx.block_client();
-
-    if let Some((region_idx, remote_offset)) = efa_args {
-        // EFA: read from client GPU into buf, then NVMe write.
+        let buf = storage
+            .pool_get()
+            .ok_or(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED))?;
+        let blocked_client = ctx.block_client();
         let key_for_reply = key_name.as_slice().to_vec();
-        if let Some(session) = session_arc {
-            session.read(
-                buf,
-                obj_len as usize,
-                region_idx,
-                remote_offset,
-                Box::new(move |buf, read_result| {
-                    match read_result {
-                        Ok(()) => {
-                            // Now write buf to NVMe.
-                            let storage = storage::get();
-                            storage.write_new(
-                                buf,
-                                obj_len,
-                                Box::new(move |_buf, write_result| {
-                                    let reply = match write_result {
-                                        Ok((oid, crc)) => ReplyData::SetOk {
-                                            key_name: key_for_reply,
-                                            oid,
-                                            len: obj_len,
-                                            crc,
-                                        },
-                                        Err(e) => ReplyData::Err(format!(
-                                            "{}: {}",
-                                            errors::ERR_NVME_WRITE,
-                                            e
-                                        )),
-                                    };
-                                    unblock_client(blocked_client, reply);
-                                }),
-                            );
-                        }
-                        Err(e) => {
-                            unblock_client(
-                                blocked_client,
-                                ReplyData::Err(format!("{}: {}", errors::ERR_EFA_READ, e)),
-                            );
-                        }
+
+        let pool = transport::worker_pool().ok_or(ValkeyError::Str(errors::ERR_EFA_UNAVAILABLE))?;
+
+        let work_item = WorkItem {
+            op: RmaOp::Read,
+            fi_addrs: session_arc.fi_addrs.clone(),
+            buf,
+            len: obj_len as usize,
+            remote_addr,
+            rkey,
+            on_complete: Box::new(move |buf, result| {
+                match result {
+                    Ok(()) => {
+                        // fi_read complete — now write buf to NVMe
+                        let storage = storage::get();
+                        storage.write_new(
+                            buf,
+                            obj_len,
+                            Box::new(move |_buf, write_result| {
+                                let reply = match write_result {
+                                    Ok((oid, crc)) => ReplyData::SetOk {
+                                        key_name: key_for_reply,
+                                        oid,
+                                        len: obj_len,
+                                        crc,
+                                    },
+                                    Err(e) => {
+                                        ReplyData::Err(format!("{}: {}", errors::ERR_NVME_WRITE, e))
+                                    }
+                                };
+                                unblock_client(blocked_client, reply);
+                            }),
+                        );
                     }
-                }),
-            );
-        } else {
-            unblock_client(
-                blocked_client,
-                ReplyData::Err(errors::ERR_SESSION_GONE.to_string()),
-            );
+                    Err(e) => {
+                        unblock_client(
+                            blocked_client,
+                            ReplyData::Err(format!("{}: {}", errors::ERR_EFA_READ, e)),
+                        );
+                    }
+                }
+            }),
+        };
+
+        if pool.submit(work_item).is_err() {
+            // submit() already called on_complete with error
         }
+
+        Ok(ValkeyValue::NoReply)
     } else {
-        // TCP: bytes come inline as args[3].
+        // TCP path: DMA.SET <key> <len> [<data>]
+        let key_name = args[1].clone();
+        let obj_len: u64 = args[2]
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_LEN))?;
+
+        let storage = storage::get();
+        if obj_len > storage.pool_buf_size() as u64 {
+            return Err(ValkeyError::Str(errors::ERR_OBJECT_EXCEEDS_BUF));
+        }
+
+        let buf = storage
+            .pool_get()
+            .ok_or(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED))?;
+        let blocked_client = ctx.block_client();
+
+        // Copy inline data to buffer
         if args.len() > 3 {
             let data = args[3].as_slice();
             let copy_len = data.len().min(obj_len as usize);
-            // SAFETY: buf.ptr() is a valid pool buffer with capacity >= buf_size >= obj_len.
-            // data.as_ptr() is valid for data.len() bytes. copy_len <= both.
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf.ptr(), copy_len) };
         }
 
-        // Write buf to NVMe.
         let key_for_reply = key_name.as_slice().to_vec();
         storage.write_new(
             buf,
@@ -357,9 +384,9 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
                 unblock_client(blocked_client, reply);
             }),
         );
-    }
 
-    Ok(ValkeyValue::NoReply)
+        Ok(ValkeyValue::NoReply)
+    }
 }
 
 // ─── UnblockClient ───────────────────────────────────────────────────────────
@@ -367,12 +394,10 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 fn unblock_client(bc: valkey_module::BlockedClient, reply: ReplyData) {
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(bc);
     match reply {
-        ReplyData::GetOk { bytes_read } => {
-            // EFA path or bench-mode TCP: reply with size (no bulk data)
-            thread_ctx.reply(Ok(ValkeyValue::Integer(bytes_read as i64)));
+        ReplyData::GetOk { bytes_written } => {
+            thread_ctx.reply(Ok(ValkeyValue::Integer(bytes_written as i64)));
         }
         ReplyData::GetOkTcp { data } => {
-            // TCP path: reply with the object bytes
             thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
         }
         ReplyData::SetOk {
@@ -381,26 +406,46 @@ fn unblock_client(bc: valkey_module::BlockedClient, reply: ReplyData) {
             len,
             crc,
         } => {
-            // Scoped block ensures drop order: key, key_str, ctx.
-            // key_str must be freed (VM_FreeString) while ctx is still alive,
-            // because ctx's autoMemory tracks the string. Without this scope,
-            // explicit drop(ctx) frees the context first, then key_str's Drop
-            // calls VM_FreeString on freed memory (use-after-free).
-            {
-                let ctx = thread_ctx.lock();
-                let key_str = ctx.create_string(key_name.as_slice());
-                let key = ctx.open_key_writable(&key_str);
-                let lo_value = LoValue {
-                    object_id: oid,
-                    len,
-                    crc32c: crc,
-                };
-                key.set_value(&LO_TYPE, lo_value).unwrap();
-            }
+            let ctx = thread_ctx.lock();
+            let key_str = ctx.create_string(key_name.as_slice());
+            let key = ctx.open_key_writable(&key_str);
+            let lo_value = LoValue {
+                object_id: oid,
+                len,
+                crc32c: crc,
+            };
+            key.set_value(&LO_TYPE, lo_value).unwrap();
+            drop(key);
+            drop(key_str);
+            drop(ctx);
             thread_ctx.reply(Ok(ValkeyValue::SimpleStringStatic("OK")));
         }
         ReplyData::Err(msg) => {
             thread_ctx.reply(Err(ValkeyError::String(msg)));
+        }
+    }
+}
+
+// ─── Session Disconnect Cleanup ──────────────────────────────────────────────
+
+/// Called by the Valkey event system when a client connects or disconnects.
+/// On disconnect, removes the client's DMA session and cleans up AV entries
+/// on all EFA workers so the AV slots can be reused.
+#[linkme::distributed_slice(CLIENT_CHANGED_SERVER_EVENTS_LIST)]
+fn on_client_change(ctx: &Context, subevent: ClientChangeSubevent) {
+    if subevent != ClientChangeSubevent::Disconnected {
+        return;
+    }
+
+    let client_id = ctx.get_client_id();
+
+    // Remove session from the map
+    let session = SESSIONS.lock().unwrap().remove(&client_id);
+
+    // If this client had a DMA session, clean up its AV entries
+    if let Some(session) = session {
+        if let Some(pool) = transport::worker_pool() {
+            pool.remove_peer(&session.fi_addrs);
         }
     }
 }

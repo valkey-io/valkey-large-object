@@ -15,3 +15,29 @@ __pycache__/
 
 # OS
 .DS_Store
+docs/RDMA_ONE_SIDED_VS_TWO_SIDED.md
+poc/EFA_RMA_POC_PLAN.md
+poc/hydration_gate_poc_v2.c
+poc/hydration_gate_poc_v2.so
+poc/hydration_gate_poc.c
+poc/hydration_gate_poc.so
+poc/Makefile
+poc/PHASE1_INFRA.md
+poc/POC_RESULTS.md
+poc/POC_V2_RESULTS.md
+poc/replication_model_comparison.md
+poc/SESSION_CONTEXT.md
+poc/efa_rma/build.rs
+poc/efa_rma/Cargo.toml
+poc/efa_rma/wrapper.h
+poc/efa_rma/src/control.rs
+poc/efa_rma/src/fabric.rs
+poc/efa_rma/src/main.rs
+poc/PHASE3_TRANSPORT.md
+poc/EFA_METRICS_CAPTURE.md
+semantic-review/2026-08-14-223629-pr-local.md
+PR_DESCRIPTION.md
+poc/PHASE4_I8GE_PLAN.md
+poc/POC_PHASE4_RESULTS.md
+poc/efa_rma/Cargo.lock
+poc/efa_rma/src/e2e_client.rs
