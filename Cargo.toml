@@ -12,11 +12,13 @@ valkey-module-macros = "0"
 linkme = "0"
 libc = "0.2"
 crc32c = "0.6"
-io-uring = "0.7"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 lazy_static = "1"
 talc = { version = "4", default-features = false, features = ["lock_api"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
 
 [dev-dependencies]
 rstest = "0.23.0"

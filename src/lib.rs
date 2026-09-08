@@ -190,6 +190,14 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     let mode = operating_mode();
     let dir = nvme_dir();
 
+    #[cfg(not(target_os = "linux"))]
+    if mode == OperatingMode::Tiered {
+        ctx.log_warning(
+            "largeobj: operating-mode tiered requires Linux (io_uring); aborting module load",
+        );
+        return Status::Err;
+    }
+
     // Reset nvme-dir before use (Tiered mode only; a no-op in Dram, which never
     // touches disk): reclaim any object files a previous run left behind after an
     // unclean exit — a hard crash / SIGKILL never reaches our shutdown handler.

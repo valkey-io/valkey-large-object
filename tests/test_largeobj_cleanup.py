@@ -1,6 +1,9 @@
 import os
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, requires_tiered_mode
 from valkeytestframework.util.waiters import wait_for_equal
+
+# The base fixture's default module args are Tiered
+pytestmark = requires_tiered_mode
 
 
 class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
