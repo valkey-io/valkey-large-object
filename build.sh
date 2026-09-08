@@ -11,7 +11,7 @@
 #   ./build.sh clean          # remove build artifacts
 #
 # Environment variables:
-#   SERVER_VERSION        valkey branch/tag to build (default: unstable)
+#   SERVER_VERSION        valkey branch, tag, or PR (like pull/4050/head) to build (default: unstable)
 #   VALKEY_SERVER_PATH    path to pre-built valkey-server binary (skips building valkey)
 #   TEST_PATTERN          pytest -k filter pattern
 #   ASAN_BUILD            if set, builds valkey with SANITIZER=address
@@ -88,9 +88,13 @@ fi
 # Use separate binary dir for ASAN so normal and ASAN builds don't collide.
 # GIT_VERSION is used for git checkout, SERVER_VERSION is exported for tests.
 GIT_VERSION="$SERVER_VERSION"
+# SERVER_VERSION is also a directory name, and the tests rebuild the same path from the exported
+# value — so flatten refs that contain slashes (a PR ref like pull/4050/head) before either uses it.
+SERVER_VERSION=$(printf '%s' "$SERVER_VERSION" | tr '/' '-')
 if [ ! -z "${ASAN_BUILD}" ]; then
-    export SERVER_VERSION="${SERVER_VERSION}-asan"
+    SERVER_VERSION="${SERVER_VERSION}-asan"
 fi
+export SERVER_VERSION
 BINARY_DIR="tests/build/binaries/${SERVER_VERSION}"
 
 BINARY_PATH="$BINARY_DIR/valkey-server"
@@ -116,7 +120,17 @@ else
     cd tests/build
     git clone "$REPO_URL"
     cd valkey
-    git checkout "$GIT_VERSION"
+    # A clone fetches branches and tags only, so a GitHub PR ref has to be fetched
+    # before it can be checked out. For versions like pull/4050/head
+    case "$GIT_VERSION" in
+        pull/*|refs/pull/*)
+            git fetch origin "$GIT_VERSION"
+            git checkout FETCH_HEAD
+            ;;
+        *)
+            git checkout "$GIT_VERSION"
+            ;;
+    esac
     make distclean
     if [ ! -z "${ASAN_BUILD}" ]; then
         make -j SANITIZER=address
