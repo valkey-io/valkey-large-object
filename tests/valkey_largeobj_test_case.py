@@ -1,9 +1,18 @@
 import os
 import glob
+import sys
 import pytest
 from valkeytestframework.valkey_test_case import ValkeyTestCase
 from valkey import ResponseError
 import logging
+
+
+# NVMe tiering reaches disk through io_uring, so the module refuses to load in Tiered mode
+# anywhere but Linux.
+requires_tiered_mode = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Tiered mode requires Linux (io_uring)",
+)
 
 
 class ValkeyLargeObjTestCaseBase(ValkeyTestCase):

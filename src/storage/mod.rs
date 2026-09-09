@@ -11,6 +11,8 @@ pub mod fd_pool;
 pub mod nvme_pool;
 pub mod segment;
 pub mod segment_pool;
+/// Linux-only. Tiered mode is refused at module load on non-Linux.
+#[cfg(target_os = "linux")]
 pub mod uring;
 
 // Re-exports for convenience.
@@ -25,6 +27,14 @@ pub const IO_ALIGN: usize = 4096;
 pub fn align_up(n: usize) -> usize {
     (n + IO_ALIGN - 1) & !(IO_ALIGN - 1)
 }
+
+/// `O_DIRECT` on Linux, where the object files live. Every open that ORs this in belongs to the
+/// NVMe path, which Tiered mode owns and non-Linux builds never reach, so 0 keeps those opens
+/// compiling without changing behaviour anywhere it matters.
+#[cfg(target_os = "linux")]
+pub const DIRECT_IO_FLAG: libc::c_int = libc::O_DIRECT;
+#[cfg(not(target_os = "linux"))]
+pub const DIRECT_IO_FLAG: libc::c_int = 0;
 pub use dram_pool::DRAMPool;
 pub use fd_pool::FdPool;
 pub use nvme_pool::NVMePool;
@@ -147,6 +157,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
 
     // io_uring NVMe engine: only in Tiered mode. Ring creation + buffer registration
     // happen on this (main) thread so failures return Err, not panic in the poller.
+    #[cfg(target_os = "linux")]
     let nvme_engine = if mode == crate::OperatingMode::Tiered {
         let pairs = IOVECS.lock().expect("IOVECS lock unavailable").clone();
         let iovecs: Vec<libc::iovec> = pairs
@@ -181,6 +192,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     if DRAM_POOL.set(dram_pool).is_err() {
         panic!("DRAMPool already initialized");
     }
+    #[cfg(target_os = "linux")]
     if let Some(engine) = nvme_engine {
         uring::set_nvme_engine(engine);
     }

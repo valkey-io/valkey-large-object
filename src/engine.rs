@@ -13,6 +13,7 @@
 //!   ReadFixed directly into DRAMPool buffers, mark Filling→Ready.
 //!   Concurrent GETs coalesce on Filling ObjectContext.
 
+#[cfg(target_os = "linux")]
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
@@ -20,7 +21,9 @@ use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
-use crate::storage::{self, uring, ObjectContext};
+#[cfg(target_os = "linux")]
+use crate::storage::uring;
+use crate::storage::{self, ObjectContext};
 use crate::transport::Session;
 use crate::OperatingMode;
 
@@ -87,9 +90,13 @@ pub fn execute_get(
                 OperatingMode::Dram => {
                     execute_get_dram_efa(object_id, obj_len, transport, blocked_client);
                 }
+                #[cfg(target_os = "linux")]
                 OperatingMode::Tiered => {
                     execute_get_tiered(object_id, obj_len, transport, blocked_client);
                 }
+                // Module load refuses Tiered off Linux, so nothing can select it here.
+                #[cfg(not(target_os = "linux"))]
+                OperatingMode::Tiered => unreachable!("Tiered mode requires Linux"),
             }
             EngineResult::Async
         }
@@ -144,6 +151,7 @@ fn execute_get_dram_efa(
 }
 
 /// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
+#[cfg(target_os = "linux")]
 fn execute_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
@@ -265,6 +273,7 @@ fn execute_get_tiered(
 
 /// Handle NVMe read result — reply to the blocked client based on the io_uring
 /// completion result and transport type. Shared across GET paths that read from NVMe.
+#[cfg(target_os = "linux")]
 async fn handle_nvme_read_result(
     read_result: Result<Result<u64, storage::StorageError>, tokio::sync::oneshot::error::RecvError>,
     transport: Transport,
@@ -359,6 +368,7 @@ pub fn execute_set(
                         object_id,
                     );
                 }
+                #[cfg(target_os = "linux")]
                 OperatingMode::Tiered => {
                     execute_set_tiered(
                         key_name_bytes,
@@ -368,6 +378,9 @@ pub fn execute_set(
                         object_id,
                     );
                 }
+                // Module load refuses Tiered off Linux, so nothing can select it here.
+                #[cfg(not(target_os = "linux"))]
+                OperatingMode::Tiered => unreachable!("Tiered mode requires Linux"),
             }
             EngineResult::Async
         }
@@ -521,6 +534,7 @@ fn execute_set_dram_efa(
 }
 
 /// Tiered SET: write to NVMe (invalidate DRAMPool entry if exists).
+#[cfg(target_os = "linux")]
 fn execute_set_tiered(
     key_name: Vec<u8>,
     obj_len: u64,
@@ -606,6 +620,7 @@ fn execute_set_tiered(
 
 /// Shared Tiered NVMe write: CRC → open tmp → WriteFixed → rename → create LoValue.
 /// Must be called from within a tokio task (awaits io_uring write).
+#[cfg(target_os = "linux")]
 async fn do_tiered_nvme_write(
     buf_ptr_usize: usize,
     obj_len: u64,
@@ -630,7 +645,7 @@ async fn do_tiered_nvme_write(
     let c_path = std::ffi::CString::new(file_path.as_str()).expect("file_path null");
     let mut write_flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
     if crate::direct_io() {
-        write_flags |= libc::O_DIRECT;
+        write_flags |= storage::DIRECT_IO_FLAG;
     }
     // FdPool intentionally not used on SET path — fd cached lazily on first GET via get_or_open.
     let raw_fd = unsafe { libc::open(c_path.as_ptr(), write_flags, 0o644) };

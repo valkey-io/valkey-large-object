@@ -1,8 +1,10 @@
 import os
 import glob
 from valkey import ResponseError
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, requires_tiered_mode
 from valkeytestframework.util.waiters import wait_for_equal
+
+pytestmark = requires_tiered_mode
 
 
 class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):

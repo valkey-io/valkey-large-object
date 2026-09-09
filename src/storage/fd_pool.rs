@@ -50,7 +50,7 @@ impl FdPool {
         let c_path = std::ffi::CString::new(path).expect("file_path null");
         let mut flags = libc::O_RDONLY;
         if crate::direct_io() {
-            flags |= libc::O_DIRECT;
+            flags |= super::DIRECT_IO_FLAG;
         }
         let fd = unsafe { libc::open(c_path.as_ptr(), flags) };
         if fd < 0 {
