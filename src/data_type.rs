@@ -87,10 +87,7 @@ impl LoValue {
     pub fn create_copy(&self) -> Option<LoValue> {
         match crate::operating_mode() {
             crate::OperatingMode::Dram => self.create_copy_dram(),
-            #[cfg(target_os = "linux")]
-            crate::OperatingMode::Tiered => self.create_copy_tiered(),
-            #[cfg(not(target_os = "linux"))]
-            crate::OperatingMode::Tiered => unreachable!("Tiered mode requires Linux"),
+            crate::OperatingMode::Tiered => crate::tiered::create_copy(self),
         }
     }
 
@@ -111,28 +108,6 @@ impl LoValue {
             crc32c: self.crc32c,
         })
     }
-
-    /// Tiered mode: copy NVMe file with a fresh OID.
-    /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
-    /// Returns None if nvme-maxmemory would be exceeded.
-    #[cfg(target_os = "linux")]
-    fn create_copy_tiered(&self) -> Option<LoValue> {
-        let data_dir = crate::nvme_dir();
-        if !crate::storage::uring::has_nvme_capacity(self.len) {
-            return None;
-        }
-        let new_oid = ObjectId::next();
-        let src_path = self.object_id.file_path(&data_dir);
-        let dst_path = new_oid.file_path(&data_dir);
-        std::fs::copy(&src_path, &dst_path)
-            .expect("Tiered COPY: source file missing — key exists implies file exists");
-        crate::storage::uring::increase_nvme_disk_usage(self.len);
-        Some(LoValue {
-            object_id: new_oid,
-            len: self.len,
-            crc32c: self.crc32c,
-        })
-    }
 }
 
 // ─── Callbacks ───────────────────────────────────────────────────────────────
@@ -147,11 +122,8 @@ unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     let lo = Box::from_raw(value as *mut LoValue);
     crate::storage::get_dram_pool().remove_object(&lo.object_id);
     // FdPool and NVMe files only exist in Tiered mode, which only exists on Linux.
-    #[cfg(target_os = "linux")]
     if crate::operating_mode() == crate::OperatingMode::Tiered {
-        crate::storage::get_fd_pool().remove(lo.object_id);
-        crate::storage::delete_file(lo.object_id);
-        crate::storage::uring::decrease_nvme_disk_usage(lo.len);
+        crate::tiered::free(&lo);
     }
 }
 

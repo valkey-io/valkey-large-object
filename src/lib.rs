@@ -43,6 +43,7 @@ pub mod data_type;
 pub mod engine;
 pub mod errors;
 pub mod storage;
+pub mod tiered;
 pub mod transport;
 
 use crate::data_type::LO_TYPE;

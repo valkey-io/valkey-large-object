@@ -84,6 +84,19 @@ pub fn append_iovec(iov: libc::iovec) -> u16 {
     idx
 }
 
+/// Snapshot the registered iovec array, in registration order, for io_uring buffer registration.
+fn iovec_snapshot() -> Vec<libc::iovec> {
+    IOVECS
+        .lock()
+        .expect("IOVECS lock unavailable")
+        .iter()
+        .map(|&(ptr, len)| libc::iovec {
+            iov_base: ptr as *mut libc::c_void,
+            iov_len: len,
+        })
+        .collect()
+}
+
 pub(super) static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
 pub(super) static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
 static FD_POOL: OnceLock<FdPool> = OnceLock::new();
@@ -157,25 +170,10 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
 
     // io_uring NVMe engine: only in Tiered mode. Ring creation + buffer registration
     // happen on this (main) thread so failures return Err, not panic in the poller.
-    #[cfg(target_os = "linux")]
-    let nvme_engine = if mode == crate::OperatingMode::Tiered {
-        let pairs = IOVECS.lock().expect("IOVECS lock unavailable").clone();
-        let iovecs: Vec<libc::iovec> = pairs
-            .iter()
-            .map(|&(ptr, len)| libc::iovec {
-                iov_base: ptr as *mut libc::c_void,
-                iov_len: len,
-            })
-            .collect();
-        let engine = uring::UringNvmeEngine::new(iovecs).map_err(|e| {
-            // Engine failed — clear IOVECS so a retry starts fresh.
-            IOVECS.lock().expect("IOVECS lock unavailable").clear();
-            format!("io_uring engine: {}", e)
-        })?;
-        Some(engine)
-    } else {
-        None
-    };
+    let nvme_engine = crate::tiered::prepare_engine(mode, iovec_snapshot()).inspect_err(|_| {
+        // Engine failed — clear IOVECS so a retry starts fresh.
+        IOVECS.lock().expect("IOVECS lock unavailable").clear();
+    })?;
 
     // ── All succeeded — commit to globals. No failure possible after this point. ──
 
@@ -192,10 +190,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     if DRAM_POOL.set(dram_pool).is_err() {
         panic!("DRAMPool already initialized");
     }
-    #[cfg(target_os = "linux")]
-    if let Some(engine) = nvme_engine {
-        uring::set_nvme_engine(engine);
-    }
+    crate::tiered::commit_engine(nvme_engine);
 
     Ok(format!(
         "mode={:?} nvme_dir={} dram_segments={}x{}MB nvme_staging={}MB",
