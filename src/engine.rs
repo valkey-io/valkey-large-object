@@ -276,7 +276,7 @@ fn execute_get_tiered(
         Some(b) => b,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)));
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS)));
             return;
         }
     };
@@ -441,7 +441,7 @@ fn serve_set_dram_tcp(
 
     let seg_buf = match dram_pool.alloc(obj_len as usize) {
         Some(b) => b,
-        None => return Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)),
+        None => return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED)),
     };
 
     let buf_ptr = dram_pool.buffer_ptr(&seg_buf);
@@ -502,7 +502,7 @@ fn execute_set_dram_efa(
         Some(b) => b,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)));
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED)));
             return;
         }
     };
@@ -597,7 +597,7 @@ fn execute_set_tiered(
         Some(b) => b,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)));
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS)));
             return;
         }
     };
@@ -680,7 +680,7 @@ async fn do_tiered_nvme_write(
     // exceed nvme-maxmemory. stream_ctx drop frees the buffer on return.
     if !uring::try_reserve_nvme_disk_usage(disk_len) {
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-        thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_POOL_EXHAUSTED)));
+        thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED)));
         return;
     }
     let buf_ptr = buf_ptr_usize as *mut u8;

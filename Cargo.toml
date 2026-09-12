@@ -15,6 +15,7 @@ crc32c = "0.6"
 io-uring = "0.7"
 crossbeam-channel = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
 lazy_static = "1"
 talc = { version = "4", default-features = false, features = ["lock_api"] }
 

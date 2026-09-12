@@ -114,6 +114,18 @@ lazy_static::lazy_static! {
     /// - Dram (0): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
     /// - Tiered (1): objects persist on NVMe, DRAMPool is a read cache with promotion.
     static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Dram);
+
+    // ─── Streaming Configs ───────────────────────────────────────────────
+
+    /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
+    /// Determines allocation unit for all I/O operations.
+    static ref CFG_BUFFER_SIZE: AtomicI64 = AtomicI64::new(8 * 1024 * 1024);
+
+    /// Max buffers per streaming operation (batch size / pipeline depth). Default: 8.
+    static ref CFG_MAX_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(8);
+
+    /// Min buffers to start a streaming operation. Below this → reject. Default: 2.
+    static ref CFG_STREAMING_MIN_BUFFERS: AtomicI64 = AtomicI64::new(2);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -186,6 +198,18 @@ pub fn operating_mode() -> OperatingMode {
     *CFG_OPERATING_MODE
         .lock()
         .expect("CFG_OPERATING_MODE lock unavailable")
+}
+
+pub fn buffer_size() -> usize {
+    CFG_BUFFER_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn max_buffers_per_op() -> usize {
+    CFG_MAX_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn streaming_min_buffers() -> usize {
+    CFG_STREAMING_MIN_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
@@ -323,6 +347,12 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 268_435_456, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, None],
+            ["lo-buffer-size", &*CFG_BUFFER_SIZE, 8_388_608, 4096, 268_435_456,
+             ConfigurationFlags::MEMORY, None, None],
+            ["lo-max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["lo-streaming-min-buffers", &*CFG_STREAMING_MIN_BUFFERS, 2, 1, 64,
+             ConfigurationFlags::DEFAULT, None, None],
         ],
         string: [
             ["nvme-dir", &*CFG_NVME_DIR, "", ConfigurationFlags::IMMUTABLE, None],

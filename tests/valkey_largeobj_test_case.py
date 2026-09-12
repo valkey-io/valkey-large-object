@@ -29,6 +29,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 1048576"
             f" dram-segment-size 1048576"
+            f" lo-buffer-size 4096"
             f" bench-mode no"
             f" direct-io no"
         )

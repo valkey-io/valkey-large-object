@@ -36,6 +36,10 @@ impl DRAMPool {
         self.pool.free(buf)
     }
 
+    pub fn alloc_n(&self, chunk_size: usize, count: usize) -> Option<Vec<SegmentBuffer>> {
+        self.pool.alloc_n(chunk_size, count, count)
+    }
+
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
         self.pool.buffer_ptr(buf)
     }
@@ -90,6 +94,10 @@ impl DRAMPool {
 
     /// Try to allocate space and create an ObjectContext for this object.
     /// Returns None if pool is full or object exceeds max-promote-size.
+    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_n
+    /// with all-or-nothing semantics (min_required = total_chunks).
+    /// chunk_size is captured here at allocation time so callers use the same
+    /// value for streaming loops — avoids TOCTOU if lo-buffer-size changes.
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
@@ -99,9 +107,12 @@ impl DRAMPool {
         if obj_len > crate::max_promote_size() {
             return None;
         }
+        let chunk_size = crate::buffer_size();
+        let total_chunks = super::chunk_count(obj_len, chunk_size);
+        // All-or-nothing: alloc_n rolls back internally if pool can't satisfy all chunks.
         // Alloc BEFORE write lock — talc scan under memory pressure
         // won't block GET readers waiting on get_object().
-        let seg_buf = self.alloc(obj_len as usize)?;
+        let buffers = self.alloc_n(chunk_size, total_chunks as usize)?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self
@@ -109,13 +120,16 @@ impl DRAMPool {
             .write()
             .expect("DRAMPool.objects lock unavailable");
         if objects.contains_key(&oid) {
-            self.free(&seg_buf);
+            for buf in &buffers {
+                self.pool.free(buf);
+            }
             return None;
         }
+        // buf.len stays chunk_size for all buffers — must match alloc size for free().
         let obj_ctx = std::sync::Arc::new(super::context::ObjectContext::new_filling(
-            vec![seg_buf],
+            buffers,
             obj_len,
-            1, // TODO: Single chunk today; streaming will pass actual chunk count.
+            total_chunks,
         ));
         objects.insert(oid, obj_ctx.clone());
         Some(obj_ctx)

@@ -3,6 +3,9 @@
 //! Operates on OIDs and file paths, NEVER on Valkey keys.
 //! Command handler resolves key → OID via data type layer, then calls storage.
 
+use crate::data_type::ObjectId;
+use std::mem::size_of;
+
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
@@ -250,4 +253,137 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
         slices.push(unsafe { std::slice::from_raw_parts(seg.base, seg.size) });
     }
     slices
+}
+
+// ─── Chunk Helpers ───────────────────────────────────────────────────────────
+
+/// Compute the number of chunks for an object of `obj_len` bytes.
+pub fn chunk_count(obj_len: u64, chunk_size: usize) -> u32 {
+    obj_len.div_ceil(chunk_size as u64) as u32
+}
+
+/// Compute the data length of chunk `i` (last chunk may be shorter).
+pub fn chunk_data_len(i: u32, total_chunks: u32, obj_len: u64, chunk_size: usize) -> usize {
+    if i == total_chunks - 1 {
+        let rem = (obj_len % chunk_size as u64) as usize;
+        if rem == 0 {
+            chunk_size
+        } else {
+            rem
+        }
+    } else {
+        chunk_size
+    }
+}
+
+// ─── FileHeader ──────────────────────────────────────────────────────────────
+
+pub const FILE_HEADER_SIZE: u64 = 4096;
+pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
+pub const FILE_HEADER_VERSION: u8 = 1;
+
+/// Packed wire size of the header fields (no inter-field padding).
+/// Computed from field types so adding a field updates this automatically.
+pub const FILE_HEADER_WIRE_LEN: usize = size_of::<[u8; 4]>()  // magic
+    + size_of::<u8>()                                           // version
+    + size_of::<u64>()                                          // object_id
+    + size_of::<u64>()                                          // len
+    + size_of::<u32>(); // crc32c
+
+// Static assert: wire header fits within the page.
+const _: () = assert!(FILE_HEADER_WIRE_LEN <= FILE_HEADER_SIZE as usize);
+
+/// On-disk file header for NVMe object files.
+/// Data starts at offset FILE_HEADER_SIZE (4096) for O_DIRECT alignment.
+///
+/// The struct's in-memory layout does NOT match the on-disk wire format —
+/// the compiler inserts padding for natural field alignment. Serialization
+/// is handled by `to_page` (sequential writes) and `from_page` (sequential
+/// reads with validation). Do not attempt to byte-cast this struct.
+pub struct FileHeader {
+    pub magic: [u8; 4],
+    pub version: u8,
+    pub object_id: u64,
+    pub len: u64,
+    pub crc32c: u32,
+}
+
+impl FileHeader {
+    pub fn new(object_id: ObjectId, len: u64, crc32c: u32) -> Self {
+        Self {
+            magic: *FILE_HEADER_MAGIC,
+            version: FILE_HEADER_VERSION,
+            object_id: object_id.0,
+            len,
+            crc32c,
+        }
+    }
+
+    /// Serialize into a 4096-byte page (header bytes + zero padding).
+    pub fn to_page(&self) -> Vec<u8> {
+        let mut page = Vec::with_capacity(FILE_HEADER_SIZE as usize);
+        page.extend_from_slice(&self.magic);
+        page.push(self.version);
+        page.extend_from_slice(&self.object_id.to_le_bytes());
+        page.extend_from_slice(&self.len.to_le_bytes());
+        page.extend_from_slice(&self.crc32c.to_le_bytes());
+        debug_assert_eq!(page.len(), FILE_HEADER_WIRE_LEN);
+        page.resize(FILE_HEADER_SIZE as usize, 0);
+        page
+    }
+
+    /// Deserialize from a page. Panics on invalid magic, version, or truncated page
+    /// (these indicate corrupt on-disk data). Fields are read sequentially via cursor.
+    pub fn from_page(page: &[u8]) -> Self {
+        if page.len() < FILE_HEADER_WIRE_LEN {
+            panic!(
+                "largeobj: file header too short ({} bytes, need {})",
+                page.len(),
+                FILE_HEADER_WIRE_LEN
+            );
+        }
+        let mut cur = 0;
+        let magic: [u8; 4] = page[cur..cur + 4]
+            .try_into()
+            .expect("file header magic slice");
+        cur += 4;
+        if &magic != FILE_HEADER_MAGIC {
+            panic!(
+                "largeobj: file header invalid magic {:?} (expected {:?})",
+                magic, FILE_HEADER_MAGIC
+            );
+        }
+        let version = page[cur];
+        cur += 1;
+        if version != FILE_HEADER_VERSION {
+            panic!(
+                "largeobj: file header unsupported version {} (expected {})",
+                version, FILE_HEADER_VERSION
+            );
+        }
+        let object_id = u64::from_le_bytes(
+            page[cur..cur + 8]
+                .try_into()
+                .expect("file header object_id slice"),
+        );
+        cur += 8;
+        let len = u64::from_le_bytes(
+            page[cur..cur + 8]
+                .try_into()
+                .expect("file header len slice"),
+        );
+        cur += 8;
+        let crc32c = u32::from_le_bytes(
+            page[cur..cur + 4]
+                .try_into()
+                .expect("file header crc32c slice"),
+        );
+        Self {
+            magic,
+            version,
+            object_id,
+            len,
+            crc32c,
+        }
+    }
 }
