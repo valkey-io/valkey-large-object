@@ -5,37 +5,18 @@
 //! LO.SET key <data>                (TCP): engine::execute_set
 //! LO.SET key len rkey remote_addr  (EFA): engine::execute_set
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use linkme::distributed_slice;
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 use crate::data_type::{LoValue, LO_TYPE};
 use crate::engine::{self, DataSource, Transport};
 use crate::errors;
-use crate::transport::{self, EfaAddress, Session};
+use crate::transport::{self, session, EfaAddress, Session};
 
-// ─── Per-Client Session Store ────────────────────────────────────────────────
-
-lazy_static::lazy_static! {
-    static ref SESSIONS: Mutex<HashMap<u64, Arc<Session>>> = Mutex::new(HashMap::new());
-}
-
-/// Remove a client's EFA session on disconnect.
-/// Registered via #[distributed_slice] — Valkey calls this on client disconnect.
-#[distributed_slice(valkey_module::server_events::CLIENT_CHANGED_SERVER_EVENTS_LIST)]
-fn on_client_change(
-    ctx: &valkey_module::Context,
-    subevent: valkey_module::server_events::ClientChangeSubevent,
-) {
-    if subevent == valkey_module::server_events::ClientChangeSubevent::Disconnected {
-        let client_id = ctx.get_client_id();
-        SESSIONS
-            .lock()
-            .expect("SESSIONS lock unavailable")
-            .remove(&client_id);
-    }
+/// The EFA session the client previously established with LO.HELLO.
+fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
+    session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))
 }
 
 // ─── LO.HELLO ────────────────────────────────────────────────────────────────
@@ -67,12 +48,7 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let session = Session::new(efa_ctx, &peer_addr)
         .map_err(|e| ValkeyError::String(format!("{}: {}", errors::ERR_SESSION_CREATE, e)))?;
     let server_addrs = session.server_addrs();
-
-    let client_id = ctx.get_client_id();
-    SESSIONS
-        .lock()
-        .expect("SESSIONS lock unavailable")
-        .insert(client_id, Arc::new(session));
+    session::insert(ctx.get_client_id(), session);
 
     let reply: Vec<ValkeyValue> = server_addrs
         .iter()
@@ -113,13 +89,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             .to_string_lossy()
             .parse()
             .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
-        let client_id = ctx.get_client_id();
-        let session = SESSIONS
-            .lock()
-            .expect("SESSIONS lock unavailable")
-            .get(&client_id)
-            .ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))?
-            .clone();
+        let session = efa_session(ctx)?;
         Transport::Efa {
             session,
             rkey,
@@ -161,13 +131,7 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             .to_string_lossy()
             .parse()
             .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
-        let client_id = ctx.get_client_id();
-        let session = SESSIONS
-            .lock()
-            .expect("SESSIONS lock unavailable")
-            .get(&client_id)
-            .ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))?
-            .clone();
+        let session = efa_session(ctx)?;
         (
             obj_len,
             DataSource::Efa {

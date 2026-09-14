@@ -6,6 +6,9 @@
 
 use std::sync::OnceLock;
 
+pub mod session;
+pub use session::Session;
+
 // ─── EFA Types ───────────────────────────────────────────────────────────────
 
 /// EFA endpoint address — 32 bytes, opaque to callers.
@@ -106,80 +109,6 @@ impl EfaContext {
 
     pub fn shutdown(self) {
         // TODO: fi_close domains, fi_close fabrics.
-    }
-}
-
-// ─── Session ─────────────────────────────────────────────────────────────────
-
-/// Per-client DMA session. Created during LO.HELLO.
-pub struct Session {
-    // TODO: dest_fi_addr handles (one per server EFA device, from fi_av_insert)
-    // TODO: Load balancing state — track in-flight count per device, pick least-loaded for each request
-    // TODO: fi_endpoint per EFA device, AV entries, LB state
-}
-
-impl Session {
-    /// Create a session: fi_av_insert peer on ALL server EFA devices.
-    /// No regions stored — client provides rkey + remote_addr per command.
-    pub fn new(_ctx: &EfaContext, _peer_addr: &EfaAddress) -> Result<Self, TransportError> {
-        // TODO:
-        //   1. For each EFA device: fi_av_insert(peer_addr) -> dest_fi_addr[i]
-        //   2. Store N dest_fi_addr handles for per-op device selection
-        Ok(Self {})
-    }
-
-    /// Server EFA addresses to return in LO.HELLO reply.
-    pub fn server_addrs(&self) -> Vec<EfaAddress> {
-        // TODO: fi_getname() on each endpoint
-        vec![]
-    }
-
-    /// DMA write: push server buffer → client memory at (rkey, remote_addr).
-    /// Non-blocking. Server picks EFA device (least-loaded).
-    ///
-    /// SAFETY: `buf_ptr` must remain valid until `on_complete` is called.
-    /// The caller (tokio task) must hold the owning SegmentBuffer/StreamingContext alive
-    /// until the callback fires. The transport does NOT own the buffer.
-    pub fn write(
-        &self,
-        buf_ptr: *mut u8,
-        _len: usize,
-        _rkey: u64,
-        _remote_addr: u64,
-        on_complete: Box<dyn FnOnce(*mut u8, Result<(), TransportError>) + Send>,
-    ) {
-        // TODO:
-        //   1. Pick device (least-loaded)
-        //   2. fi_write(ep, buf.ptr(), len, desc, dest_fi_addr[device], remote_addr, rkey, ctx)
-        //   3. CQ poller fires on_complete
-        on_complete(buf_ptr, Ok(()));
-    }
-
-    /// DMA read: pull client memory at (rkey, remote_addr) → server buffer.
-    /// Non-blocking.
-    ///
-    /// SAFETY: `buf_ptr` must remain valid until `on_complete` is called.
-    /// The caller (tokio task) must hold the owning SegmentBuffer/StreamingContext alive
-    /// until the callback fires. The transport does NOT own the buffer.
-    pub fn read(
-        &self,
-        buf_ptr: *mut u8,
-        _len: usize,
-        _rkey: u64,
-        _remote_addr: u64,
-        on_complete: Box<dyn FnOnce(*mut u8, Result<(), TransportError>) + Send>,
-    ) {
-        // TODO:
-        //   1. Pick device (least-loaded)
-        //   2. fi_read(ep, buf.ptr(), len, desc, dest_fi_addr[device], remote_addr, rkey, ctx)
-        //   3. CQ poller fires on_complete
-        on_complete(buf_ptr, Ok(()));
-    }
-
-    /// Tear down session. In-flight ops receive SessionClosed.
-    pub fn close(self) {
-        // TODO: fi_close endpoints, remove AV entries.
-        // Signal in-flight ops with SessionClosed error.
     }
 }
 
