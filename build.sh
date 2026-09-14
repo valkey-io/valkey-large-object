@@ -48,6 +48,12 @@ fi
 # ─── Build Module ─────────────────────────────────────────────────────────────
 
 if [ "$1" != "test" ] && [ "$1" != "integ-test" ]; then
+    if ! pkg-config --exists libfabric; then
+        echo "ERROR: libfabric not found via pkg-config."
+        echo "Install it (libfabric-devel or brew libfabric) or point PKG_CONFIG_PATH at its .pc file."
+        exit 1
+    fi
+
     echo "Running cargo fmt check..."
     cargo fmt --check
     echo ""
