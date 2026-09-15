@@ -93,7 +93,7 @@ fn sessions() -> MutexGuard<'static, HashMap<u64, Arc<Session>>> {
 
 /// Bind a fresh session to the client that ran LO.HELLO, replacing on collision.
 pub fn insert(client_id: u64, session: Session) {
-    if let Some(_replaced) = sessions().insert(client_id, Arc::new(session)) {
+    if sessions().insert(client_id, Arc::new(session)).is_some() {
         valkey_module::logging::log_debug(format!("replaced session for client_id: {client_id}"));
     }
 }
