@@ -16,3 +16,6 @@ __pycache__/
 # OS
 .DS_Store
 .gitignore temp
+
+# Local cargo overrides
+.cargo/

@@ -5,31 +5,23 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use linkme::distributed_slice;
 
-use crate::transport::{EfaAddress, EfaContext, TransportError};
+use crate::transport::{fabric, TransportError};
 
 // ─── Session ─────────────────────────────────────────────────────────────────
 
 /// Per-client DMA session created during LO.HELLO
 pub struct Session {
-    // TODO: dest_fi_addr handles (one per server EFA device, from fi_av_insert)
-    // TODO: Load balancing state — track in-flight count per device, pick least-loaded for each request
-    // TODO: fi_endpoint per EFA device, AV entries, LB state
+    /// The client's fabric address from LO.HELLO.
+    peer_address: Vec<u8>,
 }
 
 impl Session {
-    /// Create a new session. This does fi_av_insert of the peer on server EFA devices.
-    /// Client provides rkey and remote_addr per command.
-    pub fn new(_ctx: &EfaContext, _peer_addr: &EfaAddress) -> Result<Self, TransportError> {
-        // TODO:
-        //   1. For each EFA device: fi_av_insert(peer_addr) -> dest_fi_addr[i]
-        //   2. Store N dest_fi_addr handles for per-op device selection
-        Ok(Self {})
+    pub fn new(peer_address: Vec<u8>) -> Self {
+        Self { peer_address }
     }
 
-    /// Server EFA addresses to return in LO.HELLO reply.
-    pub fn server_addrs(&self) -> Vec<EfaAddress> {
-        // TODO: fi_getname() on each endpoint
-        vec![]
+    pub fn peer_address(&self) -> &[u8] {
+        &self.peer_address
     }
 
     /// DMA write: Push server buffer into client memory at (rkey, remote_addr).
@@ -102,7 +94,8 @@ pub fn lookup(client_id: u64) -> Option<Arc<Session>> {
     sessions().get(&client_id).cloned()
 }
 
-/// Remove a client's EFA session on disconnect.
+/// Remove a client's EFA session on disconnect, and let the fabric servers drop its
+/// address-vector entries once its transfers drain.
 /// Valkey calls this on client disconnect.
 #[distributed_slice(valkey_module::server_events::CLIENT_CHANGED_SERVER_EVENTS_LIST)]
 fn on_client_change(
@@ -115,6 +108,9 @@ fn on_client_change(
                 "rdma session terminating for client {}",
                 ctx.get_client_id()
             ));
+            if let Some(fabric) = fabric::fabric() {
+                fabric.remove_peer(ctx.get_client_id());
+            }
         }
     }
 }

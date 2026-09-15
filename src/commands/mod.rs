@@ -12,7 +12,8 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 use crate::data_type::{LoValue, LO_TYPE};
 use crate::engine::{self, DataSource, Transport};
 use crate::errors;
-use crate::transport::{self, session, EfaAddress, Session};
+use crate::transport::config::FabricProvider;
+use crate::transport::{self, session, Session};
 
 /// The EFA session the client previously established with LO.HELLO.
 fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
@@ -21,38 +22,43 @@ fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
 
 // ─── LO.HELLO ────────────────────────────────────────────────────────────────
 //
-// Establishes an EFA session with the client.
-// Client sends its EFA address (32 bytes hex). Server calls fi_av_insert on all
-// N EFA devices and returns all N server EFA addresses.
+// Establishes a fabric session with the client.
+// Client sends its fabric address as hex, opaque to us and in the provider's own format. The
+// server inserts it into each domain's address vector and returns an address per server,
+// so both sides hold each other before the first transfer.
 
 pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 2 {
         return Err(ValkeyError::WrongArity);
     }
 
-    let efa_ctx = transport::efa_context();
-    if !efa_ctx.is_available() {
+    let Some(fabric) = transport::fabric() else {
         return Err(ValkeyError::Str(errors::ERR_EFA_UNAVAILABLE));
-    }
+    };
 
     let peer_hex = args[1].to_string_lossy();
-    let peer_bytes =
+    let peer_address =
         hex_decode(&peer_hex).map_err(|_| ValkeyError::Str(errors::ERR_INVALID_PEER_ADDR_HEX))?;
-    if peer_bytes.len() != 32 {
-        return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_LEN));
+    // An EFA address is exactly 32 bytes; a tcp one is a sockaddr, opaque beyond being non-empty.
+    match crate::fabric_provider() {
+        FabricProvider::EfaDirect if peer_address.len() != 32 => {
+            return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_LEN));
+        }
+        FabricProvider::Tcp if peer_address.is_empty() => {
+            return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_EMPTY));
+        }
+        FabricProvider::EfaDirect | FabricProvider::Tcp => {}
     }
-    let mut addr = [0u8; 32];
-    addr.copy_from_slice(&peer_bytes);
-    let peer_addr = EfaAddress(addr);
 
-    let session = Session::new(efa_ctx, &peer_addr)
+    let client_id = ctx.get_client_id();
+    fabric
+        .add_peer(client_id, &peer_address)
         .map_err(|e| ValkeyError::String(format!("{}: {}", errors::ERR_SESSION_CREATE, e)))?;
-    let server_addrs = session.server_addrs();
-    session::insert(ctx.get_client_id(), session);
+    session::insert(client_id, Session::new(peer_address));
 
-    let reply: Vec<ValkeyValue> = server_addrs
-        .iter()
-        .map(|a| ValkeyValue::BulkString(hex_encode(&a.0)))
+    let reply: Vec<ValkeyValue> = fabric
+        .local_addresses()
+        .map(|address| ValkeyValue::BulkString(hex_encode(address)))
         .collect();
     Ok(ValkeyValue::Array(reply))
 }

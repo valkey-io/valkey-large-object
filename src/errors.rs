@@ -19,6 +19,7 @@ define_errors! {
     ERR_EFA_UNAVAILABLE => "ERR EFA unavailable on this instance",
     ERR_INVALID_PEER_ADDR_HEX => "ERR invalid peer address hex",
     ERR_PEER_ADDR_LEN => "ERR peer address must be 32 bytes",
+    ERR_PEER_ADDR_EMPTY => "ERR peer address must not be empty",
     ERR_INVALID_NUM_REGIONS => "ERR invalid num_regions",
     ERR_INSUFFICIENT_REGION_ARGS => "ERR insufficient region args",
     ERR_INVALID_RKEY => "ERR invalid rkey",

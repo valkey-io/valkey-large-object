@@ -15,7 +15,9 @@
 // Module init proceeds in strict order. Commands are safe to call ONLY after
 // all steps complete:
 //
-//   1. transport::init()       — discover EFA devices, create fabric/domain.
+//   1. Fabric::start()         — one libfabric server per domain. On missing
+//                                fabric, the EFA path is unavailable and LO.HELLO
+//                                gives an error.
 //   2. storage::init(mode, nvme_dir)
 //                              — validate config, allocate pool segments, create
 //                                io_uring engine (Tiered only). All resources are
@@ -46,6 +48,7 @@ pub mod storage;
 pub mod transport;
 
 use crate::data_type::LO_TYPE;
+use crate::transport::config::FabricProvider;
 
 use valkey_module::enum_configuration;
 
@@ -114,6 +117,20 @@ lazy_static::lazy_static! {
     /// - Dram (0): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
     /// - Tiered (1): objects persist on NVMe, DRAMPool is a read cache with promotion.
     static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Dram);
+
+    // ─── Fabric Configs ──────────────────────────────────────────────────
+
+    /// libfabric provider for transfers. Tcp runs anywhere, EfaDirect needs EFA hardware.
+    static ref CFG_FABRIC_PROVIDER: Mutex<FabricProvider> = Mutex::new(FabricProvider::Tcp);
+
+    /// Comma-separated fabric domains to open a server on. Default: All domains.
+    static ref CFG_FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
+
+    /// Transfers each fabric server keeps in flight. Default: the crate's provider-derived default.
+    static ref CFG_FABRIC_MAX_IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
+
+    /// Threads hashing checksummed transfers off the fabric workers. Default: one.
+    static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(1);
 
     // ─── Streaming Configs ───────────────────────────────────────────────
 
@@ -212,6 +229,31 @@ pub fn streaming_min_buffers() -> usize {
     CFG_STREAMING_MIN_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
+pub fn fabric_provider() -> FabricProvider {
+    *CFG_FABRIC_PROVIDER
+        .lock()
+        .expect("CFG_FABRIC_PROVIDER lock unavailable")
+}
+
+pub fn fabric_interfaces() -> Vec<String> {
+    CFG_FABRIC_INTERFACES
+        .lock()
+        .expect("CFG_FABRIC_INTERFACES lock unavailable")
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn fabric_max_in_flight() -> usize {
+    CFG_FABRIC_MAX_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn fabric_crc_pool_threads() -> usize {
+    CFG_FABRIC_CRC_POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
 
 fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
@@ -254,8 +296,16 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         .build()
         .expect("failed to build tokio runtime");
 
-    // Step 1: Transport::init() — discover EFA devices (may fail gracefully).
-    transport::init();
+    // Step 1: open the fabric.
+    let mut fabric = match transport::Fabric::start(&transport::config::configuration()) {
+        Ok(fabric) => Some(fabric),
+        Err(error) => {
+            ctx.log_warning(&format!(
+                "largeobj: fabric unavailable, EFA path disabled: {error}"
+            ));
+            None
+        }
+    };
 
     // Step 2: Initialize storage layer (pools, io_uring engine, validation).
     // All pool/engine OnceLocks are set inside init() only after everything succeeds.
@@ -268,26 +318,30 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         }
     };
 
-    // Step 3: Transport::register_buffers() — fi_mr_reg per segment (EFA).
-    let slices = storage::all_segment_slices();
-    let slice_refs: Vec<&[u8]> = slices.to_vec();
-    if let Err(e) = transport::register_buffers(&slice_refs) {
-        ctx.log_warning(&format!("largeobj: EFA buffer registration failed: {}", e));
-        // storage::init() already committed pools/engine to OnceLock.
-        // EFA registration failure after storage commit is fatal — panic.
-        // The admin must fix the EFA environment and restart.
-        panic!(
-            "largeobj: EFA buffer registration failed after storage init: {}",
-            e
-        );
+    // Step 3: Fabric::register_buffers() — fi_mr_reg per segment per server.
+    if let Some(fabric) = &mut fabric {
+        if let Err(e) = fabric.register_buffers(&storage::all_segment_slices()) {
+            ctx.log_warning(&format!("largeobj: EFA buffer registration failed: {}", e));
+            // storage::init() already committed pools/engine to OnceLock.
+            // EFA registration failure after storage commit is fatal.
+            // The user must fix the EFA environment and restart.
+            panic!(
+                "largeobj: EFA buffer registration failed after storage init: {}",
+                e
+            );
+        }
     }
+    let fabric_servers = fabric.as_ref().map_or(0, transport::Fabric::server_count);
+    transport::commit(fabric);
 
     // All init succeeded — commit runtime to OnceLock.
     if RUNTIME.set(rt).is_err() {
         panic!("Runtime already initialized");
     }
 
-    ctx.log_notice(&format!("largeobj: initialized {}", storage_summary));
+    ctx.log_notice(&format!(
+        "largeobj: initialized {storage_summary}, fabric servers: {fabric_servers}"
+    ));
 
     Status::Ok
 }
@@ -303,14 +357,13 @@ fn deinitialize(_ctx: &Context) -> Status {
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
-/// signal the io_uring poller to stop, deregister EFA buffers, and — in Tiered
+/// drop the fabric servers, signal the io_uring poller to stop, and — in Tiered
 /// mode — wipe nvme-dir so object files don't accumulate across server lifetimes.
 /// Process exit frees all remaining resources (pools, runtime, transport).
 /// A hard crash (SIGKILL / SIGSEGV / power loss) never reaches this handler;
 /// those leftovers are reclaimed by the startup reset in `initialize`.
 #[shutdown_event_handler]
 fn on_server_shutdown(ctx: &Context, _subevent: u64) {
-    transport::deregister_buffers();
     transport::shutdown();
     let dir = nvme_dir();
     if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
@@ -353,9 +406,14 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, None],
             ["lo-streaming-min-buffers", &*CFG_STREAMING_MIN_BUFFERS, 2, 1, 64,
              ConfigurationFlags::DEFAULT, None, None],
+            ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, 0, 0, 65_536,
+             ConfigurationFlags::IMMUTABLE, None, None],
+            ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, 1, 1, 1024,
+             ConfigurationFlags::IMMUTABLE, None, None],
         ],
         string: [
             ["nvme-dir", &*CFG_NVME_DIR, "", ConfigurationFlags::IMMUTABLE, None],
+            ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::DEFAULT, None],
@@ -363,6 +421,8 @@ valkey_module! {
         ],
         enum: [
             ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Dram,
+             ConfigurationFlags::IMMUTABLE, None],
+            ["fabric-provider", &*CFG_FABRIC_PROVIDER, FabricProvider::Tcp,
              ConfigurationFlags::IMMUTABLE, None],
         ],
         module_args_as_configuration: true,

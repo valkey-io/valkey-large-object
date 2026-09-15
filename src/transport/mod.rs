@@ -1,12 +1,12 @@
-//! Transport Crate API (libefa-rs)
-//!
-//! Placeholder module — will be replaced by the actual transport crate dependency.
-//! EFA/libfabric lifecycle, multi-device LB, completion handling.
-//! Transport never calls storage or data type.
+//! The RDMA transport: libfabric servers, the config, and the
+//! per-client sessions from `LO.HELLO`. Transport never calls storage or the
+//! data type. The engine hands transport buffers and awaits results.
 
-use std::sync::OnceLock;
-
+pub mod config;
+pub mod fabric;
 pub mod session;
+
+pub use fabric::{commit, fabric, shutdown, Fabric};
 pub use session::Session;
 
 // ─── EFA Types ───────────────────────────────────────────────────────────────
@@ -53,104 +53,4 @@ impl std::fmt::Display for TransportError {
             Self::Unavailable => write!(f, "EFA unavailable"),
         }
     }
-}
-
-// ─── EfaContext ──────────────────────────────────────────────────────────────
-
-/// Global EFA context — fabric + domain per device, registered MRs.
-pub struct EfaContext {
-    available: bool,
-    device_count: usize,
-    // TODO: fi_fabric, fi_domain, fi_eq handles per device
-    // TODO: registered MR list
-}
-
-impl EfaContext {
-    /// Discover EFA devices, create fabric + domain per device.
-    /// Synchronous — no runtime needed.
-    pub fn new() -> Result<Self, TransportError> {
-        // TODO: Actual EFA discovery via fi_getinfo("efa", ...)
-        //   1. fi_getinfo with hints (provider="efa", ep_type=FI_EP_RDM, caps=FI_RMA)
-        //   2. fi_fabric() per returned info
-        //   3. fi_domain() per fabric
-        //
-        // For now, return Unavailable (no EFA on dev desktop).
-        Ok(Self {
-            available: false,
-            device_count: 0,
-        })
-    }
-
-    pub fn is_available(&self) -> bool {
-        self.available
-    }
-
-    pub fn device_count(&self) -> usize {
-        self.device_count
-    }
-
-    /// Register pool buffers with all EFA domains (fi_mr_reg).
-    pub fn register_buffers(&self, _bufs: &[&[u8]]) -> Result<(), TransportError> {
-        if !self.available {
-            return Ok(()); // No-op if no EFA
-        }
-        // TODO: fi_mr_reg each buffer across all domains.
-        // Store MR descriptors for per-op fi_write/fi_read.
-        Ok(())
-    }
-
-    pub fn deregister_buffers(&self) -> Result<(), TransportError> {
-        if !self.available {
-            return Ok(());
-        }
-        // TODO: fi_mr_dereg all registered MRs.
-        Ok(())
-    }
-
-    pub fn shutdown(self) {
-        // TODO: fi_close domains, fi_close fabrics.
-    }
-}
-
-// ─── Global Transport State ──────────────────────────────────────────────────
-
-static EFA_CTX: OnceLock<EfaContext> = OnceLock::new();
-
-pub fn init() {
-    match EfaContext::new() {
-        Ok(ctx) => {
-            if EFA_CTX.set(ctx).is_err() {
-                panic!("EfaContext already initialized");
-            }
-        }
-        Err(_) => {
-            // EFA unavailable — module works in TCP-only mode.
-            if EFA_CTX
-                .set(EfaContext {
-                    available: false,
-                    device_count: 0,
-                })
-                .is_err()
-            {
-                panic!("EfaContext already initialized");
-            }
-        }
-    }
-}
-
-pub fn efa_context() -> &'static EfaContext {
-    EFA_CTX.get().expect("transport not initialized")
-}
-
-pub fn register_buffers(bufs: &[&[u8]]) -> Result<(), TransportError> {
-    efa_context().register_buffers(bufs)
-}
-
-pub fn deregister_buffers() {
-    let _ = efa_context().deregister_buffers();
-}
-
-pub fn shutdown() {
-    // EfaContext::shutdown() consumes self — can't call on static ref.
-    // TODO: Use Option<EfaContext> or OnceLock::take() when stabilized.
 }
