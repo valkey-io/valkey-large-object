@@ -35,7 +35,7 @@ jobs:
           sudo yum install -y clang clang-devel gcc make git python3 python3-pip pkgconfig libfabric libfabric-devel
           ${{ matrix.asan && 'sudo yum install -y libasan' || '' }}
 
-      # dma-libfabric probes libfabric through pkg-config. Check reachability early
+      # dma-libfabric probes libfabric through pkg-config. Check reachability early.
       - name: Check libfabric
         run: pkg-config --modversion libfabric
 
