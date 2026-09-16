@@ -11,10 +11,10 @@ valkey-module = { version = "0.1.5", features = ["min-valkey-compatibility-versi
 valkey-module-macros = "0"
 linkme = "0"
 libc = "0.2"
-crc32c = "0.6"
 io-uring = "0.7"
 crossbeam-channel = "0.5"
 dma-libfabric = { git = "https://github.com/momentohq/vdma.git", rev = "3a8d269bf819d3a8dc8d55867f88ef39b26f0296" }
+dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = "3a8d269bf819d3a8dc8d55867f88ef39b26f0296" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 lazy_static = "1"

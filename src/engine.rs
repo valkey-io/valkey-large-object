@@ -16,6 +16,7 @@
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
+use dma_libfabric_protocol::checksum;
 use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
@@ -448,7 +449,7 @@ fn serve_set_dram_tcp(
     let copy_len = data.len().min(obj_len as usize);
     unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len) };
 
-    let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
+    let crc = checksum(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
 
     // set_value BEFORE insert_object — sync path, no version check needed
     // (single-threaded main thread, our object_id is always the latest).
@@ -534,7 +535,7 @@ fn execute_set_dram_efa(
                 .await
                 {
                     Ok(()) => {
-                        let crc = crc32c::crc32c(unsafe {
+                        let crc = checksum(unsafe {
                             std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
                         });
 
@@ -684,7 +685,7 @@ async fn do_tiered_nvme_write(
         return;
     }
     let buf_ptr = buf_ptr_usize as *mut u8;
-    let crc = crc32c::crc32c(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
+    let crc = checksum(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
 
     let dir = crate::nvme_dir();
     let file_path = object_id.file_path(&dir);

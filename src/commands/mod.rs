@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use dma_libfabric_protocol::{decode_hex, encode_hex};
 use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 use crate::data_type::{LoValue, LO_TYPE};
@@ -36,9 +37,8 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::Str(errors::ERR_EFA_UNAVAILABLE));
     };
 
-    let peer_hex = args[1].to_string_lossy();
-    let peer_address =
-        hex_decode(&peer_hex).map_err(|_| ValkeyError::Str(errors::ERR_INVALID_PEER_ADDR_HEX))?;
+    let peer_address = decode_hex(args[1].as_slice())
+        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_PEER_ADDR_HEX))?;
     // An EFA address is exactly 32 bytes; a tcp one is a sockaddr, opaque beyond being non-empty.
     match crate::fabric_provider() {
         FabricProvider::EfaDirect if peer_address.len() != 32 => {
@@ -58,7 +58,7 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let reply: Vec<ValkeyValue> = fabric
         .local_addresses()
-        .map(|address| ValkeyValue::BulkString(hex_encode(address)))
+        .map(|address| ValkeyValue::BulkString(encode_hex(address)))
         .collect();
     Ok(ValkeyValue::Array(reply))
 }
@@ -166,20 +166,4 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
-    if !s.len().is_multiple_of(2) {
-        return Err(());
-    }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
-        .collect()
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
