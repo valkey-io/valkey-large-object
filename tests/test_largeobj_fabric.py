@@ -11,7 +11,7 @@ PEER_ADDRESS = binascii.hexlify(
 
 
 class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
-    """LO.HELLO against real fabric servers over the tcp provider on loopback."""
+    """LO.HELLO against real fabric services over the tcp provider on loopback."""
 
     def get_module_args(self, data_dir, direct_io):
         return (

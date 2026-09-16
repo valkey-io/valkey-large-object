@@ -15,7 +15,7 @@
 // Module init proceeds in strict order. Commands are safe to call ONLY after
 // all steps complete:
 //
-//   1. Fabric::start()         — one libfabric server per domain. On missing
+//   1. Fabric::start()         — one libfabric service per domain. On missing
 //                                fabric, the EFA path is unavailable and LO.HELLO
 //                                gives an error.
 //   2. storage::init(mode, nvme_dir)
@@ -123,10 +123,10 @@ lazy_static::lazy_static! {
     /// libfabric provider for transfers. Emulated exercises DMA path over libfabric's tcp provider, EfaDirect needs EFA hardware.
     static ref CFG_FABRIC_PROVIDER: Mutex<FabricProvider> = Mutex::new(FabricProvider::Emulated);
 
-    /// Comma-separated fabric domains to open a server on. Default: All domains.
+    /// Comma-separated fabric domains to open a service on. Default: All domains.
     static ref CFG_FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
 
-    /// Transfers each fabric server keeps in flight. Default: the crate's provider-derived default.
+    /// Transfers each fabric service keeps in flight. Default: the crate's provider-derived default.
     static ref CFG_FABRIC_MAX_IN_FLIGHT: AtomicI64 = AtomicI64::new(0);
 
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
@@ -331,7 +331,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
             );
         }
     }
-    let fabric_servers = fabric.as_ref().map_or(0, transport::Fabric::server_count);
+    let fabric_services = fabric.as_ref().map_or(0, transport::Fabric::service_count);
     transport::commit(fabric);
 
     // All init succeeded — commit runtime to OnceLock.
@@ -340,7 +340,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     }
 
     ctx.log_notice(&format!(
-        "largeobj: initialized {storage_summary}, fabric servers: {fabric_servers}"
+        "largeobj: initialized {storage_summary}, fabric services: {fabric_services}"
     ));
 
     Status::Ok
@@ -357,7 +357,7 @@ fn deinitialize(_ctx: &Context) -> Status {
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
-/// drop the fabric servers, signal the io_uring poller to stop, and — in Tiered
+/// drop the fabric services, signal the io_uring poller to stop, and — in Tiered
 /// mode — wipe nvme-dir so object files don't accumulate across server lifetimes.
 /// Process exit frees all remaining resources (pools, runtime, transport).
 /// A hard crash (SIGKILL / SIGSEGV / power loss) never reaches this handler;

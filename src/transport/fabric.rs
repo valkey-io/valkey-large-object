@@ -1,22 +1,22 @@
-//! The fabric servers: one `asynchronous::FabricServer` per libfabric domain, started at module
+//! The fabric services: one `asynchronous::FabricService` per libfabric domain, started at module
 //! load and dropped at shutdown. Pool segments are registered on them at load.
 //! `LO.HELLO` inserts the client's address on all of them. On disconnect the client's entry on
 //! each is released.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use dma_libfabric::asynchronous::FabricServer;
+use dma_libfabric::asynchronous::FabricService;
 use dma_libfabric::{discover_domains, Configuration, MemoryRegion, Pool};
 
 /// The per-transfer context. `Vec<u8>` implements `Operands` so it suffices as a stub.
 type Context = Vec<u8>;
 
 pub struct Fabric {
-    servers: Vec<FabricServer<Context>>,
+    services: Vec<FabricService<Context>>,
     /// The registered pool segments, alive for the fabric's lifetime. Segment memory is stable for
     /// the module's lifetime.
     regions: Vec<MemoryRegion<&'static [u8]>>,
-    /// Runs checksummed completions off the fabric workers. Held so it outlives every server.
+    /// Runs checksummed completions off the fabric workers. Held so it outlives every service.
     _pool: Arc<Pool>,
 }
 
@@ -24,13 +24,13 @@ impl std::fmt::Debug for Fabric {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Fabric")
-            .field("servers", &self.servers.len())
+            .field("services", &self.services.len())
             .finish()
     }
 }
 
 impl Fabric {
-    /// Open one server per domain: the configured allowlist, or every domain the provider
+    /// Open one service per domain: the configured allowlist, or every domain the provider
     /// exposes. Blocks until each endpoint is up, and one failing fails the lot.
     pub fn start(configuration: &Configuration) -> Result<Self, String> {
         let domains = if configuration.interfaces.is_empty() {
@@ -43,35 +43,35 @@ impl Fabric {
         }
         let threads = configuration.crc_pool_threads.unwrap_or(1);
         let pool = Arc::new(Pool::new(threads).map_err(|error| format!("crc pool: {error}"))?);
-        let mut servers = Vec::with_capacity(domains.len());
+        let mut services = Vec::with_capacity(domains.len());
         for domain in domains {
             let pinned = Configuration {
                 interfaces: vec![domain.clone()],
                 ..configuration.clone()
             };
-            let server = FabricServer::start(&pinned, Arc::clone(&pool))
+            let service = FabricService::start(&pinned, Arc::clone(&pool))
                 .map_err(|error| format!("domain {domain}: {error}"))?;
-            servers.push(server);
+            services.push(service);
         }
         Ok(Self {
-            servers,
+            services,
             regions: Vec::new(),
             _pool: pool,
         })
     }
 
-    pub fn server_count(&self) -> usize {
-        self.servers.len()
+    pub fn service_count(&self) -> usize {
+        self.services.len()
     }
 
-    /// Register every pool segment on every server ahead of any transfer, so any server can carry
-    /// any transfer and the engine is free to balance across devices. Pins each segment once per
-    /// device against `RLIMIT_MEMLOCK`.
+    /// Register every pool segment on every service ahead of any transfer, so any service can
+    /// carry any transfer and the engine is free to balance across devices. Pins each segment once
+    /// per device against `RLIMIT_MEMLOCK`.
     pub fn register_buffers(&mut self, segments: &[&'static [u8]]) -> Result<(), String> {
-        for (server_index, server) in self.servers.iter().enumerate() {
+        for (service_index, service) in self.services.iter().enumerate() {
             for (segment_index, segment) in segments.iter().enumerate() {
-                let region = server.register(*segment).map_err(|error| {
-                    format!("segment {segment_index} on server {server_index}: {error}")
+                let region = service.register(*segment).map_err(|error| {
+                    format!("segment {segment_index} on service {service_index}: {error}")
                 })?;
                 self.regions.push(region);
             }
@@ -79,26 +79,26 @@ impl Fabric {
         Ok(())
     }
 
-    /// Insert the client's address into every server's address vector at LO.HELLO, so its
+    /// Insert the client's address into every service's address vector at LO.HELLO, so its
     /// transfers post against a known peer and an unusable address fails the hello instead.
     pub fn add_peer(&self, client_id: u64, address: &[u8]) -> Result<(), String> {
-        for (index, server) in self.servers.iter().enumerate() {
-            server
+        for (index, service) in self.services.iter().enumerate() {
+            service
                 .add_peer(client_id, address)
-                .map_err(|error| format!("server {index}: {error}"))?;
+                .map_err(|error| format!("service {index}: {error}"))?;
         }
         Ok(())
     }
 
-    /// One fabric address per server, in server order; what `LO.HELLO` returns.
+    /// One fabric address per service, in service order; what `LO.HELLO` returns.
     pub fn local_addresses(&self) -> impl Iterator<Item = &[u8]> {
-        self.servers.iter().map(FabricServer::local_address)
+        self.services.iter().map(FabricService::local_address)
     }
 
-    /// Release the client's address-vector entry on every server once its transfers drain.
+    /// Release the client's address-vector entry on every service once its transfers drain.
     pub fn remove_peer(&self, client_id: u64) {
-        for server in &self.servers {
-            server.remove_peer(client_id);
+        for service in &self.services {
+            service.remove_peer(client_id);
         }
     }
 }
@@ -125,7 +125,7 @@ pub fn fabric() -> Option<Arc<Fabric>> {
     slot().clone()
 }
 
-/// Drop the servers. Each closes its channel, drains its in-flight transfers, and joins its
+/// Drop the services. Each closes its channel, drains its in-flight transfers, and joins its
 /// worker.
 pub fn shutdown() {
     let fabric = slot().take();

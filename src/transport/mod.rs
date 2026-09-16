@@ -1,4 +1,4 @@
-//! The RDMA transport: libfabric servers, the config, and the
+//! The RDMA transport: libfabric services, the config, and the
 //! per-client sessions from `LO.HELLO`. Transport never calls storage or the
 //! data type. The engine hands transport buffers and awaits results.
 
