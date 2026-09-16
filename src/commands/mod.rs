@@ -44,10 +44,10 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         FabricProvider::EfaDirect if peer_address.len() != 32 => {
             return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_LEN));
         }
-        FabricProvider::Tcp if peer_address.is_empty() => {
+        FabricProvider::Emulated if peer_address.is_empty() => {
             return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_EMPTY));
         }
-        FabricProvider::EfaDirect | FabricProvider::Tcp => {}
+        FabricProvider::EfaDirect | FabricProvider::Emulated => {}
     }
 
     let client_id = ctx.get_client_id();

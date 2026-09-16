@@ -7,10 +7,13 @@ use valkey_module::enum_configuration;
 
 enum_configuration! {
     /// `fabric-provider`: which libfabric provider carries transfers. Immutable after load.
-    /// Tcp runs anywhere and is what CI exercises; EfaDirect is the hardware path.
     #[derive(Debug, PartialEq, Eq, Copy)]
     pub enum FabricProvider {
-        Tcp = 0,
+        /// Use TCP to exercise logical DMA, without actually using dedicated hardware.
+        /// This does not change commands' dma vs. inline tcp semantics, it only refers
+        /// to libfabric's DMA implementation.
+        Emulated = 0,
+        /// Use EFA hardware, the libfabric efa provider via efa-direct path.
         EfaDirect = 1,
     }
 }
@@ -18,7 +21,7 @@ enum_configuration! {
 impl From<FabricProvider> for Provider {
     fn from(provider: FabricProvider) -> Self {
         match provider {
-            FabricProvider::Tcp => Provider::Tcp,
+            FabricProvider::Emulated => Provider::Tcp,
             FabricProvider::EfaDirect => Provider::EfaDirect,
         }
     }

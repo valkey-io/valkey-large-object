@@ -120,8 +120,8 @@ lazy_static::lazy_static! {
 
     // ─── Fabric Configs ──────────────────────────────────────────────────
 
-    /// libfabric provider for transfers. Tcp runs anywhere, EfaDirect needs EFA hardware.
-    static ref CFG_FABRIC_PROVIDER: Mutex<FabricProvider> = Mutex::new(FabricProvider::Tcp);
+    /// libfabric provider for transfers. Emulated exercises DMA path over libfabric's tcp provider, EfaDirect needs EFA hardware.
+    static ref CFG_FABRIC_PROVIDER: Mutex<FabricProvider> = Mutex::new(FabricProvider::Emulated);
 
     /// Comma-separated fabric domains to open a server on. Default: All domains.
     static ref CFG_FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
