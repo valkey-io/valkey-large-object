@@ -126,7 +126,7 @@ pub fn fabric() -> Option<Arc<Fabric>> {
 }
 
 /// Drop the servers. Each closes its channel, drains its in-flight transfers, and joins its
-/// worker. A clone held by an in-flight task defers that to the task's end.
+/// worker.
 pub fn shutdown() {
     let fabric = slot().take();
     drop(fabric);
