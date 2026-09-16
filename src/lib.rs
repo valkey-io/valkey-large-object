@@ -422,7 +422,7 @@ valkey_module! {
         enum: [
             ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Dram,
              ConfigurationFlags::IMMUTABLE, None],
-            ["fabric-provider", &*CFG_FABRIC_PROVIDER, FabricProvider::Tcp,
+            ["fabric-provider", &*CFG_FABRIC_PROVIDER, FabricProvider::Emulated,
              ConfigurationFlags::IMMUTABLE, None],
         ],
         module_args_as_configuration: true,
