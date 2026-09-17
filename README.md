@@ -68,7 +68,7 @@ valkey-server --port 7380 \
 | `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. |
 | `bench-mode` | no | Yes | LO.GET returns integer size instead of bulk data (isolates NVMe throughput). |
 | `direct-io` | yes | Immutable | Use O_DIRECT for NVMe files. Disable for ASAN builds. |
-| `fabric-provider` | `Tcp` | Immutable | libfabric provider for the EFA path: `Tcp` (runs anywhere) or `EfaDirect` (EFA hardware RDMA). |
+| `fabric-provider` | `Emulated` | Immutable | libfabric provider for the DMA path: `Emulated` (libfabric over TCP, runs anywhere) or `EfaDirect` (EFA hardware RDMA). |
 | `fabric-interfaces` | (empty) | Immutable | Comma-separated fabric domains to serve on. Empty = every domain the provider discovers. |
 | `fabric-max-in-flight` | 0 | Immutable | Transfers each fabric service keeps in flight. 0 = provider-derived default. |
 | `fabric-crc-pool-threads` | 1 | Immutable | Threads hashing checksummed transfers off the fabric workers. |

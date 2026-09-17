@@ -301,7 +301,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         Ok(fabric) => Some(fabric),
         Err(error) => {
             ctx.log_warning(&format!(
-                "largeobj: fabric unavailable, EFA path disabled: {error}"
+                "largeobj: fabric unavailable, EFA path disabled: {error}. Only Large Object Commands of the TCP variant will be supported"
             ));
             None
         }
