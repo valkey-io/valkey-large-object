@@ -63,7 +63,8 @@ if [ "$1" != "test" ] && [ "$1" != "integ-test" ]; then
     echo ""
 
     echo "Running cargo build release..."
-    cargo build --release
+    # --examples: the passive fabric target the integration tests spawn.
+    cargo build --release --lib --examples
     echo "Module built: $MODULE_PATH"
     echo ""
 

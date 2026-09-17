@@ -16,7 +16,7 @@
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
-use dma_libfabric_protocol::checksum;
+use dma_libfabric_protocol::{checksum, DmaError};
 use valkey_module::{ValkeyError, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
@@ -534,11 +534,7 @@ fn execute_set_dram_efa(
                 )
                 .await
                 {
-                    Ok(()) => {
-                        let crc = checksum(unsafe {
-                            std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
-                        });
-
+                    Ok(crc) => {
                         // Version check + set_value BEFORE insert_object.
                         {
                             let ctx = thread_ctx.lock();
@@ -619,6 +615,7 @@ fn execute_set_tiered(
                 do_tiered_nvme_write(
                     buf_ptr_usize,
                     obj_len,
+                    None,
                     stream_ctx,
                     blocked_client,
                     key_name,
@@ -643,10 +640,11 @@ fn execute_set_tiered(
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(crc) => {
                         do_tiered_nvme_write(
                             buf_ptr_usize,
                             obj_len,
+                            Some(crc),
                             stream_ctx,
                             blocked_client,
                             key_name,
@@ -654,10 +652,10 @@ fn execute_set_tiered(
                         )
                         .await;
                     }
-                    Err(_) => {
+                    Err(e) => {
                         let thread_ctx =
                             valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                        thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_EFA_READ)));
+                        thread_ctx.reply(Err(e));
                     }
                 }
             });
@@ -666,10 +664,12 @@ fn execute_set_tiered(
 }
 
 /// Shared Tiered NVMe write: CRC → open tmp → WriteFixed → rename → create LoValue.
-/// Must be called from within a tokio task (awaits io_uring write).
+/// Must be called from within a tokio task (awaits io_uring write). `crc` can be
+/// precomputed, or `None` hashes it here.
 async fn do_tiered_nvme_write(
     buf_ptr_usize: usize,
     obj_len: u64,
+    crc: Option<u32>,
     stream_ctx: storage::StreamingContext,
     blocked_client: valkey_module::BlockedClient,
     key_name: Vec<u8>,
@@ -684,8 +684,12 @@ async fn do_tiered_nvme_write(
         thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED)));
         return;
     }
-    let buf_ptr = buf_ptr_usize as *mut u8;
-    let crc = checksum(unsafe { std::slice::from_raw_parts(buf_ptr, obj_len as usize) });
+    let crc = match crc {
+        Some(crc) => crc,
+        None => checksum(unsafe {
+            std::slice::from_raw_parts(buf_ptr_usize as *const u8, obj_len as usize)
+        }),
+    };
 
     let dir = crate::nvme_dir();
     let file_path = object_id.file_path(&dir);
@@ -856,21 +860,19 @@ async fn efa_read_from_client(
     len: usize,
     rkey: u64,
     remote_addr: u64,
-) -> Result<(), ValkeyError> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    session.read(
-        buf_ptr as *mut u8,
-        len,
-        rkey,
-        remote_addr,
-        Box::new(move |_ptr, result| {
-            let _ = tx.send(result);
-        }),
-    );
-    match rx.await {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(ValkeyError::Str(errors::ERR_EFA_READ)),
-    }
+) -> Result<u32, ValkeyError> {
+    let failed =
+        |error: DmaError| ValkeyError::String(format!("{}: {error}", errors::ERR_EFA_READ));
+    let transfer = session
+        .read(buf_ptr as *mut u8, len, rkey, remote_addr)
+        .map_err(failed)?;
+    let (outcome, _operand) = transfer.await;
+    let done = outcome.map_err(failed)?;
+    done.checksum.ok_or_else(|| {
+        failed(DmaError::Transfer(
+            "no checksum on a checksummed read".into(),
+        ))
+    })
 }
 
 /// Write from local buffer to client GPU via EFA. Must be awaited in a tokio task.
@@ -881,18 +883,13 @@ async fn efa_write_to_client(
     rkey: u64,
     remote_addr: u64,
 ) -> Result<(), ValkeyError> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    session.write(
-        buf_ptr as *mut u8,
-        len,
-        rkey,
-        remote_addr,
-        Box::new(move |_ptr, result| {
-            let _ = tx.send(result);
-        }),
-    );
-    match rx.await {
-        Ok(Ok(())) => Ok(()),
-        _ => Err(ValkeyError::Str(errors::ERR_EFA_WRITE)),
+    let failed = ValkeyError::Str(errors::ERR_EFA_WRITE);
+    let Ok(transfer) = session.write(buf_ptr as *mut u8, len, rkey, remote_addr) else {
+        return Err(failed);
+    };
+    let (outcome, _operand) = transfer.await;
+    match outcome {
+        Ok(_done) => Ok(()),
+        Err(_) => Err(failed),
     }
 }

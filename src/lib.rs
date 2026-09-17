@@ -34,6 +34,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
+use dma_libfabric_protocol::encode_hex;
 use valkey_module::configuration::ConfigurationFlags;
 use valkey_module::{valkey_module, Context, Status, ValkeyString};
 use valkey_module_macros::shutdown_event_handler;
@@ -332,6 +333,14 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         }
     }
     let fabric_services = fabric.as_ref().map_or(0, transport::Fabric::service_count);
+    if let Some(fabric) = &fabric {
+        for (index, address) in fabric.local_addresses().enumerate() {
+            ctx.log_notice(&format!(
+                "largeobj: fabric service {index} address {}",
+                encode_hex(address)
+            ));
+        }
+    }
     transport::commit(fabric);
 
     // All init succeeded — commit runtime to OnceLock.

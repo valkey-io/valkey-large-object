@@ -53,7 +53,7 @@ jobs:
         run: cargo clippy --profile release --all-targets -- -D warnings
 
       - name: Release build
-        run: cargo build --release
+        run: cargo build --release --lib --examples
 
       - name: Run unit tests
         run: cargo test --features enable-system-alloc

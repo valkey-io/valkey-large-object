@@ -36,6 +36,7 @@ pub fn configuration() -> Configuration {
         bind: None,
         max_in_flight: nonzero(crate::fabric_max_in_flight()),
         crc_pool_threads: Some(crate::fabric_crc_pool_threads()),
+        progress_deadline: std::time::Duration::from_secs(1),
     }
 }
 

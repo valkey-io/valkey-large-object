@@ -51,10 +51,16 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let client_id = ctx.get_client_id();
+    // One endpoint per connection. A second HELLO would hold the old address-vector entry while
+    // inserting the new one; when the client's old endpoint has died and the new one reuses its
+    // QPN, efa-direct cannot represent both (vdma/.claude/open_issue.md). Reconnect instead.
+    if session::lookup(client_id).is_some() {
+        return Err(ValkeyError::Str(errors::ERR_DMA_SESSION_EXISTS));
+    }
     fabric
         .add_peer(client_id, &peer_address)
         .map_err(|e| ValkeyError::String(format!("{}: {}", errors::ERR_SESSION_CREATE, e)))?;
-    session::insert(client_id, Session::new(peer_address));
+    session::insert(client_id, Session::new(client_id, peer_address));
 
     let reply: Vec<ValkeyValue> = fabric
         .local_addresses()

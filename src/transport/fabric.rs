@@ -5,14 +5,15 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use dma_libfabric::asynchronous::FabricService;
-use dma_libfabric::{discover_domains, Configuration, MemoryRegion, Pool};
+use dma_libfabric::asynchronous::{FabricService, Transfer};
+use dma_libfabric::{discover_domains, Configuration, MemoryRegion, Pool, TransferRequest};
+use dma_libfabric_protocol::DmaError;
+use rand::RngExt;
 
-/// The per-transfer context. `Vec<u8>` implements `Operands` so it suffices as a stub.
-type Context = Vec<u8>;
+use crate::transport::operand::PoolOperand;
 
 pub struct Fabric {
-    services: Vec<FabricService<Context>>,
+    services: Vec<FabricService<PoolOperand>>,
     /// The registered pool segments, alive for the fabric's lifetime. Segment memory is stable for
     /// the module's lifetime.
     regions: Vec<MemoryRegion<&'static [u8]>>,
@@ -62,6 +63,24 @@ impl Fabric {
 
     pub fn service_count(&self) -> usize {
         self.services.len()
+    }
+
+    /// Submit on the best of two services picked at random, by transfers outstanding.
+    pub fn transfer(
+        &self,
+        request: TransferRequest<PoolOperand>,
+    ) -> Result<Transfer<PoolOperand>, DmaError> {
+        let mut rng = rand::rng();
+        let first = &self.services[rng.random_range(0..self.services.len())];
+        let second = &self.services[rng.random_range(0..self.services.len())];
+        let service = if second.outstanding() < first.outstanding() {
+            second
+        } else {
+            first
+        };
+        service
+            .transfer(request)
+            .map_err(|_request| DmaError::Fabric("fabric worker is gone".into()))
     }
 
     /// Register every pool segment on every service ahead of any transfer, so any service can

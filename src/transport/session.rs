@@ -3,73 +3,91 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use dma_libfabric::asynchronous::Transfer;
+use dma_libfabric::{Direction, TransferRequest};
+use dma_libfabric_protocol::DmaError;
 use linkme::distributed_slice;
 
-use crate::transport::{fabric, TransportError};
+use crate::transport::fabric;
+use crate::transport::operand::PoolOperand;
 
 // ─── Session ─────────────────────────────────────────────────────────────────
 
 /// Per-client DMA session created during LO.HELLO
 pub struct Session {
+    /// The Valkey client id: the fabric keys address-vector entries and in-flight accounting by it.
+    client_id: u64,
     /// The client's fabric address from LO.HELLO.
     peer_address: Vec<u8>,
 }
 
 impl Session {
-    pub fn new(peer_address: Vec<u8>) -> Self {
-        Self { peer_address }
+    pub fn new(client_id: u64, peer_address: Vec<u8>) -> Self {
+        Self {
+            client_id,
+            peer_address,
+        }
     }
 
     pub fn peer_address(&self) -> &[u8] {
         &self.peer_address
     }
 
-    /// DMA write: Push server buffer into client memory at (rkey, remote_addr).
-    /// Non-blocking, completion fires in on_complete.
-    ///
-    /// SAFETY: `buf_ptr` must remain valid until `on_complete` is called.
-    /// The caller (tokio task) must hold the owning SegmentBuffer/StreamingContext alive
-    /// until the callback fires. The transport does not own the buffer.
+    /// DMA write: push `len` bytes at `buf_ptr` into client memory at (rkey, remote_addr).
+    /// Resolves to the transfer's outcome. The caller holds the owning SegmentBuffer or
+    /// StreamingContext alive until then, since the worker reads the buffer across the await.
     pub fn write(
         &self,
         buf_ptr: *mut u8,
-        _len: usize,
-        _rkey: u64,
-        _remote_addr: u64,
-        on_complete: Box<dyn FnOnce(*mut u8, Result<(), TransportError>) + Send>,
-    ) {
-        // TODO:
-        //   1. Pick device (least-loaded)
-        //   2. fi_write(ep, buf.ptr(), len, desc, dest_fi_addr[device], remote_addr, rkey, ctx)
-        //   3. CQ poller fires on_complete
-        on_complete(buf_ptr, Ok(()));
+        len: usize,
+        rkey: u64,
+        remote_addr: u64,
+    ) -> Result<Transfer<PoolOperand>, DmaError> {
+        self.transfer(Direction::ToPeer, buf_ptr, len, rkey, remote_addr, false)
     }
 
-    /// DMA read: Pull client memory at (rkey, remote_addr) into server's buf_ptr.
-    /// Non-blocking.
-    ///
-    /// SAFETY: `buf_ptr` must remain valid until `on_complete` is called.
-    /// The caller (tokio task) must hold the owning SegmentBuffer/StreamingContext alive
-    /// until the callback fires. The transport does not own the buffer.
+    /// DMA read: pull `len` bytes from client memory at (rkey, remote_addr) into `buf_ptr`, with
+    /// the checksum of what landed taken on the fabric's CRC pool rather than the reply path.
+    /// Same buffer-lifetime rule as `write`.
     pub fn read(
         &self,
         buf_ptr: *mut u8,
-        _len: usize,
-        _rkey: u64,
-        _remote_addr: u64,
-        on_complete: Box<dyn FnOnce(*mut u8, Result<(), TransportError>) + Send>,
-    ) {
-        // TODO:
-        //   1. Pick device (least-loaded)
-        //   2. fi_read(ep, buf.ptr(), len, desc, dest_fi_addr[device], remote_addr, rkey, ctx)
-        //   3. CQ poller fires on_complete
-        on_complete(buf_ptr, Ok(()));
+        len: usize,
+        rkey: u64,
+        remote_addr: u64,
+    ) -> Result<Transfer<PoolOperand>, DmaError> {
+        self.transfer(
+            Direction::FromPeer { length: len },
+            buf_ptr,
+            len,
+            rkey,
+            remote_addr,
+            true,
+        )
     }
 
-    /// Tear down session. In-flight ops receive SessionClosed.
-    pub fn close(self) {
-        // TODO: fi_close endpoints, remove AV entries.
-        // Signal in-flight ops with SessionClosed error.
+    fn transfer(
+        &self,
+        direction: Direction,
+        buf_ptr: *mut u8,
+        len: usize,
+        rkey: u64,
+        remote_addr: u64,
+        want_checksum: bool,
+    ) -> Result<Transfer<PoolOperand>, DmaError> {
+        // A session only exists while a fabric does; it went away at shutdown.
+        let fabric =
+            fabric::fabric().ok_or_else(|| DmaError::Fabric("fabric is shut down".into()))?;
+        fabric.transfer(TransferRequest {
+            client_id: self.client_id,
+            peer_address: self.peer_address.clone(),
+            remote_key: rkey,
+            remote_address: remote_addr,
+            direction,
+            want_checksum,
+            caller_context: PoolOperand::new(buf_ptr, len),
+            parent_id: None,
+        })
     }
 }
 
