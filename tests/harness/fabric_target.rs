@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! # prints: advertisement: <address-hex> <rkey> <remote-addr>
-//! cargo run --example fabric_target -- 127.0.0.1
+//! cargo run --features test-harness --bin fabric_target -- 127.0.0.1
 //! # against a module started with fabric-provider Emulated:
 //! LO.HELLO <address-hex>
 //! LO.GET key <rkey> <remote-addr>            # writes the object into the target's buffer

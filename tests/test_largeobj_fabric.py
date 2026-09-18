@@ -74,13 +74,13 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
         self.verify_error_response(client, f'LO.HELLO {PEER_ADDRESS}', 'EFA unavailable on this instance')
         assert client.execute_command('LO.SET', 'key', b'A' * 4096) == b'OK'
 
-# What examples/fabric_target waits for (write) or serves (--read): one buffer of this byte.
+# What tests/harness/fabric_target waits for (write) or serves (--read): one buffer of this byte.
 PATTERN = b'\xab'
 TARGET_LEN = 4096
 
 
 class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
-    """Bytes actually move: examples/fabric_target, a passive libfabric peer on tcp loopback, is
+    """Bytes actually move: tests/harness/fabric_target, a passive libfabric peer on tcp loopback, is
     the client's buffer. Its advertisement is what a real client would carry into LO.HELLO and the
     per-request rkey / remote address."""
 
@@ -94,7 +94,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         )
 
     def start_target(self, *flags):
-        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'examples', 'fabric_target')
+        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
         process = subprocess.Popen(
             [target, '127.0.0.1', *flags],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

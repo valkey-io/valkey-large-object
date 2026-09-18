@@ -59,12 +59,11 @@ if [ "$1" != "test" ] && [ "$1" != "integ-test" ]; then
     echo ""
 
     echo "Running cargo clippy..."
-    cargo clippy --profile release --all-targets -- -D warnings
+    cargo clippy --profile release --all-targets --features test-harness -- -D warnings
     echo ""
 
     echo "Running cargo build release..."
-    # --examples: the passive fabric target the integration tests spawn.
-    cargo build --release --lib --examples
+    cargo build --release
     echo "Module built: $MODULE_PATH"
     echo ""
 
@@ -180,6 +179,9 @@ if [ -f "$REQUIREMENTS_FILE" ]; then
 fi
 
 # ─── Run Integration Tests ───────────────────────────────────────────────────
+
+# The passive fabric peer for fabric tests.
+cargo build --release --features test-harness --bin fabric_target
 
 echo ""
 echo "Running integration tests..."

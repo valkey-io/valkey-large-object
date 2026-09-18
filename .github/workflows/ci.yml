@@ -50,10 +50,10 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --profile release --all-targets -- -D warnings
+        run: cargo clippy --profile release --all-targets --features test-harness -- -D warnings
 
       - name: Release build
-        run: cargo build --release --lib --examples
+        run: cargo build --release
 
       - name: Run unit tests
         run: cargo test --features enable-system-alloc
@@ -99,6 +99,9 @@ jobs:
 
       - name: Set module path
         run: echo "MODULE_PATH=$(realpath target/release/libvalkey_largeobj.so)" >> $GITHUB_ENV
+
+      - name: Build test harness
+        run: cargo build --release --features test-harness --bin fabric_target
 
       - name: Run integration tests
         if: ${{ !matrix.asan }}
