@@ -36,6 +36,10 @@ pub fn configuration() -> Configuration {
         bind: None,
         max_in_flight: nonzero(crate::fabric_max_in_flight()),
         crc_pool_threads: Some(crate::fabric_crc_pool_threads()),
+        // deadline for a connection to return something other than EAGAIN. Without this, the
+        // libfabric thread can't tell the difference between an establishing or overloaded
+        // connection and one that is dead. This keeps rpcs from trying to post forever and
+        // spinning the efa service thread.
         progress_deadline: std::time::Duration::from_secs(1),
     }
 }

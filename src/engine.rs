@@ -861,8 +861,7 @@ async fn efa_read_from_client(
     rkey: u64,
     remote_addr: u64,
 ) -> Result<u32, ValkeyError> {
-    let failed =
-        |_error: DmaError| ValkeyError::Str(errors::ERR_EFA_READ);
+    let failed = |_error: DmaError| ValkeyError::Str(errors::ERR_EFA_READ);
     let transfer = session
         .read(buf_ptr as *mut u8, len, rkey, remote_addr)
         .map_err(failed)?;
