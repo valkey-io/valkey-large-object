@@ -126,3 +126,59 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('LO.GET', 'key') == PATTERN * TARGET_LEN
         finally:
             process.kill()
+
+
+class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
+    """Tiered mode with promotion off to run the NVMe paths."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 1048576"
+            f" dram-segment-size 1048576"
+            f" lo-buffer-size 4096"
+            f" max-promote-size 0"
+            f" direct-io no"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def test_set_over_efa_persists_to_nvme(self):
+        process, address, rkey, remote_addr = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.HELLO', address)
+            assert client.execute_command('LO.SET', 'key', TARGET_LEN, rkey, remote_addr) == b'OK'
+            assert len(self._object_files()) == 1
+        finally:
+            process.kill()
+
+
+class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
+    """Tiered mode with promotion on."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 1048576"
+            f" dram-segment-size 1048576"
+            f" lo-buffer-size 4096"
+            f" direct-io no"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def test_get_over_efa_after_promotion(self):
+        process, address, rkey, remote_addr = self.start_target()
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.SET', 'key', PATTERN * TARGET_LEN)
+            assert client.execute_command('LO.GET', 'key') == PATTERN * TARGET_LEN
+            client.execute_command('LO.HELLO', address)
+            assert client.execute_command('LO.GET', 'key', rkey, remote_addr) == TARGET_LEN
+            output = process.communicate(timeout=30)[0]
+            assert 'payload verified' in output, output
+        finally:
+            process.kill()
