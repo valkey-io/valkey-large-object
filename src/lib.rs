@@ -46,6 +46,7 @@ pub mod data_type;
 pub mod engine;
 pub mod errors;
 pub mod info;
+pub mod smart;
 pub mod storage;
 pub mod transport;
 
@@ -418,6 +419,12 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Start the scaling cron (both modes — handles expand and shrink based on mode).
     storage::scaling::rearm_scaling_cron(ctx, scaling_poll_ms());
+
+    // Background SMART poller: reads the controllers once per interval;
+    // INFO only ever serves the latest snapshot. First read populates it.
+    if mode == OperatingMode::Tiered {
+        smart::start_poller();
+    }
 
     Status::Ok
 }

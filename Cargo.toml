@@ -15,9 +15,10 @@ io-uring = "0.7"
 crossbeam-channel = "0.5"
 dma-libfabric = { git = "https://github.com/momentohq/vdma.git", rev = "39e58840d1828fbcbe1c6ab08bbe07ec201e3797" }
 dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = "39e58840d1828fbcbe1c6ab08bbe07ec201e3797" }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 lazy_static = "1"
+nvme-telem = "0.3.3"
 rand = "0.10"
 talc = { version = "4", default-features = false, features = ["lock_api"] }
 

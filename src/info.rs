@@ -5,7 +5,9 @@
 
 use valkey_module::{InfoContext, ValkeyResult};
 
+use crate::smart::{media_read_only, snapshot_for_info};
 use crate::storage;
+use crate::{operating_mode, OperatingMode};
 
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
@@ -17,6 +19,7 @@ pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
 fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     dram_pool_section(ctx)?;
     nvme_staging_section(ctx)?;
+    nvme_smart_section(ctx)?;
     Ok(())
 }
 
@@ -71,4 +74,53 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .build_section()?
         .build_info()
         .map(|_| ())
+}
+
+/// NVMe SMART health, Tiered mode only. The section appears once the
+/// poller's first read lands; before that INFO simply omits it.
+fn nvme_smart_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    if operating_mode() != OperatingMode::Tiered {
+        return Ok(());
+    }
+    let Some(snap) = snapshot_for_info() else {
+        return Ok(());
+    };
+
+    let mut section = ctx
+        .builder()
+        .add_section("nvme_smart")
+        .field("snapshot_age_seconds", snap.age().as_secs())?;
+    for d in &snap.devices {
+        // /dev/nvme0 -> nvme0 field prefix
+        let name = d.device.rsplit('/').next().unwrap_or(&d.device);
+        section = match &d.health {
+            Err(e) => section.field(
+                &format!("{name}_read_error"),
+                e.raw_os_error()
+                    .map_or_else(|| e.to_string(), |errno| format!("errno {errno}")),
+            )?,
+            Ok(h) => section
+                .field(
+                    &format!("{name}_critical_warning"),
+                    u64::from(h.critical_warning),
+                )?
+                .field(
+                    &format!("{name}_media_read_only"),
+                    u64::from(media_read_only(h.critical_warning)),
+                )?
+                .field(
+                    &format!("{name}_available_spare_pct"),
+                    u64::from(h.avail_spare),
+                )?
+                .field(
+                    &format!("{name}_percentage_used"),
+                    u64::from(h.percent_used),
+                )?
+                .field(
+                    &format!("{name}_media_errors"),
+                    u64::try_from(h.media_errors).unwrap_or(u64::MAX),
+                )?,
+        };
+    }
+    section.build_section()?.build_info().map(|_| ())
 }
