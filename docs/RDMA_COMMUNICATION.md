@@ -201,3 +201,34 @@ It is unknown whether a pci-e side-channel attack is possible via AWS nitro. Fac
 instance placement and tenancy varying with attached EFA's would have to be considered.
 These kinds of attacks are similar in spirit to spectre or meltdown, but are the domain of
 nitro hardware and firmware designers to stamp out, should they prove possible.
+
+# Implementation responsibilities
+The `dma-libfabric` library wraps `libfabric`, which itself wraps `libibverbs` and other
+dma provider implementations. These are progressively higher-level libraries. The first
+touch point with them in ValkeyLargeObject is in the `transport` module.
+
+**Memory:** ValkeyLargeObject `transport` module maps `dma-libfabric` types to ValkeyLargeObject
+memory and types. ValkeyLargeObject has memory pools that it manages, and `transport`
+facilitates registration of those regions with `dma-libfabric`.
+
+**Load balancing:** The `libfabric` underlying types have io queues, and ValkeyLargeObject
+commands require a choice. The semantic of the LO.GET/SET commands is `N` server interfaces to
+`1` client interface, per connection. This means the `transport` module also implements
+the choice of which of the `N` server interfaces to use (best of 2, by work queue length).
+By choosing the target interface up front, queueing is predominantly kept inside `libfabric`
+where the network device can be kept as busy as possible, with the lowest latency possible.
+By choosing per-rpc, the server's interfaces can have balanced load. Together, this maximizes
+saturated throughput while minimizing one-shot latency.
+
+**State:** Session state is provided by `transport` as well. The Valkey client id, and the target
+dma address are kept so the address can be deregistered on valkey disconnection. `dma-libfabric`
+has no knowledge of Valkey, or any particular control channel, and centers on one-sided dma.
+This means there is no notification of a target "disconnecting" as the notion is meaningless
+to a connectionless protocol. Semantically, however, the libfabric address vector needs to be
+maintained according to the Valkey command channel lifecycle. So `transport` sessions are
+cleaned up via Valkey client lifecycle events.
+
+Further abstraction above `dma-libfabric` and below `transport` may be possible, moving some
+of these concerns out of ValkeyLargeObject. Each of the key responsibilities of `transport`
+are tightly integrated with `ValkeyLargeObject` requirements, but some of these requirements
+may be found to be common and traits extracted.
