@@ -110,6 +110,11 @@ lazy_static::lazy_static! {
     /// timer fires to check utilization and memory pressure. Default: 5000ms.
     static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(5000);
 
+    /// NVMe SMART poll interval in seconds (Tiered mode). 0 disables polling
+    /// entirely: no background reads, and the INFO section never appears.
+    /// Immutable after load — the poller either starts at init or not at all.
+    static ref CFG_SMART_POLL_SECS: AtomicI64 = AtomicI64::new(60);
+
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
     /// ratio, a new segment is added ahead of time. Default: 0.80 (80%).
     static ref CFG_SCALING_EXPAND_WATERMARK: AtomicI64 = AtomicI64::new(80); // stored as percent
@@ -235,6 +240,10 @@ pub fn bench_mode() -> bool {
 
 pub fn scaling_poll_ms() -> u64 {
     CFG_SCALING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn smart_poll_secs() -> u64 {
+    CFG_SMART_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn scaling_expand_watermark() -> f64 {
@@ -422,8 +431,10 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Background SMART poller: reads the controllers once per interval;
     // INFO only ever serves the latest snapshot. First read populates it.
-    if mode == OperatingMode::Tiered {
-        smart::start_poller();
+    // smart-poll-secs 0 disables polling and its INFO section.
+    let smart_secs = smart_poll_secs();
+    if mode == OperatingMode::Tiered && smart_secs > 0 {
+        smart::start_poller(std::time::Duration::from_secs(smart_secs));
     }
 
     Status::Ok
@@ -492,6 +503,8 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
+            ["smart-poll-secs", &*CFG_SMART_POLL_SECS, 60, 0, 86_400,
+             ConfigurationFlags::IMMUTABLE, None, None],
             ["scaling-expand-watermark", &*CFG_SCALING_EXPAND_WATERMARK, 80, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,

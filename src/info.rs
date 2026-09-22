@@ -117,6 +117,22 @@ fn nvme_smart_section(ctx: &InfoContext) -> ValkeyResult<()> {
                     u64::from(h.percent_used),
                 )?
                 .field(
+                    &format!("{name}_temperature_kelvin"),
+                    u64::from(h.temperature),
+                )?
+                .field(
+                    &format!("{name}_data_units_read"),
+                    u64::try_from(h.data_units_read).unwrap_or(u64::MAX),
+                )?
+                .field(
+                    &format!("{name}_data_units_written"),
+                    u64::try_from(h.data_units_written).unwrap_or(u64::MAX),
+                )?
+                .field(
+                    &format!("{name}_unsafe_shutdowns"),
+                    u64::try_from(h.unsafe_shutdowns).unwrap_or(u64::MAX),
+                )?
+                .field(
                     &format!("{name}_media_errors"),
                     u64::try_from(h.media_errors).unwrap_or(u64::MAX),
                 )?,

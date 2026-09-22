@@ -72,9 +72,6 @@ lazy_static::lazy_static! {
     pub static ref SMART_CACHE: SmartCache = SmartCache::default();
 }
 
-/// How often the poller re-reads the SMART logs.
-pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Read every controller and publish one snapshot. This is blocking, callers run
 /// it on the module runtime, never the main thread.
 pub fn refresh_snapshot() {
@@ -94,12 +91,12 @@ pub fn refresh_snapshot() {
 }
 
 /// Spawn the background SMART poller: one read of every controller per
-/// POLL_INTERVAL, forever.
-pub fn start_poller() {
-    crate::runtime_handle().spawn(async {
+/// `interval`, forever.
+pub fn start_poller(interval: Duration) {
+    crate::runtime_handle().spawn(async move {
         loop {
             let _ = tokio::task::spawn_blocking(refresh_snapshot).await;
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(interval).await;
         }
     });
 }
