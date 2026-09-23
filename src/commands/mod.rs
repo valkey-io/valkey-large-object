@@ -4,6 +4,7 @@
 //! LO.GET key [rkey remote_addr]: engine::execute_get
 //! LO.SET key <data>                (TCP): engine::execute_set
 //! LO.SET key len rkey remote_addr  (EFA): engine::execute_set
+//! LO.INFO key [LEN|CRC|TIER]: metadata from LoValue, no engine call
 
 use std::sync::Arc;
 
@@ -171,5 +172,45 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     match engine::execute_set(ctx, &args[1], obj_len, data_source) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
+    }
+}
+
+// ─── LO.INFO ─────────────────────────────────────────────────────────────────
+//
+// LO.INFO key [LEN | CRC | TIER]
+//
+// Parse args → resolve key → return metadata field or all fields as array.
+
+pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    if !(2..=3).contains(&args.len()) {
+        return Err(ValkeyError::WrongArity);
+    }
+
+    let key = ctx.open_key(&args[1]);
+    let value = match key.get_value::<LoValue>(&LO_TYPE)? {
+        Some(v) => v,
+        None => return Err(ValkeyError::Str(errors::ERR_NOT_FOUND)),
+    };
+
+    let len = ValkeyValue::Integer(value.len as i64);
+    let crc = ValkeyValue::Integer(i64::from(value.crc32c));
+    let tier = ValkeyValue::SimpleStringStatic(value.tier().as_str());
+
+    if args.len() == 2 {
+        return Ok(ValkeyValue::Array(vec![
+            ValkeyValue::SimpleStringStatic("len"),
+            len,
+            ValkeyValue::SimpleStringStatic("crc"),
+            crc,
+            ValkeyValue::SimpleStringStatic("tier"),
+            tier,
+        ]));
+    }
+
+    match args[2].to_string_lossy().to_uppercase().as_str() {
+        "LEN" => Ok(len),
+        "CRC" => Ok(crc),
+        "TIER" => Ok(tier),
+        _ => Err(ValkeyError::Str(errors::ERR_INVALID_INFO_FIELD)),
     }
 }
