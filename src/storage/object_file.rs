@@ -65,11 +65,66 @@ impl ObjectFile {
         self.object_id
     }
 
+    pub fn disk_len(&self) -> u64 {
+        self.disk_len
+    }
+
     /// Returns a cloned `Arc<OwnedFd>`. Calls into the `FdPool`, which owns the fd and
     /// caches it for reuse. The returned reference should be used to protect the
     /// fd from being closed while there are inflight read requests.
     pub fn ensure_open(&self, pool: &FdPool, dir: &str) -> Option<Arc<OwnedFd>> {
         pool.get_or_open(self.object_id, dir)
+    }
+
+    /// Copy this file into a new object version: allocates a fresh `ObjectId`, writes a
+    /// header carrying the new OID with this object's `len`/`crc32c`, then copies the
+    /// payload past the header byte-for-byte. `fsync`s before returning so the file is
+    /// durable before it is exposed to O_DIRECT reads via io_uring.
+    ///
+    /// Reserves `disk_len` against nvme-maxmemory up front; the returned handle's `Drop`
+    /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
+    /// the command rather than aborting the node), leaving no partial file behind.
+    pub fn copy(&self, len: u64, crc32c: u32) -> Option<ObjectFile> {
+        let dir = crate::nvme_dir();
+        let disk_len = self.disk_len;
+        if !super::nvme::try_reserve_nvme_disk_usage(disk_len) {
+            return None;
+        }
+        let new_oid = ObjectId::next();
+        let dst_path = new_oid.file_path(&dir);
+        match self.copy_file(&dst_path, new_oid, len, crc32c) {
+            Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&dst_path);
+                super::nvme::decrease_nvme_disk_usage(disk_len);
+                valkey_module::logging::log_warning(format!(
+                    "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
+                    self.object_id
+                ));
+                None
+            }
+        }
+    }
+
+    /// Header write + payload copy for `copy`. Buffered I/O on purpose: this runs off
+    /// the io_uring path, and the destination is not yet visible to any reader.
+    fn copy_file(
+        &self,
+        dst_path: &str,
+        new_oid: ObjectId,
+        len: u64,
+        crc32c: u32,
+    ) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut src = std::fs::File::open(self.object_id.file_path(&crate::nvme_dir()))?;
+        let mut dst = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dst_path)?;
+        dst.write_all(&super::FileHeader::new(new_oid, len, crc32c).to_page())?;
+        src.seek(SeekFrom::Start(super::FILE_HEADER_SIZE))?;
+        std::io::copy(&mut src, &mut dst)?;
+        dst.sync_all()
     }
 }
 
@@ -92,7 +147,7 @@ impl Drop for ObjectFile {
                 super::warn_failed_unlink("teardown", &path, &e);
             }
             // Release exactly what create added — no stat, so it can't drift.
-            crate::storage::uring::decrease_nvme_disk_usage(disk_len);
+            crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
         };
 
         // The main event-loop thread must be kept syscall-free. Hand the operation

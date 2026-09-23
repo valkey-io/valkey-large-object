@@ -32,6 +32,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" dram-maxmemory 0"
             f" scaling-poll-ms 60000"
+            f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -128,6 +129,7 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
             f" scaling-expand-watermark 50"
             f" scaling-shrink-watermark 99"
             f" scaling-poll-ms 1000"
+            f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -169,6 +171,7 @@ class TestDramMaxMemoryCap(ValkeyLargeObjTestCaseBase):
             f"operating-mode Dram"
             f" segment-size 1048576"
             f" dram-maxmemory 2097152"
+            f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -201,6 +204,7 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" dram-maxmemory 4194304"
             f" max-promote-size 1048576"
+            f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
         )
@@ -259,6 +263,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
             f" dram-maxmemory 0"
             f" max-promote-size 1048576"
             f" scaling-poll-ms 1000"
+            f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
         )

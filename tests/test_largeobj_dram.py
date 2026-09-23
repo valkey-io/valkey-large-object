@@ -9,19 +9,33 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Dram"
-            f" segment-size 1048576"
+            f" segment-size 2097152"
             f" bench-mode no"
             f" direct-io no"
+            f" chunk-size 4096"
         )
 
     def test_set_get_roundtrip(self):
-        """Basic SET + GET in Dram mode."""
+        """Basic SET + GET in Dram mode, including multi-chunk objects."""
         client = self.server.get_new_client()
+        # Single-chunk: 4096 bytes with chunk-size=4096 → 1 chunk.
         payload = b'A' * 4096
         result = client.execute_command('LO.SET', 'dramkey', payload)
         assert result == b'OK'
         data = client.execute_command('LO.GET', 'dramkey')
         assert data == payload
+        # Partial last chunk: 4096 + 1 = 4097 → 2 chunks (second chunk is 1 byte).
+        payload_partial = b'B' * 4097
+        client.execute_command('LO.SET', 'partial_key', payload_partial)
+        assert client.execute_command('LO.GET', 'partial_key') == payload_partial
+        # Exact multiple: 8192 = 2 * 4096 → 2 full chunks.
+        payload_exact = b'C' * 8192
+        client.execute_command('LO.SET', 'exact_key', payload_exact)
+        assert client.execute_command('LO.GET', 'exact_key') == payload_exact
+        # Many chunks: 20000 bytes → 5 chunks (last chunk is 20000 % 4096 = 3616 bytes).
+        payload_many = b'D' * 20000
+        client.execute_command('LO.SET', 'many_key', payload_many)
+        assert client.execute_command('LO.GET', 'many_key') == payload_many
 
     def test_get_nonexistent_key(self):
         """GET on nonexistent key returns nil in Dram mode."""
@@ -48,8 +62,8 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def test_dram_pool_exhaustion(self):
         """An object larger than segment-size fails with pool exhausted."""
         client = self.server.get_new_client()
-        # segment-size is 1MB. A 2MB object cannot be allocated.
-        obj_size = 2 * 1024 * 1024
+        # segment-size is 2MB. A 4MB object cannot be allocated.
+        obj_size = 4 * 1024 * 1024
         payload = b'D' * obj_size
         try:
             client.execute_command('LO.SET', 'toobig', payload)
@@ -96,15 +110,15 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def test_copy_pool_exhausted(self):
         """COPY fails when DRAMPool cannot fit the duplicate."""
         client = self.server.get_new_client()
-        # Fill most of the 1MB pool with a large object.
-        payload = b'F' * (900 * 1024)
+        # Fill most of the 2MB pool with a large object.
+        payload = b'F' * (1200 * 1024)
         client.execute_command('LO.SET', 'bigkey', payload)
-        # COPY needs another 900KB — pool is only 1MB total.
+        # COPY needs another 1200KB — pool is only 2MB total.
         try:
             client.execute_command('COPY', 'bigkey', 'bigcopy')
             assert False, "Expected COPY to fail with pool exhausted"
         except ResponseError:
-            pass  # Expected — pool cannot fit two 900KB objects
+            pass  # Expected — pool cannot fit two 1200KB objects
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 

@@ -7,7 +7,7 @@
 //! Each Segment carries its OWN `Talc<>` instance covering exactly its own
 //! memory range. This eliminates the reverse-lookup pointer→segment path and
 //! the shared-allocator lock: allocations are routed to a segment at the
-//! picker level (SegmentPool::alloc_n), and the segment's local talc handles
+//! picker level (SegmentPool::alloc_exact / alloc_window), and the segment's local talc handles
 //! only its own address range.
 
 use std::alloc::Layout;

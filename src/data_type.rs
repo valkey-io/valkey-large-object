@@ -120,34 +120,14 @@ impl LoValue {
 
     /// Tiered mode: copy NVMe file with a fresh OID.
     /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
-    /// Returns None if nvme-maxmemory would be exceeded.
+    /// Returns None if nvme-maxmemory would be exceeded or the copy fails.
     fn create_copy_tiered(&self) -> Option<LoValue> {
-        let data_dir = crate::nvme_dir();
-        // On-disk size.
-        let disk_len = crate::storage::object_disk_len(self.len);
-        if !crate::storage::uring::try_reserve_nvme_disk_usage(disk_len) {
-            return None;
-        }
-        let new_oid = ObjectId::next();
-        let src_path = self.object_id.file_path(&data_dir);
-        let dst_path = new_oid.file_path(&data_dir);
-        // A copy failure (ENOSPC, EIO, ...) fails the COPY (lo_copy maps None -> null)
-        // rather than aborting the node. Release the reservation we took above and
-        // best-effort remove any partial destination.
-        if let Err(e) = std::fs::copy(&src_path, &dst_path) {
-            crate::storage::uring::decrease_nvme_disk_usage(disk_len);
-            let _ = std::fs::remove_file(&dst_path);
-            valkey_module::logging::log_warning(format!(
-                "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
-                self.object_id
-            ));
-            return None;
-        }
+        let file = self.file.as_ref()?.copy(self.len, self.crc32c)?;
         Some(LoValue {
-            object_id: new_oid,
+            object_id: file.object_id(),
             len: self.len,
             crc32c: self.crc32c,
-            file: Some(Arc::new(ObjectFile::new(new_oid, disk_len))),
+            file: Some(Arc::new(file)),
         })
     }
 }

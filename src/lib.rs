@@ -159,17 +159,25 @@ lazy_static::lazy_static! {
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
     static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(1);
 
+    // ─── Test Hooks ──────────────────────────────────────────────────────
+
+    /// Test-only: pause the tiered SET path for this many milliseconds after
+    /// writing data chunks but before calling set_finalize. 0 = disabled.
+    /// Allows integration tests to inject a DEL in the mid-stream window
+    /// and deterministically exercise the delete-during-SET race.
+    static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);
+
     // ─── Streaming Configs ───────────────────────────────────────────────
 
     /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
     /// Determines allocation unit for all I/O operations.
-    static ref CFG_BUFFER_SIZE: AtomicI64 = AtomicI64::new(8 * 1024 * 1024);
+    static ref CFG_CHUNK_SIZE: AtomicI64 = AtomicI64::new(8 * 1024 * 1024);
 
     /// Max buffers per streaming operation (batch size / pipeline depth). Default: 8.
     static ref CFG_MAX_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(8);
 
     /// Min buffers to start a streaming operation. Below this → reject. Default: 2.
-    static ref CFG_STREAMING_MIN_BUFFERS: AtomicI64 = AtomicI64::new(2);
+    static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(2);
 }
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
@@ -293,16 +301,20 @@ pub fn operating_mode() -> OperatingMode {
         .expect("CFG_OPERATING_MODE lock unavailable")
 }
 
-pub fn buffer_size() -> usize {
-    CFG_BUFFER_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn chunk_size() -> usize {
+    CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn max_buffers_per_op() -> usize {
     CFG_MAX_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
-pub fn streaming_min_buffers() -> usize {
-    CFG_STREAMING_MIN_BUFFERS.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn min_buffers_per_op() -> usize {
+    CFG_MIN_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn test_pause_before_finalize_set_ms() -> u64 {
+    CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn fabric_provider() -> FabricProvider {
@@ -490,12 +502,32 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, 67_108_864, 0, 1_099_511_627_776,
              ConfigurationFlags::MEMORY, None, None],
-            ["lo-buffer-size", &*CFG_BUFFER_SIZE, 8_388_608, 4096, 268_435_456,
-             ConfigurationFlags::MEMORY, None, None],
-            ["lo-max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
-             ConfigurationFlags::DEFAULT, None, None],
-            ["lo-streaming-min-buffers", &*CFG_STREAMING_MIN_BUFFERS, 2, 1, 64,
-             ConfigurationFlags::DEFAULT, None, None],
+            ["chunk-size", &*CFG_CHUNK_SIZE, 8_388_608, 4096, 268_435_456,
+             ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
+            ["max-buffers-per-op", &*CFG_MAX_BUFFERS_PER_OP, 8, 2, 64,
+             ConfigurationFlags::DEFAULT, None,
+             Some(Box::new(|_ctx, _name, new_val| {
+                 let max = new_val.load(std::sync::atomic::Ordering::Relaxed);
+                 let min = CFG_MIN_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed);
+                 if min > max {
+                     Err(valkey_module::ValkeyError::Str("ERR max-buffers-per-op must be >= min-buffers-per-op"))
+                 } else {
+                     Ok(())
+                 }
+             }))],
+            ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, 2, 1, 64,
+             ConfigurationFlags::DEFAULT, None,
+             Some(Box::new(|_ctx, _name, new_val| {
+                 let min = new_val.load(std::sync::atomic::Ordering::Relaxed);
+                 let max = CFG_MAX_BUFFERS_PER_OP.load(std::sync::atomic::Ordering::Relaxed);
+                 if min > max {
+                     Err(valkey_module::ValkeyError::Str("ERR min-buffers-per-op must be <= max-buffers-per-op"))
+                 } else {
+                     Ok(())
+                 }
+             }))],
+            ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
             ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, 60, 0, 86_400,
@@ -514,7 +546,7 @@ valkey_module! {
             ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
-            ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::DEFAULT, None],
+            ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
         ],
         enum: [

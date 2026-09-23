@@ -4,8 +4,14 @@
 //! evicted independently of commands.
 //!
 //! - ObjectContext: lives in DRAMPool HashMap, long-lived, complete object.
-//! - StreamingContext: lives on a tokio task, short-lived, partial buffer window.
+//!   Owns all N buffers for the entire object.
+//! - StreamingContext: lives on a tokio task, short-lived, rotating buffer window.
+//!   Owns only X buffers; task-local ChunkIterator handles pagination.
 //! - SegmentBuffer: a slice within a registered segment (DRAMPool or NVMePool).
+//!
+//! Neither context stores total_len or chunk counts — those are derived from
+//! LoValue.len and crate::chunk_size() (immutable config). ChunkIterator (task-local)
+//! handles all chunk geometry and iteration state.
 //!
 //! NOTE: CRC32c is NOT stored on either context struct. It is a local variable
 //! in the tokio task that performs the SET. The task computes the rolling CRC as
@@ -26,14 +32,18 @@ pub struct SegmentBuffer {
     pub segment_idx: u16,
     /// Byte offset within that segment.
     pub offset: u64,
-    /// Size of this buffer allocation.
+    /// Requested allocation size in bytes: the user data length rounded up to IO_ALIGN
+    /// via align_up(). Talc may internally allocate more due to its own metadata, but
+    /// this field tracks only what we asked for. The user of this structure (e.g. Chunk)
+    /// needs to track the exact bytes to read from every SegmentBuffer due to the
+    /// alignment mentioned above.
     pub len: u32,
 }
 
 impl super::TryClone for SegmentBuffer {
     fn try_clone(&self) -> Option<Self> {
         let pool = crate::storage::get_dram_pool();
-        let new_buf = pool.alloc(self.len as usize)?;
+        let new_buf = pool.alloc_exact(self.len as usize)?.remove(0);
         let src_ptr = pool.buffer_ptr(self);
         let dst_ptr = pool.buffer_ptr(&new_buf);
         // SAFETY: src and dst are non-overlapping regions within pool segment(s).
@@ -62,43 +72,38 @@ pub enum ObjectState {
 /// ALL N buffers for the entire object are allocated upfront from DRAMPool segment.
 /// Stored in: `RwLock<HashMap<ObjectId, Arc<ObjectContext>>>`
 /// Buffers are automatically returned to DRAMPool when the last Arc drops.
+///
+/// Does NOT store total_len or chunk counts. Callers derive object length from
+/// LoValue.len and chunk geometry from crate::chunk_size() (immutable).
+/// Each task creates its own ChunkIterator for iteration.
 #[derive(Debug)]
 pub struct ObjectContext {
-    /// Ordered chunks. 1 for small objects, N for large.
+    /// Ordered buffers. 1 for small objects, N for large.
     pub buffers: Vec<SegmentBuffer>,
-    /// Total object size (sum of all buffer lens).
-    pub total_len: u64,
-    /// Filling→Ready transition via mark_ready() with Release ordering.
+    /// Filling->Ready transition via mark_ready() with Release ordering.
     /// Readers use is_ready() with Acquire ordering — guarantees visibility
     /// of the NVMe read data that was written before mark_ready().
     state: AtomicU8,
     /// Chunks completed during promotion (only meaningful when state == Filling).
     chunks_ready: AtomicU32,
-    /// Total chunks for this object (used by streaming/chunking path).
-    #[allow(dead_code)]
-    total_chunks: u32,
 }
 
 impl ObjectContext {
     /// Create a new ObjectContext in Ready state (e.g., DRAM-only SET).
-    pub fn new_ready(buffers: Vec<SegmentBuffer>, total_len: u64) -> Self {
+    pub fn new_ready(buffers: Vec<SegmentBuffer>) -> Self {
         Self {
             buffers,
-            total_len,
             state: AtomicU8::new(ObjectState::Ready as u8),
             chunks_ready: AtomicU32::new(0),
-            total_chunks: 0,
         }
     }
 
     /// Create a new ObjectContext in Filling state (Tiered promotion path).
-    pub fn new_filling(buffers: Vec<SegmentBuffer>, total_len: u64, total_chunks: u32) -> Self {
+    pub fn new_filling(buffers: Vec<SegmentBuffer>) -> Self {
         Self {
             buffers,
-            total_len,
             state: AtomicU8::new(ObjectState::Filling as u8),
             chunks_ready: AtomicU32::new(0),
-            total_chunks,
         }
     }
 
@@ -132,12 +137,12 @@ impl ObjectContext {
     }
 
     /// Advance chunks_ready after a batch completes. Called from tokio promotion task.
-    pub fn advance_chunks_ready(&self, batch_size: u32) {
+    pub fn advance_chunks_ready(&self, count: u32) {
         assert!(
             !self.is_ready(),
             "advance_chunks_ready called on Ready ObjectContext"
         );
-        self.chunks_ready.fetch_add(batch_size, Ordering::Release);
+        self.chunks_ready.fetch_add(count, Ordering::Release);
     }
 }
 
@@ -165,7 +170,7 @@ impl super::TryClone for ObjectContext {
         for buf in &self.buffers {
             new_buffers.push(buf.try_clone()?);
         }
-        Some(Self::new_ready(new_buffers, self.total_len))
+        Some(Self::new_ready(new_buffers))
     }
 }
 
@@ -175,16 +180,22 @@ impl super::TryClone for ObjectContext {
 /// Rotating window of X buffers, reused across batches.
 /// Owned by a single tokio task — no Arc needed.
 /// Buffers are automatically returned to NVMePool on drop.
+///
+/// Does NOT track progress (chunks_completed, total_chunks). The task-local
+/// ChunkIterator handles all iteration state and progress tracking.
 #[derive(Debug)]
 pub struct StreamingContext {
-    /// Rotating buffer window (max X = batch size).
+    /// Rotating buffer window.
     pub buffers: Vec<SegmentBuffer>,
-    /// Total object size being transferred.
-    pub total_len: u64,
-    /// Number of chunks completed.
-    pub chunks_completed: u32,
-    /// Total chunks needed for the full object.
-    pub total_chunks: u32,
+}
+
+impl StreamingContext {
+    /// Create a new StreamingContext for a transient NVMe I/O operation (GET or SET).
+    /// The context owns only its rotating buffer window; the caller's task holds any
+    /// `Arc<ObjectFile>` pin needed to keep the `ObjectFile` and fd alive for the transfer.
+    pub fn new(buffers: Vec<SegmentBuffer>) -> Self {
+        Self { buffers }
+    }
 }
 
 impl Drop for StreamingContext {
@@ -195,35 +206,6 @@ impl Drop for StreamingContext {
                 nvme_pool.free(buf);
             }
         }
-    }
-}
-
-impl StreamingContext {
-    /// Create a new StreamingContext for a transient NVMe I/O operation (GET or SET).
-    /// The context owns only its rotating buffer window; the caller's task holds any
-    /// `Arc<ObjectFile>` pin needed to keep the `ObjectFile` and fd alive for the transfer.
-    pub fn new(buffers: Vec<SegmentBuffer>, total_len: u64, total_chunks: u32) -> Self {
-        Self {
-            buffers,
-            total_len,
-            chunks_completed: 0,
-            total_chunks,
-        }
-    }
-
-    /// Number of buffers (batch size / pipeline depth).
-    pub fn batch_size(&self) -> usize {
-        self.buffers.len()
-    }
-
-    /// Advance progress after a chunk completes.
-    pub fn advance(&mut self) {
-        self.chunks_completed += 1;
-    }
-
-    /// Check if the entire object has been transferred.
-    pub fn is_complete(&self) -> bool {
-        self.chunks_completed == self.total_chunks
     }
 }
 
@@ -247,7 +229,7 @@ mod tests {
                 len: 1024,
             },
         ];
-        let ctx = ObjectContext::new_ready(bufs, 2048);
+        let ctx = ObjectContext::new_ready(bufs);
         assert!(ctx.is_ready());
         assert_eq!(ctx.chunks_ready(), 2);
     }
@@ -271,43 +253,12 @@ mod tests {
                 len: 8_000_000,
             },
         ];
-        let ctx = ObjectContext::new_filling(bufs, 24_000_000, 3);
+        let ctx = ObjectContext::new_filling(bufs);
         assert!(!ctx.is_ready());
         assert_eq!(ctx.chunks_ready(), 0);
-
         ctx.advance_chunks_ready(2);
         assert_eq!(ctx.chunks_ready(), 2);
-
         ctx.advance_chunks_ready(1);
         assert_eq!(ctx.chunks_ready(), 3);
-    }
-
-    #[test]
-    fn test_streaming_context_progress() {
-        let bufs = vec![
-            SegmentBuffer {
-                segment_idx: 0,
-                offset: 0,
-                len: 8_000_000,
-            },
-            SegmentBuffer {
-                segment_idx: 0,
-                offset: 8_000_000,
-                len: 8_000_000,
-            },
-        ];
-        let mut ctx = StreamingContext::new(bufs, 50_000_000, 4);
-        assert!(!ctx.is_complete());
-        assert_eq!(ctx.batch_size(), 2);
-
-        ctx.advance();
-        assert!(!ctx.is_complete());
-
-        ctx.advance();
-        ctx.advance();
-        assert!(!ctx.is_complete());
-
-        ctx.advance();
-        assert!(ctx.is_complete());
     }
 }

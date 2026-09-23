@@ -87,11 +87,15 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let object_id = lo_value.object_id;
     let obj_len = lo_value.len;
+    let crc32c = lo_value.crc32c;
 
     // Pin the file to protect it from asynchronous deletion in tiered mode.
     let file = lo_value.file.clone();
 
     // Determine transport: EFA if rkey+remote_addr provided, else TCP.
+    // TODO: Add a client buffer length argument to LO.GET so the server can
+    // validate the address space covers obj_len before fi_write. Also add
+    // validation when multi-address support lands (sum of address lengths >= obj_len).
     let transport = if args.len() >= 4 {
         let rkey: u64 = args[2]
             .to_string_lossy()
@@ -112,7 +116,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     };
 
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_get(ctx, object_id, obj_len, file, transport) {
+    match engine::execute_get(ctx, object_id, obj_len, crc32c, file, transport) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }

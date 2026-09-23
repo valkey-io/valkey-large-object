@@ -19,21 +19,21 @@ impl NVMePool {
         }
     }
 
-    pub fn alloc(&self, size: usize) -> Option<SegmentBuffer> {
-        self.pool.alloc(size)
-    }
-
     pub fn free(&self, buf: &SegmentBuffer) {
         self.pool.free(buf)
     }
 
-    pub fn alloc_n(
+    pub fn free_n(&self, buffers: &[SegmentBuffer]) {
+        self.pool.free_n(buffers)
+    }
+
+    pub fn alloc_window(
         &self,
-        chunk_size: usize,
-        count: usize,
-        min_required: usize,
+        size: usize,
+        max_buffers: usize,
+        min_buffers: usize,
     ) -> Option<Vec<SegmentBuffer>> {
-        self.pool.alloc_n(chunk_size, count, min_required)
+        self.pool.alloc_window(size, max_buffers, min_buffers)
     }
 
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {

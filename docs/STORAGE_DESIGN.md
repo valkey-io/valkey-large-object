@@ -811,7 +811,7 @@ This integrates with PR #42's CoalescingMap: the DRAMPool HashMap entry in `Fill
 | Config | Default | Meaning |
 |---|---|---|
 | `lo-max-buffers-per-op` (X) | 8 | Max buffers per operation = batch size. All X submitted simultaneously. |
-| `lo-streaming-min-buffers` (Y) | 2 | Min buffers to start (below = reject). Y=2 enables double-buffering. |
+| `lo-min-buffers-per-op` (Y) | 2 | Min buffers to start (below = reject). Y=2 enables double-buffering. |
 | `lo-max-streaming-ops` | 2 | Max concurrent streaming operations (prevents cascading) |
 
 > **Note (open tuning item):** the values above are placeholders. The maximum
@@ -1487,7 +1487,7 @@ this section owns the semantics.
 | `max-promote-size` | `256MB` | `0` (disable) | `1TB` | Live | Promotion eligibility; objects above this never enter DRAMPool (detail: §7.5) |
 | `lo-max-object-size` | — | — | — | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
 | `lo-buffer-size` | `8MB` | — | — | Immutable | I/O chunk / allocation unit (detail: §7.2) |
-| `lo-max-buffers-per-op` / `lo-streaming-min-buffers` / `lo-max-streaming-ops` | 8 / 2 / 2 | — | — | — | Streaming pipeline depth (detail: §7.3.6) |
+| `lo-max-buffers-per-op` / `lo-min-buffers-per-op` / `lo-max-streaming-ops` | 8 / 2 / 2 | — | — | — | Streaming pipeline depth (detail: §7.3.6) |
 | `worker-threads` | `2` | `1` | `32` | Immutable | tokio transport CQ-polling threads |
 | `scaling-poll-ms` | `5000` | `500` | — | Live | Scaling cron interval in milliseconds. How often the cron checks utilization and memory pressure to expand or shrink the pool |
 | `scaling-expand-watermark` | `80` | `1` | `99` | Live | Pool utilization % above which the cron adds a segment proactively. Prevents alloc failures on the hot path |

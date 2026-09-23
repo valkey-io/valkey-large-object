@@ -1,4 +1,5 @@
 import binascii
+import crc32c
 import os
 import subprocess
 from valkey import ResponseError
@@ -19,7 +20,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" dram-segment-size 1048576"
-            f" lo-buffer-size 4096"
+            f" chunk-size 4096"
             f" fabric-provider Emulated"
             f" fabric-interfaces lo"
         )
@@ -64,7 +65,7 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
         return (
             f"operating-mode Dram"
             f" dram-segment-size 1048576"
-            f" lo-buffer-size 4096"
+            f" chunk-size 4096"
             f" fabric-provider Emulated"
             f" fabric-interfaces no-such-interface"
         )
@@ -110,7 +111,8 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client = self.server.get_new_client()
             client.execute_command('LO.SET', 'key', PATTERN * TARGET_LEN)
             client.execute_command('LO.HELLO', address)
-            assert client.execute_command('LO.GET', 'key', rkey, remote_addr) == TARGET_LEN
+            crc = client.execute_command('LO.GET', 'key', rkey, remote_addr)
+            assert crc == crc32c.crc32c(PATTERN * TARGET_LEN)
             # The target exits once every byte of the pattern has landed.
             output = process.communicate(timeout=30)[0]
             assert 'payload verified' in output, output
@@ -124,5 +126,83 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client.execute_command('LO.HELLO', address)
             assert client.execute_command('LO.SET', 'key', TARGET_LEN, rkey, remote_addr) == b'OK'
             assert client.execute_command('LO.GET', 'key') == PATTERN * TARGET_LEN
+        finally:
+            process.kill()
+
+    def test_multi_transfer_mixed_protocol(self):
+        """Do mixed sets and gets, read the server value into the client, set it back, and
+        read it back in the test"""
+        payload = b'\x5a' * TARGET_LEN
+        process, address, rkey, remote_addr = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.SET', 'key', payload)
+            client.execute_command('LO.HELLO', address)
+            crc = client.execute_command('LO.GET', 'key', rkey, remote_addr)
+            assert crc == crc32c.crc32c(payload)
+            assert client.execute_command('LO.SET', 'copy', TARGET_LEN, rkey, remote_addr) == b'OK'
+            assert client.execute_command('LO.GET', 'copy') == payload
+        finally:
+            process.kill()
+
+
+class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
+    """Tiered mode with promotion off to run the NVMe paths."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 1048576"
+            f" segment-size 1048576"
+            f" chunk-size 4096"
+            f" max-promote-size 0"
+            f" direct-io no"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def test_set_over_efa_persists_to_nvme(self):
+        process, address, rkey, remote_addr = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.HELLO', address)
+            assert client.execute_command('LO.SET', 'key', TARGET_LEN, rkey, remote_addr) == b'OK'
+            assert len(self._object_files()) == 1
+        finally:
+            process.kill()
+
+
+class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
+    """Tiered mode with promotion on."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 1048576"
+            f" segment-size 1048576"
+            f" chunk-size 4096"
+            f" direct-io no"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def test_get_over_efa_cold_then_warm_on_one_session(self):
+        payload = PATTERN * TARGET_LEN
+        process, address, rkey, remote_addr = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.HELLO', address)
+            assert client.execute_command('LO.SET', 'key', TARGET_LEN, rkey, remote_addr) == b'OK'
+            # Cold load into dram
+            crc = client.execute_command('LO.GET', 'key', rkey, remote_addr)
+            assert crc == crc32c.crc32c(payload)
+            # Hot load from dram
+            crc2 = client.execute_command('LO.GET', 'key', rkey, remote_addr)
+            assert crc2 == crc32c.crc32c(payload)
+            # Read back from client and verify literal bytes
+            assert client.execute_command('LO.SET', 'copy', TARGET_LEN, rkey, remote_addr) == b'OK'
+            assert client.execute_command('LO.GET', 'copy') == payload
         finally:
             process.kill()

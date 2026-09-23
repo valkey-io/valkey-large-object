@@ -42,16 +42,16 @@ impl DRAMPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    pub fn alloc(&self, size: usize) -> Option<SegmentBuffer> {
-        self.pool.alloc(size)
+    pub fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
+        self.pool.alloc_exact(size)
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {
         self.pool.free(buf)
     }
 
-    pub fn alloc_n(&self, chunk_size: usize, count: usize) -> Option<Vec<SegmentBuffer>> {
-        self.pool.alloc_n(chunk_size, count, count)
+    pub fn free_n(&self, buffers: &[SegmentBuffer]) {
+        self.pool.free_n(buffers)
     }
 
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
@@ -119,10 +119,10 @@ impl DRAMPool {
 
     /// Try to allocate space and create an ObjectContext for this object.
     /// Returns None if pool is full or object exceeds max-promote-size.
-    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_n
-    /// with all-or-nothing semantics (min_required = total_chunks).
-    /// chunk_size is captured here at allocation time so callers use the same
-    /// value for streaming loops — avoids TOCTOU if lo-buffer-size changes.
+    /// On success returns Arc<ObjectContext> in Filling state — caller reads
+    /// NVMe data into the buffers, then calls mark_ready().
+    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_exact
+    /// with all-or-nothing semantics.
     ///
     /// Pool full → returns None. Caller falls back to NVMe read (Tiered mode).
     /// Expansion is the scaling cron's responsibility, not the GET hot path.
@@ -131,20 +131,14 @@ impl DRAMPool {
         oid: ObjectId,
         obj_len: u64,
     ) -> Option<std::sync::Arc<super::context::ObjectContext>> {
+        // Don't promote objects above the configured threshold.
         if obj_len > crate::max_promote_size() {
             return None;
         }
-        // TODO(streaming/batching PR): chunk the object into lo-buffer-size buffers
-        // once the multi-buffer read/write path is implemented. Until then, using
-        // lo-buffer-size here produces >1 buffer for large objects, which the
-        // single-buffer promotion read path cannot consume (hits the todo!() in the
-        // GET path). Promote as ONE buffer sized to the whole object instead.
-        //   let chunk_size = crate::buffer_size();
-        let chunk_size = obj_len as usize;
-        let total_chunks = super::chunk_count(obj_len, chunk_size);
-        // Alloc BEFORE taking the write lock — a talc scan under memory pressure
-        // must not block GET readers waiting on get_object().
-        let buffers = self.alloc_n(chunk_size, total_chunks as usize)?;
+        // All-or-nothing: alloc_exact rolls back internally if pool can't satisfy.
+        // Alloc BEFORE write lock — talc scan under memory pressure
+        // won't block GET readers waiting on get_object().
+        let buffers = self.alloc_exact(obj_len as usize)?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self
@@ -152,17 +146,11 @@ impl DRAMPool {
             .write()
             .expect("DRAMPool.objects lock unavailable");
         if objects.contains_key(&oid) {
-            for buf in &buffers {
-                self.pool.free(buf);
-            }
+            self.free_n(&buffers);
             return None;
         }
         // buf.len stays chunk_size for all buffers — must match alloc size for free().
-        let obj_ctx = std::sync::Arc::new(super::context::ObjectContext::new_filling(
-            buffers,
-            obj_len,
-            total_chunks,
-        ));
+        let obj_ctx = std::sync::Arc::new(super::context::ObjectContext::new_filling(buffers));
         objects.insert(oid, obj_ctx.clone());
         Some(obj_ctx)
     }

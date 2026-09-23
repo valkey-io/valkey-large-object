@@ -42,6 +42,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
             f" segment-size 1048576"
             f" bench-mode no"
             f" direct-io no"
+            f" chunk-size 4096"
         )
 
     @pytest.fixture(autouse=True)
