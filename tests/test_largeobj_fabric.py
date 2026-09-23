@@ -127,6 +127,21 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         finally:
             process.kill()
 
+    def test_multi_transfer_mixed_protocol(self):
+        """Do mixed sets and gets, read the server value into the client, set it back, and
+        read it back in the test"""
+        payload = b'\x5a' * TARGET_LEN
+        process, address, rkey, remote_addr = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('LO.SET', 'key', payload)
+            client.execute_command('LO.HELLO', address)
+            assert client.execute_command('LO.GET', 'key', rkey, remote_addr) == TARGET_LEN
+            assert client.execute_command('LO.SET', 'copy', TARGET_LEN, rkey, remote_addr) == b'OK'
+            assert client.execute_command('LO.GET', 'copy') == payload
+        finally:
+            process.kill()
+
 
 class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
     """Tiered mode with promotion off to run the NVMe paths."""
@@ -170,15 +185,19 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
             f" fabric-interfaces lo"
         )
 
-    def test_get_over_efa_after_promotion(self):
-        process, address, rkey, remote_addr = self.start_target()
+    def test_get_over_efa_cold_then_warm_on_one_session(self):
+        payload = b'\x5a' * TARGET_LEN
+        process, address, rkey, remote_addr = self.start_target('--read')
         try:
             client = self.server.get_new_client()
-            client.execute_command('LO.SET', 'key', PATTERN * TARGET_LEN)
-            assert client.execute_command('LO.GET', 'key') == PATTERN * TARGET_LEN
+            client.execute_command('LO.SET', 'key', payload)
             client.execute_command('LO.HELLO', address)
+            # Cold load into dram
             assert client.execute_command('LO.GET', 'key', rkey, remote_addr) == TARGET_LEN
-            output = process.communicate(timeout=30)[0]
-            assert 'payload verified' in output, output
+            # Hot load from dram
+            assert client.execute_command('LO.GET', 'key', rkey, remote_addr) == TARGET_LEN
+            # Read back from client and verify literal bytes
+            assert client.execute_command('LO.SET', 'copy', TARGET_LEN, rkey, remote_addr) == b'OK'
+            assert client.execute_command('LO.GET', 'copy') == payload
         finally:
             process.kill()
