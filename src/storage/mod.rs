@@ -134,7 +134,8 @@ pub fn get_fd_pool() -> &'static FdPool {
 
 // ─── Initialization ──────────────────────────────────────────────────────────
 
-/// Initialize storage layer: validate config, create pools, spawn io_uring poller (Tiered only).
+/// Initialize storage layer: validate config, create pools, spawn the io_uring
+/// and SMART log pollers (Tiered only).
 /// All OnceLock statics are set at the very end after everything succeeds.
 /// On failure, local variables drop naturally — no cleanup needed, module load retryable.
 /// Returns Ok(summary string) on success, Err(message) on validation/environment failure.
@@ -233,6 +234,14 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     }
     if let Some(engine) = nvme_engine {
         uring::set_nvme_engine(engine);
+
+        // Background SMART log poller: reads the controllers once per interval;
+        // INFO only ever serves the latest snapshot. First read populates it.
+        // smartlog-poll-secs 0 disables polling and its INFO section.
+        let smartlog_secs = crate::smartlog_poll_secs();
+        if smartlog_secs > 0 {
+            crate::smartlog::start_poller(std::time::Duration::from_secs(smartlog_secs));
+        }
     }
 
     Ok(format!(

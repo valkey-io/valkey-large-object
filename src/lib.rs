@@ -20,9 +20,10 @@
 //                                gives an error.
 //   2. storage::init(mode, nvme_dir)
 //                              — validate config, allocate pool segments, create
-//                                io_uring engine (Tiered only). All resources are
-//                                created as locals; OnceLock statics are set only
-//                                after everything succeeds. On failure, locals
+//                                io_uring engine and start the smartlog poller
+//                                (Tiered only). All resources are created as
+//                                locals; OnceLock statics are set only after
+//                                everything succeeds. On failure, locals
 //                                drop naturally — module load retryable.
 //   3. transport::register_buffers()
 //                              — fi_mr_reg pool buffers with EFA domains.
@@ -428,14 +429,6 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Start the scaling cron (both modes — handles expand and shrink based on mode).
     storage::scaling::rearm_scaling_cron(ctx, scaling_poll_ms());
-
-    // Background SMART log poller: reads the controllers once per interval;
-    // INFO only ever serves the latest snapshot. First read populates it.
-    // smartlog-poll-secs 0 disables polling and its INFO section.
-    let smartlog_secs = smartlog_poll_secs();
-    if mode == OperatingMode::Tiered && smartlog_secs > 0 {
-        smartlog::start_poller(std::time::Duration::from_secs(smartlog_secs));
-    }
 
     Status::Ok
 }
