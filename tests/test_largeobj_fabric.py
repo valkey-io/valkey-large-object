@@ -186,12 +186,12 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
         )
 
     def test_get_over_efa_cold_then_warm_on_one_session(self):
-        payload = b'\x5a' * TARGET_LEN
+        payload = PATTERN * TARGET_LEN
         process, address, rkey, remote_addr = self.start_target('--read')
         try:
             client = self.server.get_new_client()
-            client.execute_command('LO.SET', 'key', payload)
             client.execute_command('LO.HELLO', address)
+            assert client.execute_command('LO.SET', 'key', TARGET_LEN, rkey, remote_addr) == b'OK'
             # Cold load into dram
             assert client.execute_command('LO.GET', 'key', rkey, remote_addr) == TARGET_LEN
             # Hot load from dram
