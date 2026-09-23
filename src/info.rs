@@ -5,7 +5,7 @@
 
 use valkey_module::{InfoContext, ValkeyResult};
 
-use crate::smart::{media_read_only, snapshot_for_info};
+use crate::smartlog::{media_read_only, snapshot_for_info};
 use crate::storage;
 use crate::{operating_mode, OperatingMode};
 
@@ -19,7 +19,7 @@ pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
 fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     dram_pool_section(ctx)?;
     nvme_staging_section(ctx)?;
-    nvme_smart_section(ctx)?;
+    smartlog_section(ctx)?;
     Ok(())
 }
 
@@ -76,9 +76,9 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .map(|_| ())
 }
 
-/// NVMe SMART health, Tiered mode only. The section appears once the
+/// NVMe SMART log health, Tiered mode only. The section appears once the
 /// poller's first read lands; before that INFO simply omits it.
-fn nvme_smart_section(ctx: &InfoContext) -> ValkeyResult<()> {
+fn smartlog_section(ctx: &InfoContext) -> ValkeyResult<()> {
     if operating_mode() != OperatingMode::Tiered {
         return Ok(());
     }
@@ -88,7 +88,7 @@ fn nvme_smart_section(ctx: &InfoContext) -> ValkeyResult<()> {
 
     let mut section = ctx
         .builder()
-        .add_section("nvme_smart")
+        .add_section("smartlog")
         .field("snapshot_age_seconds", snap.age().as_secs())?;
     for d in &snap.devices {
         // /dev/nvme0 -> nvme0 field prefix
@@ -99,27 +99,8 @@ fn nvme_smart_section(ctx: &InfoContext) -> ValkeyResult<()> {
                 e.raw_os_error()
                     .map_or_else(|| e.to_string(), |errno| format!("errno {errno}")),
             )?,
+            // Usage first, then warnings/errors.
             Ok(h) => section
-                .field(
-                    &format!("{name}_critical_warning"),
-                    u64::from(h.critical_warning),
-                )?
-                .field(
-                    &format!("{name}_media_read_only"),
-                    u64::from(media_read_only(h.critical_warning)),
-                )?
-                .field(
-                    &format!("{name}_available_spare_pct"),
-                    u64::from(h.avail_spare),
-                )?
-                .field(
-                    &format!("{name}_percentage_used"),
-                    u64::from(h.percent_used),
-                )?
-                .field(
-                    &format!("{name}_temperature_kelvin"),
-                    u64::from(h.temperature),
-                )?
                 .field(
                     &format!("{name}_data_units_read"),
                     u64::try_from(h.data_units_read).unwrap_or(u64::MAX),
@@ -129,12 +110,32 @@ fn nvme_smart_section(ctx: &InfoContext) -> ValkeyResult<()> {
                     u64::try_from(h.data_units_written).unwrap_or(u64::MAX),
                 )?
                 .field(
-                    &format!("{name}_unsafe_shutdowns"),
-                    u64::try_from(h.unsafe_shutdowns).unwrap_or(u64::MAX),
+                    &format!("{name}_percentage_used"),
+                    u64::from(h.percent_used),
+                )?
+                .field(
+                    &format!("{name}_available_spare_pct"),
+                    u64::from(h.avail_spare),
+                )?
+                .field(
+                    &format!("{name}_temperature_kelvin"),
+                    u64::from(h.temperature),
+                )?
+                .field(
+                    &format!("{name}_critical_warning"),
+                    u64::from(h.critical_warning),
+                )?
+                .field(
+                    &format!("{name}_media_read_only"),
+                    u64::from(media_read_only(h.critical_warning)),
                 )?
                 .field(
                     &format!("{name}_media_errors"),
                     u64::try_from(h.media_errors).unwrap_or(u64::MAX),
+                )?
+                .field(
+                    &format!("{name}_unsafe_shutdowns"),
+                    u64::try_from(h.unsafe_shutdowns).unwrap_or(u64::MAX),
                 )?,
         };
     }

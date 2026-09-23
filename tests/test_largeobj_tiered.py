@@ -3,7 +3,7 @@ import glob
 import time
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
-from valkeytestframework.util.waiters import wait_for_equal
+from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 
 
 class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
@@ -480,3 +480,59 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
         self._set_ok(client, "fitkey", b"Q" * (1024 * 1024))
         assert client.execute_command("DBSIZE") == 1
         wait_for_equal(self._dat_count, 1)
+
+
+class TestLargeObjSmartlog(ValkeyLargeObjTestCaseBase):
+    """SMART log INFO section in Tiered mode (default poll interval)."""
+
+    def test_smartlog_section_present(self):
+        """Tiered mode: the smartlog section appears once the poller's first
+        read lands, with well-formed per-device field groups."""
+        client = self.server.get_new_client()
+        wait_for_true(
+            lambda: 'largeobj_snapshot_age_seconds' in client.info('largeobj_smartlog')
+        )
+        info = client.info('largeobj_smartlog')
+
+        # Each enumerated controller reports either health fields or a
+        # read error (CI hosts usually lack /dev/nvme* access), never both.
+        prefixes = set()
+        for key in info:
+            m = key.removeprefix('largeobj_')
+            if m.startswith('nvme'):
+                prefixes.add(m.split('_')[0])
+        for dev in prefixes:
+            has_error = f'largeobj_{dev}_read_error' in info
+            has_health = f'largeobj_{dev}_critical_warning' in info
+            assert has_error != has_health, (
+                f"{dev} must report exactly one of read_error / health fields"
+            )
+            if has_health:
+                # Usage + warning fields all present for a healthy read.
+                for field in ('data_units_read', 'data_units_written',
+                              'percentage_used', 'available_spare_pct',
+                              'temperature_kelvin', 'media_read_only',
+                              'media_errors', 'unsafe_shutdowns'):
+                    assert f'largeobj_{dev}_{field}' in info
+
+
+class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
+    """smartlog-poll-secs 0: no poller, no INFO section, even in Tiered mode."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 1048576"
+            f" segment-size 1048576"
+            f" bench-mode no"
+            f" direct-io no"
+            f" smartlog-poll-secs 0"
+        )
+
+    def test_smartlog_absent_when_disabled(self):
+        """The poller never starts at 0, so absence is immediate and permanent
+        (nothing to wait out). Module load succeeding with the arg already
+        proves the config is registered and accepts 0."""
+        client = self.server.get_new_client()
+        assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog')

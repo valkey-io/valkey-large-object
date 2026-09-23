@@ -1,4 +1,4 @@
-//! NVMe SMART/Health snapshot cache for the INFO section.
+//! NVMe SMART log snapshot cache for the INFO section.
 //!
 //! Reading and decoding the SMART log page is done by the `nvme-telem`
 //! crate (a Get Log Page 0x02 admin ioctl on the controller node); this
@@ -6,6 +6,7 @@
 //! thread and serving INFO from a cached snapshot.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,15 +20,16 @@ pub fn media_read_only(critical_warning: u8) -> bool {
     critical_warning & CW_MEDIA_READ_ONLY != 0
 }
 
-/// Read one controller's SMART log. Blocking (admin ioctl);
-pub fn read_smart_log(device: &str) -> io::Result<NvmeSmartLog> {
+/// Read one controller's SMART log. Blocking (admin ioctl); never call
+/// on the main event-loop thread.
+pub fn read_smartlog(device: &str) -> io::Result<NvmeSmartLog> {
     Device::open(device)?.smart_log()
 }
 
 // ─── Cached snapshot for INFO (polled off-main-thread) ───
 //
 // INFO runs on the main event-loop thread and must never issue the ioctl.
-// A background poller reads every controller once per POLL_INTERVAL and
+// A background poller thread reads every controller once per interval and
 // publishes a snapshot; INFO only ever reads the latest snapshot.
 
 /// One device's latest reading; errors are kept and reported per device.
@@ -38,42 +40,56 @@ pub struct DeviceHealth {
 }
 
 /// A published set of readings with its sample time.
-pub struct SmartSnapshot {
+pub struct SmartlogSnapshot {
     pub sampled_at: Instant,
     pub devices: Vec<DeviceHealth>,
 }
 
-impl SmartSnapshot {
+impl SmartlogSnapshot {
     pub fn age(&self) -> Duration {
         self.sampled_at.elapsed()
     }
 }
 
 #[derive(Default)]
-pub struct SmartCache {
-    snapshot: Mutex<Option<Arc<SmartSnapshot>>>,
+pub struct SmartlogCache {
+    snapshot: Mutex<Option<Arc<SmartlogSnapshot>>>,
 }
 
-impl SmartCache {
-    pub fn snapshot(&self) -> Option<Arc<SmartSnapshot>> {
-        self.snapshot.lock().expect("smart cache poisoned").clone()
+impl SmartlogCache {
+    pub fn snapshot(&self) -> Option<Arc<SmartlogSnapshot>> {
+        self.snapshot
+            .lock()
+            .expect("smartlog cache poisoned")
+            .clone()
     }
 
     pub fn publish(&self, devices: Vec<DeviceHealth>) {
-        *self.snapshot.lock().expect("smart cache poisoned") = Some(Arc::new(SmartSnapshot {
-            sampled_at: Instant::now(),
-            devices,
-        }));
+        *self.snapshot.lock().expect("smartlog cache poisoned") =
+            Some(Arc::new(SmartlogSnapshot {
+                sampled_at: Instant::now(),
+                devices,
+            }));
     }
 }
 
 lazy_static::lazy_static! {
     /// Module-global snapshot cache read by the INFO handler.
-    pub static ref SMART_CACHE: SmartCache = SmartCache::default();
+    pub static ref SMARTLOG_CACHE: SmartlogCache = SmartlogCache::default();
 }
 
-/// Read every controller and publish one snapshot. This is blocking, callers run
-/// it on the module runtime, never the main thread.
+/// Set on graceful server shutdown; the poller exits its loop instead of
+/// starting another device read.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Signal the poller thread to exit. Called from the shutdown handler;
+/// nothing joins the thread, so this only stops new reads from starting.
+pub fn signal_shutdown() {
+    SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+/// Read every controller and publish one snapshot. Blocking; runs on the
+/// poller thread, never the main thread.
 pub fn refresh_snapshot() {
     let mut names = list_nvme_controllers();
     names.sort();
@@ -82,28 +98,35 @@ pub fn refresh_snapshot() {
         .map(|name| {
             let device = format!("/dev/{name}");
             DeviceHealth {
-                health: read_smart_log(&device),
+                health: read_smartlog(&device),
                 device,
             }
         })
         .collect();
-    SMART_CACHE.publish(devices);
+    SMARTLOG_CACHE.publish(devices);
 }
 
-/// Spawn the background SMART poller: one read of every controller per
-/// `interval`, forever.
+/// Spawn the background SMART log poller: a dedicated thread reading every
+/// controller once per `interval` until shutdown. This mirrors the io_uring poller
 pub fn start_poller(interval: Duration) {
-    crate::runtime_handle().spawn(async move {
-        loop {
-            let _ = tokio::task::spawn_blocking(refresh_snapshot).await;
-            tokio::time::sleep(interval).await;
-        }
-    });
+    let spawned = std::thread::Builder::new()
+        .name("lo-smartlog".into())
+        .spawn(move || {
+            while !SHUTDOWN.load(Ordering::Relaxed) {
+                refresh_snapshot();
+                std::thread::sleep(interval);
+            }
+        });
+    if let Err(e) = spawned {
+        valkey_module::logging::log_warning(format!(
+            "largeobj: smartlog poller failed to start; INFO section will be absent: {e}"
+        ));
+    }
 }
 
-/// INFO-path entry point: the latest polled snapshot
-pub fn snapshot_for_info() -> Option<Arc<SmartSnapshot>> {
-    SMART_CACHE.snapshot()
+/// INFO-path entry point: the latest polled snapshot.
+pub fn snapshot_for_info() -> Option<Arc<SmartlogSnapshot>> {
+    SMARTLOG_CACHE.snapshot()
 }
 
 #[cfg(test)]
@@ -120,7 +143,7 @@ mod tests {
 
     #[test]
     fn snapshot_cache_starts_empty_and_publishes() {
-        let cache = SmartCache::default();
+        let cache = SmartlogCache::default();
         assert!(cache.snapshot().is_none());
         cache.publish(vec![DeviceHealth {
             device: "/dev/nvme0".into(),
