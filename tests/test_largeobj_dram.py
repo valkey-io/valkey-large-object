@@ -147,7 +147,70 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
         assert nil_digest == [b'0' * 40]
 
+    # ─── SMART LOG tests ───────────────────────────────────────────────────
+
     def test_smartlog_section_absent(self):
         """Dram mode never starts the SMART log poller"""
         client = self.server.get_new_client()
         assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog')
+
+    # ─── LO.INFO tests ───────────────────────────────────────────────────
+
+    def test_info(self):
+        client = self.server.get_new_client()
+        payload = bytes(range(256)) * 16  # 4096 bytes, non-uniform so CRC is meaningful
+        client.execute_command('LO.SET', 'infokey', payload)
+        # Check the specfic fields for info
+        assert client.execute_command('LO.INFO', 'infokey', 'LEN') == len(payload)
+        # CRC is a u32: in range, stable across calls, and identical for identical payloads.
+        crc = client.execute_command('LO.INFO', 'infokey', 'CRC')
+        assert 0 <= crc <= 0xFFFFFFFF
+        assert client.execute_command('LO.INFO', 'infokey', 'CRC') == crc
+        client.execute_command('LO.SET', 'infokey2', payload)
+        assert client.execute_command('LO.INFO', 'infokey2', 'CRC') == crc
+        assert client.execute_command('LO.INFO', 'infokey', 'TIER') == b'dram'
+        # Check full info call
+        result = client.execute_command('LO.INFO', 'infokey')
+        assert result == [
+            b'len', len(payload),
+            b'crc', crc,
+            b'tier', b'dram',
+        ], f"Unexpected LO.INFO reply: {result!r}"
+
+    def test_info_crc_changes_on_overwrite(self):
+        """Overwriting a key updates LEN and CRC."""
+        client = self.server.get_new_client()
+        first = b'A' * 4096
+        second = b'B' * 8192
+        client.execute_command('LO.SET', 'owkey', first)
+        first_crc = client.execute_command('LO.INFO', 'owkey', 'CRC')
+        client.execute_command('LO.SET', 'owkey', second)
+        assert client.execute_command('LO.INFO', 'owkey', 'LEN') == 8192
+        assert client.execute_command('LO.INFO', 'owkey', 'CRC') != first_crc
+
+    def test_info_errors(self):
+        """LO.INFO errors are correct"""
+        client = self.server.get_new_client()
+        # Nonexistant key
+        self.verify_error_response(client, 'LO.INFO nokey', 'not found')
+        self.verify_error_response(client, 'LO.INFO nokey LEN', 'not found')
+        # Wrong type error
+        client.execute_command('SET', 'strkey', 'plain')
+        try:
+            client.execute_command('LO.INFO', 'strkey')
+            assert False, "Expected WRONGTYPE error"
+        except ResponseError as e:
+            assert 'existing key has wrong valkey type' in str(e).lower(), f"Unexpected error: {e}"
+        # Wrong number of arguments error
+        client.execute_command('LO.SET', 'badkey', b'x' * 4096)
+        try:
+            client.execute_command('LO.INFO', 'badkey', 'LEN', 'CRC')
+            assert False, "Expected arity error"
+        except ResponseError as e:
+            assert 'wrong number of arguments' in str(e).lower(), f"Unexpected error: {e}"
+        # Bad field error
+        try:
+            client.execute_command('LO.INFO', 'badkey', 'NOTREAL')
+            assert False, "Expected wrong information field error"
+        except ResponseError as e:
+            assert 'invalid information value' in str(e).lower(), f"Unexpected error: {e}"

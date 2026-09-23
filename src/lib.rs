@@ -487,6 +487,7 @@ valkey_module! {
         ["LO.HELLO", commands::lo_hello, "write", 0, 0, 0],
         ["LO.GET", commands::lo_get, "readonly", 1, 1, 1],
         ["LO.SET", commands::lo_set, "write deny-oom", 1, 1, 1],
+        ["LO.INFO", commands::lo_info, "readonly fast", 1, 1, 1],
     ],
     configurations: [
         i64: [

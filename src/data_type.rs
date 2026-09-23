@@ -41,6 +41,26 @@ impl ObjectId {
     }
 }
 
+// ─── Tier ────────────────────────────────────────────────────────────────────
+
+/// Storage tier an object is currently served from. Reported by `LO.INFO`.
+pub enum Tier {
+    /// Resident in DRAMPool (Dram mode always; Tiered mode when promoted).
+    Dram,
+    /// On NVMe only, not cached in DRAMPool (Tiered mode).
+    Nvme,
+}
+
+impl Tier {
+    /// Lowercase token used in LO.INFO replies.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Dram => "dram",
+            Tier::Nvme => "nvme",
+        }
+    }
+}
+
 // ─── LoValue ─────────────────────────────────────────────────────────────────
 
 /// LoValue — the Valkey data type value struct, stored in Valkey's keyspace.
@@ -77,6 +97,22 @@ impl LoValue {
                     dram_usage
                 } else {
                     base
+                }
+            }
+        }
+    }
+
+    /// Where a GET issued right now would be served from:
+    /// - Dram mode: always `Dram` (objects live nowhere else).
+    /// - Tiered mode: `Dram` if a Ready ObjectContext is cached in DRAMPool, else
+    ///   `Nvme`.
+    pub fn tier(&self) -> Tier {
+        match crate::operating_mode() {
+            crate::OperatingMode::Dram => Tier::Dram,
+            crate::OperatingMode::Tiered => {
+                match crate::storage::get_dram_pool().get_object(&self.object_id) {
+                    Some(ctx) if ctx.is_ready() => Tier::Dram,
+                    _ => Tier::Nvme,
                 }
             }
         }

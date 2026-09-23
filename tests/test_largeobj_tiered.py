@@ -72,18 +72,23 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
 
     def test_promotion_caches_in_dram(self):
         """After a GET miss, the object is promoted to DRAMPool.
-        A second GET should succeed (served from DRAM)."""
+        LO.INFO TIER observes the transition: nvme after SET, dram after the first GET."""
         client = self.server.get_new_client()
         payload = b'B' * 4096
         client.execute_command('LO.SET', 'promo_key', payload)
 
+        # Freshly SET: on NVMe only, nothing cached yet.
+        assert client.execute_command('LO.INFO', 'promo_key', 'TIER') == b'nvme'
+
         # First GET: DRAMPool miss -> NVMe read -> promote to DRAMPool.
         result1 = client.execute_command('LO.GET', 'promo_key')
         assert result1 == payload
+        assert client.execute_command('LO.INFO', 'promo_key', 'TIER') == b'dram'
 
         # Second GET: served from DRAMPool (promotion happened).
         result2 = client.execute_command('LO.GET', 'promo_key')
         assert result2 == payload
+        assert client.execute_command('LO.INFO', 'promo_key', 'TIER') == b'dram'
 
     def test_delete_removes_nvme_file(self):
         """DEL removes the NVMe file."""
@@ -109,6 +114,9 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert result == 1 or result is True
         assert client.execute_command('LO.GET', 'srckey') == payload
         assert client.execute_command('LO.GET', 'dstkey') == payload
+        # COPY carries the CRC over unchanged.
+        assert (client.execute_command('LO.INFO', 'srckey', 'CRC')
+                == client.execute_command('LO.INFO', 'dstkey', 'CRC'))
         dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files) >= 2, f"Expected at least 2 .dat files, got {len(dat_files)}"
         # COPY gets a new OID so digests differ
@@ -125,6 +133,11 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client.execute_command('DEL', 'dstkey2')
         wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
         assert client.execute_command('LO.GET', 'srckey2') == payload
+        #  The copy starts un-promoted even if the source is cached
+        client.execute_command('LO.GET', 'srckey2')  # promote source
+        assert client.execute_command('LO.INFO', 'srckey2', 'TIER') == b'dram'
+        client.execute_command('COPY', 'srckey2', 'dstkey3')
+        assert client.execute_command('LO.INFO', 'dstkey3', 'TIER') == b'nvme'
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 
@@ -374,6 +387,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
         for _ in range(5):
             result = client.execute_command('LO.GET', 'repeat_key')
             assert result == payload
+            assert client.execute_command('LO.INFO', 'repeat_key', 'TIER') == b'nvme'
 
     def test_reject_invalid_buffer_configs(self):
         """CONFIG SET rejects min-buffers-per-op > max-buffers-per-op and

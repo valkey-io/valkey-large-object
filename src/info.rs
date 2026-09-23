@@ -154,6 +154,7 @@ fn smartlog_section(ctx: &InfoContext) -> ValkeyResult<()> {
         };
     }
     section.build_section()?.build_info().map(|_| ())
+}
 fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
     ctx.builder()
         .add_section("error_metrics")

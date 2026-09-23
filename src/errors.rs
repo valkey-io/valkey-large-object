@@ -33,6 +33,8 @@ define_errors! {
     ERR_DMA_SESSION_EXISTS => "ERR DMA session already established (one LO.HELLO per connection)",
     ERR_DRAM_POOL_EXHAUSTED => "ERR DRAM buffer pool exhausted",
     ERR_SESSION_GONE => "ERR session gone",
+    ERR_NOT_FOUND => "ERR not found",
+    ERR_INVALID_INFO_FIELD => "ERR invalid information value",
 
     // Storage/Engine Errors
     ERR_NVME_READ => "ERR NVMe read",
