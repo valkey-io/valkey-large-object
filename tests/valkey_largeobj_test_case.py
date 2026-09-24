@@ -71,6 +71,10 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         self.data_dir = data_dir
         logging.info("startup args are: %s", args)
 
+    def teardown_method(self):
+        # Without this hook every server started by create_server() leaks.
+        self.teardown()
+
     def _object_files(self):
         """Every file currently in nvme-dir (name-agnostic)."""
         return sorted(glob.glob(os.path.join(self.data_dir, "*")))
