@@ -12,13 +12,23 @@ use std::time::{Duration, Instant};
 
 use nvme_telem::nvme::{list_nvme_controllers, Device, NvmeSmartLog};
 
-/// Critical Warning bit 3 (SMART log byte 0): all media placed in
-/// read-only mode. Endurance exhaustion; every tiered write will fail.
+// Critical Warning bitfield (SMART log byte 0), one constant per spec bit.
+pub const CW_SPARE_BELOW_THRESHOLD: u8 = 1 << 0;
+pub const CW_TEMPERATURE: u8 = 1 << 1;
+pub const CW_RELIABILITY_DEGRADED: u8 = 1 << 2;
 pub const CW_MEDIA_READ_ONLY: u8 = 1 << 3;
+pub const CW_VOLATILE_MEM_BACKUP_FAILED: u8 = 1 << 4;
+pub const CW_PERSISTENT_MEM_READ_ONLY: u8 = 1 << 5;
 
-pub fn media_read_only(critical_warning: u8) -> bool {
-    critical_warning & CW_MEDIA_READ_ONLY != 0
-}
+/// Decode table for the warnings INFO section: one boolean field per bit.
+pub const CRITICAL_WARNING_BITS: [(u8, &str); 6] = [
+    (CW_SPARE_BELOW_THRESHOLD, "spare_below_threshold"),
+    (CW_TEMPERATURE, "temperature_warning"),
+    (CW_RELIABILITY_DEGRADED, "reliability_degraded"),
+    (CW_MEDIA_READ_ONLY, "media_read_only"),
+    (CW_VOLATILE_MEM_BACKUP_FAILED, "volatile_mem_backup_failed"),
+    (CW_PERSISTENT_MEM_READ_ONLY, "persistent_mem_read_only"),
+];
 
 /// Read one controller's SMART log. Blocking (admin ioctl); never call
 /// on the main event-loop thread.
@@ -132,14 +142,6 @@ pub fn snapshot_for_info() -> Option<Arc<SmartlogSnapshot>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn media_read_only_bit() {
-        assert!(media_read_only(CW_MEDIA_READ_ONLY));
-        assert!(media_read_only(CW_MEDIA_READ_ONLY | 0b0111));
-        assert!(!media_read_only(0));
-        assert!(!media_read_only(0b0111));
-    }
 
     #[test]
     fn snapshot_cache_starts_empty_and_publishes() {

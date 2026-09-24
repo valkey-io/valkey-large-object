@@ -152,7 +152,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def test_smartlog_section_absent(self):
         """Dram mode never starts the SMART log poller"""
         client = self.server.get_new_client()
-        assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog')
+        assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog_usage')
 
     # ─── LO.INFO tests ───────────────────────────────────────────────────
 

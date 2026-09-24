@@ -701,35 +701,26 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
 class TestLargeObjSmartlog(ValkeyLargeObjTestCaseBase):
     """SMART log INFO section in Tiered mode (default poll interval)."""
 
-    def test_smartlog_section_present(self):
-        """Tiered mode: the smartlog section appears once the poller's first
-        read lands, with well-formed per-device field groups."""
+    def test_smartlog_sections_present(self):
+        """Tiered mode: the aggregated smartlog sections appear"""
         client = self.server.get_new_client()
         wait_for_true(
-            lambda: 'largeobj_snapshot_age_seconds' in client.info('largeobj_smartlog')
+            lambda: 'largeobj_snapshot_age_seconds' in client.info('largeobj_smartlog_usage')
         )
-        info = client.info('largeobj_smartlog')
+        usage = client.info('largeobj_smartlog_usage')
+        warnings = client.info('largeobj_smartlog_critical_warnings')
 
-        # Each enumerated controller reports either health fields or a
-        # read error (CI hosts usually lack /dev/nvme* access), never both.
-        prefixes = set()
-        for key in info:
-            m = key.removeprefix('largeobj_')
-            if m.startswith('nvme'):
-                prefixes.add(m.split('_')[0])
-        for dev in prefixes:
-            has_error = f'largeobj_{dev}_read_error' in info
-            has_health = f'largeobj_{dev}_critical_warning' in info
-            assert has_error != has_health, (
-                f"{dev} must report exactly one of read_error / health fields"
-            )
-            if has_health:
-                # Usage + warning fields all present for a healthy read.
-                for field in ('data_units_read', 'data_units_written',
-                              'percentage_used', 'available_spare_pct',
-                              'temperature_kelvin', 'media_read_only',
-                              'media_errors', 'unsafe_shutdowns'):
-                    assert f'largeobj_{dev}_{field}' in info
+        # Every field is present on every host, including ones where no
+        # controller could be read (CI usually lacks /dev/nvme* access).
+        assert usage['largeobj_devices'] >= usage['largeobj_devices_read_failed']
+        for field in ('data_units_read', 'data_units_written',
+                      'percentage_used_avg', 'available_spare_pct_avg',
+                      'media_errors', 'unsafe_shutdowns'):
+            assert f'largeobj_{field}' in usage
+        for field in ('spare_below_threshold', 'temperature_warning',
+                      'reliability_degraded', 'media_read_only',
+                      'volatile_mem_backup_failed', 'persistent_mem_read_only'):
+            assert warnings[f'largeobj_{field}'] in (0, 1)
 
 
 class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
@@ -751,4 +742,4 @@ class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
         (nothing to wait out). Module load succeeding with the arg already
         proves the config is registered and accepts 0."""
         client = self.server.get_new_client()
-        assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog')
+        assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog_usage')
