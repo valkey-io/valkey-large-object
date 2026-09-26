@@ -23,10 +23,10 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         )
 
     def test_set_creates_nvme_file(self):
-        """In Tiered mode, LO.SET persists to NVMe."""
+        """In Tiered mode, BLOB.SET persists to NVMe."""
         client = self.server.get_new_client()
         payload = b'X' * 4096
-        client.execute_command('LO.SET', 'tiered_key', payload)
+        client.execute_command('BLOB.SET', 'tiered_key', payload)
         dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files) >= 1, "Tiered SET should create an NVMe .dat file"
 
@@ -46,16 +46,16 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         # chunk-size is 4096 in this class.
         # Single chunk: 4096 bytes.
         payload_single = b'A' * 4096
-        client.execute_command('LO.SET', 'rt_single', payload_single)
-        assert client.execute_command('LO.GET', 'rt_single') == payload_single
+        client.execute_command('BLOB.SET', 'rt_single', payload_single)
+        assert client.execute_command('BLOB.GET', 'rt_single') == payload_single
         # Multi-chunk with partial last chunk: 8192 + 1 = 8193 → 3 chunks.
         payload_multi = b'M' * 8193
-        client.execute_command('LO.SET', 'rt_multi', payload_multi)
+        client.execute_command('BLOB.SET', 'rt_multi', payload_multi)
         # GET via serve-and-discard (first GET triggers promotion, verify data).
-        result = client.execute_command('LO.GET', 'rt_multi')
+        result = client.execute_command('BLOB.GET', 'rt_multi')
         assert result == payload_multi
         # Second GET from DRAM after promotion.
-        assert client.execute_command('LO.GET', 'rt_multi') == payload_multi
+        assert client.execute_command('BLOB.GET', 'rt_multi') == payload_multi
         # Validate FileHeader on disk: first 4 bytes should be b"LOBJ",
         # data starts at offset 4096.
         dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
@@ -72,29 +72,29 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
 
     def test_promotion_caches_in_dram(self):
         """After a GET miss, the object is promoted to DRAMPool.
-        LO.INFO TIER observes the transition: nvme after SET, dram after the first GET."""
+        BLOB.INFO TIER observes the transition: nvme after SET, dram after the first GET."""
         client = self.server.get_new_client()
         payload = b'B' * 4096
-        client.execute_command('LO.SET', 'promo_key', payload)
+        client.execute_command('BLOB.SET', 'promo_key', payload)
 
         # Freshly SET: on NVMe only, nothing cached yet.
-        assert client.execute_command('LO.INFO', 'promo_key', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'promo_key', 'TIER') == b'nvme'
 
         # First GET: DRAMPool miss -> NVMe read -> promote to DRAMPool.
-        result1 = client.execute_command('LO.GET', 'promo_key')
+        result1 = client.execute_command('BLOB.GET', 'promo_key')
         assert result1 == payload
-        assert client.execute_command('LO.INFO', 'promo_key', 'TIER') == b'dram'
+        assert client.execute_command('BLOB.INFO', 'promo_key', 'TIER') == b'dram'
 
         # Second GET: served from DRAMPool (promotion happened).
-        result2 = client.execute_command('LO.GET', 'promo_key')
+        result2 = client.execute_command('BLOB.GET', 'promo_key')
         assert result2 == payload
-        assert client.execute_command('LO.INFO', 'promo_key', 'TIER') == b'dram'
+        assert client.execute_command('BLOB.INFO', 'promo_key', 'TIER') == b'dram'
 
     def test_delete_removes_nvme_file(self):
         """DEL removes the NVMe file."""
         client = self.server.get_new_client()
         payload = b'D' * 4096
-        client.execute_command('LO.SET', 'del_key', payload)
+        client.execute_command('BLOB.SET', 'del_key', payload)
         dat_files_before = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_before) >= 1
         client.execute_command('DEL', 'del_key')
@@ -108,15 +108,15 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         """COPY in Tiered mode: independent NVMe file, digest differs, delete independence."""
         client = self.server.get_new_client()
         payload = b'C' * 4096
-        client.execute_command('LO.SET', 'srckey', payload)
+        client.execute_command('BLOB.SET', 'srckey', payload)
         # COPY creates an independent object with its own NVMe file
         result = client.execute_command('COPY', 'srckey', 'dstkey')
         assert result == 1 or result is True
-        assert client.execute_command('LO.GET', 'srckey') == payload
-        assert client.execute_command('LO.GET', 'dstkey') == payload
+        assert client.execute_command('BLOB.GET', 'srckey') == payload
+        assert client.execute_command('BLOB.GET', 'dstkey') == payload
         # COPY carries the CRC over unchanged.
-        assert (client.execute_command('LO.INFO', 'srckey', 'CRC')
-                == client.execute_command('LO.INFO', 'dstkey', 'CRC'))
+        assert (client.execute_command('BLOB.INFO', 'srckey', 'CRC')
+                == client.execute_command('BLOB.INFO', 'dstkey', 'CRC'))
         dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files) >= 2, f"Expected at least 2 .dat files, got {len(dat_files)}"
         # COPY gets a new OID so digests differ
@@ -126,18 +126,18 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         # Deleting source does not affect the copy
         client.execute_command('DEL', 'srckey')
         wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
-        assert client.execute_command('LO.GET', 'dstkey') == payload
+        assert client.execute_command('BLOB.GET', 'dstkey') == payload
         # Deleting copy does not affect the source
-        client.execute_command('LO.SET', 'srckey2', payload)
+        client.execute_command('BLOB.SET', 'srckey2', payload)
         client.execute_command('COPY', 'srckey2', 'dstkey2')
         client.execute_command('DEL', 'dstkey2')
         wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
-        assert client.execute_command('LO.GET', 'srckey2') == payload
+        assert client.execute_command('BLOB.GET', 'srckey2') == payload
         #  The copy starts un-promoted even if the source is cached
-        client.execute_command('LO.GET', 'srckey2')  # promote source
-        assert client.execute_command('LO.INFO', 'srckey2', 'TIER') == b'dram'
+        client.execute_command('BLOB.GET', 'srckey2')  # promote source
+        assert client.execute_command('BLOB.INFO', 'srckey2', 'TIER') == b'dram'
         client.execute_command('COPY', 'srckey2', 'dstkey3')
-        assert client.execute_command('LO.INFO', 'dstkey3', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'dstkey3', 'TIER') == b'nvme'
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 
@@ -145,9 +145,9 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         """MEMORY USAGE after promotion returns a non-zero value for the key."""
         client = self.server.get_new_client()
         payload_size = 4096
-        client.execute_command('LO.SET', 'memkey', b'M' * payload_size)
+        client.execute_command('BLOB.SET', 'memkey', b'M' * payload_size)
         # Single GET promotes into DRAMPool (promote-on-first-GET policy).
-        client.execute_command('LO.GET', 'memkey')
+        client.execute_command('BLOB.GET', 'memkey')
         mem = client.execute_command('MEMORY', 'USAGE', 'memkey')
         assert mem is not None
         assert mem > 0, f"Expected non-zero MEMORY USAGE after promotion, got {mem}"
@@ -157,7 +157,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
     def test_debug_digest(self):
         """DEBUG DIGEST-VALUE is deterministic; nonexistent key returns nil digest."""
         client = self.server.get_new_client()
-        client.execute_command('LO.SET', 'digkey', b'G' * 4096)
+        client.execute_command('BLOB.SET', 'digkey', b'G' * 4096)
         d1 = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digkey')
         d2 = client.execute_command('DEBUG', 'DIGEST-VALUE', 'digkey')
         assert d1 == d2
@@ -182,8 +182,8 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         del_client = self.server.get_new_client()
         payload = b'D' * 32768
-        client.execute_command('LO.SET', 'delset_key', payload)
-        assert client.execute_command('LO.GET', 'delset_key') == payload
+        client.execute_command('BLOB.SET', 'delset_key', payload)
+        assert client.execute_command('BLOB.GET', 'delset_key') == payload
         # Enable the test hook: pause tiered SET for 2s after writing chunks.
         client.execute_command(
             'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '2000'
@@ -195,7 +195,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             try:
                 # This SET blocks for ~2s (paused after NVMe write, before commit).
                 set_result[0] = client.execute_command(
-                    'LO.SET', 'delset_key', payload2
+                    'BLOB.SET', 'delset_key', payload2
                 )
             except Exception as e:
                 set_error[0] = e
@@ -219,13 +219,13 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         wait_for_equal(
             lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0
         )
-        assert client.execute_command('LO.GET', 'delset_key') == payload2
+        assert client.execute_command('BLOB.GET', 'delset_key') == payload2
 
     def test_zero_length_object_rejected(self):
-        """LO.SET with zero-length payload is rejected."""
+        """BLOB.SET with zero-length payload is rejected."""
         client = self.server.get_new_client()
         try:
-            client.execute_command('LO.SET', 'empty_key', b'')
+            client.execute_command('BLOB.SET', 'empty_key', b'')
             assert False, "Expected error for zero-length object"
         except ResponseError as e:
             assert 'object length must be > 0' in str(e).lower(), f"Unexpected: {e}"
@@ -239,11 +239,11 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         # Three fit (798720 < 1MB), fourth exceeds (1064960 > 1MB).
         payload = b'A' * (256 * 1024)
         for i in range(3):
-            result = client.execute_command('LO.SET', f'nvme_cap_{i}', payload)
+            result = client.execute_command('BLOB.SET', f'nvme_cap_{i}', payload)
             assert result == b'OK'
         # Fourth SET should fail (would exceed 1MB).
         try:
-            client.execute_command('LO.SET', 'nvme_cap_3', payload)
+            client.execute_command('BLOB.SET', 'nvme_cap_3', payload)
             assert False, "Expected capacity exceeded error from nvme-maxmemory"
         except ResponseError as e:
             assert 'nvme disk capacity exceeded' in str(e).lower(), f"Unexpected error: {e}"
@@ -259,19 +259,19 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert client.execute_command("DBSIZE") == 0
 
         # Cold object: GET after DEL is nil; DEL drops the key from the keyspace.
-        client.execute_command("LO.SET", "gk", payload)
+        client.execute_command("BLOB.SET", "gk", payload)
         assert client.execute_command("DBSIZE") == 1
-        assert client.execute_command("LO.GET", "gk") == payload
+        assert client.execute_command("BLOB.GET", "gk") == payload
         client.execute_command("DEL", "gk")
         assert client.execute_command("DBSIZE") == 0
-        assert client.execute_command("LO.GET", "gk") is None
+        assert client.execute_command("BLOB.GET", "gk") is None
 
         # Promoted object: DEL still resolves to nil and the NVMe file is unlinked.
-        client.execute_command("LO.SET", "pk", payload)
-        assert client.execute_command("LO.GET", "pk") == payload  # first GET promotes
+        client.execute_command("BLOB.SET", "pk", payload)
+        assert client.execute_command("BLOB.GET", "pk") == payload  # first GET promotes
         client.execute_command("DEL", "pk")
         assert client.execute_command("DBSIZE") == 0
-        assert client.execute_command("LO.GET", "pk") is None
+        assert client.execute_command("BLOB.GET", "pk") is None
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
 
@@ -287,26 +287,26 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         v2 = b"2" * 8192
 
         # Basic overwrite: the new value wins at commit; the old file is torn down.
-        client.execute_command("LO.SET", "ok", v1)
+        client.execute_command("BLOB.SET", "ok", v1)
         assert client.execute_command("DBSIZE") == 1
         wait_for_equal(self._dat_count, 1)
-        client.execute_command("LO.SET", "ok", v2)
+        client.execute_command("BLOB.SET", "ok", v2)
         assert client.execute_command("DBSIZE") == 1  # overwrite reuses the key
-        assert client.execute_command("LO.GET", "ok") == v2
+        assert client.execute_command("BLOB.GET", "ok") == v2
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 1)
 
         # Overwrite after promotion: the new GET must serve the new payload.
-        client.execute_command("LO.SET", "opk", b"A" * 4096)
-        assert client.execute_command("LO.GET", "opk") == b"A" * 4096  # promote v1
-        client.execute_command("LO.SET", "opk", b"B" * 4096)
-        assert client.execute_command("LO.GET", "opk") == b"B" * 4096
-        assert client.execute_command("LO.GET", "opk") == b"B" * 4096
+        client.execute_command("BLOB.SET", "opk", b"A" * 4096)
+        assert client.execute_command("BLOB.GET", "opk") == b"A" * 4096  # promote v1
+        client.execute_command("BLOB.SET", "opk", b"B" * 4096)
+        assert client.execute_command("BLOB.GET", "opk") == b"B" * 4096
+        assert client.execute_command("BLOB.GET", "opk") == b"B" * 4096
 
         # Repeated overwrite of one key never leaks files.
         for i in range(10):
-            client.execute_command("LO.SET", "leakkey", bytes([65 + (i % 26)]) * 4096)
-        assert client.execute_command("LO.GET", "leakkey") is not None
+            client.execute_command("BLOB.SET", "leakkey", bytes([65 + (i % 26)]) * 4096)
+        assert client.execute_command("BLOB.GET", "leakkey") is not None
         self._wait_free_settled(client)
         # One live file per surviving key: ok, opk, leakkey.
         wait_for_equal(self._dat_count, 3)
@@ -321,12 +321,12 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = b"Z" * 8192
         for _ in range(20):
-            client.execute_command("LO.SET", "churn", payload)
+            client.execute_command("BLOB.SET", "churn", payload)
             assert client.execute_command("DBSIZE") == 1
-            assert client.execute_command("LO.GET", "churn") == payload
+            assert client.execute_command("BLOB.GET", "churn") == payload
             client.execute_command("DEL", "churn")
             assert client.execute_command("DBSIZE") == 0
-            assert client.execute_command("LO.GET", "churn") is None
+            assert client.execute_command("BLOB.GET", "churn") is None
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
 
@@ -338,7 +338,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
 
         # Passive expiry: polling EXISTS drives expiry, then teardown unlinks.
-        client.execute_command("LO.SET", "exk", b"E" * 4096)
+        client.execute_command("BLOB.SET", "exk", b"E" * 4096)
         wait_for_equal(self._dat_count, 1)
         client.execute_command("PEXPIRE", "exk", 50)
         wait_for_equal(lambda: client.execute_command("EXISTS", "exk"), 0)
@@ -348,7 +348,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
 
         # FLUSHALL unlinks every remaining file.
         for i in range(3):
-            client.execute_command("LO.SET", f"fk{i}", b"F" * 4096)
+            client.execute_command("BLOB.SET", f"fk{i}", b"F" * 4096)
         wait_for_equal(self._dat_count, 3)
         client.execute_command("FLUSHALL")
         assert client.execute_command("DBSIZE") == 0
@@ -375,19 +375,19 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
         """With max-promote-size=0, GET always reads from NVMe (no DRAMPool caching)."""
         client = self.server.get_new_client()
         payload = b'N' * 8192
-        client.execute_command('LO.SET', 'nvme_key', payload)
-        result = client.execute_command('LO.GET', 'nvme_key')
+        client.execute_command('BLOB.SET', 'nvme_key', payload)
+        result = client.execute_command('BLOB.GET', 'nvme_key')
         assert result == payload
 
     def test_multiple_gets_all_from_nvme(self):
         """Multiple GETs with max-promote-size=0 should all succeed."""
         client = self.server.get_new_client()
         payload = b'R' * 4096
-        client.execute_command('LO.SET', 'repeat_key', payload)
+        client.execute_command('BLOB.SET', 'repeat_key', payload)
         for _ in range(5):
-            result = client.execute_command('LO.GET', 'repeat_key')
+            result = client.execute_command('BLOB.GET', 'repeat_key')
             assert result == payload
-            assert client.execute_command('LO.INFO', 'repeat_key', 'TIER') == b'nvme'
+            assert client.execute_command('BLOB.INFO', 'repeat_key', 'TIER') == b'nvme'
 
     def test_reject_invalid_buffer_configs(self):
         """CONFIG SET rejects min-buffers-per-op > max-buffers-per-op and
@@ -419,9 +419,9 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload_size = 4096
         payload = b'M' * payload_size
-        client.execute_command('LO.SET', 'memkey', payload)
+        client.execute_command('BLOB.SET', 'memkey', payload)
         # Even after a GET the object stays cold (max-promote-size=0).
-        client.execute_command('LO.GET', 'memkey')
+        client.execute_command('BLOB.GET', 'memkey')
         mem = client.execute_command('MEMORY', 'USAGE', 'memkey')
         assert mem is not None
         lo_value_size = 24
@@ -467,7 +467,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
         )
 
     def _set_ok(self, client, key, payload):
-        assert client.execute_command("LO.SET", key, payload) == b"OK"
+        assert client.execute_command("BLOB.SET", key, payload) == b"OK"
 
     def _set_ok_eventually(self, client, key, payload, tries=100, delay=0.02):
         """Overwrite SET that tolerates a *transient* 'pool exhausted'.
@@ -483,7 +483,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
         last = None
         for _ in range(tries):
             try:
-                assert client.execute_command("LO.SET", key, payload) == b"OK"
+                assert client.execute_command("BLOB.SET", key, payload) == b"OK"
                 return
             except ResponseError as e:
                 if "pool exhausted" not in str(e).lower():
@@ -497,7 +497,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
 
     def _set_rejected(self, client, key, payload):
         try:
-            client.execute_command("LO.SET", key, payload)
+            client.execute_command("BLOB.SET", key, payload)
             assert False, f"Expected '{key}' SET to be rejected (capacity exceeded)"
         except ResponseError as e:
             err = str(e).lower()
@@ -652,7 +652,7 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
         """Corrupt CRC in .dat header → GET triggers panic."""
         client = self.server.get_new_client()
         payload = b'X' * 4096
-        client.execute_command('LO.SET', 'crc_key', payload)
+        client.execute_command('BLOB.SET', 'crc_key', payload)
         # Corrupt the CRC field in the FileHeader (bytes 21-24 in packed layout).
         dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
         assert len(dat_files) >= 1, "Expected .dat file after SET"
@@ -662,7 +662,7 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
         # GET should trigger panic (CRC mismatch in read_and_verify_file_header).
         with self.server.expect_crash(self):
             try:
-                client.execute_command('LO.GET', 'crc_key')
+                client.execute_command('BLOB.GET', 'crc_key')
             except Exception:
                 pass
 
@@ -686,7 +686,7 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
         """Corrupt magic bytes → GET triggers panic."""
         client = self.server.get_new_client()
         payload = b'Y' * 4096
-        client.execute_command('LO.SET', 'magic_key', payload)
+        client.execute_command('BLOB.SET', 'magic_key', payload)
         dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
         assert len(dat_files) >= 1, "Expected .dat file after SET"
         with open(dat_files[-1], 'r+b') as f:
@@ -694,7 +694,7 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
             f.write(b'BAAD')
         with self.server.expect_crash(self):
             try:
-                client.execute_command('LO.GET', 'magic_key')
+                client.execute_command('BLOB.GET', 'magic_key')
             except Exception:
                 pass
 

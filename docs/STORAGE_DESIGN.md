@@ -220,7 +220,7 @@ In Dram mode, there is no io_uring engine — NVMe I/O does not exist — so nei
 - DRAMPool: fi_write to client from cached objects (the hot serving path)
 
 If EFA init fails at startup, `fi_mr_reg` is skipped for all segments. EFA-transport
-command paths (`LO.SET`/`LO.GET` with `[rkey remote_addr]`) are rejected with an
+command paths (`BLOB.SET`/`BLOB.GET` with `[rkey remote_addr]`) are rejected with an
 error until EFA becomes available. TCP-transport paths continue normally.
 
 **Why separate segments per layer:**
@@ -243,10 +243,10 @@ EFA `fi_write` has no alignment constraint — sends exact `len`.
 Without O_DIRECT (DRAM-only mode, or `direct-io no`), neither constraint applies.
 
 **Max object size enforcement:**
-- **`lo-max-object-size` (all modes):** Objects whose length exceeds this configurable limit are rejected at `LO.SET`, regardless of transport (TCP or EFA) or operating mode (Dram or Tiered). This is a single global cap on object size.
+- **`lo-max-object-size` (all modes):** Objects whose length exceeds this configurable limit are rejected at `BLOB.SET`, regardless of transport (TCP or EFA) or operating mode (Dram or Tiered). This is a single global cap on object size.
 - **TCP additionally:** Valkey's querybuf accumulates the whole payload before dispatch and cannot stream, so TCP is bounded by `lo-max-object-size` in the same way (§7.7).
 - **EFA:** Objects larger than a single buffer are chunked internally via multi-buffer parallel I/O (§7.3) using `lo-buffer-size`, still subject to `lo-max-object-size`.
-- **NVMe capacity:** Objects exceeding available NVMe space are also rejected at `LO.SET`.
+- **NVMe capacity:** Objects exceeding available NVMe space are also rejected at `BLOB.SET`.
 
 ---
 
@@ -261,13 +261,13 @@ Both approaches follow the same command-level flow. "Alloc" and "free" refer to 
 All objects live exclusively in DRAM. No NVMe storage. Fastest possible reads. Capacity limited by available DRAM.
 
 ```
-LO.SET key len <payload> [rkey remote_addr]:
+BLOB.SET key len <payload> [rkey remote_addr]:
   1. Alloc buffer (registered memory)
   2a. TCP: copy payload into buffer
   2b. EFA: fi_read from client GPU into buffer (zero-copy)
   3. Track buffer: key → buffer location + len
 
-LO.GET key [rkey remote_addr len]:
+BLOB.GET key [rkey remote_addr len]:
   4. Lookup in HashMap → buffer pointer
   5a. TCP: reply from buffer
   5b. EFA: fi_write from buffer to client GPU (zero-copy)
@@ -284,7 +284,7 @@ DEL key:
 All objects persist on NVMe (write-through). DRAM is a read cache — hot objects promoted on GET only.
 
 ```
-LO.SET key len <payload> [rkey remote_addr]:
+BLOB.SET key len <payload> [rkey remote_addr]:
   1. If key has existing DRAMPool entry: free that buffer (invalidate stale data)
   2. Alloc buffer (registered memory)
   3a. TCP: copy payload into buffer
@@ -293,19 +293,19 @@ LO.SET key len <payload> [rkey remote_addr]:
   5. Free buffer (no DRAMPool caching on write path)
   6. Track file in key/object: key → NVMe location only
 
-LO.GET key [rkey remote_addr len] — DRAMPool hit:
+BLOB.GET key [rkey remote_addr len] — DRAMPool hit:
   7. Lookup in HashMap → buffer is cached in DRAMPool
   8a. TCP: reply from buffer
   8b. EFA: fi_write from buffer (zero-copy)
 
-LO.GET key [rkey remote_addr len] — DRAMPool miss (serve-and-discard, no promotion):
+BLOB.GET key [rkey remote_addr len] — DRAMPool miss (serve-and-discard, no promotion):
   9. Alloc buffer from NVMePool (registered memory)
   10. io_uring ReadFixed from NVMe into NVMePool buffer (O_DIRECT)
   11a. TCP: reply from NVMePool buffer
   11b. EFA: fi_write from NVMePool buffer (zero-copy)
   12. Free NVMePool buffer
 
-LO.GET key [rkey remote_addr len] — DRAMPool miss + promotion (promotion policy says YES):
+BLOB.GET key [rkey remote_addr len] — DRAMPool miss + promotion (promotion policy says YES):
   9. Alloc ObjectContext with N buffers directly in a DRAMPool segment, insert as Filling
   10. io_uring ReadFixed from NVMe directly into the DRAMPool buffers (no memcpy, no NVMePool involvement)
   11. Mark ObjectContext Ready when complete; serve the client from it:
@@ -519,10 +519,10 @@ in on top of it without touching the safety model.)
 ObjectContext exists in two layers with different lifetimes. Same struct, same SegmentBuffer type, but allocated from **separate talc instances in separate segments** (§4.5).
 
 **DRAMPool (long-lived):**
-- ObjectContext created on cache promotion (LO.GET hit policy admits it)
+- ObjectContext created on cache promotion (BLOB.GET hit policy admits it)
 - Buffers allocated from a DRAMPool segment via `dram_pool.alloc()` (picks a segment, mallocs from that segment's own talc)
 - Held in `HashMap<ObjectId, ObjectContext>` for the object's entire cached lifetime
-- Buffers remain allocated and serve repeated LO.GET hits directly
+- Buffers remain allocated and serve repeated BLOB.GET hits directly
 - On DRAMPool eviction (policy-based — LRU/LFU/memory pressure): ObjectContext dropped → `dram_pool.free()` for each buffer (frees into the owning segment's talc)
 - Object survives on NVMe. Next GET is a cache miss (NVMePool serves it).
 
@@ -602,18 +602,18 @@ The server decides chunk size — the client never specifies or sees it.
 
 **Server config:** `lo-buffer-size` (e.g., 8MB). This determines the allocation unit for all I/O operations.
 
-**LO.SET translation:**
+**BLOB.SET translation:**
 ```
-Client sends:  LO.SET key 50MB <payload or rkey+addr+len>
+Client sends:  BLOB.SET key 50MB <payload or rkey+addr+len>
 Server sees:   total_len=50MB, chunk_size=8MB → N=7 chunks
 Server does:   alloc 7 buffers from shared segments
                partition incoming data into 8MB pieces
                submit 7 parallel WriteFixed SQEs to NVMe
 ```
 
-**LO.GET translation:**
+**BLOB.GET translation:**
 ```
-Client sends:  LO.GET key [rkey addr 50MB]
+Client sends:  BLOB.GET key [rkey addr 50MB]
 Server sees:   LoValue.len=50MB, chunk_size=8MB → N=7 chunks
 Server does:   alloc 4-8 buffers (pipeline depth)
                submit ReadFixed SQEs at file offsets 0, 8MB, 16MB, ...
@@ -668,7 +668,7 @@ See §6.2 for full struct definitions. Summary:
 - **StreamingContext** (NVMePool): rotating window of X buffers, used for SET writes and GET serve-and-discard. Short-lived.
 - **ObjectContext** (DRAMPool): complete allocation of ALL N buffers, with `ObjectState` (`Ready` or `Filling{chunks_ready, total}`). Long-lived. Coalescing point for concurrent GETs during promotion.
 
-#### 7.3.3 LO.SET Flows
+#### 7.3.3 BLOB.SET Flows
 
 **SET + EFA + NVMe mode:**
 ```
@@ -736,7 +736,7 @@ Main thread (synchronous — no tokio task needed):
   Verify CRC → create LoValue + ObjectContext{buffers, state=Ready}, reply OK.
 ```
 
-#### 7.3.4 LO.GET Flows
+#### 7.3.4 BLOB.GET Flows
 
 **GET + DRAMPool hit (both transports):**
 ```
@@ -877,8 +877,8 @@ Two cases for how EFA handles large objects:
 The command includes multiple client regions:
 
 ```
-LO.SET key <total_len> <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
-LO.GET key <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
+BLOB.SET key <total_len> <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
+BLOB.GET key <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
 ```
 
 - The server treats the regions as **one logical contiguous destination** (region1
@@ -922,11 +922,11 @@ Server internally:
 
 Valkey's RESP command dispatch accumulates the full payload in `client->querybuf` before calling the module handler. Replies use single-allocation `VM_ReplyWithStringBuffer`. There is no incremental streaming API for either direction.
 
-**Consequence:** A 10GB LO.SET over TCP requires 10GB in querybuf before the module even runs. This is untenable.
+**Consequence:** A 10GB BLOB.SET over TCP requires 10GB in querybuf before the module even runs. This is untenable.
 
 **v1 behavior:**
-- `LO.SET`: reject with `ERR object exceeds lo-max-object-size` if payload > `lo-max-object-size` (configurable, applies to all modes and transports)
-- `LO.GET`: reject with the same error if a stored object's size somehow exceeds the current `lo-max-object-size`
+- `BLOB.SET`: reject with `ERR object exceeds lo-max-object-size` if payload > `lo-max-object-size` (configurable, applies to all modes and transports)
+- `BLOB.GET`: reject with the same error if a stored object's size somehow exceeds the current `lo-max-object-size`
 - Over TCP this is the only size bound (querybuf cannot stream); EFA clients are additionally chunked via multi-buffer parallel I/O (Cases 1/2 above) but remain subject to `lo-max-object-size`
 
 **Future (v2+):** If Valkey adds a streaming/incremental module API for reading from client socket and writing chunked replies, TCP could support larger objects. Until then, large objects require EFA.
@@ -957,7 +957,7 @@ module and core alike, is bounded by.
 
 | Actor | What it does | Data loss? | Modes |
 |---|---|---|---|
-| **Core maxmemory eviction** | Valkey's `maxmemory-policy` selects a victim key and deletes it (LO keys included), calling the module free callback. `noeviction` → `LO.SET` fails (OOM). | **Yes** — the object is gone | Both |
+| **Core maxmemory eviction** | Valkey's `maxmemory-policy` selects a victim key and deletes it (LO keys included), calling the module free callback. `noeviction` → `BLOB.SET` fails (OOM). | **Yes** — the object is gone | Both |
 | **Module cache eviction** | Drops a cached DRAM copy; the object persists on NVMe, next GET is an NVMe read. | No | **Tiered only** |
 | **Module empty-segment reclaim** | When memory pressure crosses the shrink watermark, the module reclaims DRAM segments with zero live allocations. | No | Both |
 
@@ -985,9 +985,9 @@ who loads the module but uses only standard Valkey data types (strings, hashes,
 lists, etc.) still pays the cost of the module's initial DRAMPool segment. This
 reduces the memory available to core. Three startup allocation options exist:
 
-| Option | Description | Overhead for non-users | First LO.SET cost |
+| Option | Description | Overhead for non-users | First BLOB.SET cost |
 |---|---|---|---|
-| **A — Lazy** | Start with 0 segments. Allocate the first segment on the first `LO.SET`. | Zero | EFA `fi_mr_reg` (~333µs) + segment alloc |
+| **A — Lazy** | Start with 0 segments. Allocate the first segment on the first `BLOB.SET`. | Zero | EFA `fi_mr_reg` (~333µs) + segment alloc |
 | **B — Eager** `[CURRENT]` | Pre-allocate at startup: if `dram-maxmemory=0` → 1 segment; if `dram-maxmemory>0` → all `dram-maxmemory / segment-size` segments. | `segment-size` bytes (64MB default) up to full `dram-maxmemory` | None — already registered |
 
 **Option B is the current implementation.** It guarantees the first LO command
@@ -1016,7 +1016,7 @@ Bounds by mode (config meaning in §11.3):
     shrink timer reclaims segments to stay under pressure; GETs that miss DRAM serve
     directly from NVMe (no data loss — NVMe is always the source of truth).
   - **Dram mode:** same demand-driven growth, but hitting the server ceiling is fatal
-    to new writes — `LO.SET` is rejected (OOM) since there is no NVMe fallback.
+    to new writes — `BLOB.SET` is rejected (OOM) since there is no NVMe fallback.
 - **`dram-maxmemory>0`:** grow up to `dram-maxmemory / segment-size` segments.
 
 **Detection — Dram mode: reactive-primary.** Expand is naturally reactive in Dram mode: the alloc-fail row
@@ -1519,7 +1519,7 @@ This subsection defines the *meaning* of the value — the scale-out/scale-in
 
 | Mode | `dram-maxmemory` | Meaning |
 |---|---|---|
-| Dram | `0` | Grow on demand, bounded by the server ceiling (§11.2). DRAMPool *is* the store — there is no NVMe fallback, so exhausting the ceiling means `LO.SET` is rejected (OOM). |
+| Dram | `0` | Grow on demand, bounded by the server ceiling (§11.2). DRAMPool *is* the store — there is no NVMe fallback, so exhausting the ceiling means `BLOB.SET` is rejected (OOM). |
 | Dram | `>0` | Hard cap on the DRAM store. |
 | Tiered | `0` | Elastic promotion cache, bounded by the server ceiling. Reclaimable under pressure (the object is safe on NVMe). |
 | Tiered | `>0` | Cache cap. |

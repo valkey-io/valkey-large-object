@@ -26,9 +26,9 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         """A graceful SHUTDOWN deletes every object file from nvme-dir, whether
         it was left by a SET or partially cleared by an async DEL."""
         client = self.server.get_new_client()
-        client.execute_command("LO.SET", "a", b"A" * 4096)
-        client.execute_command("LO.SET", "b", b"B" * 4096)
-        client.execute_command("LO.SET", "c", b"C" * 4096)
+        client.execute_command("BLOB.SET", "a", b"A" * 4096)
+        client.execute_command("BLOB.SET", "b", b"B" * 4096)
+        client.execute_command("BLOB.SET", "c", b"C" * 4096)
         # DEL frees asynchronously (BIO thread); wait for completion.
         client.execute_command("DEL", "b")
         wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
@@ -78,7 +78,7 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         """End-to-end: data written before a restart does not linger."""
         client = self.server.get_new_client()
         for i in range(3):
-            client.execute_command("LO.SET", f"rk{i}", b"Z" * 4096)
+            client.execute_command("BLOB.SET", f"rk{i}", b"Z" * 4096)
         assert len(self._object_files()) == 3
 
         # restart() = graceful exit (handler purges) + fresh start (startup purge).
@@ -87,5 +87,5 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         assert self._object_files() == [], "object files lingered across restart"
         # A fresh server can still serve new writes.
         client = self.server.get_new_client()
-        assert client.execute_command("LO.SET", "after", b"Q" * 4096) == b"OK"
+        assert client.execute_command("BLOB.SET", "after", b"Q" * 4096) == b"OK"
         assert len(self._object_files()) == 1

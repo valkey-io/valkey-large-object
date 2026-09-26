@@ -1,14 +1,14 @@
 #!/bin/bash
 # ValkeyLargeObj Benchmark Script
 #
-# Cycles through operating modes and object sizes, measuring LO.GET throughput.
+# Cycles through operating modes and object sizes, measuring BLOB.GET throughput.
 #
 # Three modes:
 #   Dram    — all objects in DRAMPool (no NVMe)
 #   Tiered  — NVMe persistence + DRAM read cache with promotion
 #   NVMe    — NVMe persistence, no DRAM cache (max-promote-size 0)
 #
-# bench-mode: LO.GET does full storage path but replies with integer size only
+# bench-mode: BLOB.GET does full storage path but replies with integer size only
 # (no TCP bulk copy). Isolates storage throughput from network bandwidth.
 #
 # Prerequisites:
@@ -417,7 +417,7 @@ s.setsockopt(6, 1, 1)
 payload = os.urandom($BYTES)
 start = time.monotonic()
 for i in range($EFFECTIVE_KEYS):
-    s.sendall(resp('LO.SET', f'k:{i:012d}', payload))
+    s.sendall(resp('BLOB.SET', f'k:{i:012d}', payload))
     r = s.recv(1024)
 elapsed = time.monotonic() - start
 s.close()
@@ -433,7 +433,7 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
         echo "  DBSIZE: $DBSIZE"
         if [ "$DBSIZE" != "$EFFECTIVE_KEYS" ]; then
             echo "  FATAL: DBSIZE mismatch — expected $EFFECTIVE_KEYS, got $DBSIZE."
-            echo "         LO.SET populate failed or keys were not stored correctly."
+            echo "         BLOB.SET populate failed or keys were not stored correctly."
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
             exit 1
         fi
@@ -464,14 +464,14 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             fi
         fi
 
-        # LO.GET benchmark (timeout = duration + 30s grace)
+        # BLOB.GET benchmark (timeout = duration + 30s grace)
         BENCH_TIMEOUT=$(( DURATION + 30 ))
         BENCH_TMPFILE=$(mktemp /tmp/bench-output-XXXXXX)
         BENCH_EXIT=0
         timeout $BENCH_TIMEOUT \
             taskset -c $BENCH_CPUS \
             $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
-            -- LO.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1 || BENCH_EXIT=$?
+            -- BLOB.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1 || BENCH_EXIT=$?
 
         # Print the results
         tr '\r' '\n' < "$BENCH_TMPFILE" | grep -A3 "throughput summary" || true
@@ -535,7 +535,7 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
             exit 1
         fi
-        # Hits must be > 0 (proves LO.GET actually ran and found keys)
+        # Hits must be > 0 (proves BLOB.GET actually ran and found keys)
         if [ "$CACHE_HITS" -eq 0 ]; then
             echo "  FATAL: 0 cache hits — benchmark did not perform any valid key lookups."
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true

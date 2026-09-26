@@ -1,10 +1,10 @@
 //! Command Handlers — thin layer that parses args and dispatches to engine.
 //!
-//! LO.HELLO: EFA session establishment
-//! LO.GET key [rkey remote_addr]: engine::execute_get
-//! LO.SET key <data>                (TCP): engine::execute_set
-//! LO.SET key len rkey remote_addr  (EFA): engine::execute_set
-//! LO.INFO key [LEN|CRC|TIER]: metadata from LoValue, no engine call
+//! BLOB.HELLO: EFA session establishment
+//! BLOB.GET key [rkey remote_addr]: engine::execute_get
+//! BLOB.SET key <data>                (TCP): engine::execute_set
+//! BLOB.SET key len rkey remote_addr  (EFA): engine::execute_set
+//! BLOB.INFO key [LEN|CRC|TIER]: metadata from LoValue, no engine call
 
 use std::sync::Arc;
 
@@ -17,12 +17,12 @@ use crate::errors;
 use crate::transport::config::FabricProvider;
 use crate::transport::{self, session, Session};
 
-/// The EFA session the client previously established with LO.HELLO.
+/// The EFA session the client previously established with BLOB.HELLO.
 fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
     session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))
 }
 
-// ─── LO.HELLO ────────────────────────────────────────────────────────────────
+// ─── BLOB.HELLO ────────────────────────────────────────────────────────────────
 //
 // Establishes a fabric session with the client.
 // Client sends its fabric address as hex, opaque to us and in the provider's own format. The
@@ -70,7 +70,7 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     Ok(ValkeyValue::Array(reply))
 }
 
-// ─── LO.GET ──────────────────────────────────────────────────────────────────
+// ─── BLOB.GET ──────────────────────────────────────────────────────────────────
 //
 // Parse args → resolve key → determine transport → dispatch to engine.
 
@@ -94,7 +94,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let file = lo_value.file.clone();
 
     // Determine transport: EFA if rkey+remote_addr provided, else TCP.
-    // TODO: Add a client buffer length argument to LO.GET so the server can
+    // TODO: Add a client buffer length argument to BLOB.GET so the server can
     // validate the address space covers obj_len before fi_write. Also add
     // validation when multi-address support lands (sum of address lengths >= obj_len).
     let transport = if args.len() >= 4 {
@@ -123,7 +123,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 }
 
-// ─── LO.SET ──────────────────────────────────────────────────────────────────
+// ─── BLOB.SET ──────────────────────────────────────────────────────────────────
 //
 // Parse args → determine data source → dispatch to engine.
 
@@ -134,7 +134,7 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     // Determine data source and obj_len based on arg count.
     let (obj_len, data_source) = if args.len() >= 5 {
-        // EFA path: LO.SET key len rkey remote_addr
+        // EFA path: BLOB.SET key len rkey remote_addr
         // len is required — server needs to know how many bytes to fi_read from client GPU.
         let obj_len: u64 = args[2]
             .to_string_lossy()
@@ -158,7 +158,7 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
             },
         )
     } else if args.len() >= 3 {
-        // TCP path: LO.SET key <data>
+        // TCP path: BLOB.SET key <data>
         // data.len() IS the authoritative length. No user-provided len needed.
         let data = args[2].as_slice().to_vec();
         let obj_len = data.len() as u64;
@@ -179,9 +179,9 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 }
 
-// ─── LO.INFO ─────────────────────────────────────────────────────────────────
+// ─── BLOB.INFO ─────────────────────────────────────────────────────────────────
 //
-// LO.INFO key [LEN | CRC | TIER]
+// BLOB.INFO key [LEN | CRC | TIER]
 //
 // Parse args → resolve key → return metadata field or all fields as array.
 

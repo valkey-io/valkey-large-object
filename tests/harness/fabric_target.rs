@@ -6,16 +6,16 @@
 //! # prints: advertisement: <address-hex> <rkey> <remote-addr>
 //! cargo run --features test-harness --bin fabric_target -- 127.0.0.1
 //! # against a module started with fabric-provider Emulated:
-//! LO.HELLO <address-hex>
-//! LO.GET key <rkey> <remote-addr>            # writes the object into the target's buffer
+//! BLOB.HELLO <address-hex>
+//! BLOB.GET key <rkey> <remote-addr>            # writes the object into the target's buffer
 //! ```
 //!
-//! `--read` prefills the buffer and serves it for `LO.SET key <len> <rkey> <remote-addr>` instead.
+//! `--read` prefills the buffer and serves it for `BLOB.SET key <len> <rkey> <remote-addr>` instead.
 //! This holds the buffer open and lets the initiator do the verifying.
 //!
 //! `--efa` opens the `efa-direct` fabric instead of tcp loopback. There a target must hold the
 //! initiator's address before it can be RMA'd against, so it takes one as its only positional.
-//! `LO.HELLO` can't supply it, since HELLO needs the target's address first. The module logs each
+//! `BLOB.HELLO` can't supply it, since HELLO needs the target's address first. The module logs each
 //! service's address at load (`largeobj: fabric service N address <hex>`).
 
 use std::ffi::CString;

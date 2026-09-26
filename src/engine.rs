@@ -181,7 +181,7 @@ fn commit_lo_value(
 // GET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute LO.GET with mode + transport routing.
+/// Execute BLOB.GET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_get(
     ctx: &valkey_module::Context,
@@ -530,7 +530,7 @@ async fn cmd_get_tiered_run(
 // SET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute LO.SET with mode + transport routing.
+/// Execute BLOB.SET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_set(
     ctx: &valkey_module::Context,

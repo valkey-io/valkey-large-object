@@ -18,10 +18,10 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 
 | Command | Description |
 |---------|-------------|
-| `LO.SET key <data>` | Store object (TCP). Data length is implicit. |
-| `LO.SET key len rkey remote_addr` | Store object (EFA). Server reads `len` bytes from client GPU via RDMA. |
-| `LO.GET key` | Retrieve object. Returns bulk string (TCP) or DMA to client GPU (EFA). |
-| `LO.HELLO` | Establish EFA/RDMA session for GPU-direct DMA transfers. |
+| `BLOB.SET key <data>` | Store object (TCP). Data length is implicit. |
+| `BLOB.SET key len rkey remote_addr` | Store object (EFA). Server reads `len` bytes from client GPU via RDMA. |
+| `BLOB.GET key` | Retrieve object. Returns bulk string (TCP) or DMA to client GPU (EFA). |
+| `BLOB.HELLO` | Establish EFA/RDMA session for GPU-direct DMA transfers. |
 | `DEL key` | Native Valkey DEL. Triggers module free callback (cleans up NVMe file + pool buffers). |
 
 ## Build
@@ -66,7 +66,7 @@ valkey-server --port 7380 \
 | `nvme-staging-size` | 64mb | Immutable | Size of NVMe staging buffer (1 segment). Min 1mb. |
 | `max-promote-size` | 256mb | Yes | Max object size for NVMe→DRAM promotion. 0 = disable promotion. |
 | `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. |
-| `bench-mode` | no | Yes | LO.GET returns integer size instead of bulk data (isolates NVMe throughput). |
+| `bench-mode` | no | Yes | BLOB.GET returns integer size instead of bulk data (isolates NVMe throughput). |
 | `direct-io` | yes | Immutable | Use O_DIRECT for NVMe files. Disable for ASAN builds. |
 | `fabric-provider` | `Emulated` | Immutable | libfabric provider for the DMA path: `Emulated` (libfabric over TCP, runs anywhere) or `EfaDirect` (EFA hardware RDMA). |
 | `fabric-interfaces` | (empty) | Immutable | Comma-separated fabric domains to serve on. Empty = every domain the provider discovers. |

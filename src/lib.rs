@@ -7,7 +7,7 @@
 //!       ↓ passes buffers to
 //!   Transport (EFA, fi_write/fi_read)
 //!
-//! Commands: LO.HELLO, LO.GET, LO.SET
+//! Commands: BLOB.HELLO, BLOB.GET, BLOB.SET
 //! Deletion: native Valkey DEL triggers module free callback.
 
 // ─── Initialization Order ────────────────────────────────────────────────────
@@ -16,7 +16,7 @@
 // all steps complete:
 //
 //   1. Fabric::start()         — one libfabric service per domain. On missing
-//                                fabric, the EFA path is unavailable and LO.HELLO
+//                                fabric, the EFA path is unavailable and BLOB.HELLO
 //                                gives an error.
 //   2. storage::init(mode, nvme_dir)
 //                              — validate config, allocate pool segments, create
@@ -29,7 +29,7 @@
 //                              — fi_mr_reg pool buffers with EFA domains.
 //   4. RUNTIME.set(rt)         — commit tokio runtime last (only used by commands).
 //
-// After step 4, commands (LO.GET, LO.SET, LO.HELLO) may execute safely.
+// After step 4, commands (BLOB.GET, BLOB.SET, BLOB.HELLO) may execute safely.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::sync::atomic::{AtomicBool, AtomicI64};
@@ -125,7 +125,7 @@ lazy_static::lazy_static! {
     /// the scaling cron evicts the least-used DRAM segment. Default: 0.90 (90%).
     static ref CFG_SCALING_SHRINK_WATERMARK: AtomicI64 = AtomicI64::new(90); // stored as percent
 
-    /// Bench mode: LO.GET TCP path replies with size integer instead of bulk value bytes.
+    /// Bench mode: BLOB.GET TCP path replies with size integer instead of bulk value bytes.
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
     static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
 
@@ -485,10 +485,10 @@ valkey_module! {
     deinit: deinitialize,
     info: lo_info,
     commands: [
-        ["LO.HELLO", commands::lo_hello, "write", 0, 0, 0],
-        ["LO.GET", commands::lo_get, "readonly", 1, 1, 1],
-        ["LO.SET", commands::lo_set, "write deny-oom", 1, 1, 1],
-        ["LO.INFO", commands::lo_info, "readonly fast", 1, 1, 1],
+        ["BLOB.HELLO", commands::lo_hello, "write", 0, 0, 0],
+        ["BLOB.GET", commands::lo_get, "readonly", 1, 1, 1],
+        ["BLOB.SET", commands::lo_set, "write deny-oom", 1, 1, 1],
+        ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1],
     ],
     configurations: [
         i64: [
