@@ -8,7 +8,9 @@ from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 
 
 class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
-    """Tiered mode with DRAMPool promotion enabled (default max-promote-size)."""
+    """Tiered mode with DRAMPool promotion enabled (default max-promote-size).
+    promote-min-hits 1 so the first GET promotes and these tests observe promotion
+    directly; second-touch admission has its own classes below."""
 
     def get_module_args(self, data_dir, direct_io):
         return (
@@ -17,6 +19,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             f" nvme-staging-size 4194304"
             f" segment-size 4194304"
             f" max-promote-size 268435456"
+            f" promote-min-hits 1"
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
@@ -743,3 +746,241 @@ class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
         proves the config is registered and accepts 0."""
         client = self.server.get_new_client()
         assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog_usage')
+
+
+# ─── Second-touch admission ─────────────────────────────────────────────────
+
+
+class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
+    """Default admission: promote-min-hits 2."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 4194304"
+            f" segment-size 4194304"
+            f" max-promote-size 268435456"
+            f" bench-mode no"
+            f" direct-io no"
+            f" chunk-size 4096"
+        )
+
+    def test_second_touch_promotes(self):
+        """SET moves no cache counter. The first GET is a miss that admission
+        rejects; the second promotes; the third is a hit. Objects above
+        max-promote-size are misses that never count as admission rejects."""
+        client = self.server.get_new_client()
+        dram = lambda: client.info('largeobj_largeobj_dram')
+        payload = b'T' * 4096
+        base = dram()
+
+        client.execute_command('LO.SET', 'basic_key', payload)
+        assert dram() == base
+
+        # GET 1: rejected by admission, served transiently.
+        assert client.execute_command('LO.GET', 'basic_key') == payload
+        assert client.execute_command('LO.INFO', 'basic_key', 'TIER') == b'nvme'
+        after1 = dram()
+        assert after1['largeobj_cache_misses_total'] == 1
+        assert after1['largeobj_admission_rejects_total'] == 1
+        assert after1['largeobj_promotions_total'] == 0
+        assert after1['largeobj_cached_objects'] == 0
+
+        # GET 2: second touch, promoted. mark_ready runs before the reply.
+        assert client.execute_command('LO.GET', 'basic_key') == payload
+        assert client.execute_command('LO.INFO', 'basic_key', 'TIER') == b'dram'
+        after2 = dram()
+        assert after2['largeobj_cache_misses_total'] == 2
+        assert after2['largeobj_admission_rejects_total'] == 1
+        assert after2['largeobj_promotions_total'] == 1
+        assert after2['largeobj_cached_objects'] == 1
+        assert after2['largeobj_cache_hits_total'] == 0
+
+        # GET 3: plain hit, nothing on the miss side moves.
+        assert client.execute_command('LO.GET', 'basic_key') == payload
+        after3 = dram()
+        assert after3['largeobj_cache_hits_total'] == 1
+        assert after3['largeobj_cache_misses_total'] == 2
+        assert after3['largeobj_admission_rejects_total'] == 1
+        assert after3['largeobj_promotions_total'] == 1
+
+        # Oversize: three misses, no rejects, no promotion.
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-promote-size', '4096')
+        big = b'O' * 8192
+        client.execute_command('LO.SET', 'big_key', big)
+        for _ in range(3):
+            assert client.execute_command('LO.GET', 'big_key') == big
+        after4 = dram()
+        assert after4['largeobj_cache_misses_total'] == 5
+        assert after4['largeobj_admission_rejects_total'] == 1
+        assert after4['largeobj_promotions_total'] == 1
+
+    def test_promote_min_hits_runtime(self):
+        """promote-min-hits is runtime mutable: 1 restores first-GET promotion,
+        3 requires three misses."""
+        client = self.server.get_new_client()
+        payload = b'R' * 4096
+
+        client.execute_command('CONFIG', 'SET', 'largeobj.promote-min-hits', '1')
+        client.execute_command('LO.SET', 'one_key', payload)
+        rejects = client.info('largeobj_largeobj_dram')['largeobj_admission_rejects_total']
+        assert client.execute_command('LO.GET', 'one_key') == payload
+        assert client.execute_command('LO.INFO', 'one_key', 'TIER') == b'dram'
+        assert client.info('largeobj_largeobj_dram')['largeobj_admission_rejects_total'] == rejects
+
+        client.execute_command('CONFIG', 'SET', 'largeobj.promote-min-hits', '3')
+        client.execute_command('LO.SET', 'three_key', payload)
+        for _ in range(2):
+            assert client.execute_command('LO.GET', 'three_key') == payload
+            assert client.execute_command('LO.INFO', 'three_key', 'TIER') == b'nvme'
+        assert client.execute_command('LO.GET', 'three_key') == payload
+        assert client.execute_command('LO.INFO', 'three_key', 'TIER') == b'dram'
+
+
+# ─── Inline eviction ────────────────────────────────────────────────────────
+
+
+class TestLargeObjTieredEviction(ValkeyLargeObjTestCaseBase):
+    """One 1 MiB segment, no room to grow (dram-maxmemory == segment-size), so a
+    promotion into a full pool must evict. promote-min-hits 1 so every GET
+    promotes; decay off so scores are stable across a minute boundary. The
+    default evict-sample-size (5) exceeds the 3-entry map, so victim selection
+    scans every entry and is exact. 256 KiB objects: three fill 768 KiB; a
+    fourth needs the remaining 256 KiB exactly, which any allocator overhead
+    denies."""
+
+    OBJ = 256 * 1024
+    KEYS = [f'ev_{i}' for i in range(3)]
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 4194304"
+            f" segment-size 1048576"
+            f" dram-maxmemory 1048576"
+            f" max-promote-size 1048576"
+            f" promote-min-hits 1"
+            f" lfu-decay-time 0"
+            f" chunk-size 65536"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def test_evicts_lowest_score_object(self):
+        """A fourth promotion into the full pool evicts exactly one cold object and
+        never the hot one."""
+        client = self.server.get_new_client()
+        # SET and promote three objects that fill the single segment.
+        for i, k in enumerate(self.KEYS):
+            payload = bytes([65 + i]) * self.OBJ
+            client.execute_command('LO.SET', k, payload)
+            assert client.execute_command('LO.GET', k) == payload
+        info = client.info('largeobj_largeobj_dram')
+        assert info['largeobj_cached_objects'] == 3
+        assert info['largeobj_evictions_total'] == 0
+        assert info['largeobj_live_segments'] == 1
+
+        hot = self.KEYS[0]
+        for _ in range(10):
+            assert client.execute_command('LO.GET', hot) == b'A' * self.OBJ
+
+        payload = b'N' * self.OBJ
+        client.execute_command('LO.SET', 'ev_new', payload)
+        assert client.execute_command('LO.GET', 'ev_new') == payload
+
+        info = client.info('largeobj_largeobj_dram')
+        assert info['largeobj_evictions_total'] == 1
+        assert info['largeobj_cached_objects'] == 3
+        assert info['largeobj_live_segments'] == 1
+        assert info['largeobj_scaling_expand_total'] == 0
+        assert client.execute_command('LO.INFO', hot, 'TIER') == b'dram'
+        assert client.execute_command('LO.INFO', 'ev_new', 'TIER') == b'dram'
+        tiers = [client.execute_command('LO.INFO', k, 'TIER') for k in self.KEYS[1:]]
+        assert tiers.count(b'nvme') == 1, tiers
+
+        # The evicted copy is still on NVMe and reads back intact.
+        evicted = self.KEYS[1:][tiers.index(b'nvme')]
+        idx = self.KEYS.index(evicted)
+        assert client.execute_command('LO.GET', evicted) == bytes([65 + idx]) * self.OBJ
+
+
+class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
+    """max-open-fds 2 with promotion effectively off (promote-min-hits 255), so
+    every GET reads through the fd pool. Decay off so scores are stable across
+    a minute boundary. The default evict-sample-size (5) exceeds the 2-entry
+    map, so victim selection scans both entries and is exact."""
+
+    OBJ = 64 * 1024
+    KEYS = [f'fd_{i}' for i in range(5)]
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 4194304"
+            f" segment-size 1048576"
+            f" dram-maxmemory 1048576"
+            f" promote-min-hits 255"
+            f" lfu-decay-time 0"
+            f" max-open-fds 2"
+            f" chunk-size 65536"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def _payload(self, i):
+        return bytes([65 + i]) * self.OBJ
+
+    def test_cap_respected_and_reads_succeed(self):
+        """Reading more objects than the cap keeps open_fds at the cap, evicts
+        exactly the overflow, and every read still returns the right bytes."""
+        client = self.server.get_new_client()
+        for i, k in enumerate(self.KEYS):
+            client.execute_command('LO.SET', k, self._payload(i))
+        info = client.info('largeobj_largeobj_fd')
+        assert info['largeobj_open_fds'] == 0
+
+        for i, k in enumerate(self.KEYS):
+            assert client.execute_command('LO.GET', k) == self._payload(i)
+
+        info = client.info('largeobj_largeobj_fd')
+        assert info['largeobj_open_fds'] == 2
+        assert info['largeobj_fd_evictions_total'] == 3
+        # Nothing was promoted, so these were all NVMe reads.
+        dram = client.info('largeobj_largeobj_dram')
+        assert dram['largeobj_cached_objects'] == 0
+
+        # A second pass reads everything back correctly through reopened fds.
+        for i, k in enumerate(self.KEYS):
+            assert client.execute_command('LO.GET', k) == self._payload(i)
+        info = client.info('largeobj_largeobj_fd')
+        assert info['largeobj_open_fds'] == 2
+        evictions = info['largeobj_fd_evictions_total']
+
+        # DEL drops the pool's fd through ObjectFile::Drop, so the next open
+        # takes the free slot instead of evicting. KEYS[4] was read last, so
+        # its fd is one of the two cached.
+        client.execute_command('DEL', self.KEYS[4])
+        wait_for_equal(
+            lambda: client.info('largeobj_largeobj_fd')['largeobj_open_fds'], 1)
+        assert client.execute_command('LO.GET', self.KEYS[0]) == self._payload(0)
+        info = client.info('largeobj_largeobj_fd')
+        assert info['largeobj_open_fds'] == 2
+        assert info['largeobj_fd_evictions_total'] == evictions
+
+    def test_lower_cap_at_runtime(self):
+        """CONFIG SET to a smaller cap takes effect on the next open."""
+        client = self.server.get_new_client()
+        for i, k in enumerate(self.KEYS[:2]):
+            client.execute_command('LO.SET', k, self._payload(i))
+            assert client.execute_command('LO.GET', k) == self._payload(i)
+        assert client.info('largeobj_largeobj_fd')['largeobj_open_fds'] == 2
+
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-open-fds', '1')
+        client.execute_command('LO.SET', self.KEYS[2], self._payload(2))
+        assert client.execute_command('LO.GET', self.KEYS[2]) == self._payload(2)
+        info = client.info('largeobj_largeobj_fd')
+        assert info['largeobj_open_fds'] == 1
+        assert info['largeobj_fd_evictions_total'] == 2

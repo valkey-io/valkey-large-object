@@ -286,8 +286,10 @@ fn cmd_get_tiered(
 ) {
     let dram_pool = storage::get_dram_pool();
     // ─── DRAMPool hit ────────────────────────────────────────────────────
+    let mut filling = false;
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
+            dram_pool.record_hit(&obj_ctx);
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             cmd_get_from_dram(
                 dram_pool,
@@ -303,10 +305,19 @@ fn cmd_get_tiered(
         // Filling state: promotion in progress.
         // TODO: coalesce — register as waiter on this ObjectContext.
         // For now: fall through to NVMe read.
+        filling = true;
     }
+    // Everything below reads from NVMe, whether or not it also promotes.
+    dram_pool.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
-    // If pool has space and object is eligible, read directly into DRAMPool.
-    if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
+    // Admit via the ghost table, then allocate (evicting cold copies if full).
+    // Skip both if another GET is already promoting this OID (Filling).
+    let promoted = if !filling && dram_pool.admit(object_id, obj_len) {
+        dram_pool.try_promote_object(object_id, obj_len)
+    } else {
+        None
+    };
+    if let Some(obj_ctx) = promoted {
         let fd_pool = storage::get_fd_pool();
         let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
             Some(fd) => fd,
@@ -337,8 +348,10 @@ fn cmd_get_tiered(
         };
         let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
         crate::runtime_handle().spawn(async move {
-            let _keep_alive = (file, fd);
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+            // Declared after thread_ctx so it drops first: the fd clone is gone
+            // before the client unblocks, so its next GET sees the fd unpinned.
+            let _keep_alive = (file, fd);
             // Promotion: read the NVMe file INTO the DRAM buffers (pool=Dram), and the
             // progress hook marks the cached entry Ready.
             let progress = crate::stream::PromotionProgress {
@@ -362,9 +375,8 @@ fn cmd_get_tiered(
         return;
     }
     // ─── NVMePool fallback (promotion skipped) ───────────────────────────
-    // Reaches here when try_promote_object returns None: pool full, object
-    // exceeds max-promote-size, or another GET is already promoting this OID.
-    // Future: LRFU admission policy may also reject promotion here.
+    // Reaches here when admission rejected the object, try_promote_object returned None
+    // or another GET is already promoting this OID.
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
@@ -407,8 +419,9 @@ fn cmd_get_tiered(
         // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
         // open fd are held alive for the read's duration. No promotion → no cache,
         // source reads straight from the NVMe pool window.
-        let _keep_alive = (file, fd);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        // Declared after thread_ctx so it drops first (see the promotion path).
+        let _keep_alive = (file, fd);
         cmd_get_tiered_run(
             get_info,
             &stream_ctx.buffers,

@@ -16,6 +16,7 @@ pub mod fd_pool;
 pub mod nvme;
 pub mod nvme_pool;
 pub mod object_file;
+pub mod policy;
 pub mod scaling;
 pub mod segment;
 pub mod segment_pool;
@@ -148,7 +149,7 @@ pub fn clear_iovec(iovec_index: u16) {
 
 pub(super) static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
 pub(super) static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
-static FD_POOL: OnceLock<FdPool> = OnceLock::new();
+pub(super) static FD_POOL: OnceLock<FdPool> = OnceLock::new();
 
 pub fn get_dram_pool() -> &'static DRAMPool {
     DRAM_POOL.get().expect("DRAMPool not initialized")

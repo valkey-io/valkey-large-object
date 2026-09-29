@@ -32,9 +32,27 @@ pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
 fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     dram_pool_section(ctx)?;
     nvme_staging_section(ctx)?;
+    fd_pool_section(ctx)?;
     smartlog_section(ctx)?;
     error_metrics_section(ctx)?;
     Ok(())
+}
+
+/// Tiered only: absent in Dram mode, where no FdPool exists.
+fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    let Some(fds) = storage::FD_POOL.get() else {
+        return Ok(());
+    };
+    ctx.builder()
+        .add_section("largeobj_fd")
+        .field("open_fds", fds.len() as i64)?
+        .field(
+            "fd_evictions_total",
+            fds.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
 }
 
 fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
@@ -57,6 +75,27 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("capacity_bytes", capacity as i64)?
         .field("utilization_pct", util_pct)?
         .field("cached_objects", dram.object_count() as i64)?
+        .field(
+            "cache_hits_total",
+            dram.cache_hits.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "cache_misses_total",
+            dram.cache_misses.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "promotions_total",
+            dram.promotions.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "admission_rejects_total",
+            dram.admission_rejects
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "evictions_total",
+            dram.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
         .field(
             "scaling_expand_total",
             dram.expand_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
