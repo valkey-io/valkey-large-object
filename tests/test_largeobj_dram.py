@@ -92,6 +92,28 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             expected = bytes([i % 256]) * 4096
             assert data == expected, f"Key multi{i} mismatch"
 
+    # ─── Keyspace event tests ────────────────────────────────────────────
+
+    def test_keyspace_events(self):
+        """BLOB.SET publishes largeobj.create on a new key and largeobj.update on overwrite."""
+        client = self.server.get_new_client()
+        pubsub = self.subscribe_keyspace_events(client)
+        client.execute_command('BLOB.SET', 'eventkey', b'A' * 4096)
+        client.execute_command('BLOB.SET', 'eventkey', b'B' * 8192)
+        assert self.read_keyspace_events(pubsub, 2) == [
+            ('largeobj.create', 'eventkey'),
+            ('largeobj.update', 'eventkey'),
+        ]
+        # A failed SET publishes nothing.
+        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '2097152')
+        try:
+            client.execute_command('BLOB.SET', 'toobig', b'D' * (4 * 1024 * 1024))
+            assert False, "Expected pool exhausted error"
+        except ResponseError:
+            pass
+        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '0')
+        assert self.read_keyspace_events(pubsub, 1) == []
+
     # ─── COPY callback tests ─────────────────────────────────────────────
 
     def test_copy(self):

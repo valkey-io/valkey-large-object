@@ -30,6 +30,17 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files) >= 1, "Tiered SET should create an NVMe .dat file"
 
+    def test_keyspace_events(self):
+        """Async NVMe commit publishes largeobj.create then largeobj.update."""
+        client = self.server.get_new_client()
+        pubsub = self.subscribe_keyspace_events(client)
+        client.execute_command('BLOB.SET', 'eventkey', b'A' * 4096)
+        client.execute_command('BLOB.SET', 'eventkey', b'B' * 8192)
+        assert self.read_keyspace_events(pubsub, 2) == [
+            ('largeobj.create', 'eventkey'),
+            ('largeobj.update', 'eventkey'),
+        ]
+
     def _dat_count(self):
         return len(glob.glob(os.path.join(self.data_dir, "*.dat")))
 

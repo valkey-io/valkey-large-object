@@ -23,7 +23,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use valkey_module::{ValkeyError, ValkeyValue, VALKEY_OK};
+use valkey_module::{NotifyEvent, ValkeyError, ValkeyValue, VALKEY_OK};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
@@ -166,16 +166,24 @@ fn commit_lo_value(
     let ctx = thread_ctx.lock();
     let key_str = ctx.create_string(key_name.to_vec());
     let key = ctx.open_key_writable(&key_str);
-    if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
-        if existing.object_id > object_id {
+    // One lookup drives both the version guard and the create/update event.
+    let event = match key.get_value::<LoValue>(&LO_TYPE) {
+        Ok(Some(existing)) if existing.object_id > object_id => {
             return Ok(CommitOutcome::StaleDiscarded);
         }
-    }
+        Ok(Some(_)) => EVENT_UPDATE,
+        _ => EVENT_CREATE,
+    };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key_str);
     Ok(CommitOutcome::ValueSet)
 }
+
+/// Keyspace event names published after a successful BLOB.SET.
+pub(crate) const EVENT_CREATE: &str = "largeobj.create";
+pub(crate) const EVENT_UPDATE: &str = "largeobj.update";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET Engine
@@ -624,11 +632,17 @@ fn cmd_set_dram_tcp(
         crc32c: crc,
         file: None,
     };
+    let event = if key.is_empty() {
+        EVENT_CREATE
+    } else {
+        EVENT_UPDATE
+    };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         dram_pool.remove_object(&object_id);
         info::SET_VALUE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, event, key_name);
     VALKEY_OK
 }
 

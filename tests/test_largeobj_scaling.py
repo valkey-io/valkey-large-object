@@ -140,14 +140,14 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         expand_before = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
         # Fill most of the 1MB segment with a TCP SET (900KB).
-        client.execute_command('LO.SET', 'filler', b'F' * (900 * 1024))
+        client.execute_command('BLOB.SET', 'filler', b'F' * (900 * 1024))
         # EFA SET of 4096 bytes — segment nearly full, must trigger expand.
         process, address, rkey, remote_addr = self.start_target('--read')
         try:
-            client.execute_command('LO.HELLO', address)
-            result = client.execute_command('LO.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr)
+            client.execute_command('BLOB.HELLO', address)
+            result = client.execute_command('BLOB.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr)
             assert result == b'OK', f"EFA SET failed: {result}"
-            assert client.execute_command('LO.GET', 'efa_key') == EFA_PATTERN * EFA_TARGET_LEN
+            assert client.execute_command('BLOB.GET', 'efa_key') == EFA_PATTERN * EFA_TARGET_LEN
             expand_after = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
             assert expand_after > expand_before, \
                 "Expected scaling_expand_total to increase from reactive EFA SET expand"
