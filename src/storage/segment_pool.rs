@@ -75,60 +75,14 @@ impl SegmentPool {
         }
     }
 
-    // ─── Allocator ───────────────────────────────────────────────────────────
-
-    /// Allocate up to `count` uniform buffers of `chunk_size` each, requiring at
-    /// least `min_required`. All-or-nothing when `min_required == count`.
-    ///
-    /// Each iteration walks the live non-draining segments in LEAST-LOADED-first
-    /// order under one state lock and attempts `talc.malloc`. Allocation may
-    /// return `None` when the segment allocator cannot satisfy the request.
-    ///
-    /// Returns `None` if fewer than `min_required` could be allocated (partial
-    /// allocation freed internally). Callers never need cleanup logic.
-    ///
-    /// Private — callers use `alloc_exact` (ObjectContext) or `alloc_window`
-    /// (StreamingContext) which derive correct geometry from `obj_len`.
-    fn alloc_n(
-        &self,
-        chunk_size: usize,
-        count: usize,
-        min_required: usize,
-    ) -> Option<Vec<SegmentBuffer>> {
-        assert!(chunk_size > 0, "alloc_n: chunk_size must be > 0");
-        assert!(count > 0, "alloc_n: count must be > 0");
-        assert!(min_required > 0, "alloc_n: min_required must be > 0");
-        assert!(
-            min_required <= count,
-            "alloc_n: min_required ({}) > count ({})",
-            min_required,
-            count
-        );
-        let aligned_size = super::align_up(chunk_size);
-        let layout = Layout::from_size_align(aligned_size, super::IO_ALIGN)
-            .expect("alloc_n: invalid chunk_size layout");
-        let mut buffers: Vec<SegmentBuffer> = Vec::with_capacity(count);
-        for _ in 0..count {
-            let Some(buf) = self.alloc_one(aligned_size, layout) else {
-                break;
-            };
-            buffers.push(buf);
-        }
-        if buffers.len() < min_required {
-            for buf in &buffers {
-                self.free(buf);
-            }
-            return None;
-        }
-        Some(buffers)
-    }
+    // ─── Allocator ─────────────────────────────────────────────────────────
 
     /// Allocate all the buffers needed for an entire object. All-or-nothing.
     /// First N-1 buffers are `chunk_size`; the last is trimmed to the
     /// remainder (or `chunk_size` when `obj_len` is an exact multiple).
     ///
     /// Used for ObjectContext (DRAM cache) allocations.
-    pub fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
+    pub(super) fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
         assert!(size > 0, "alloc_exact: size must be > 0");
         let chunk_size = crate::chunk_size();
         let total_chunks = size.div_ceil(chunk_size);
@@ -225,6 +179,48 @@ impl SegmentPool {
         Some(buffers)
     }
 
+    /// Allocate up to `count` uniform buffers of `chunk_size` each, requiring at
+    ///
+    /// Each iteration walks the live non-draining segments in LEAST-LOADED-first
+    /// order under one state lock and attempts `talc.malloc`. Allocation may
+    /// return `None` when the segment allocator cannot satisfy the request.
+    ///
+    /// Returns `None` if fewer than `min_required` could be allocated (partial
+    /// allocation freed internally). Callers never need cleanup logic.
+    fn alloc_n(
+        &self,
+        chunk_size: usize,
+        count: usize,
+        min_required: usize,
+    ) -> Option<Vec<SegmentBuffer>> {
+        assert!(chunk_size > 0, "alloc_n: chunk_size must be > 0");
+        assert!(count > 0, "alloc_n: count must be > 0");
+        assert!(min_required > 0, "alloc_n: min_required must be > 0");
+        assert!(
+            min_required <= count,
+            "alloc_n: min_required ({}) > count ({})",
+            min_required,
+            count
+        );
+        let aligned_size = super::align_up(chunk_size);
+        let layout = Layout::from_size_align(aligned_size, super::IO_ALIGN)
+            .expect("alloc_n: invalid chunk_size layout");
+        let mut buffers: Vec<SegmentBuffer> = Vec::with_capacity(count);
+        for _ in 0..count {
+            let Some(buf) = self.alloc_one(aligned_size, layout) else {
+                break;
+            };
+            buffers.push(buf);
+        }
+        if buffers.len() < min_required {
+            for buf in &buffers {
+                self.free(buf);
+            }
+            return None;
+        }
+        Some(buffers)
+    }
+
     /// One allocation: pick the least-loaded live, non-draining segment that
     /// clears the fast byte filter (single O(N) `min_by_key` pass, no sort, no
     /// candidate Vec), then attempt `talc.malloc`. Returns `None` if no segment
@@ -289,6 +285,8 @@ impl SegmentPool {
             len: aligned_size as u32,
         })
     }
+
+    // ─── Free ────────────────────────────────────────────────────────────────
 
     /// Free a buffer back to its owning segment.
     /// Uses `buf.segment_idx` directly — no reverse lookup needed.
@@ -532,15 +530,6 @@ impl SegmentPool {
 mod tests {
     use super::*;
 
-    // ── alloc_n (private, tested from within module) ───────────────────
-
-    #[test]
-    #[should_panic(expected = "alloc_n: min_required (3) > count (2)")]
-    fn test_alloc_n_panics_when_min_exceeds_count() {
-        let pool = SegmentPool::new(1, 65536);
-        pool.alloc_n(4096, 2, 3);
-    }
-
     // ── alloc_exact ──────────────────────────────────────────────────────
 
     #[test]
@@ -622,6 +611,14 @@ mod tests {
         for buf in &filler {
             pool.free(buf);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "alloc_exact: size must be > 0")]
+    fn test_alloc_exact_panics_on_zero_len() {
+        crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
+        let pool = SegmentPool::new(1, 65536);
+        pool.alloc_exact(0);
     }
 
     // ── alloc_window ─────────────────────────────────────────────────────
@@ -775,18 +772,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "alloc_exact: size must be > 0")]
-    fn test_alloc_exact_panics_on_zero_len() {
-        crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = SegmentPool::new(1, 65536);
-        pool.alloc_exact(0);
-    }
-
-    #[test]
     #[should_panic(expected = "alloc_window: size must be > 0")]
     fn test_alloc_window_panics_on_zero_len() {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
         let pool = SegmentPool::new(1, 65536);
         pool.alloc_window(0, 8, 2);
+    }
+
+    // ── alloc_n (private, tested from within module) ───────────────────
+
+    #[test]
+    #[should_panic(expected = "alloc_n: min_required (3) > count (2)")]
+    fn test_alloc_n_panics_when_min_exceeds_count() {
+        let pool = SegmentPool::new(1, 65536);
+        pool.alloc_n(4096, 2, 3);
     }
 }

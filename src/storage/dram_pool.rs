@@ -42,8 +42,36 @@ impl DRAMPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    pub fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
-        self.pool.alloc_exact(size)
+    /// Allocate all buffers for an object, expanding the pool as needed.
+    /// Try alloc_exact first; on failure, expand one segment and retry.
+    /// Terminates when alloc succeeds, try_expand returns None (dram-maxmemory
+    /// cap or server maxmemory watermark), or the iteration cap is reached.
+    ///
+    /// The cap — ceil(obj_len / segment_size) + 1 — is a roomy upper bound
+    /// to prevent OOM when both maxmemory and dram-maxmemory are unbounded
+    /// (0). The +1 accounts for per-allocation talc overhead that can push
+    /// the object's real footprint past one segment boundary.
+    ///
+    /// Callers on the main thread pass their command `&Context`; callers on
+    /// tokio workers or data-type callbacks pass `&Context::dummy()` (null ctx
+    /// is accepted by RM_GetServerInfo for the memory watermark check).
+    pub fn alloc_exact_or_expand(
+        &self,
+        ctx: &valkey_module::Context,
+        obj_len: u64,
+    ) -> Option<Vec<super::context::SegmentBuffer>> {
+        let max_expands = (obj_len as usize).div_ceil(self.pool.segment_size) + 1;
+        let mut expands = 0;
+        loop {
+            if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
+                return Some(bufs);
+            }
+            if expands >= max_expands {
+                return None;
+            }
+            self.try_expand(ctx)?;
+            expands += 1;
+        }
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {
@@ -121,11 +149,11 @@ impl DRAMPool {
     /// Returns None if pool is full or object exceeds max-promote-size.
     /// On success returns Arc<ObjectContext> in Filling state — caller reads
     /// NVMe data into the buffers, then calls mark_ready().
-    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_exact
-    /// with all-or-nothing semantics.
+    /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via
+    /// alloc_exact_or_expand with all-or-nothing semantics.
     ///
-    /// Pool full → returns None. Caller falls back to NVMe read (Tiered mode).
-    /// Expansion is the scaling cron's responsibility, not the GET hot path.
+    /// Pool full after expansion attempts → returns None. Caller falls back
+    /// to NVMe read (Tiered mode).
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
@@ -135,10 +163,12 @@ impl DRAMPool {
         if obj_len > crate::max_promote_size() {
             return None;
         }
-        // All-or-nothing: alloc_exact rolls back internally if pool can't satisfy.
+        // All-or-nothing with reactive expansion via dummy context (promotion
+        // runs on tokio workers — null ctx is accepted by RM_GetServerInfo).
         // Alloc BEFORE write lock — talc scan under memory pressure
         // won't block GET readers waiting on get_object().
-        let buffers = self.alloc_exact(obj_len as usize)?;
+        let dummy = valkey_module::Context::dummy();
+        let buffers = self.alloc_exact_or_expand(&dummy, obj_len)?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self

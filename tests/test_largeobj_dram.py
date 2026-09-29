@@ -60,9 +60,17 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         assert result is None
 
     def test_dram_pool_exhaustion(self):
-        """An object larger than segment-size fails with pool exhausted."""
+        """Pool exhaustion when dram-maxmemory caps expansion.
+        alloc_exact_or_expand loops expanding until the budget is hit.
+        A 4MB object needs >1 segment of 2MB; capping dram-maxmemory at
+        segment-size (2MB) blocks expansion, so the second segment never
+        appears and alloc fails.
+        """
         client = self.server.get_new_client()
-        # segment-size is 2MB. A 4MB object cannot be allocated.
+        # Clear leftover keys from prior tests so the pool has known capacity.
+        client.execute_command('FLUSHALL')
+        # Cap dram-maxmemory to segment-size (2MB) so expansion is blocked.
+        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '2097152')
         obj_size = 4 * 1024 * 1024
         payload = b'D' * obj_size
         try:
@@ -70,6 +78,8 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             assert False, "Expected pool exhausted error"
         except ResponseError as e:
             assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+        # Restore unlimited expansion for subsequent tests.
+        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '0')
 
     def test_multiple_objects(self):
         """Multiple small objects can coexist in DRAMPool."""
@@ -108,17 +118,26 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.GET', 'srckey2') == payload
 
     def test_copy_pool_exhausted(self):
-        """COPY fails when DRAMPool cannot fit the duplicate."""
+        """COPY fails when DRAMPool cannot fit the duplicate.
+        Uses a 1500KB object in a 2MB segment. After the SET succeeds,
+        COPY tries alloc_exact_or_expand. The pool has ~500KB free (2MB - 1500KB
+        - talc overhead), which is not enough for a second 1500KB object.
+        Expansion would add a 2MB segment, making COPY succeed — so we cap
+        dram-maxmemory to segment-size first.
+        """
         client = self.server.get_new_client()
-        # Fill most of the 2MB pool with a large object.
-        payload = b'F' * (1200 * 1024)
+        client.execute_command('FLUSHALL')
+        payload = b'F' * (1500 * 1024)
         client.execute_command('BLOB.SET', 'bigkey', payload)
-        # COPY needs another 1200KB — pool is only 2MB total.
+        # Now cap so COPY cannot expand.
+        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '2097152')
         try:
             client.execute_command('COPY', 'bigkey', 'bigcopy')
             assert False, "Expected COPY to fail with pool exhausted"
         except ResponseError:
-            pass  # Expected — pool cannot fit two 1200KB objects
+            pass  # Expected — pool cannot fit two 1500KB objects in 2MB
+        # Restore unlimited expansion for subsequent tests.
+        client.execute_command('CONFIG', 'SET', 'largeobj.dram-maxmemory', '0')
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 
