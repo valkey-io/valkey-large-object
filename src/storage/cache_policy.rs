@@ -1,9 +1,11 @@
 //! Cache policy primitives shared by DRAMPool and FdPool (see
 //! `docs/CACHE_POLICY_DESIGN.md`): `AccessStats` (Valkey-style LFU score),
-//! `GhostTable` (second-touch admission) and `IndexedMap` (a map with sampled
-//! eviction). None of them lock; the pools call them under their own locks.
+//! `GhostTable` (second-touch admission) and `IndexedMap` (an `IndexMap` with
+//! sampled demotion). None of them lock; the pools call them under their own locks.
 
 use std::collections::{HashMap, VecDeque};
+
+use indexmap::IndexMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -35,9 +37,9 @@ pub const LFU_LOG_FACTOR: u64 = 10;
 /// Ghost table capacity in ObjectIds (about 24 bytes each).
 pub const GHOST_CAPACITY: usize = 65_536;
 
-/// Most cached objects one promotion may evict to make room. Bounds the inline
-/// eviction loop on the main thread.
-pub const EVICT_MAX_VICTIMS: usize = 16;
+/// Most cached objects one promotion may demote to make room. Bounds the inline
+/// demotion loop on the main thread.
+pub const DEMOTE_MAX_VICTIMS: usize = 16;
 
 const COUNTER_MASK: u32 = 0xFF;
 const MINUTES_SHIFT: u32 = 8;
@@ -59,7 +61,7 @@ impl AccessStats {
     }
 
     /// Counter after applying decay for the minutes elapsed since the last
-    /// decay. This is what eviction ranks by. `decay_time == 0` disables decay.
+    /// decay. This is what demotion ranks by. `decay_time == 0` disables decay.
     pub fn decayed_counter(&self, now_min: u16, decay_time: u64) -> u8 {
         let raw = self.0.load(Ordering::Relaxed);
         decay(
@@ -146,7 +148,7 @@ impl GhostTable {
         1
     }
 
-    /// Evict the oldest entry if the table is full. Entries are never removed
+    /// Drop the oldest entry if the table is full. Entries are never removed
     /// out of order, so `hits` and `order` always hold the same OIDs.
     fn make_room(&mut self) {
         if self.hits.len() >= self.capacity {
@@ -159,7 +161,7 @@ impl GhostTable {
 
 // ─── Sampled victim selection ────────────────────────────────────────────────
 
-/// Lowest-scoring evictable slot among up to `samples` slots in `0..len`;
+/// Lowest-scoring unpinned slot among up to `samples` slots in `0..len`;
 /// `probe` returns `None` for a pinned slot. Maps with `len <= samples` are
 /// scanned fully (exact); larger ones get `samples` random draws, as in Valkey.
 fn sample_victim<F>(len: usize, samples: usize, mut probe: F) -> Option<usize>
@@ -188,118 +190,23 @@ where
 
 // ─── IndexedMap ──────────────────────────────────────────────────────────────
 
-/// A map from `ObjectId` that can also be sampled by slot, which `HashMap`
-/// cannot. Each entry stores its position in `index`; `remove` is a
-/// `swap_remove` that fixes the moved entry's position. O(1) except `retain`.
-#[derive(Debug)]
-pub struct IndexedMap<V> {
-    entries: HashMap<ObjectId, (V, usize)>,
-    index: Vec<ObjectId>,
-}
+/// A map from `ObjectId` that can also be sampled by slot. `IndexMap` keeps
+/// entries in a dense `Vec`, so a sample is a direct index with no hashing,
+/// and `swap_remove` is O(1).
+pub type IndexedMap<V> = IndexMap<ObjectId, V>;
 
-// Manual rather than derived: derive would demand `V: Default`, which neither
-// pool's value type has.
-impl<V> Default for IndexedMap<V> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<V> IndexedMap<V> {
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            index: Vec::new(),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.index.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
-    }
-
-    pub fn get(&self, oid: &ObjectId) -> Option<&V> {
-        self.entries.get(oid).map(|(v, _)| v)
-    }
-
-    pub fn contains_key(&self, oid: &ObjectId) -> bool {
-        self.entries.contains_key(oid)
-    }
-
-    /// Insert or replace. Replacing keeps the existing slot.
-    pub fn insert(&mut self, oid: ObjectId, value: V) {
-        if let Some((old, _)) = self.entries.get_mut(&oid) {
-            *old = value;
-            return;
-        }
-        self.entries.insert(oid, (value, self.index.len()));
-        self.index.push(oid);
-    }
-
-    pub fn remove(&mut self, oid: &ObjectId) -> Option<V> {
-        let (value, pos) = self.entries.remove(oid)?;
-        self.index.swap_remove(pos);
-        if let Some(moved) = self.index.get(pos) {
-            self.entries
-                .get_mut(moved)
-                .expect("IndexedMap: index entry missing from map")
-                .1 = pos;
-        }
-        Some(value)
-    }
-
-    /// Remove and return the lowest-scoring entry among up to `samples` slots
-    /// (see `sample_victim`). `score` returns `None` for a pinned entry.
-    pub fn evict_one<F>(&mut self, samples: usize, mut score: F) -> Option<(ObjectId, V)>
-    where
-        F: FnMut(&V) -> Option<u8>,
-    {
-        let slot = sample_victim(self.len(), samples, |s| score(self.slot(s).1))?;
-        Some(self.remove_slot(slot))
-    }
-
-    /// Remove the entry at `slot` in `0..len()`.
-    fn remove_slot(&mut self, slot: usize) -> (ObjectId, V) {
-        let oid = self.index[slot];
-        let value = self
-            .remove(&oid)
-            .expect("IndexedMap: index entry missing from map");
-        (oid, value)
-    }
-
-    /// Entry at a slot in `0..len()`. For sampling.
-    fn slot(&self, slot: usize) -> (&ObjectId, &V) {
-        let oid = &self.index[slot];
-        let (value, _) = self
-            .entries
-            .get(oid)
-            .expect("IndexedMap: index entry missing from map");
-        (oid, value)
-    }
-
-    /// Keep only entries for which `f` returns true. Rebuilds the index.
-    pub fn retain<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&ObjectId, &V) -> bool,
-    {
-        self.entries.retain(|oid, (v, _)| f(oid, v));
-        self.index.clear();
-        for (oid, (_, pos)) in self.entries.iter_mut() {
-            *pos = self.index.len();
-            self.index.push(*oid);
-        }
-    }
-
-    #[cfg(test)]
-    fn check_invariants(&self) {
-        assert_eq!(self.entries.len(), self.index.len());
-        for (slot, oid) in self.index.iter().enumerate() {
-            assert_eq!(self.entries[oid].1, slot, "slot mismatch for {oid:?}");
-        }
-    }
+/// Remove and return the lowest-scoring entry among up to `samples` slots
+/// (see `sample_victim`). `score` returns `None` for a pinned entry.
+pub fn demote_one<V, F>(
+    map: &mut IndexedMap<V>,
+    samples: usize,
+    mut score: F,
+) -> Option<(ObjectId, V)>
+where
+    F: FnMut(&V) -> Option<u8>,
+{
+    let slot = sample_victim(map.len(), samples, |s| score(&map[s]))?;
+    map.swap_remove_index(slot)
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
@@ -352,7 +259,7 @@ mod tests {
     // ─── GhostTable ───
 
     #[test]
-    fn ghost_counts_misses_and_evicts_oldest() {
+    fn ghost_counts_misses_and_drops_oldest() {
         let mut g = GhostTable::new(3);
         assert_eq!(g.record_miss(ObjectId(1)), 1);
         assert_eq!(g.record_miss(ObjectId(1)), 2);
@@ -371,7 +278,7 @@ mod tests {
     #[test]
     fn sample_victim_scans_small_maps_and_skips_pinned() {
         // len <= samples: every slot is probed exactly once, so the minimum
-        // evictable score is found exactly. Slot 1 (score 3) is pinned.
+        // demotable score is found exactly. Slot 1 (score 3) is pinned.
         let scores = [50u8, 3, 20, 7];
         let mut probed = [0u32; 4];
         let v = sample_victim(4, 4, |i| {
@@ -397,52 +304,26 @@ mod tests {
             probed.insert(i);
             Some(i as u8)
         })
-        .expect("some slot is evictable");
+        .expect("some slot is unpinned");
         assert!(!probed.is_empty() && probed.len() <= 64, "{probed:?}");
         assert_eq!(Some(&v), probed.iter().next());
     }
 
-    // ─── IndexedMap ───
+    // ─── demote_one ───
 
     #[test]
-    fn indexed_map_insert_remove_keeps_slots_consistent() {
-        let mut m: IndexedMap<u32> = IndexedMap::new();
-        for i in 0..10u64 {
-            m.insert(ObjectId(i), i as u32 * 10);
+    fn demote_one_removes_lowest_unpinned() {
+        let mut m: IndexedMap<u8> = IndexedMap::new();
+        for (i, score) in [50u8, 3, 20, 7].into_iter().enumerate() {
+            m.insert(ObjectId(i as u64), score);
         }
-        // Replacing keeps the slot and the length.
-        m.insert(ObjectId(1), 10);
-        assert_eq!((m.len(), m.get(&ObjectId(1))), (10, Some(&10)));
-        m.check_invariants();
-        // Remove from the middle, the head, and the tail.
-        for oid in [4u64, 0, 9] {
-            assert_eq!(m.remove(&ObjectId(oid)), Some(oid as u32 * 10));
-            m.check_invariants();
-        }
-        assert_eq!(m.remove(&ObjectId(99)), None);
-        // Remove by slot at the tail, the head, and the middle.
-        for s in [m.len() - 1, 0, m.len() / 2] {
-            let (oid, v) = m.slot(s);
-            let expected = (*oid, *v);
-            assert_eq!(m.remove_slot(s), expected);
-            assert!(!m.contains_key(&expected.0));
-            m.check_invariants();
-        }
-        assert_eq!(m.len(), 4);
-    }
-
-    #[test]
-    fn indexed_map_retain_rebuilds_index() {
-        let mut m: IndexedMap<u64> = IndexedMap::new();
-        for i in 0..20u64 {
-            m.insert(ObjectId(i), i);
-        }
-        m.retain(|_, v| v % 3 == 0);
-        m.check_invariants();
-        assert_eq!(m.len(), 7);
-        assert!(!m.contains_key(&ObjectId(19)));
-        // Still removable after the rebuild.
-        assert_eq!(m.remove(&ObjectId(0)), Some(0));
-        m.check_invariants();
+        // Score 3 is pinned, so 7 is the victim.
+        let v = demote_one(&mut m, 16, |&s| (s != 3).then_some(s));
+        assert_eq!(v, Some((ObjectId(3), 7)));
+        assert_eq!(m.len(), 3);
+        assert!(!m.contains_key(&ObjectId(3)));
+        // Everything pinned: nothing removed.
+        assert_eq!(demote_one(&mut m, 16, |_| None), None);
+        assert_eq!(m.len(), 3);
     }
 }

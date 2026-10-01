@@ -124,10 +124,10 @@ lazy_static::lazy_static! {
     /// promotes it into DRAMPool. Default: 2.
     static ref CFG_PROMOTE_MIN_HITS: AtomicI64 = AtomicI64::new(2);
 
-    /// Entries sampled per eviction round; the lowest LFU score is evicted.
-    static ref CFG_EVICT_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(5);
+    /// Entries sampled per demotion round; the lowest LFU score is demoted.
+    static ref CFG_DEMOTE_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(5);
 
-    /// Cap on read fds cached by the FdPool. When full, opening a new fd evicts
+    /// Cap on read fds cached by the FdPool. When full, opening a new fd demotes
     /// the lowest LFU score among samples. 0 means unlimited.
     static ref CFG_MAX_OPEN_FDS: AtomicI64 = AtomicI64::new(1024);
 
@@ -278,8 +278,8 @@ pub fn promote_min_hits() -> u8 {
     CFG_PROMOTE_MIN_HITS.load(std::sync::atomic::Ordering::Relaxed) as u8
 }
 
-pub fn evict_sample_size() -> usize {
-    CFG_EVICT_SAMPLE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn demote_sample_size() -> usize {
+    CFG_DEMOTE_SAMPLE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn max_open_fds() -> usize {
@@ -572,7 +572,7 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, None],
             ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, 2, 1, 255,
              ConfigurationFlags::DEFAULT, None, None],
-            ["evict-sample-size", &*CFG_EVICT_SAMPLE_SIZE, 5, 1, 64,
+            ["demote-sample-size", &*CFG_DEMOTE_SAMPLE_SIZE, 5, 1, 64,
              ConfigurationFlags::DEFAULT, None, None],
             ["max-open-fds", &*CFG_MAX_OPEN_FDS, 1024, 0, 1_048_576,
              ConfigurationFlags::DEFAULT, None, None],

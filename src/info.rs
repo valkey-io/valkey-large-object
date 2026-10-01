@@ -47,8 +47,8 @@ fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .add_section("largeobj_fd")
         .field("open_fds", fds.len() as i64)?
         .field(
-            "fd_evictions_total",
-            fds.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            "fd_demotions_total",
+            fds.demotions.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .build_section()?
         .build_info()
@@ -93,8 +93,8 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
                 .load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
-            "evictions_total",
-            dram.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            "demotions_total",
+            dram.demotions.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
             "scaling_expand_total",

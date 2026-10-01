@@ -20,7 +20,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
-use super::policy::{now_minutes, AccessStats};
+use super::cache_policy::{now_minutes, AccessStats};
 
 // ─── SegmentBuffer ───────────────────────────────────────────────────────────
 

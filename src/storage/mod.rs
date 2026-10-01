@@ -10,13 +10,13 @@ use crc_fast::CrcAlgorithm;
 /// in the `FileHeader`/`LoValue`; the `checksum_combine` accumulator widens to
 /// `u64` internally, which is a crc-fast API detail, not this type.
 pub type Crc = u32;
+pub mod cache_policy;
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
 pub mod nvme;
 pub mod nvme_pool;
 pub mod object_file;
-pub mod policy;
 pub mod scaling;
 pub mod segment;
 pub mod segment_pool;

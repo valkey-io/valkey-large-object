@@ -10,11 +10,11 @@
 //!   1. **Reuse** — avoid a fresh `open()` on every GET.
 //!   2. **Serialize the lazy first-open** — the write lock stops two concurrent first-GETs
 //!      on a cold object from both `open()`-ing and leaking an fd.
-//!   3. **Own the fd independently of `ObjectFile`** — eviction drops the pool's ref to
+//!   3. **Own the fd independently of `ObjectFile`** — demotion drops the pool's ref to
 //!      reclaim a cold fd without disturbing in-flight readers that still hold one.
 //!
-//! Cap and eviction (`docs/CACHE_POLICY_DESIGN.md` §4.8): with `max-open-fds` set, a
-//! full pool evicts the lowest-scoring fd not held by a reader. If every sampled fd is
+//! Cap and demotion (`docs/CACHE_POLICY_DESIGN.md` §4.8): with `max-open-fds` set, a
+//! full pool demotes the lowest-scoring fd not held by a reader. If every sampled fd is
 //! held, the new fd is handed out uncached and closes when the reader finishes.
 //!
 //! `remove` drops the pool's ref; `ObjectFile::Drop` (on delete) calls it. There is no
@@ -25,7 +25,7 @@ use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use super::policy::{now_minutes, AccessStats, IndexedMap};
+use super::cache_policy::{demote_one, now_minutes, AccessStats, IndexedMap};
 use crate::data_type::ObjectId;
 
 /// One cached fd plus its LFU score.
@@ -37,7 +37,7 @@ struct FdEntry {
 pub struct FdPool {
     fds: RwLock<IndexedMap<FdEntry>>,
     /// Cached fds dropped to stay under `max-open-fds`.
-    pub evictions: AtomicU64,
+    pub demotions: AtomicU64,
 }
 
 impl Default for FdPool {
@@ -50,7 +50,7 @@ impl FdPool {
     pub fn new() -> Self {
         Self {
             fds: RwLock::new(IndexedMap::new()),
-            evictions: AtomicU64::new(0),
+            demotions: AtomicU64::new(0),
         }
     }
 
@@ -93,13 +93,13 @@ impl FdPool {
         }
 
         // Make room before opening, so the cap counts the new entry. An entry is
-        // evictable only when the map holds its sole Arc; cloning needs the read
+        // demotable only when the map holds its sole Arc; cloning needs the read
         // lock, so a count of 1 seen here stays 1. Victims close after unlock.
         let mut victims = Vec::new();
         if cap > 0 && fds.len() >= cap {
-            let samples = crate::evict_sample_size();
+            let samples = crate::demote_sample_size();
             for _ in 0..fds.len() + 1 - cap {
-                let Some((_, entry)) = fds.evict_one(samples, |e| {
+                let Some((_, entry)) = demote_one(&mut fds, samples, |e| {
                     (Arc::strong_count(&e.fd) == 1)
                         .then(|| e.stats.decayed_counter(now_min, decay_time))
                 }) else {
@@ -107,7 +107,7 @@ impl FdPool {
                 };
                 victims.push(entry.fd);
             }
-            self.evictions
+            self.demotions
                 .fetch_add(victims.len() as u64, Ordering::Relaxed);
         }
         let cache_it = cap == 0 || fds.len() < cap;
@@ -150,7 +150,7 @@ impl FdPool {
             .fds
             .write()
             .expect("FdPool.fds lock unavailable")
-            .remove(&object_id);
+            .swap_remove(&object_id);
         drop(removed);
     }
 
@@ -290,10 +290,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ─── Cap and eviction ───
+    // ─── Cap and demotion ───
 
     #[test]
-    fn cap_evicts_lowest_score_and_keeps_hot() {
+    fn cap_demotes_lowest_score_and_keeps_hot() {
         let files = Files::new(1, 4);
         let pool = FdPool::new();
         let k = 3;
@@ -311,12 +311,12 @@ mod tests {
             pool.get_or_open_with(*oid, &files.dir, k).unwrap();
         }
 
-        // A fourth open must evict exactly one entry: the cold oid[0].
+        // A fourth open must demote exactly one entry: the cold oid[0].
         pool.get_or_open_with(files.oids[3], &files.dir, k).unwrap();
         assert_eq!(pool.len(), 3, "cap respected");
-        assert!(!pool.contains(files.oids[0]), "cold fd evicted");
+        assert!(!pool.contains(files.oids[0]), "cold fd demoted");
         assert!(files.oids[1..].iter().all(|o| pool.contains(*o)));
-        assert_eq!(pool.evictions.load(Ordering::Relaxed), 1);
+        assert_eq!(pool.demotions.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -334,7 +334,7 @@ mod tests {
         let extra = pool.get_or_open_with(files.oids[2], &files.dir, k).unwrap();
         assert_eq!(pool.len(), 2, "cap holds");
         assert!(!pool.contains(files.oids[2]));
-        assert_eq!(pool.evictions.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.demotions.load(Ordering::Relaxed), 0);
         drop(extra);
 
         // Once a reader releases, the next open caches again.

@@ -17,6 +17,7 @@ crossbeam-channel = "0.5"
 dma-libfabric = { git = "https://github.com/momentohq/vdma.git", rev = "e2679fb03fb62daf4c04d15c2cf89772788857bf" }
 dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = "e2679fb03fb62daf4c04d15c2cf89772788857bf" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+indexmap = "2"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 lazy_static = "1"
 nvme-telem = "0.3.3"

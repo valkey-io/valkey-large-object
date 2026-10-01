@@ -14,15 +14,17 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use super::cache_policy::{
+    demote_one, now_minutes, GhostTable, IndexedMap, DEMOTE_MAX_VICTIMS, GHOST_CAPACITY,
+};
 use super::context::{ObjectContext, SegmentBuffer};
-use super::policy::{now_minutes, GhostTable, IndexedMap, EVICT_MAX_VICTIMS, GHOST_CAPACITY};
 use super::segment_pool::SegmentPool;
 use crate::data_type::ObjectId;
 
 pub struct DRAMPool {
     pool: SegmentPool,
     /// Cached objects: ObjectId → Arc<ObjectContext>, plus a slot index so
-    /// eviction can sample at random.
+    /// demotion can sample at random.
     /// RwLock: main thread reads (GET hit), tokio writes (promotion insert).
     objects: RwLock<IndexedMap<Arc<ObjectContext>>>,
     /// Cumulative count of successful expand operations since module load.
@@ -38,8 +40,8 @@ pub struct DRAMPool {
     /// Tiered GET misses served transiently because the object had not yet
     /// accumulated `promote-min-hits` misses in the ghost table.
     pub admission_rejects: AtomicU64,
-    /// Cached copies removed by `evict_cached_for`; keys untouched.
-    pub evictions: AtomicU64,
+    /// Cached copies removed by `demote_for`; keys untouched.
+    pub demotions: AtomicU64,
     /// Second-touch admission filter. Touched only on the miss path.
     ghost: Mutex<GhostTable>,
 }
@@ -55,7 +57,7 @@ impl DRAMPool {
             cache_misses: AtomicU64::new(0),
             promotions: AtomicU64::new(0),
             admission_rejects: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
+            demotions: AtomicU64::new(0),
             ghost: Mutex::new(GhostTable::new(GHOST_CAPACITY)),
         }
     }
@@ -154,7 +156,7 @@ impl DRAMPool {
         self.objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
-            .remove(oid)
+            .swap_remove(oid)
     }
 
     /// Check if object exists (coalesce check — is promotion in progress?).
@@ -179,7 +181,7 @@ impl DRAMPool {
     /// buffers, then calls mark_ready().
     /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via alloc_exact
     /// with all-or-nothing semantics.
-    /// If the pool is full, evicts cold cached copies and retries once.
+    /// If the pool is full, demotes cold cached copies and retries once.
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
@@ -189,7 +191,7 @@ impl DRAMPool {
         // Alloc BEFORE write lock — talc scan under memory pressure
         // won't block GET readers waiting on get_object().
         let mut buffers = self.alloc_exact(obj_len as usize);
-        if buffers.is_none() && self.evict_cached_for(obj_len as usize) {
+        if buffers.is_none() && self.demote_for(obj_len as usize) {
             buffers = self.alloc_exact(obj_len as usize);
         }
         let buffers = buffers?;
@@ -210,25 +212,25 @@ impl DRAMPool {
         Some(obj_ctx)
     }
 
-    // ─── Eviction ────────────────────────────────────────────────────────────
+    // ─── Demotion ────────────────────────────────────────────────────────────
 
-    /// Evict up to `EVICT_MAX_VICTIMS` low-score cached copies (Tiered only; the
-    /// data stays on NVMe) to free `need` bytes. Evicts nothing if that plus free
-    /// space can't cover `need`. True if anything was evicted.
-    pub fn evict_cached_for(&self, need: usize) -> bool {
-        let (count, _bytes) = self.evict_victims_with(need, self.free_bytes(), EVICT_MAX_VICTIMS);
+    /// Demote up to `DEMOTE_MAX_VICTIMS` low-score cached copies (Tiered only; the
+    /// data stays on NVMe) to free `need` bytes. Demotes nothing if that plus free
+    /// space can't cover `need`. True if anything was demoted.
+    pub fn demote_for(&self, need: usize) -> bool {
+        let (count, _bytes) = self.demote_with(need, self.free_bytes(), DEMOTE_MAX_VICTIMS);
         count > 0
     }
 
-    /// Eviction loop with free space and the round limit explicit for tests.
-    /// Only entries whose sole `Arc` is in the map are evicted.
-    pub(crate) fn evict_victims_with(
+    /// Demotion loop with free space and the round limit explicit for tests.
+    /// Only entries whose sole `Arc` is in the map are demoted.
+    pub(crate) fn demote_with(
         &self,
         need: usize,
         free_now: usize,
         max_victims: usize,
     ) -> (usize, usize) {
-        let samples = crate::evict_sample_size();
+        let samples = crate::demote_sample_size();
         let now_min = now_minutes();
         let decay_time = crate::lfu_decay_time();
         let mut victims: Vec<(ObjectId, Arc<ObjectContext>)> = Vec::new();
@@ -238,11 +240,13 @@ impl DRAMPool {
                 .objects
                 .write()
                 .expect("DRAMPool.objects lock unavailable");
+            // Loop until victims alone cover `need`, but roll back only if
+            // victims plus `free_now` fall short: `free_now` is an upper bound.
             for _ in 0..max_victims {
                 if freed >= need {
                     break;
                 }
-                let Some((oid, ctx)) = objects.evict_one(samples, |ctx| {
+                let Some((oid, ctx)) = demote_one(&mut objects, samples, |ctx| {
                     (Arc::strong_count(ctx) == 1)
                         .then(|| ctx.stats.decayed_counter(now_min, decay_time))
                 }) else {
@@ -259,7 +263,7 @@ impl DRAMPool {
             }
         }
         let count = victims.len();
-        self.evictions.fetch_add(count as u64, Ordering::Relaxed);
+        self.demotions.fetch_add(count as u64, Ordering::Relaxed);
         drop(victims);
         (count, freed)
     }
@@ -267,7 +271,7 @@ impl DRAMPool {
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
 
     /// Unallocated bytes across live segments. Ignores talc overhead, so it is
-    /// an upper bound; used only to rule out hopeless evictions.
+    /// an upper bound; used only to rule out hopeless demotions.
     fn free_bytes(&self) -> usize {
         (self.pool.live_segment_count() * self.pool.segment_size)
             .saturating_sub(self.pool.allocated_bytes())
@@ -388,7 +392,7 @@ impl DRAMPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::policy::LFU_INIT_VAL;
+    use crate::storage::cache_policy::LFU_INIT_VAL;
 
     const BUF: u32 = 4096;
 
@@ -407,10 +411,10 @@ mod tests {
     }
 
     #[test]
-    fn evicts_lowest_score_and_skips_pinned() {
+    fn demotes_lowest_score_and_skips_pinned() {
         let p = pool();
         // Empty map: nothing to sample.
-        assert_eq!(p.evict_victims_with(1, 0, 16), (0, 0));
+        assert_eq!(p.demote_with(1, 0, 16), (0, 0));
         let hot = ctx(0);
         hot.stats.set(LFU_INIT_VAL + 10, now_minutes());
         let pinned = ctx(2); // counter 5 but held by us
@@ -418,7 +422,7 @@ mod tests {
         p.insert_object(ObjectId(2), ctx(1)); // counter 5
         p.insert_object(ObjectId(3), pinned.clone());
 
-        let (n, bytes) = p.evict_victims_with(1, 0, 1);
+        let (n, bytes) = p.demote_with(1, 0, 1);
         assert_eq!((n, bytes), (1, BUF as usize));
         assert!(p.contains_object(&ObjectId(1)), "hot object must survive");
         assert!(
@@ -429,11 +433,11 @@ mod tests {
             p.contains_object(&ObjectId(3)),
             "pinned object must survive"
         );
-        assert_eq!(p.evictions.load(Ordering::Relaxed), 1);
+        assert_eq!(p.demotions.load(Ordering::Relaxed), 1);
 
         // Pin the hot entry too: every entry is now pinned, so nothing goes.
         let _hot = p.get_object(&ObjectId(1)).unwrap();
-        assert_eq!(p.evict_victims_with(1, 0, 16), (0, 0));
+        assert_eq!(p.demote_with(1, 0, 16), (0, 0));
         assert_eq!(p.object_count(), 2);
     }
 
@@ -443,26 +447,23 @@ mod tests {
         for i in 0..4u16 {
             p.insert_object(ObjectId(i as u64), ctx(i));
         }
-        let (n, bytes) = p.evict_victims_with(2 * BUF as usize, 0, 16);
+        let (n, bytes) = p.demote_with(2 * BUF as usize, 0, 16);
         assert_eq!((n, bytes), (2, 2 * BUF as usize));
         assert_eq!(p.object_count(), 2);
     }
 
     #[test]
-    fn evicts_nothing_when_victims_cannot_cover_need() {
+    fn demotes_nothing_when_victims_cannot_cover_need() {
         let p = pool();
         for i in 0..4u16 {
             p.insert_object(ObjectId(i as u64), ctx(i));
         }
         // The 2-round cap frees 2 BUF, plus 1 BUF free: short of 4 BUF. Roll back.
-        assert_eq!(
-            p.evict_victims_with(4 * BUF as usize, BUF as usize, 2),
-            (0, 0)
-        );
+        assert_eq!(p.demote_with(4 * BUF as usize, BUF as usize, 2), (0, 0));
         assert_eq!(p.object_count(), 4);
-        assert_eq!(p.evictions.load(Ordering::Relaxed), 0);
+        assert_eq!(p.demotions.load(Ordering::Relaxed), 0);
         // The same need with enough free space goes through.
-        let (n, _) = p.evict_victims_with(4 * BUF as usize, 2 * BUF as usize, 2);
+        let (n, _) = p.demote_with(4 * BUF as usize, 2 * BUF as usize, 2);
         assert_eq!(n, 2);
         assert_eq!(p.object_count(), 2);
     }

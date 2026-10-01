@@ -310,7 +310,7 @@ fn cmd_get_tiered(
     // Everything below reads from NVMe, whether or not it also promotes.
     dram_pool.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
-    // Admit via the ghost table, then allocate (evicting cold copies if full).
+    // Admit via the ghost table, then allocate (demoting cold copies if full).
     // Skip both if another GET is already promoting this OID (Filling).
     let promoted = if !filling && dram_pool.admit(object_id, obj_len) {
         dram_pool.try_promote_object(object_id, obj_len)

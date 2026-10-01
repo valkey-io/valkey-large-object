@@ -838,14 +838,14 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('LO.INFO', 'three_key', 'TIER') == b'dram'
 
 
-# ─── Inline eviction ────────────────────────────────────────────────────────
+# ─── Inline demotion ────────────────────────────────────────────────────────
 
 
-class TestLargeObjTieredEviction(ValkeyLargeObjTestCaseBase):
+class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
     """One 1 MiB segment, no room to grow (dram-maxmemory == segment-size), so a
-    promotion into a full pool must evict. promote-min-hits 1 so every GET
+    promotion into a full pool must demote. promote-min-hits 1 so every GET
     promotes; decay off so scores are stable across a minute boundary. The
-    default evict-sample-size (5) exceeds the 3-entry map, so victim selection
+    default demote-sample-size (5) exceeds the 3-entry map, so victim selection
     scans every entry and is exact. 256 KiB objects: three fill 768 KiB; a
     fourth needs the remaining 256 KiB exactly, which any allocator overhead
     denies."""
@@ -868,8 +868,8 @@ class TestLargeObjTieredEviction(ValkeyLargeObjTestCaseBase):
             f" direct-io no"
         )
 
-    def test_evicts_lowest_score_object(self):
-        """A fourth promotion into the full pool evicts exactly one cold object and
+    def test_demotes_lowest_score_object(self):
+        """A fourth promotion into the full pool demotes exactly one cold object and
         never the hot one."""
         client = self.server.get_new_client()
         # SET and promote three objects that fill the single segment.
@@ -879,7 +879,7 @@ class TestLargeObjTieredEviction(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('LO.GET', k) == payload
         info = client.info('largeobj_largeobj_dram')
         assert info['largeobj_cached_objects'] == 3
-        assert info['largeobj_evictions_total'] == 0
+        assert info['largeobj_demotions_total'] == 0
         assert info['largeobj_live_segments'] == 1
 
         hot = self.KEYS[0]
@@ -891,7 +891,7 @@ class TestLargeObjTieredEviction(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('LO.GET', 'ev_new') == payload
 
         info = client.info('largeobj_largeobj_dram')
-        assert info['largeobj_evictions_total'] == 1
+        assert info['largeobj_demotions_total'] == 1
         assert info['largeobj_cached_objects'] == 3
         assert info['largeobj_live_segments'] == 1
         assert info['largeobj_scaling_expand_total'] == 0
@@ -900,16 +900,16 @@ class TestLargeObjTieredEviction(ValkeyLargeObjTestCaseBase):
         tiers = [client.execute_command('LO.INFO', k, 'TIER') for k in self.KEYS[1:]]
         assert tiers.count(b'nvme') == 1, tiers
 
-        # The evicted copy is still on NVMe and reads back intact.
-        evicted = self.KEYS[1:][tiers.index(b'nvme')]
-        idx = self.KEYS.index(evicted)
-        assert client.execute_command('LO.GET', evicted) == bytes([65 + idx]) * self.OBJ
+        # The demoted copy is still on NVMe and reads back intact.
+        demoted = self.KEYS[1:][tiers.index(b'nvme')]
+        idx = self.KEYS.index(demoted)
+        assert client.execute_command('LO.GET', demoted) == bytes([65 + idx]) * self.OBJ
 
 
 class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
     """max-open-fds 2 with promotion effectively off (promote-min-hits 255), so
     every GET reads through the fd pool. Decay off so scores are stable across
-    a minute boundary. The default evict-sample-size (5) exceeds the 2-entry
+    a minute boundary. The default demote-sample-size (5) exceeds the 2-entry
     map, so victim selection scans both entries and is exact."""
 
     OBJ = 64 * 1024
@@ -934,7 +934,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         return bytes([65 + i]) * self.OBJ
 
     def test_cap_respected_and_reads_succeed(self):
-        """Reading more objects than the cap keeps open_fds at the cap, evicts
+        """Reading more objects than the cap keeps open_fds at the cap, demotes
         exactly the overflow, and every read still returns the right bytes."""
         client = self.server.get_new_client()
         for i, k in enumerate(self.KEYS):
@@ -947,7 +947,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
 
         info = client.info('largeobj_largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_evictions_total'] == 3
+        assert info['largeobj_fd_demotions_total'] == 3
         # Nothing was promoted, so these were all NVMe reads.
         dram = client.info('largeobj_largeobj_dram')
         assert dram['largeobj_cached_objects'] == 0
@@ -957,10 +957,10 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('LO.GET', k) == self._payload(i)
         info = client.info('largeobj_largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        evictions = info['largeobj_fd_evictions_total']
+        demotions = info['largeobj_fd_demotions_total']
 
         # DEL drops the pool's fd through ObjectFile::Drop, so the next open
-        # takes the free slot instead of evicting. KEYS[4] was read last, so
+        # takes the free slot instead of demoting. KEYS[4] was read last, so
         # its fd is one of the two cached.
         client.execute_command('DEL', self.KEYS[4])
         wait_for_equal(
@@ -968,7 +968,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('LO.GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_evictions_total'] == evictions
+        assert info['largeobj_fd_demotions_total'] == demotions
 
     def test_lower_cap_at_runtime(self):
         """CONFIG SET to a smaller cap takes effect on the next open."""
@@ -983,4 +983,4 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('LO.GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_largeobj_fd')
         assert info['largeobj_open_fds'] == 1
-        assert info['largeobj_fd_evictions_total'] == 2
+        assert info['largeobj_fd_demotions_total'] == 2
