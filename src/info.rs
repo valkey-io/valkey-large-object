@@ -66,7 +66,8 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let allocated = dram.allocated_bytes();
     let util_pct = (allocated * 100).checked_div(capacity).unwrap_or(0) as i64;
 
-    ctx.builder()
+    let mut section = ctx
+        .builder()
         .add_section("dram")
         .field("dram_live_segments", live as i64)?
         .field("draining_segments", draining as i64)?
@@ -75,35 +76,18 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("dram_fragment_count", dram.fragment_count() as i64)?
         .field("capacity_bytes", capacity as i64)?
         .field("utilization_pct", util_pct)?
-        .field("cached_objects", dram.object_count() as i64)?
-        .field(
-            "cache_hits_total",
-            dram.tiered.hits.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "cache_misses_total",
-            dram.tiered
-                .misses
-                .load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "promotions_total",
-            dram.tiered
-                .promotions
-                .load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "admission_rejects_total",
-            dram.tiered
-                .admission_rejects
-                .load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "demotions_total",
-            dram.tiered
-                .demotions
-                .load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
+        .field("cached_objects", dram.object_count() as i64)?;
+    // Cache policy counters exist only in Tiered mode.
+    if let Some(policy) = &dram.policy {
+        let counts = policy.counts();
+        section = section
+            .field("cache_hits_total", counts.hits as i64)?
+            .field("cache_misses_total", counts.misses as i64)?
+            .field("promotions_total", counts.promotions as i64)?
+            .field("admission_rejects_total", counts.admission_rejects as i64)?
+            .field("demotions_total", counts.demotions as i64)?;
+    }
+    section
         .field(
             "scaling_expand_total",
             dram.expand_count.load(std::sync::atomic::Ordering::Relaxed) as i64,

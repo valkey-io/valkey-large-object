@@ -81,7 +81,7 @@ Operations, all on `AccessStats` in `src/storage/cache_policy.rs`:
 
 ### 4.2 Where the score lives
 
-`ObjectContext` has `pub stats: AccessStats`. The tiered GET hit path calls `DRAMPool::record_hit`, which touches the score and counts the hit, with no write lock. The touch is not inside `get_object`, because `LO.INFO key TIER` and `COPY` also use `get_object` and are not cache accesses.
+`ObjectContext` has `pub stats: AccessStats`. The tiered GET hit path calls `CachePolicy::record_hit`, which touches the score and counts the hit, with no write lock. The touch is not inside `get_object`, because `LO.INFO key TIER` and `COPY` also use `get_object` and are not cache accesses.
 
 Stats are keyed by `ObjectId`, not by key. An `LO.SET` mints a new OID and the free callback drops the old DRAM entry, so a rewritten object starts with fresh stats. A RENAME is invisible to the policy.
 
@@ -97,7 +97,7 @@ pub struct GhostTable {
 }
 ```
 
-1. On a miss, `DRAMPool::admit(oid, obj_len)` calls `record_miss(oid)`, which returns the object's miss count, inserting it at 1 if absent and dropping the FIFO head when full. A repeat miss does not move an entry in the FIFO, so the window is the last `GHOST_CAPACITY` distinct missed objects.
+1. On a miss, `CachePolicy::admit(oid, obj_len)` calls `record_miss(oid)`, which returns the object's miss count, inserting it at 1 if absent and dropping the FIFO head when full. A repeat miss does not move an entry in the FIFO, so the window is the last `GHOST_CAPACITY` distinct missed objects.
 2. If the count is at least `promote-min-hits`, promote. Otherwise serve through the transient NVMePool path and count an admission reject. The ghost entry is not removed on promotion; it ages out FIFO. So an admitted object whose promotion fails is admitted again on its next miss, and an object demoted from DRAM while its ghost entry is still present is promoted again on its first miss (an ARC-style ghost hit).
 3. Objects above `max-promote-size` are refused without touching the ghost, since they can never be promoted.
 4. With `promote-min-hits 1`, `admit` returns true without touching the ghost, so admission is off and costs nothing. Misses in that time are not counted, so after the setting is raised those objects start from zero.
@@ -173,8 +173,8 @@ fds: RwLock<IndexedMap<FdEntry>>
 ```
 
 1. The `get_or_open` fast path touches `stats` under the read lock and hands out a clone. The re-check under the write lock (two concurrent first GETs on a cold object) does the same.
-2. Slow path, under the write lock: if `max-open-fds` is nonzero and `len >= cap`, demote with the same rule as the DRAM pool: demotable only if `Arc::strong_count(&fd) == 1`. An in-flight read holds a clone, so its fd stays open until the read completes. Enough entries are removed to leave room for the new one under the cap (normally one; more after the cap is lowered at runtime, since it is enforced on the next open). Victims close after the lock is released. They are chosen before `open()`, so if the open fails they are still demoted and counted, costing one reopen each.
-3. If no sampled entry is demotable, the new fd is handed to the caller uncached, so the cap holds and the read proceeds; the fd closes when the reader drops it.
+2. Slow path, under the write lock: if `max-open-fds` is nonzero and `len >= cap`, remove the lowest-scoring sampled fd until there is room for the new one under the cap (normally one; more after the cap is lowered at runtime, since it is enforced on the next open). Unlike the DRAM pool, an fd held by an in-flight read is not skipped: demotion only drops the map's `Arc`, the reader's clone keeps the fd open until the read completes, and it closes then. Open fds can briefly exceed the cap by the number of such readers. Victims are chosen before `open()`, so if the open fails they are still demoted and counted, costing one reopen each.
+3. The DRAM pool keeps the held-entry skip because demotion there must free bytes for an allocation that happens right after; a held entry frees nothing until its reader finishes. The fd cap has no such follow-up, so the skip buys nothing.
 4. The next GET on a demoted fd reopens it, which costs one `open()` syscall, so a wrong fd demotion is far cheaper than a wrong DRAM demotion.
 5. No ghost table for fds: a miss costs a syscall, not DRAM, so first-touch admission is fine.
 

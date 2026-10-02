@@ -14,8 +14,8 @@
 //!      reclaim a cold fd without disturbing in-flight readers that still hold one.
 //!
 //! Cap and demotion (`docs/CACHE_POLICY_DESIGN.md` §4.8): with `max-open-fds` set, a
-//! full pool demotes the lowest-scoring fd not held by a reader. If every sampled fd is
-//! held, the new fd is handed out uncached and closes when the reader finishes.
+//! full pool demotes the lowest-scoring fd. A reader still holding a demoted fd keeps
+//! it open until its read finishes.
 //!
 //! `remove` drops the pool's ref; `ObjectFile::Drop` (on delete) calls it. There is no
 //! `Drop for FdPool` — it is a process-lifetime static, so any fds still cached at
@@ -92,25 +92,19 @@ impl FdPool {
             return Some(hit(entry));
         }
 
-        // Make room before opening, so the cap counts the new entry. An entry is
-        // demotable only when the map holds its sole Arc; cloning needs the read
-        // lock, so a count of 1 seen here stays 1. Victims close after unlock.
-        let mut victims = Vec::new();
-        if cap > 0 && fds.len() >= cap {
+        // Make room before opening, so the cap counts the new entry. Removing an
+        // entry only drops the map's ref: a reader still holding a clone keeps the
+        // fd open until its read finishes, then it closes.
+        if cap > 0 {
             let samples = crate::demote_sample_size();
-            for _ in 0..fds.len() + 1 - cap {
-                let Some((_, entry)) = demote_one(&mut fds, samples, |e| {
-                    (Arc::strong_count(&e.fd) == 1)
-                        .then(|| e.stats.decayed_counter(now_min, decay_time))
-                }) else {
-                    break;
-                };
-                victims.push(entry.fd);
+            while fds.len() >= cap {
+                demote_one(&mut fds, samples, |e| {
+                    Some(e.stats.decayed_counter(now_min, decay_time))
+                })
+                .expect("a non-empty map always yields a victim");
+                self.demotions.fetch_add(1, Ordering::Relaxed);
             }
-            self.demotions
-                .fetch_add(victims.len() as u64, Ordering::Relaxed);
         }
-        let cache_it = cap == 0 || fds.len() < cap;
 
         let path = object_id.file_path(dir);
         let c_path = std::ffi::CString::new(path).expect("file_path null");
@@ -121,23 +115,16 @@ impl FdPool {
         // SAFETY: c_path is a valid NUL-terminated path; open returns a fd or -1.
         let raw = unsafe { libc::open(c_path.as_ptr(), flags) };
         if raw < 0 {
-            drop(fds);
-            drop(victims);
             return None;
         }
         let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
-        if cache_it {
-            fds.insert(
-                object_id,
-                FdEntry {
-                    fd: Arc::clone(&fd),
-                    stats: AccessStats::new(now_min),
-                },
-            );
-        }
-        drop(fds);
-        // Closing the victims happens here, after the lock is released.
-        drop(victims);
+        fds.insert(
+            object_id,
+            FdEntry {
+                fd: Arc::clone(&fd),
+                stats: AccessStats::new(now_min),
+            },
+        );
         Some(fd)
     }
 
@@ -253,37 +240,32 @@ mod tests {
 
     // ─── Cap and demotion ───
     // Victim choice and the cap count are covered end to end by
-    // TestLargeObjTieredFdCap. This case needs readers pinned mid-open, which
-    // a client cannot line up, so it stays here.
+    // TestLargeObjTieredFdCap. This case needs a reader holding an fd across a
+    // demotion, which a client cannot line up, so it stays here.
 
     #[test]
-    fn all_pinned_hands_out_uncached_fd() {
+    fn demoted_fd_stays_open_for_its_reader() {
         let dir = std::env::temp_dir();
         let dir = dir.to_str().unwrap();
-        let oids = [ObjectId(0x7370), ObjectId(0x7371), ObjectId(0x7372)];
+        let oids = [ObjectId(0x7370), ObjectId(0x7371)];
         for oid in &oids {
             std::fs::write(oid.file_path(dir), b"x").unwrap();
         }
         let pool = FdPool::new();
-        let k = 2;
 
-        if let Some(r0) = pool.get_or_open_with(oids[0], dir, k) {
-            let r1 = pool.get_or_open_with(oids[1], dir, k).unwrap();
+        if let Some(reader) = pool.get_or_open_with(oids[0], dir, 1) {
+            let weak = Arc::downgrade(&reader);
 
-            // Pool full, both pinned: the third open succeeds but is not cached.
-            let extra = pool.get_or_open_with(oids[2], dir, k).unwrap();
-            assert_eq!(pool.len(), 2, "cap holds");
-            assert!(!pool.contains(oids[2]));
-            assert_eq!(pool.demotions.load(Ordering::Relaxed), 0);
-            drop(extra);
-
-            // Once a reader releases, the next open caches again.
-            drop(r0);
-            pool.get_or_open_with(oids[2], dir, k).unwrap();
-            assert!(pool.contains(oids[2]));
+            // Pool full: the next open demotes the held fd and caches the new one.
+            pool.get_or_open_with(oids[1], dir, 1).unwrap();
+            assert_eq!(pool.len(), 1, "cap holds");
             assert!(!pool.contains(oids[0]));
-            assert_eq!(pool.len(), 2);
-            drop(r1);
+            assert!(pool.contains(oids[1]));
+            assert_eq!(pool.demotions.load(Ordering::Relaxed), 1);
+            assert!(weak.upgrade().is_some(), "reader keeps the demoted fd open");
+
+            drop(reader);
+            assert!(weak.upgrade().is_none(), "fd closes with its last reader");
         }
 
         for oid in &oids {

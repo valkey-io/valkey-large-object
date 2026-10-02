@@ -1,13 +1,14 @@
 //! Cache policy primitives shared by DRAMPool and FdPool (see
 //! `docs/CACHE_POLICY_DESIGN.md`): `AccessStats` (Valkey-style LFU score),
-//! `GhostTable` (second-touch admission) and `IndexedMap` (an `IndexMap` with
-//! sampled demotion). None of them lock; the pools call them under their own locks.
+//! `GhostTable` (second-touch admission), `IndexedMap` (an `IndexMap` with
+//! sampled demotion) and `CachePolicy` (DRAM admission and counters). Only
+//! `CachePolicy` locks (its ghost table); the pools call the rest under their own locks.
 
 use std::collections::{HashMap, VecDeque};
 
 use indexmap::IndexMap;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use rand::RngExt;
@@ -155,6 +156,101 @@ impl GhostTable {
             if let Some(old) = self.order.pop_front() {
                 self.hits.remove(&old);
             }
+        }
+    }
+}
+
+// ─── CachePolicy ─────────────────────────────────────────────────────────────
+
+/// DRAM cache policy state for Tiered mode: the admission filter and its
+/// counters. DRAMPool holds it as `Option`, `None` in Dram mode.
+pub struct CachePolicy {
+    /// Tiered GETs served from a Ready cached object.
+    pub hits: AtomicU64,
+    /// Tiered GETs that found no Ready cached object (absent or still Filling).
+    pub misses: AtomicU64,
+    /// Successful `try_promote_object` calls.
+    pub promotions: AtomicU64,
+    /// Tiered GET misses served transiently because the object had not yet
+    /// accumulated `promote-min-hits` misses in the ghost table.
+    pub admission_rejects: AtomicU64,
+    /// Cached copies removed by `demote_for`; keys untouched.
+    pub demotions: AtomicU64,
+    /// Second-touch admission filter. Touched only on the miss path.
+    ghost: Mutex<GhostTable>,
+}
+
+/// Point-in-time copy of the `CachePolicy` counters, for INFO.
+#[derive(Debug)]
+pub struct PolicyCounts {
+    pub hits: u64,
+    pub misses: u64,
+    pub promotions: u64,
+    pub admission_rejects: u64,
+    pub demotions: u64,
+}
+
+impl Default for CachePolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CachePolicy {
+    pub fn new() -> Self {
+        Self {
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            promotions: AtomicU64::new(0),
+            admission_rejects: AtomicU64::new(0),
+            demotions: AtomicU64::new(0),
+            ghost: Mutex::new(GhostTable::new(GHOST_CAPACITY)),
+        }
+    }
+
+    /// Record a GET served from the cache: touch the object's LFU score and
+    /// count the hit. Atomic only; no lock needed.
+    pub fn record_hit(&self, stats: &AccessStats) {
+        stats.touch(now_minutes(), crate::tiered_decay_time());
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a GET that could not be served from the cache.
+    pub fn record_miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Second-touch admission: true once the object has missed `promote-min-hits`
+    /// times. Oversize objects are refused without touching the ghost table.
+    /// Entries stay after promotion and age out FIFO (design doc §4.3).
+    pub fn admit(&self, oid: ObjectId, obj_len: u64) -> bool {
+        if obj_len > crate::max_promote_size() {
+            return false;
+        }
+        let min_hits = crate::promote_min_hits();
+        if min_hits <= 1 {
+            return true;
+        }
+        let misses = self
+            .ghost
+            .lock()
+            .expect("CachePolicy.ghost lock unavailable")
+            .record_miss(oid);
+        if misses >= min_hits {
+            true
+        } else {
+            self.admission_rejects.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
+
+    pub fn counts(&self) -> PolicyCounts {
+        PolicyCounts {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            promotions: self.promotions.load(Ordering::Relaxed),
+            admission_rejects: self.admission_rejects.load(Ordering::Relaxed),
+            demotions: self.demotions.load(Ordering::Relaxed),
         }
     }
 }

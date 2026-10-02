@@ -285,11 +285,12 @@ fn cmd_get_tiered(
     blocked_client: valkey_module::BlockedClient,
 ) {
     let dram_pool = storage::get_dram_pool();
+    let policy = dram_pool.tiered_policy();
     // ─── DRAMPool hit ────────────────────────────────────────────────────
     let mut filling = false;
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
-            dram_pool.record_hit(&obj_ctx);
+            policy.record_hit(&obj_ctx.stats);
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             cmd_get_from_dram(
                 dram_pool,
@@ -308,11 +309,11 @@ fn cmd_get_tiered(
         filling = true;
     }
     // Everything below reads from NVMe, whether or not it also promotes.
-    dram_pool.record_miss();
+    policy.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // Admit via the ghost table, then allocate (demoting cold copies if full).
     // Skip both if another GET is already promoting this OID (Filling).
-    let promoted = if !filling && dram_pool.admit(object_id, obj_len) {
+    let promoted = if !filling && policy.admit(object_id, obj_len) {
         dram_pool.try_promote_object(object_id, obj_len)
     } else {
         None
