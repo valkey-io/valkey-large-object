@@ -31,10 +31,16 @@ pub struct DRAMPool {
     pub expand_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
     pub shrink_count: AtomicU64,
+    /// Tiered-mode cache policy state. Unused in Dram mode.
+    pub tiered: TieredCache,
+}
+
+/// Tiered-mode cache policy state: the admission filter and its counters.
+pub struct TieredCache {
     /// Tiered GETs served from a Ready cached object.
-    pub cache_hits: AtomicU64,
+    pub hits: AtomicU64,
     /// Tiered GETs that found no Ready cached object (absent or still Filling).
-    pub cache_misses: AtomicU64,
+    pub misses: AtomicU64,
     /// Successful `try_promote_object` calls.
     pub promotions: AtomicU64,
     /// Tiered GET misses served transiently because the object had not yet
@@ -46,6 +52,19 @@ pub struct DRAMPool {
     ghost: Mutex<GhostTable>,
 }
 
+impl TieredCache {
+    fn new() -> Self {
+        Self {
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            promotions: AtomicU64::new(0),
+            admission_rejects: AtomicU64::new(0),
+            demotions: AtomicU64::new(0),
+            ghost: Mutex::new(GhostTable::new(GHOST_CAPACITY)),
+        }
+    }
+}
+
 impl DRAMPool {
     pub fn new(segment_count: usize, segment_size: usize) -> Self {
         Self {
@@ -53,12 +72,7 @@ impl DRAMPool {
             objects: RwLock::new(IndexedMap::new()),
             expand_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
-            cache_hits: AtomicU64::new(0),
-            cache_misses: AtomicU64::new(0),
-            promotions: AtomicU64::new(0),
-            admission_rejects: AtomicU64::new(0),
-            demotions: AtomicU64::new(0),
-            ghost: Mutex::new(GhostTable::new(GHOST_CAPACITY)),
+            tiered: TieredCache::new(),
         }
     }
 
@@ -159,12 +173,12 @@ impl DRAMPool {
     /// the object's LFU score. Atomic only; no lock needed.
     pub fn record_hit(&self, ctx: &ObjectContext) {
         ctx.stats.touch(now_minutes(), crate::tiered_decay_time());
-        self.cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.tiered.hits.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a tiered GET that could not be served from the cache.
     pub fn record_miss(&self) {
-        self.cache_misses.fetch_add(1, Ordering::Relaxed);
+        self.tiered.misses.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Second-touch admission: true once the object has missed `promote-min-hits`
@@ -179,14 +193,17 @@ impl DRAMPool {
             return true;
         }
         let misses = self
+            .tiered
             .ghost
             .lock()
-            .expect("DRAMPool.ghost lock unavailable")
+            .expect("TieredCache.ghost lock unavailable")
             .record_miss(oid);
         if misses >= min_hits {
             true
         } else {
-            self.admission_rejects.fetch_add(1, Ordering::Relaxed);
+            self.tiered
+                .admission_rejects
+                .fetch_add(1, Ordering::Relaxed);
             false
         }
     }
@@ -223,6 +240,7 @@ impl DRAMPool {
             .len()
     }
 
+    /// Tiered mode only: promotes an NVMe object into the DRAM cache.
     /// Try to allocate space and create an ObjectContext for this object.
     /// Returns None if no space can be found. On success returns
     /// Arc<ObjectContext> in Filling state -- caller reads NVMe data into the
@@ -259,7 +277,7 @@ impl DRAMPool {
         // buf.len stays chunk_size for all buffers — must match alloc size for free().
         let obj_ctx = std::sync::Arc::new(super::context::ObjectContext::new_filling(buffers));
         objects.insert(oid, obj_ctx.clone());
-        self.promotions.fetch_add(1, Ordering::Relaxed);
+        self.tiered.promotions.fetch_add(1, Ordering::Relaxed);
         Some(obj_ctx)
     }
 
@@ -314,7 +332,9 @@ impl DRAMPool {
             }
         }
         let count = victims.len();
-        self.demotions.fetch_add(count as u64, Ordering::Relaxed);
+        self.tiered
+            .demotions
+            .fetch_add(count as u64, Ordering::Relaxed);
         drop(victims);
         (count, freed)
     }
@@ -487,7 +507,7 @@ mod tests {
             p.contains_object(&ObjectId(3)),
             "pinned object must survive"
         );
-        assert_eq!(p.demotions.load(Ordering::Relaxed), 1);
+        assert_eq!(p.tiered.demotions.load(Ordering::Relaxed), 1);
 
         // Pin the hot entry too: every entry is now pinned, so nothing goes.
         let _hot = p.get_object(&ObjectId(1)).unwrap();
@@ -515,7 +535,7 @@ mod tests {
         // The 2-round cap frees 2 BUF, plus 1 BUF free: short of 4 BUF. Roll back.
         assert_eq!(p.demote_with(4 * BUF as usize, BUF as usize, 2), (0, 0));
         assert_eq!(p.object_count(), 4);
-        assert_eq!(p.demotions.load(Ordering::Relaxed), 0);
+        assert_eq!(p.tiered.demotions.load(Ordering::Relaxed), 0);
         // The same need with enough free space goes through.
         let (n, _) = p.demote_with(4 * BUF as usize, 2 * BUF as usize, 2);
         assert_eq!(n, 2);

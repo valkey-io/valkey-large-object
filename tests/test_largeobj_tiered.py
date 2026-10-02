@@ -1036,6 +1036,34 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_open_fds'] == 2
         assert info['largeobj_fd_demotions_total'] == demotions
 
+    def test_demotes_coldest_keeps_hot(self):
+        """A full pool demotes the lowest-scoring fd. KEYS[0] is read three
+        times and KEYS[1] once, so opening KEYS[2] must demote KEYS[1], and a
+        later read of KEYS[0] is a cache hit that demotes nothing."""
+        client = self.server.get_new_client()
+        for i, k in enumerate(self.KEYS[:3]):
+            client.execute_command('LO.SET', k, self._payload(i))
+
+        # The first read opens the fd; the next two touch its score. The first
+        # touch on a fresh entry always increments, so KEYS[0] outscores KEYS[1].
+        for _ in range(3):
+            assert client.execute_command('LO.GET', self.KEYS[0]) == self._payload(0)
+        assert client.execute_command('LO.GET', self.KEYS[1]) == self._payload(1)
+        info = client.info('largeobj_fd')
+        assert info['largeobj_open_fds'] == 2
+        assert info['largeobj_fd_demotions_total'] == 0
+
+        assert client.execute_command('LO.GET', self.KEYS[2]) == self._payload(2)
+        info = client.info('largeobj_fd')
+        assert info['largeobj_open_fds'] == 2
+        assert info['largeobj_fd_demotions_total'] == 1
+
+        # KEYS[0] survived, so reading it again needs no open and no demotion.
+        assert client.execute_command('LO.GET', self.KEYS[0]) == self._payload(0)
+        info = client.info('largeobj_fd')
+        assert info['largeobj_open_fds'] == 2
+        assert info['largeobj_fd_demotions_total'] == 1
+
     def test_lower_cap_at_runtime(self):
         """CONFIG SET to a smaller cap takes effect on the next open."""
         client = self.server.get_new_client()

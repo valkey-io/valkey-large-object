@@ -78,24 +78,31 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("cached_objects", dram.object_count() as i64)?
         .field(
             "cache_hits_total",
-            dram.cache_hits.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            dram.tiered.hits.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
             "cache_misses_total",
-            dram.cache_misses.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            dram.tiered
+                .misses
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
             "promotions_total",
-            dram.promotions.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            dram.tiered
+                .promotions
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
             "admission_rejects_total",
-            dram.admission_rejects
+            dram.tiered
+                .admission_rejects
                 .load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
             "demotions_total",
-            dram.demotions.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            dram.tiered
+                .demotions
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
             "scaling_expand_total",

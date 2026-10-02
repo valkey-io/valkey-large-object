@@ -185,31 +185,6 @@ mod tests {
     // filesystems (e.g. tmpfs). When the open fails we skip the fd-dependent
     // assertions — the Python integration tests cover the real NVMe path.
 
-    /// Files for `n` objects in a fresh temp dir. Removed on drop.
-    struct Files {
-        dir: String,
-        oids: Vec<ObjectId>,
-    }
-
-    impl Files {
-        fn new(tag: u64, n: usize) -> Self {
-            let dir = std::env::temp_dir().join(format!("lo_fdpool_{tag}_{}", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap();
-            let dir = dir.to_str().unwrap().to_string();
-            let oids: Vec<ObjectId> = (0..n as u64).map(|i| ObjectId(tag * 1000 + i)).collect();
-            for oid in &oids {
-                std::fs::write(oid.file_path(&dir), b"x").unwrap();
-            }
-            Self { dir, oids }
-        }
-    }
-
-    impl Drop for Files {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
-
     #[test]
     fn test_remove_is_idempotent() {
         let pool = FdPool::new();
@@ -277,58 +252,42 @@ mod tests {
     }
 
     // ─── Cap and demotion ───
-
-    #[test]
-    fn cap_demotes_lowest_score_and_keeps_hot() {
-        let files = Files::new(1, 4);
-        let pool = FdPool::new();
-        let k = 3;
-
-        // Fill to the cap; skip if this filesystem refuses the open.
-        let Some(_) = pool.get_or_open_with(files.oids[0], &files.dir, k) else {
-            return;
-        };
-        for oid in &files.oids[1..3] {
-            pool.get_or_open_with(*oid, &files.dir, k).unwrap();
-        }
-        // Touch oid[1] and oid[2]. The first hit on a fresh entry always
-        // increments, so the untouched oid[0] is the unique minimum.
-        for oid in &files.oids[1..3] {
-            pool.get_or_open_with(*oid, &files.dir, k).unwrap();
-        }
-
-        // A fourth open must demote exactly one entry: the cold oid[0].
-        pool.get_or_open_with(files.oids[3], &files.dir, k).unwrap();
-        assert_eq!(pool.len(), 3, "cap respected");
-        assert!(!pool.contains(files.oids[0]), "cold fd demoted");
-        assert!(files.oids[1..].iter().all(|o| pool.contains(*o)));
-        assert_eq!(pool.demotions.load(Ordering::Relaxed), 1);
-    }
+    // Victim choice and the cap count are covered end to end by
+    // TestLargeObjTieredFdCap. This case needs readers pinned mid-open, which
+    // a client cannot line up, so it stays here.
 
     #[test]
     fn all_pinned_hands_out_uncached_fd() {
-        let files = Files::new(3, 3);
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let oids = [ObjectId(0x7370), ObjectId(0x7371), ObjectId(0x7372)];
+        for oid in &oids {
+            std::fs::write(oid.file_path(dir), b"x").unwrap();
+        }
         let pool = FdPool::new();
         let k = 2;
 
-        let Some(r0) = pool.get_or_open_with(files.oids[0], &files.dir, k) else {
-            return;
-        };
-        let r1 = pool.get_or_open_with(files.oids[1], &files.dir, k).unwrap();
+        if let Some(r0) = pool.get_or_open_with(oids[0], dir, k) {
+            let r1 = pool.get_or_open_with(oids[1], dir, k).unwrap();
 
-        // Pool full, both pinned: the third open succeeds but is not cached.
-        let extra = pool.get_or_open_with(files.oids[2], &files.dir, k).unwrap();
-        assert_eq!(pool.len(), 2, "cap holds");
-        assert!(!pool.contains(files.oids[2]));
-        assert_eq!(pool.demotions.load(Ordering::Relaxed), 0);
-        drop(extra);
+            // Pool full, both pinned: the third open succeeds but is not cached.
+            let extra = pool.get_or_open_with(oids[2], dir, k).unwrap();
+            assert_eq!(pool.len(), 2, "cap holds");
+            assert!(!pool.contains(oids[2]));
+            assert_eq!(pool.demotions.load(Ordering::Relaxed), 0);
+            drop(extra);
 
-        // Once a reader releases, the next open caches again.
-        drop(r0);
-        pool.get_or_open_with(files.oids[2], &files.dir, k).unwrap();
-        assert!(pool.contains(files.oids[2]));
-        assert!(!pool.contains(files.oids[0]));
-        assert_eq!(pool.len(), 2);
-        drop(r1);
+            // Once a reader releases, the next open caches again.
+            drop(r0);
+            pool.get_or_open_with(oids[2], dir, k).unwrap();
+            assert!(pool.contains(oids[2]));
+            assert!(!pool.contains(oids[0]));
+            assert_eq!(pool.len(), 2);
+            drop(r1);
+        }
+
+        for oid in &oids {
+            let _ = std::fs::remove_file(oid.file_path(dir));
+        }
     }
 }
