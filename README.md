@@ -66,7 +66,7 @@ valkey-server --port 7380 \
 | `nvme-staging-size` | 64mb | Immutable | Size of NVMe staging buffer (1 segment). Min 1mb. |
 | `max-promote-size` | 256mb | Yes | Max object size for NVMe→DRAM promotion. 0 = disable promotion. |
 | `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Range 1-255. |
-| `lfu-decay-time` | 1 | Yes | Tiered: minutes per one-point decay of the LFU score used for DRAM and fd demotion. 0 = no decay. |
+| `tiered-decay-time` | 1 | Yes | Tiered: minutes per one-point decay of the LFU score used for DRAM and fd demotion. 0 = no decay. |
 | `demote-sample-size` | 5 | Yes | Tiered: cached entries sampled per demotion; the lowest LFU score goes. Range 1-64. |
 | `max-open-fds` | 1024 | Yes | Tiered: cap on cached read fds. 0 = unlimited. |
 | `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. |

@@ -110,7 +110,7 @@ impl DRAMPool {
     /// Record a tiered GET served from `ctx`: bump the hit counter and touch
     /// the object's LFU score. Atomic only; no lock needed.
     pub fn record_hit(&self, ctx: &ObjectContext) {
-        ctx.stats.touch(now_minutes(), crate::lfu_decay_time());
+        ctx.stats.touch(now_minutes(), crate::tiered_decay_time());
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -232,7 +232,7 @@ impl DRAMPool {
     ) -> (usize, usize) {
         let samples = crate::demote_sample_size();
         let now_min = now_minutes();
-        let decay_time = crate::lfu_decay_time();
+        let decay_time = crate::tiered_decay_time();
         let mut victims: Vec<(ObjectId, Arc<ObjectContext>)> = Vec::new();
         let mut freed = 0usize;
         {

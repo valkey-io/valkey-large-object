@@ -47,7 +47,7 @@ Four runtime-mutable configs:
 
 | Config | Default | Range | Meaning |
 |---|---|---|---|
-| `lfu-decay-time` | 1 | 0..=65535 | Minutes per one-point counter decay. 0 disables decay (pure LFU). Same semantics as core. |
+| `tiered-decay-time` | 1 | 0..=65535 | Minutes per one-point counter decay. 0 disables decay (pure LFU). Same semantics as core `lfu-decay-time`. |
 | `promote-min-hits` | 2 | 1..=255 | Misses an object must accumulate before a GET promotes it. 1 promotes on the first GET. |
 | `demote-sample-size` | 5 | 1..=64 | Entries sampled per demotion round. Same idea as core's `maxmemory-samples`. |
 | `max-open-fds` | 1024 | 0..=1048576 | Cap on cached read fds. 0 means unlimited. The default stays well under Valkey's fd limit (about `maxclients + 32`), which the module's fds share with client sockets. |

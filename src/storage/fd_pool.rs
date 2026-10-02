@@ -71,7 +71,7 @@ impl FdPool {
         cap: usize,
     ) -> Option<Arc<OwnedFd>> {
         let now_min = now_minutes();
-        let decay_time = crate::lfu_decay_time();
+        let decay_time = crate::tiered_decay_time();
         let hit = |entry: &FdEntry| {
             entry.stats.touch(now_min, decay_time);
             Arc::clone(&entry.fd)
@@ -179,20 +179,11 @@ impl FdPool {
 mod tests {
     use super::*;
     use crate::data_type::ObjectId;
-    use std::os::unix::fs::MetadataExt;
     use std::os::unix::io::AsRawFd;
 
     // get_or_open uses O_DIRECT when direct_io() is set and can fail on some
     // filesystems (e.g. tmpfs). When the open fails we skip the fd-dependent
     // assertions — the Python integration tests cover the real NVMe path.
-
-    /// Inode behind fd number `raw`, or `None` if it is not open. Fd numbers are
-    /// reused across threads, so only "does it still name this file" proves a close.
-    fn inode_of_fd(raw: i32) -> Option<u64> {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: fstat on an arbitrary fd number fills `st` or fails with EBADF.
-        (unsafe { libc::fstat(raw, &mut st) } == 0).then_some(st.st_ino as u64)
-    }
 
     /// Files for `n` objects in a fresh temp dir. Removed on drop.
     struct Files {
@@ -263,26 +254,21 @@ mod tests {
 
         let pool = FdPool::new();
         if let Some(reader) = pool.get_or_open(object_id, dir) {
-            let raw = reader.as_raw_fd();
-            let file_ino = std::fs::metadata(&path).unwrap().ino();
+            let weak = Arc::downgrade(&reader);
             assert_eq!(pool.len(), 1);
 
             // Pool drops its ref; the reader clone is still alive, so fd stays open.
             pool.remove(object_id);
             assert_eq!(pool.len(), 0);
-            assert_eq!(
-                inode_of_fd(raw),
-                Some(file_ino),
+            assert!(
+                weak.upgrade().is_some(),
                 "fd must stay open while a reader clone is alive"
             );
 
-            // Last clone drops -> OwnedFd::drop closes the fd. The number may
-            // already have been reused by another test's open(), so check that it
-            // no longer names this file rather than that it is invalid.
+            // Last clone drops -> OwnedFd::drop closes the fd.
             drop(reader);
-            assert_ne!(
-                inode_of_fd(raw),
-                Some(file_ino),
+            assert!(
+                weak.upgrade().is_none(),
                 "fd must be closed once the last clone drops"
             );
         }

@@ -118,7 +118,7 @@ lazy_static::lazy_static! {
     static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(60);
 
     /// LFU counter decay: minutes per one-point decrement. 0 disables decay.
-    static ref CFG_LFU_DECAY_TIME: AtomicI64 = AtomicI64::new(1);
+    static ref CFG_TIERED_DECAY_TIME: AtomicI64 = AtomicI64::new(1);
 
     /// How many misses an object must accumulate in the ghost table before a GET
     /// promotes it into DRAMPool. Default: 2.
@@ -270,8 +270,8 @@ pub fn smartlog_poll_secs() -> u64 {
     CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn lfu_decay_time() -> u64 {
-    CFG_LFU_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn tiered_decay_time() -> u64 {
+    CFG_TIERED_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn promote_min_hits() -> u8 {
@@ -568,7 +568,7 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, None],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
              ConfigurationFlags::DEFAULT, None, None],
-            ["lfu-decay-time", &*CFG_LFU_DECAY_TIME, 1, 0, 65_535,
+            ["tiered-decay-time", &*CFG_TIERED_DECAY_TIME, 1, 0, 65_535,
              ConfigurationFlags::DEFAULT, None, None],
             ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, 2, 1, 255,
              ConfigurationFlags::DEFAULT, None, None],
