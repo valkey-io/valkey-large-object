@@ -15,7 +15,7 @@ pub struct NVMePool {
 impl NVMePool {
     pub fn new(segment_count: usize, segment_size: usize) -> Self {
         Self {
-            pool: SegmentPool::new(segment_count, segment_size),
+            pool: SegmentPool::new(segment_count, segment_size, super::uring::PoolType::Nvme),
         }
     }
 
@@ -44,9 +44,42 @@ impl NVMePool {
         self.pool.iovec_index_for_buf(buf)
     }
 
+    /// Whether the segment owning `buf` is registered in the io_uring kernel
+    /// buffer table (picks fixed vs non-fixed I/O). See SegmentPool.
+    pub fn is_buf_io_uring_registered(&self, buf: &SegmentBuffer) -> bool {
+        self.pool.is_buf_io_uring_registered(buf)
+    }
+
+    /// Mark all current segments io_uring-registered (startup, post-register).
+    pub fn mark_all_registered(&self) {
+        self.pool.mark_all_registered();
+    }
+
+    /// Startup iovec snapshot for this pool's ring. See `SegmentPool::startup_iovecs`.
+    pub fn startup_iovecs(&self) -> Vec<libc::iovec> {
+        self.pool.startup_iovecs()
+    }
+
+    /// See `SegmentPool::rebuild_dense_iovecs`. The NVMe pool never expands or
+    /// shrinks, so its ring never actually re-registers; provided only so the poller's
+    /// pool-generic rebuild path is total.
+    pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
+        self.pool.rebuild_dense_iovecs()
+    }
+
+    /// See `SegmentPool::io_uring_registered_count`.
+    pub fn io_uring_registered_count(&self) -> usize {
+        self.pool.io_uring_registered_count()
+    }
+
     /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         self.pool.segment_counts()
+    }
+
+    /// Total free-gap count across the staging pool's segments (talc fragmentation signal).
+    pub fn fragment_count(&self) -> usize {
+        self.pool.fragment_count()
     }
 
     /// Call `f` with each segment's base pointer and size. Used for EFA registration.

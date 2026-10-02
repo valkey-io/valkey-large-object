@@ -151,7 +151,7 @@ Known limitation: `DEMOTE_MAX_VICTIMS` is also a size ceiling. An object that ne
 
 ### 4.7 Observability
 
-Fields in the `largeobj_dram` INFO section (reported as `largeobj_largeobj_dram`, because `add_section` adds the module prefix):
+Fields in the `largeobj_dram` INFO section (`add_section("dram")`; the module name is added as a prefix):
 
 ```
 cache_hits_total            tiered GET served from a Ready cached entry

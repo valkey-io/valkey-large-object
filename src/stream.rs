@@ -148,6 +148,7 @@ impl Source<'_> {
         match self {
             Source::NvmeRead { .. } => {
                 let rx = uring::submit_read(
+                    pool.pool_id(),
                     fd.expect("NvmeRead requires an fd"),
                     uring::UringOp {
                         iovec_index: pool.iovec(buf),
@@ -155,6 +156,7 @@ impl Source<'_> {
                         file_offset: storage::FILE_HEADER_SIZE
                             + chunk.index as u64 * chunk_size as u64,
                         len: chunk.user_data_len as u64,
+                        use_fixed: pool.is_io_uring_registered(buf),
                     },
                 );
                 match rx.await {
@@ -271,6 +273,7 @@ impl Target<'_> {
             Target::NvmeWrite { buffers, pool } => {
                 let buf = &buffers[chunk.buffer_idx];
                 let rx = uring::submit_write(
+                    uring::PoolType::Nvme,
                     fd.expect("NvmeWrite requires an fd"),
                     uring::UringOp {
                         iovec_index: pool.iovec_index_for_buf(buf),
@@ -278,6 +281,7 @@ impl Target<'_> {
                         file_offset: storage::FILE_HEADER_SIZE
                             + chunk.index as u64 * chunk_size as u64,
                         len: chunk.user_data_len as u64,
+                        use_fixed: pool.is_buf_io_uring_registered(buf),
                     },
                 );
                 match rx.await {
@@ -314,6 +318,24 @@ impl Pool {
         match self {
             Pool::Nvme(p) => p.iovec_index_for_buf(b),
             Pool::Dram(p) => p.iovec_index_for_buf(b),
+        }
+    }
+    /// Whether the buffer's segment is registered in the kernel io_uring buffer
+    /// table — drives the per-op fixed vs non-fixed path. Startup segments are
+    /// registered; a segment added by expand() is not until the pool's poller
+    /// runs the whole-table unregister + re-register.
+    pub(crate) fn is_io_uring_registered(&self, b: &SegmentBuffer) -> bool {
+        match self {
+            Pool::Nvme(p) => p.is_buf_io_uring_registered(b),
+            Pool::Dram(p) => p.is_buf_io_uring_registered(b),
+        }
+    }
+    /// Which pool's io_uring ring backs these buffers — routes each op to the
+    /// engine that owns its buffer's registered table.
+    pub(crate) fn pool_id(&self) -> uring::PoolType {
+        match self {
+            Pool::Nvme(_) => uring::PoolType::Nvme,
+            Pool::Dram(_) => uring::PoolType::Dram,
         }
     }
 }
@@ -380,6 +402,12 @@ pub struct FileHeaderRead {
     pub iovec: u16,
     /// Pool buffer pointer the header is read into.
     pub ptr: usize,
+    /// Whether the header buffer's segment is registered in the io_uring buffer
+    /// table — drives the fixed vs non-fixed read path for the header op.
+    pub use_fixed: bool,
+    /// Which pool's ring owns the header buffer (DRAM promotion buffer vs NVMe
+    /// streaming buffer) — routes the header read to the correct engine.
+    pub pool_id: uring::PoolType,
 }
 
 /// Everything the loop needs that isn't the source/target themselves.
@@ -450,6 +478,8 @@ impl<'a> StreamJob<'a> {
             verify_file_header: Some(FileHeaderRead {
                 iovec: pool.iovec(hdr_buf),
                 ptr: pool.ptr(hdr_buf) as usize,
+                use_fixed: pool.is_io_uring_registered(hdr_buf),
+                pool_id: pool.pool_id(),
             }),
             batch_width,
             persist_file_header: None,
@@ -627,8 +657,10 @@ pub async fn run_get(
         // validation.
         storage::read_and_verify_file_header(
             job.fd.expect("GET header read requires an fd"),
+            fh.pool_id,
             fh.iovec,
             fh.ptr,
+            fh.use_fixed,
             job.object_id
                 .expect("GET header read requires an object_id"),
             job.obj_len,

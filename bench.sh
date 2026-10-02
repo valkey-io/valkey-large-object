@@ -28,8 +28,9 @@ RUN_FIO=0
 CLIENTS=200
 DURATION=10
 NUM_KEYS=500
-DRAM_MAXMEMORY="34359738368"       # 32GB
+MAXMEMORY="34359738368"            # 32GB — server maxmemory; DRAM pool scales up toward this
 SEGMENT_SIZE="67108864"      # 64MB
+MAX_OBJECT_SIZE="58720256"   # 56MB — must be >= largest SIZES entry (50MB) and fit segment-size (64MB, minus talc overhead)
 NVME_MAXMEMORY="107374182400"    # 100GB
 NVME_STAGING_SIZE="67108864"      # 64MB
 WORKER_THREADS=2
@@ -50,7 +51,7 @@ while [[ $# -gt 0 ]]; do
         --clients)       CLIENTS="$2"; shift 2 ;;
         --duration)      DURATION="$2"; shift 2 ;;
         --keys)          NUM_KEYS="$2"; shift 2 ;;
-        --dram-maxmemory)    DRAM_MAXMEMORY="$2"; shift 2 ;;
+        --maxmemory)         MAXMEMORY="$2"; shift 2 ;;
         --segment-size)      SEGMENT_SIZE="$2"; shift 2 ;;
         --nvme-maxmemory)    NVME_MAXMEMORY="$2"; shift 2 ;;
         --worker-threads)    WORKER_THREADS="$2"; shift 2 ;;
@@ -65,7 +66,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --clients <N>              Benchmark clients (default: 200)"
             echo "  --duration <SEC>           Duration per size (default: 10)"
             echo "  --keys <N>                 Number of keys to populate (default: 500)"
-            echo "  --dram-maxmemory <BYTES>   DRAM budget in bytes (default: 34359738368 = 32GB)"
+            echo "  --maxmemory <BYTES>        Server maxmemory; DRAM pool scales toward it (default: 34359738368 = 32GB)"
             echo "  --segment-size <BYTES>     Segment size in bytes (default: 67108864 = 64MB)"
             echo "  --nvme-maxmemory <BYTES>   NVMe budget in bytes (default: 107374182400 = 100GB)"
             echo "  --worker-threads <N>       Tokio threads (default: 2)"
@@ -180,6 +181,46 @@ for s in $SIZES_STR; do
     esac
 done
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+# Print a one-line DRAM scaling snapshot from INFO largeobj. Arg: label.
+print_scaling() {
+    local label="$1"
+    local info
+    info=$($VALKEY_CLI -p $PORT INFO largeobj 2>/dev/null | tr -d '\r')
+    local live nvme_live util expands shrinks dram_uring nvme_uring efa
+    live=$(echo       "$info" | grep -E "dram_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
+    nvme_live=$(echo  "$info" | grep -E "nvme_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
+    util=$(echo       "$info" | grep -E "utilization_pct"                 | awk -F: '{print $2}' | tr -d '[:space:]')
+    expands=$(echo    "$info" | grep -E "scaling_expand_total"            | awk -F: '{print $2}' | tr -d '[:space:]')
+    shrinks=$(echo    "$info" | grep -E "scaling_shrink_total"            | awk -F: '{print $2}' | tr -d '[:space:]')
+    dram_uring=$(echo "$info" | grep -E "dram_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
+    nvme_uring=$(echo "$info" | grep -E "nvme_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
+    efa=$(echo        "$info" | grep -E "efa_registered_segments"         | awk -F: '{print $2}' | tr -d '[:space:]')
+    local total_live=$(( ${live:-0} + ${nvme_live:-0} ))
+    echo "     [scaling: $label] dram_live=${live:-?} nvme_live=${nvme_live:-0} total_live=${total_live} util_pct=${util:-?} expand=${expands:-?} shrink=${shrinks:-?}"
+    # io_uring registration coverage, per pool: each should equal that pool's live
+    # count once the post-expand re-register has completed. Dram mode shows dram=0 (no
+    # io_uring engine). EFA is fabric-global (one MR per segment, not per-pool), so
+    # it is reported once against total_live.
+    echo "     [registered: $label] io_uring dram=${dram_uring:-0}/${live:-?} nvme=${nvme_uring:-0}/${nvme_live:-0}  efa=${efa:-?}/${total_live}"
+}
+
+# Run one LO.GET benchmark pass and print throughput + latency. Arg: label.
+# Leaves output in $BENCH_TMPFILE and exit code in $BENCH_EXIT for the caller
+# to assert on / clean up. Needs BENCH_TIMEOUT / EFFECTIVE_* set by the caller.
+run_bench_pass() {
+    local label="$1"
+    BENCH_TMPFILE=$(mktemp /tmp/bench-output-XXXXXX)
+    BENCH_EXIT=0
+    timeout $BENCH_TIMEOUT \
+        taskset -c $BENCH_CPUS \
+        $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
+        -- LO.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1 || BENCH_EXIT=$?
+    echo "  ┌─ $label"
+    tr '\r' '\n' < "$BENCH_TMPFILE" | grep -A3 "throughput summary" | sed 's/^/  │ /' || true
+}
+
 # ─── Header ───────────────────────────────────────────────────────────────────
 
 echo "=============================================="
@@ -193,7 +234,7 @@ echo "Duration:       ${DURATION}s"
 echo "Keys:           $NUM_KEYS"
 echo "Module:         $MODULE_SO"
 [ -n "$NVME_DIR" ] && echo "NVMe dir:       $NVME_DIR"
-echo "DRAM maxmem:    $DRAM_MAXMEMORY ($((DRAM_MAXMEMORY / 1048576))MB)"
+echo "Server maxmem:  $MAXMEMORY ($((MAXMEMORY / 1048576))MB) — DRAM pool scales toward this"
 echo "Segment size:   $SEGMENT_SIZE ($((SEGMENT_SIZE / 1048576))MB)"
 echo "Worker threads: $WORKER_THREADS"
 echo "IO threads:     $IO_THREADS"
@@ -312,30 +353,31 @@ for BENCH_MODE in $MODES_STR; do
 
         echo ""
         echo "  ── $LABEL ($BYTES bytes) ── [keys=$EFFECTIVE_KEYS, clients=$EFFECTIVE_CLIENTS]"
-        echo "     mode=$BENCH_MODE dram-maxmemory=$((DRAM_MAXMEMORY / 1048576))MB segment-size=$((SEGMENT_SIZE / 1048576))MB nvme-staging-size=$((STAGING_NEEDED / 1048576))MB worker-threads=$WORKER_THREADS io-threads=$IO_THREADS"
+        echo "     mode=$BENCH_MODE maxmemory=$((MAXMEMORY / 1048576))MB segment-size=$((SEGMENT_SIZE / 1048576))MB nvme-staging-size=$((STAGING_NEEDED / 1048576))MB worker-threads=$WORKER_THREADS io-threads=$IO_THREADS"
 
         # Build module args based on mode.
         case "$BENCH_MODE" in
             Dram)
                 MODULE_ARGS="operating-mode Dram"
-                MODULE_ARGS="$MODULE_ARGS dram-maxmemory $DRAM_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
+                MODULE_ARGS="$MODULE_ARGS max-object-size $MAX_OBJECT_SIZE"
                 ;;
             Tiered)
                 MODULE_ARGS="operating-mode Tiered"
                 MODULE_ARGS="$MODULE_ARGS nvme-dir $NVME_DIR"
-                MODULE_ARGS="$MODULE_ARGS dram-maxmemory $DRAM_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
+                MODULE_ARGS="$MODULE_ARGS max-object-size $MAX_OBJECT_SIZE"
+                MODULE_ARGS="$MODULE_ARGS max-promote-size $MAX_OBJECT_SIZE"
                 ;;
             NVMe)
                 MODULE_ARGS="operating-mode Tiered"
                 MODULE_ARGS="$MODULE_ARGS nvme-dir $NVME_DIR"
-                MODULE_ARGS="$MODULE_ARGS dram-maxmemory $DRAM_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
+                MODULE_ARGS="$MODULE_ARGS max-object-size $MAX_OBJECT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS max-promote-size 0"
                 ;;
             *)
@@ -364,6 +406,8 @@ for BENCH_MODE in $MODES_STR; do
             --logfile /tmp/bench-server-$PORT.log \
             --pidfile /tmp/bench-server-$PORT.pid \
             --loadmodule "$MODULE_SO" $MODULE_ARGS \
+            --maxmemory $MAXMEMORY \
+            --maxmemory-policy noeviction \
             --save "" \
             --appendonly no \
             --io-threads $IO_THREADS
@@ -438,16 +482,23 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             exit 1
         fi
 
-        # Reset stats before benchmark to get clean hit/miss counts
+        # ── Two-phase benchmark ──────────────────────────────────────────────
+        # Phase 1 (warm-up) runs on a COLD pool: in Tiered/NVMe the first GET of
+        # each key promotes it NVMe→DRAM, filling DRAM and triggering reactive
+        # scaling (expand); in Dram the pool already expanded during populate.
+        # Phase 2 (steady-state) reruns the same benchmark on the now-scaled,
+        # warm pool. Printing both, with the scaling counters between them, shows
+        # how scaling/promotion affects latency.
+        BENCH_TIMEOUT=$(( DURATION + 30 ))
+
+        # Reset stats before the warm-up pass. Disk reads are captured across the
+        # warm-up pass only — that is the promotion pass; steady-state is cache hits.
         $VALKEY_CLI -p $PORT CONFIG RESETSTAT > /dev/null 2>&1
 
-        # Disk read assertion: verify actual NVMe I/O is happening.
-        # Detect the block device for nvme-dir (e.g., dm-0 for LVM).
+        # Detect the block device for the disk-read assertion (e.g. dm-0 for LVM).
         DISK_READS_BEFORE=""
-        DISK_READS_AFTER=""
         if [ -n "$NVME_DIR" ] && [ "$BENCH_MODE" != "Dram" ]; then
             BLOCK_DEV=$(df "$NVME_DIR" 2>/dev/null | tail -1 | awk '{print $1}' | sed 's|/dev/||; s|/|-|g')
-            # Try /sys/block path (works for dm-X, nvmeXnY, etc.)
             STAT_FILE="/sys/block/${BLOCK_DEV}/stat"
             if [ ! -f "$STAT_FILE" ]; then
                 # LVM: /dev/mapper/vg-lv -> dm-X
@@ -464,62 +515,58 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             fi
         fi
 
-        # LO.GET benchmark (timeout = duration + 30s grace)
-        BENCH_TIMEOUT=$(( DURATION + 30 ))
-        BENCH_TMPFILE=$(mktemp /tmp/bench-output-XXXXXX)
-        BENCH_EXIT=0
-        timeout $BENCH_TIMEOUT \
-            taskset -c $BENCH_CPUS \
-            $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
-            -- LO.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1 || BENCH_EXIT=$?
+        print_scaling "before warm-up (cold)"
 
-        # Print the results
-        tr '\r' '\n' < "$BENCH_TMPFILE" | grep -A3 "throughput summary" || true
+        # Phase 1: warm-up — drives promotion + scaling.
+        run_bench_pass "PHASE 1 — warm-up (cold pool: promotion + scaling)"
+        WARMUP_EXIT=$BENCH_EXIT
+        WARMUP_TMPFILE=$BENCH_TMPFILE
 
-        # Assert benchmark completed and produced results
-        if [ $BENCH_EXIT -eq 124 ]; then
-            echo "  FATAL: Benchmark timed out after ${BENCH_TIMEOUT}s. Server may be hung or staging pool exhausted."
-            rm -f "$BENCH_TMPFILE"
-            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
-            exit 1
-        fi
-        if ! tr '\r' '\n' < "$BENCH_TMPFILE" | grep -q "throughput summary"; then
-            echo "  FATAL: Benchmark produced no throughput results."
-            echo "         Raw output:"
-            tr '\r' '\n' < "$BENCH_TMPFILE" | tail -10
-            rm -f "$BENCH_TMPFILE"
-            $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
-            exit 1
-        fi
-        rm -f "$BENCH_TMPFILE"
-
-        # Disk read assertion
+        # Disk-read assertion on the warm-up pass (the promotion pass).
         if [ -n "$DISK_READS_BEFORE" ] && [ -f "$STAT_FILE" ]; then
             DISK_READS_AFTER=$(awk '{print $1}' "$STAT_FILE")
             DISK_READS_DELTA=$(( DISK_READS_AFTER - DISK_READS_BEFORE ))
-            echo "  Disk reads: $DISK_READS_DELTA"
-
-            if [ "$BENCH_MODE" = "Tiered" ]; then
-                # Tiered: first GET promotes each key from NVMe → DRAM. Subsequent GETs are DRAM cache hits.
-                # Expect at least EFFECTIVE_KEYS reads (one promotion per key).
-                if [ $DISK_READS_DELTA -lt $EFFECTIVE_KEYS ]; then
-                    echo "  FATAL: Tiered mode disk read mismatch — expected >= $EFFECTIVE_KEYS reads (one promotion per key), got $DISK_READS_DELTA."
-                    echo "         NVMe reads are not happening. Check: wrong mount point, key format mismatch, or code bug in promotion path."
-                    $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
-                    exit 1
-                fi
-            elif [ "$BENCH_MODE" = "NVMe" ]; then
-                # NVMe-only: every GET reads from NVMe. Expect reads >> keys.
-                if [ $DISK_READS_DELTA -lt $EFFECTIVE_KEYS ]; then
-                    echo "  FATAL: NVMe mode disk read mismatch — expected >> $EFFECTIVE_KEYS reads (every GET reads from disk), got $DISK_READS_DELTA."
-                    echo "         NVMe reads are not happening. Check: wrong mount point, key format mismatch, or bench-mode replying before read."
-                    $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
-                    exit 1
-                fi
+            echo "  Disk reads (warm-up): $DISK_READS_DELTA"
+            # Tiered: >= one promotion read per key. NVMe-only: every GET reads disk (>> keys).
+            if [ $DISK_READS_DELTA -lt $EFFECTIVE_KEYS ]; then
+                echo "  FATAL: $BENCH_MODE mode warm-up disk reads ($DISK_READS_DELTA) < keys ($EFFECTIVE_KEYS)."
+                echo "         NVMe reads are not happening. Check: wrong mount point, key format mismatch, or promotion-path bug."
+                rm -f "$WARMUP_TMPFILE"
+                $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+                exit 1
             fi
         fi
 
-        # Cache hit/miss assertion: verify benchmark is hitting real keys, not returning nil.
+        print_scaling "after warm-up (scaled)"
+
+        # Phase 2: steady-state — warm, scaled pool.
+        run_bench_pass "PHASE 2 — steady-state (warm, scaled pool)"
+        REAL_EXIT=$BENCH_EXIT
+        REAL_TMPFILE=$BENCH_TMPFILE
+
+        print_scaling "after steady-state"
+
+        # Assert both passes completed and produced results.
+        for pass in "warm-up|$WARMUP_EXIT|$WARMUP_TMPFILE" "steady-state|$REAL_EXIT|$REAL_TMPFILE"; do
+            P_NAME="${pass%%|*}"; rest="${pass#*|}"; P_EXIT="${rest%%|*}"; P_FILE="${rest##*|}"
+            if [ "$P_EXIT" -eq 124 ]; then
+                echo "  FATAL: $P_NAME benchmark timed out after ${BENCH_TIMEOUT}s. Server hung or staging pool exhausted."
+                rm -f "$WARMUP_TMPFILE" "$REAL_TMPFILE"
+                $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+                exit 1
+            fi
+            if ! tr '\r' '\n' < "$P_FILE" | grep -q "throughput summary"; then
+                echo "  FATAL: $P_NAME benchmark produced no throughput results."
+                echo "         Raw output:"
+                tr '\r' '\n' < "$P_FILE" | tail -10
+                rm -f "$WARMUP_TMPFILE" "$REAL_TMPFILE"
+                $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
+                exit 1
+            fi
+        done
+        rm -f "$WARMUP_TMPFILE" "$REAL_TMPFILE"
+
+        # Cache hit/miss assertion (cumulative over both passes: hits > 0, misses == 0).
         CACHE_HITS=$($VALKEY_CLI -p $PORT INFO stats 2>/dev/null | grep keyspace_hits | awk -F: '{print $2}' | tr -d '[:space:]')
         CACHE_MISSES=$($VALKEY_CLI -p $PORT INFO stats 2>/dev/null | grep keyspace_misses | awk -F: '{print $2}' | tr -d '[:space:]')
         echo "  Cache hits: ${CACHE_HITS:-<missing>}, misses: ${CACHE_MISSES:-<missing>}"

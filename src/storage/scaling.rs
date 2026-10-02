@@ -28,7 +28,8 @@ pub fn scaling_cron(ctx: &Context) {
     // 2. Proactive expand: grow before the pool fills so promotions don't
     //    stall on segment creation + EFA registration on the hot path.
     let util = pool.utilization_ratio();
-    if util > expand_watermark && pool.try_expand(ctx).is_some() {
+    let expanded = util > expand_watermark && pool.try_expand(ctx).is_some();
+    if expanded {
         ctx.log_notice(&format!(
             "largeobj: scaling — pool utilization {:.1}% > {:.0}%, added one DRAM segment",
             util * 100.0,
@@ -40,11 +41,19 @@ pub fn scaling_cron(ctx: &Context) {
     // try_shrink() is safe in both modes: in Dram mode it only drains segments
     // with zero allocated bytes, so no live data is ever lost.
     //
-    // Shrink signal is SERVER-scoped (crate::server_memory): we release DRAM
-    // segments when Valkey overall is under memory pressure, giving space back to
-    // core data types. The module's own pool utilization drives EXPAND; it must
-    // not gate SHRINK, or a module with a low dram-maxmemory would shrink itself
-    // under module-local pressure unrelated to server-wide pressure.
+    // Shrink is SERVER-scoped (crate::server_memory), not module-scoped: we give
+    // DRAM back only under Valkey-wide pressure, so the module's own pool pressure
+    // (which drives expand) must not trigger shrink.
+    //
+    // Expand takes priority within a tick: expand and shrink read different
+    // denominators (module utilization vs server memory), so both can cross on
+    // the same tick, and firing both would add a segment then immediately drain
+    // one — pure churn. Gated on expand-SUCCEEDED, not merely wanted, so a pool
+    // that can't grow still shrinks under pressure.
+    if expanded {
+        rearm_scaling_cron(ctx, poll_ms);
+        return;
+    }
     let (used, maxmemory) = crate::server_memory(ctx);
     if maxmemory == 0 {
         // No server-wide maxmemory configured — no shrink pressure signal exists.

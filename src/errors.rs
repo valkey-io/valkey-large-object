@@ -47,6 +47,16 @@ define_errors! {
     ERR_INSUFFICIENT_NVME_BUFFERS => "ERR NVMe staging buffer pool exhausted",
     ERR_NVME_CAPACITY_EXCEEDED => "ERR NVMe disk capacity exceeded",
     ERR_SET_VALUE => "ERR failed to set key",
+
+    // Config Validation Errors
+    ERR_OBJECT_TOO_LARGE => "ERR object size exceeds max-object-size limit",
+    ERR_ZERO_LENGTH_OBJECT => "ERR object length must be > 0",
+    ERR_NVME_GE_MAX_OBJ => "ERR nvme-maxmemory must be >= max-object-size in Tiered mode",
+    ERR_SEGMENT_GE_MAX_OBJ => "ERR segment-size is insufficient for max-object-size",
+    ERR_SEGMENT_GE_PROMOTE => "ERR segment-size is insufficient for max-promote-size",
+    ERR_STAGING_GE_SEGMENT => "ERR nvme-staging-size must be >= segment-size",
+    ERR_SEGMENT_GE_CHUNK => "ERR segment-size must be >= chunk-size",
+    ERR_MAX_BUF_GE_MIN_BUF => "ERR max-buffers-per-op must be >= min-buffers-per-op",
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

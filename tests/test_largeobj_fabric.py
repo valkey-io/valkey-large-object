@@ -19,7 +19,8 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Dram"
-            f" dram-segment-size 1048576"
+            f" segment-size 1048576"
+            f" max-object-size 520192"
             f" chunk-size 4096"
             f" fabric-provider Emulated"
             f" fabric-interfaces lo"
@@ -64,7 +65,8 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Dram"
-            f" dram-segment-size 1048576"
+            f" segment-size 1048576"
+            f" max-object-size 520192"
             f" chunk-size 4096"
             f" fabric-provider Emulated"
             f" fabric-interfaces no-such-interface"
@@ -88,8 +90,9 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         return (
             f"operating-mode Dram"
-            f" dram-segment-size 1048576"
-            f" lo-buffer-size 4096"
+            f" segment-size 1048576"
+            f" max-object-size 520192"
+            f" chunk-size 4096"
             f" fabric-provider Emulated"
             f" fabric-interfaces lo"
         )
@@ -102,7 +105,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         )
         line = process.stdout.readline()
         assert line.startswith('advertisement: '), line
-        address, rkey, remote_addr = line.split()[1:]
+        address, rkey, remote_addr = line.split()[1:4]
         return process, address, int(rkey), int(remote_addr)
 
     def test_get_writes_into_the_target(self):
@@ -182,6 +185,7 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 1048576"
             f" segment-size 1048576"
+            f" max-promote-size 520192"
             f" chunk-size 4096"
             f" direct-io no"
             f" fabric-provider Emulated"

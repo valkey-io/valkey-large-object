@@ -1,14 +1,12 @@
-//! NVMe io_uring Engine — registered segments, ReadFixed/WriteFixed, CQ poller thread.
+//! io_uring engine — one independent instance PER POOL (Tiered mode only).
 //!
-//! Only used in Tiered mode. Dram-only mode has no io_uring engine.
-//!
-//! Architecture:
-//!   Caller: submit(IoRequest) via channel → returns immediately
-//!   Poller thread: owns io_uring ring, submits ReadFixed/WriteFixed, polls CQ,
-//!                  sends completion result via oneshot channel.
-//!
-//! Segments are registered with IORING_REGISTER_BUFFERS at startup.
-//! ReadFixed/WriteFixed use buf_index (segment index) + offset within segment.
+//! Each engine owns its own ring, registered-buffer table, and CQ poller thread.
+//! `submit(PoolType, IoRequest)` routes to that pool's ring; the poller submits
+//! ReadFixed/WriteFixed and returns results on a oneshot channel. The two tables
+//! are independent (IORING_REGISTER_BUFFERS is per-ring-fd) and `iovec_index` is
+//! pool-local. Every op names exactly one buffer + a raw file fd/offset, so no op
+//! spans both pools. Only the DRAM pool scales, so only the DRAM ring rebuilds —
+//! the NVMe ring never stalls.
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
@@ -20,6 +18,16 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use tokio::sync::oneshot;
 
 use super::StorageError;
+
+// ─── Pool identity ───────────────────────────────────────────────────────────
+
+/// Which pool's ring an op or reregister targets. The whole generic seam: one
+/// `UringEngine` type, two instances keyed by this field — no trait, no dyn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolType {
+    Dram,
+    Nvme,
+}
 
 // ─── Request Types ───────────────────────────────────────────────────────────
 
@@ -35,6 +43,12 @@ pub struct UringOp {
     pub file_offset: u64,
     /// Number of bytes to read/write.
     pub len: u64,
+    /// Whether this op's buffer segment is registered in the io_uring kernel
+    /// table. `true` → ReadFixed/WriteFixed (fast path, segment in the
+    /// IORING_REGISTER_BUFFERS set); `false` → plain Read/Write (a segment
+    /// added after startup that is not yet kernel-registered). Set by the caller
+    /// from the owning segment's registration flag at construction time.
+    pub use_fixed: bool,
 }
 
 // SAFETY: buf_ptr points to segment memory that is stable for module lifetime.
@@ -53,6 +67,11 @@ enum IoRequest {
         op: UringOp,
         tx: oneshot::Sender<Result<(), StorageError>>,
     },
+    /// Rebuild this ring's fixed-buffer table from its live segments. 5.10 has
+    /// only a whole-table re-register: the poller sets `registration_pending` (new ops
+    /// go non-fixed), waits for in-flight fixed ops to drain, then
+    /// unregister + register. Fire-and-forget from expand()/release().
+    Reregister,
 }
 
 // SAFETY: IoRequest contains raw pointers (inside UringOp) referring to segment-allocated memory
@@ -67,15 +86,27 @@ enum PendingOp {
         tx: oneshot::Sender<Result<u64, StorageError>>,
         /// Expected byte count for this I/O op. Short reads are rejected.
         expected_bytes: u64,
+        /// True if issued as ReadFixed — counts against `fixed_in_flight`, which
+        /// gates the whole-table re-registration (see `poller_loop`).
+        fixed: bool,
     },
     Write {
         tx: oneshot::Sender<Result<(), StorageError>>,
         /// Expected byte count for this I/O op. Short writes are rejected.
         expected_bytes: u64,
+        /// True if issued as WriteFixed — counts against `fixed_in_flight`.
+        fixed: bool,
     },
 }
 
 impl PendingOp {
+    /// True if this op was issued on the fixed (ReadFixed/WriteFixed) path.
+    fn is_fixed(&self) -> bool {
+        match self {
+            PendingOp::Read { fixed, .. } | PendingOp::Write { fixed, .. } => *fixed,
+        }
+    }
+
     /// Send an error to the waiting caller. Used when submit fails fatally.
     fn send_error(self, code: i32) {
         match self {
@@ -89,21 +120,36 @@ impl PendingOp {
     }
 }
 
-// ─── Global NVMe Engine ──────────────────────────────────────────────────────
+// ─── Per-Pool Engines ────────────────────────────────────────────────────────
 
-static NVME_ENGINE: OnceLock<UringNvmeEngine> = OnceLock::new();
+/// One engine per pool: the DRAM ring and the NVMe ring are fully independent
+/// (separate ring fd, separate registered-buffer table, separate poller thread).
+static DRAM_ENGINE: OnceLock<UringEngine> = OnceLock::new();
+static NVME_ENGINE: OnceLock<UringEngine> = OnceLock::new();
 
-pub fn set_nvme_engine(engine: UringNvmeEngine) {
-    if NVME_ENGINE.set(engine).is_err() {
-        panic!("NVMe engine already initialized");
+/// Install the engine for `pool`. Panics if already set (init runs once).
+pub fn set_engine(pool: PoolType, engine: UringEngine) {
+    let slot = match pool {
+        PoolType::Dram => &DRAM_ENGINE,
+        PoolType::Nvme => &NVME_ENGINE,
+    };
+    if slot.set(engine).is_err() {
+        panic!("{:?} engine already initialized", pool);
     }
 }
 
-/// Submit an IoRequest to the poller thread.
+fn engine(pool: PoolType) -> Option<&'static UringEngine> {
+    match pool {
+        PoolType::Dram => DRAM_ENGINE.get(),
+        PoolType::Nvme => NVME_ENGINE.get(),
+    }
+}
+
+/// Submit an IoRequest to the poller thread of `pool`'s ring.
 /// Returns SendError with the request back on failure (channel disconnected)
 /// so the caller can extract the oneshot sender and fire an explicit error.
-fn submit(req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>> {
-    match NVME_ENGINE.get() {
+fn submit(pool: PoolType, req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>> {
+    match engine(pool) {
         Some(engine) => engine.tx.send(req),
         None => Err(crossbeam_channel::SendError(req)),
     }
@@ -111,56 +157,79 @@ fn submit(req: IoRequest) -> Result<(), crossbeam_channel::SendError<IoRequest>>
 
 // ─── Async submit helpers ────────────────────────────────────────────────────
 //
-// Create a oneshot channel, send the tx inside the IoRequest to the poller.
+// Create a oneshot channel, send the tx inside the IoRequest to the pool's poller.
 // Poller fires tx.send() on CQE completion. Caller awaits rx.
 
-/// Submit a ReadFixed and return a oneshot receiver.
+/// Submit a ReadFixed to `pool`'s ring and return a oneshot receiver.
 /// If the poller is dead, sends an explicit error on the oneshot.
-pub fn submit_read(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<u64, StorageError>> {
+pub fn submit_read(
+    pool: PoolType,
+    fd: RawFd,
+    op: UringOp,
+) -> oneshot::Receiver<Result<u64, StorageError>> {
     let (tx, rx) = oneshot::channel();
     if let Err(crossbeam_channel::SendError(IoRequest::Read { tx, .. })) =
-        submit(IoRequest::Read { fd, op, tx })
+        submit(pool, IoRequest::Read { fd, op, tx })
     {
         let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
     }
     rx
 }
 
-/// Submit a WriteFixed and return a oneshot receiver.
+/// Submit a WriteFixed to `pool`'s ring and return a oneshot receiver.
 /// If the poller is dead, sends an explicit error on the oneshot.
-pub fn submit_write(fd: RawFd, op: UringOp) -> oneshot::Receiver<Result<(), StorageError>> {
+pub fn submit_write(
+    pool: PoolType,
+    fd: RawFd,
+    op: UringOp,
+) -> oneshot::Receiver<Result<(), StorageError>> {
     let (tx, rx) = oneshot::channel();
     if let Err(crossbeam_channel::SendError(IoRequest::Write { tx, .. })) =
-        submit(IoRequest::Write { fd, op, tx })
+        submit(pool, IoRequest::Write { fd, op, tx })
     {
         let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
     }
     rx
 }
 
-// ─── UringNvmeEngine ─────────────────────────────────────────────────────────
+/// Ask `pool`'s poller to rebuild its fixed-buffer table after an expand/release.
+/// Fire-and-forget; no-op if that pool has no engine (Dram mode). Only `Dram` in
+/// practice — the NVMe pool is fixed-size.
+///
+/// Spawned on a tokio worker, not the caller: crossbeam's send inits a
+/// thread-local reclaimed only on thread exit, and the main valkey thread (the
+/// caller) never exits — a worker does.
+pub fn submit_reregister(pool: PoolType) {
+    if engine(pool).is_none() {
+        return; // Dram mode / not initialized — nothing to reregister.
+    }
+    crate::runtime_handle().spawn(async move {
+        let _ = submit(pool, IoRequest::Reregister);
+    });
+}
 
-pub struct UringNvmeEngine {
+// ─── UringEngine ─────────────────────────────────────────────────────────────
+
+pub struct UringEngine {
     tx: Sender<IoRequest>,
     shutdown: Arc<AtomicBool>,
     _poller: Option<thread::JoinHandle<()>>,
 }
 
-impl Drop for UringNvmeEngine {
+impl Drop for UringEngine {
     fn drop(&mut self) {
         // Set shutdown flag BEFORE tx drops. This ensures the poller sees
         // shutdown=true when the channel disconnects, and exits cleanly
         // instead of panicking on unexpected disconnect.
-        // Fires on: (1) init failure (local engine dropped), (2) process exit.
+        // Fires on init failure (local engine dropped) upon the rollback.
         self.shutdown.store(true, Ordering::Relaxed);
     }
 }
 
-impl UringNvmeEngine {
-    /// Create engine: init io_uring ring + register buffers on the calling thread,
-    /// then spawn CQ poller with the working ring. Returns Err if the kernel
-    /// doesn't support io_uring or buffer registration fails.
-    pub fn new(iovecs: Vec<libc::iovec>) -> Result<Self, String> {
+impl UringEngine {
+    /// Create an engine for `pool`: init the ring, register its buffers, spawn the
+    /// CQ poller. Err if the kernel lacks io_uring or registration fails.
+    pub fn new(pool: PoolType, iovecs: Vec<libc::iovec>) -> Result<Self, String> {
         // Create ring on main thread — fail gracefully instead of panicking.
         let ring =
             io_uring::IoUring::new(256).map_err(|e| format!("io_uring init failed: {}", e))?;
@@ -174,9 +243,9 @@ impl UringNvmeEngine {
         let shutdown_clone = shutdown.clone();
         // Pass the fully initialized ring to the poller thread.
         let poller = thread::Builder::new()
-            .name("lo-uring-poller".into())
+            .name(format!("lo-uring-poller-{:?}", pool))
             .spawn(move || {
-                Self::poller_loop(rx, shutdown_clone, ring);
+                Self::poller_loop(pool, rx, shutdown_clone, ring);
             })
             .expect("failed to spawn io_uring poller thread");
         Ok(Self {
@@ -186,22 +255,41 @@ impl UringNvmeEngine {
         })
     }
 
-    /// The CQ poller loop — owns the io_uring ring (received fully initialized).
+    /// The CQ poller loop — owns one pool's io_uring ring (received fully
+    /// initialized). `pool` selects which pool's table a re-registration
+    /// rebuilds.
     fn poller_loop(
+        pool: PoolType,
         rx: Receiver<IoRequest>,
         shutdown: Arc<AtomicBool>,
         mut ring: io_uring::IoUring,
     ) {
         let mut pending: HashMap<u64, PendingOp> = HashMap::new();
         let mut next_token: u64 = 1;
-        // Buffer registration is guaranteed by the caller (main thread).
-        let use_fixed = true;
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
+        // Re-registration state: while pending, ops go non-fixed; the re-register fires
+        // once in-flight fixed ops drain to 0.
+        let mut registration_pending = false;
+        let mut fixed_in_flight: usize = 0;
         loop {
             // Exit when shutdown requested and all in-flight ops are drained.
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
                 break;
+            }
+            // Re-register: once in-flight fixed ops have drained, rebuild + re-register
+            // the table. In-window ops went non-fixed, so stale indices are unused.
+            if registration_pending && fixed_in_flight == 0 {
+                let iovecs = super::rebuild_dense_iovecs_for(pool);
+                unsafe {
+                    let _ = ring.submitter().unregister_buffers();
+                    if !iovecs.is_empty() {
+                        ring.submitter()
+                            .register_buffers(&iovecs)
+                            .expect("largeobj: io_uring re-register_buffers failed");
+                    }
+                }
+                registration_pending = false;
             }
             // Channel disconnected without shutdown flag = bug. The sender lives
             // in an OnceLock for the entire process lifetime. If it's gone without
@@ -247,9 +335,19 @@ impl UringNvmeEngine {
                 let token = next_token;
                 next_token += 1;
                 let (sqe, op) = match req {
+                    IoRequest::Reregister => {
+                        // Enter the re-register window. Ops keep flowing but are forced
+                        // non-fixed below until `fixed_in_flight` drains and the
+                        // top-of-loop re-register rebuilds the table. No SQE to build.
+                        registration_pending = true;
+                        continue;
+                    }
                     IoRequest::Read { fd, op, tx } => {
                         let read_len = super::align_up(op.len as usize) as u32;
-                        let sqe = if use_fixed {
+                        // Kill-switch: while a re-register is pending, issue non-fixed so a
+                        // stale iovec_index against the about-to-change table is never used.
+                        let issue_fixed = op.use_fixed && !registration_pending;
+                        let sqe = if issue_fixed {
                             io_uring::opcode::ReadFixed::new(
                                 io_uring::types::Fd(fd),
                                 op.buf_ptr,
@@ -274,12 +372,14 @@ impl UringNvmeEngine {
                             PendingOp::Read {
                                 tx,
                                 expected_bytes: op.len,
+                                fixed: issue_fixed,
                             },
                         )
                     }
                     IoRequest::Write { fd, op, tx } => {
                         let write_len = super::align_up(op.len as usize) as u32;
-                        let sqe = if use_fixed {
+                        let issue_fixed = op.use_fixed && !registration_pending;
+                        let sqe = if issue_fixed {
                             io_uring::opcode::WriteFixed::new(
                                 io_uring::types::Fd(fd),
                                 op.buf_ptr as *const u8,
@@ -304,10 +404,12 @@ impl UringNvmeEngine {
                             PendingOp::Write {
                                 tx,
                                 expected_bytes: op.len,
+                                fixed: issue_fixed,
                             },
                         )
                     }
                 };
+                let op_is_fixed = op.is_fixed();
                 unsafe {
                     if ring.submission().is_full() {
                         let _ = ring.submit();
@@ -317,6 +419,9 @@ impl UringNvmeEngine {
                         op.send_error(libc::EAGAIN);
                     } else {
                         pending.insert(token, op);
+                        if op_is_fixed {
+                            fixed_in_flight += 1;
+                        }
                     }
                 }
                 batch += 1;
@@ -360,8 +465,13 @@ impl UringNvmeEngine {
             }
             for (token, result) in completed {
                 if let Some(op) = pending.remove(&token) {
+                    if op.is_fixed() {
+                        fixed_in_flight -= 1;
+                    }
                     match op {
-                        PendingOp::Read { tx, expected_bytes } => {
+                        PendingOp::Read {
+                            tx, expected_bytes, ..
+                        } => {
                             if result >= 0 && result as u64 >= expected_bytes {
                                 let _ = tx.send(Ok(result as u64));
                             } else if result < 0 {
@@ -371,7 +481,9 @@ impl UringNvmeEngine {
                                 let _ = tx.send(Err(StorageError::IoError { code: libc::EIO }));
                             }
                         }
-                        PendingOp::Write { tx, expected_bytes } => {
+                        PendingOp::Write {
+                            tx, expected_bytes, ..
+                        } => {
                             if result >= 0 && result as u64 >= expected_bytes {
                                 let _ = tx.send(Ok(()));
                             } else if result < 0 {
@@ -396,6 +508,9 @@ impl UringNvmeEngine {
                     .collect();
                 for token in batch_tokens {
                     if let Some(op) = pending.remove(&token) {
+                        if op.is_fixed() {
+                            fixed_in_flight -= 1;
+                        }
                         op.send_error(code);
                     }
                 }

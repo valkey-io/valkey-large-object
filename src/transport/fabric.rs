@@ -14,9 +14,10 @@ use crate::transport::operand::PoolOperand;
 
 pub struct Fabric {
     services: Vec<FabricService<PoolOperand>>,
-    /// The registered pool segments, alive for the fabric's lifetime. Segment memory is stable for
-    /// the module's lifetime.
-    regions: Vec<MemoryRegion<&'static [u8]>>,
+    /// EFA registrations keyed by segment base (one `MemoryRegion` per service), retained for the
+    /// segment's lifetime. `release_segment` drops them before the memory is freed. `Mutex` because
+    /// segments are added/removed at runtime through the shared `Arc<Fabric>`.
+    regions: Mutex<std::collections::HashMap<usize, Vec<MemoryRegion<&'static [u8]>>>>,
     /// Runs checksummed completions off the fabric workers. Held so it outlives every service.
     _pool: Arc<Pool>,
 }
@@ -56,7 +57,7 @@ impl Fabric {
         }
         Ok(Self {
             services,
-            regions: Vec::new(),
+            regions: Mutex::new(std::collections::HashMap::new()),
             _pool: pool,
         })
     }
@@ -83,19 +84,50 @@ impl Fabric {
             .map_err(|_request| DmaError::Fabric("fabric worker is gone".into()))
     }
 
-    /// Register every pool segment on every service ahead of any transfer, so any service can
-    /// carry any transfer and the engine is free to balance across devices. Pins each segment once
-    /// per device against `RLIMIT_MEMLOCK`.
-    pub fn register_buffers(&mut self, segments: &[&'static [u8]]) -> Result<(), String> {
+    /// Register ONE segment on every service so any device can carry a transfer to it. Pins it
+    /// once per device against `RLIMIT_MEMLOCK`. `&self` — works at startup and at runtime (pool
+    /// expansion) through the shared `Arc<Fabric>`. Handles are retained in `self.regions` keyed
+    /// by base for `release_segment`. On mid-loop failure the regions taken in THIS call drop and
+    /// the error propagates, so a segment is never left registered on only some services.
+    pub fn register_segment(&self, segment: &'static [u8]) -> Result<(), String> {
+        let base = segment.as_ptr() as usize;
+        let mut new_regions = Vec::with_capacity(self.services.len());
         for (service_index, service) in self.services.iter().enumerate() {
-            for (segment_index, segment) in segments.iter().enumerate() {
-                let region = service.register(*segment).map_err(|error| {
-                    format!("segment {segment_index} on service {service_index}: {error}")
-                })?;
-                self.regions.push(region);
-            }
+            let region = service
+                .register(segment)
+                .map_err(|error| format!("segment on service {service_index}: {error}"))?;
+            new_regions.push(region);
         }
+        // All services registered — retain the handles keyed by base.
+        self.regions
+            .lock()
+            .expect("Fabric.regions lock unavailable")
+            .insert(base, new_regions);
         Ok(())
+    }
+
+    /// Drop a segment's EFA registration by base. MUST run before the segment memory is freed:
+    /// dropping the `MemoryRegion` handles tears the registration down in the DMA library's order
+    /// (invalidate the cache entry, then `fi_close`), so no registration outlives its pages. No-op
+    /// if the base was never registered (fabric down at expand, or already released).
+    pub fn release_segment(&self, base: usize) {
+        let regions = self
+            .regions
+            .lock()
+            .expect("Fabric.regions lock unavailable")
+            .remove(&base);
+        // Drop outside the lock: MemoryRegion::drop calls region_cache::invalidate → fi_close,
+        // and deregistration must not run while the regions map lock is held.
+        drop(regions);
+    }
+
+    /// Count of currently EFA-registered segments (one map entry per base). Equals the live
+    /// segment count when the fabric is up — used to assert that invariant in tests, not a metric.
+    pub fn registered_segment_count(&self) -> usize {
+        self.regions
+            .lock()
+            .expect("Fabric.regions lock unavailable")
+            .len()
     }
 
     /// Insert the client's address into every service's address vector at LO.HELLO, so its
@@ -142,6 +174,11 @@ pub fn commit(fabric: Option<Fabric>) {
 /// The running fabric, or `None` when this instance has none.
 pub fn fabric() -> Option<Arc<Fabric>> {
     slot().clone()
+}
+
+/// Number of EFA-registered segments, or 0 when no fabric is up.
+pub fn registered_segment_count() -> usize {
+    fabric().map_or(0, |f| f.registered_segment_count())
 }
 
 /// Drop the services. Each closes its channel, drains its in-flight transfers, and joins its

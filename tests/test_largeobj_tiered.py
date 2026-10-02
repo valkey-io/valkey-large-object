@@ -13,13 +13,16 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
     directly; second-touch admission has its own classes below."""
 
     def get_module_args(self, data_dir, direct_io):
+        # max-promote-size must fit in one segment after talc overhead.
+        # With seg=4M and chunk=4K the max is 2093056 (~2044 KiB).
         return (
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 4194304"
-            f" max-promote-size 268435456"
             f" promote-min-hits 1"
+            f" max-promote-size 2093056"
+            f" max-object-size 1048576"
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
@@ -358,6 +361,49 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         self._wait_free_settled(client)
         wait_for_equal(self._dat_count, 0)
 
+    # ─── max-object-size tests ───────────────────────────────────────────
+
+    def test_max_object_size_tiered(self):
+        """max-object-size rejects oversized SETs in Tiered mode.
+        No .dat file created for rejected SET. Reads unaffected after lowering limit."""
+        client = self.server.get_new_client()
+        limit = 4096
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit))
+        # Oversized SET is rejected with max-object-size error (not NVMe capacity).
+        try:
+            client.execute_command('LO.SET', 'bigkey', b'X' * (limit + 1))
+            assert False, "Expected max object size rejection"
+        except ResponseError as e:
+            err = str(e).lower()
+            assert 'max-object-size' in err, f"Unexpected error: {e}"
+            assert 'nvme' not in err, f"Should not hit NVMe error: {e}"
+        # Rejected SET must not leave a .dat file or phantom key.
+        assert self._dat_count() == 0
+        assert client.execute_command('DBSIZE') == 0
+        # At-limit SET succeeds and creates a .dat file.
+        assert client.execute_command('LO.SET', 'okkey', b'Y' * limit) == b'OK'
+        wait_for_equal(self._dat_count, 1)
+        # GET returns correct data (promotion path on first GET, DRAM on second).
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
+        # Lowering limit below stored object size does not affect reads.
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit // 2))
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
+
+    def test_max_object_size_tiered_rejection(self):
+        """CONFIG SET max-object-size > nvme-maxmemory is rejected."""
+        client = self.server.get_new_client()
+        # Set nvme-maxmemory to a small value so we can exceed it.
+        nvme_limit = 1048576  # 1 MiB
+        client.execute_command('CONFIG', 'SET', 'largeobj.nvme-maxmemory', str(nvme_limit))
+        obj_limit = 2 * 1048576  # 2 MiB
+        try:
+            client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(obj_limit))
+            assert False, "Expected CONFIG SET to be rejected"
+        except ResponseError as e:
+            assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'nvme-maxmemory' in str(e).lower(), f"Unexpected error: {e}"
+
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
     """Tiered mode with max-promote-size=0 (no promotion, all reads from NVMe)."""
@@ -517,12 +563,16 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
     OBJ = 256 * 1024
 
     def get_module_args(self, data_dir, direct_io):
+        # max-promote-size must fit in segment after talc overhead.
+        # seg=1M, chunk=OBJ=256K → max 1028096.
         return (
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-maxmemory {self.CAP}"
+            f" max-object-size {self.CAP}"
             f" nvme-staging-size {self.CAP}"
             f" segment-size 1048576"
+            f" max-promote-size 1028096"
             f" chunk-size {self.OBJ}"
             f" bench-mode no"
             f" direct-io no"
@@ -593,12 +643,15 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
         # segment-size must exceed the largest staged object (object < segment):
         # this test stages 1 MiB and ~1 MiB+2KiB objects, so use 2 MiB segments.
         # nvme-staging-size 4 MiB -> ceil(4MiB / 2MiB) = 2 NVMe staging segments.
+        # max-promote-size must fit in segment after talc overhead (max 2084864).
         return (
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-maxmemory {self.CAP}"
+            f" max-object-size {self.CAP}"
             f" nvme-staging-size 4194304"
             f" segment-size 2097152"
+            f" max-promote-size 2084864"
             f" chunk-size 1048576"
             f" bench-mode no"
             f" direct-io no"
@@ -644,7 +697,7 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
-            f" dram-segment-size 4194304"
+            f" segment-size 4194304"
             f" max-promote-size 0"
             f" chunk-size 4096"
             f" bench-mode no"
@@ -678,7 +731,7 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
             f"operating-mode Tiered"
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
-            f" dram-segment-size 4194304"
+            f" segment-size 4194304"
             f" max-promote-size 0"
             f" chunk-size 4096"
             f" bench-mode no"
@@ -735,6 +788,8 @@ class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 1048576"
             f" segment-size 1048576"
+            f" max-promote-size 520192"
+            f" chunk-size 4096"
             f" bench-mode no"
             f" direct-io no"
             f" smartlog-poll-secs 0"
@@ -760,7 +815,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 4194304"
-            f" max-promote-size 268435456"
+            f" max-promote-size 1048576"
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
@@ -771,7 +826,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         rejects; the second promotes; the third is a hit. Objects above
         max-promote-size are misses that never count as admission rejects."""
         client = self.server.get_new_client()
-        dram = lambda: client.info('largeobj_largeobj_dram')
+        dram = lambda: client.info('largeobj_dram')
         payload = b'T' * 4096
         base = dram()
 
@@ -824,10 +879,10 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
 
         client.execute_command('CONFIG', 'SET', 'largeobj.promote-min-hits', '1')
         client.execute_command('LO.SET', 'one_key', payload)
-        rejects = client.info('largeobj_largeobj_dram')['largeobj_admission_rejects_total']
+        rejects = client.info('largeobj_dram')['largeobj_admission_rejects_total']
         assert client.execute_command('LO.GET', 'one_key') == payload
         assert client.execute_command('LO.INFO', 'one_key', 'TIER') == b'dram'
-        assert client.info('largeobj_largeobj_dram')['largeobj_admission_rejects_total'] == rejects
+        assert client.info('largeobj_dram')['largeobj_admission_rejects_total'] == rejects
 
         client.execute_command('CONFIG', 'SET', 'largeobj.promote-min-hits', '3')
         client.execute_command('LO.SET', 'three_key', payload)
@@ -842,8 +897,9 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
 
 
 class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
-    """One 1 MiB segment, no room to grow (dram-maxmemory == segment-size), so a
-    promotion into a full pool must demote. promote-min-hits 1 so every GET
+    """One 1 MiB segment, no room to grow (server maxmemory leaves less than a
+    segment of headroom, see _block_expansion), so a promotion into a full pool
+    must demote. promote-min-hits 1 so every GET
     promotes; decay off so scores are stable across a minute boundary. The
     default demote-sample-size (5) exceeds the 3-entry map, so victim selection
     scans every entry and is exact. 256 KiB objects: three fill 768 KiB; a
@@ -859,8 +915,7 @@ class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
-            f" dram-maxmemory 1048576"
-            f" max-promote-size 1048576"
+            f" max-promote-size 262144"
             f" promote-min-hits 1"
             f" tiered-decay-time 0"
             f" chunk-size 65536"
@@ -868,19 +923,30 @@ class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
             f" direct-io no"
         )
 
+    def _block_expansion(self, client):
+        """Set server maxmemory so a new segment crosses the expand ceiling
+        (used + 1 MiB >= watermark * maxmemory) while used stays below the
+        shrink trigger, leaving 512 KiB of slack."""
+        watermark = int(client.config_get('largeobj.scaling-shrink-watermark')
+                        ['largeobj.scaling-shrink-watermark']) / 100
+        used = int(client.info('memory')['used_memory'])
+        client.config_set('maxmemory-policy', 'noeviction')
+        client.config_set('maxmemory', int((used + 512 * 1024) / watermark))
+
     def test_demotes_lowest_score_object(self):
         """A fourth promotion into the full pool demotes exactly one cold object and
         never the hot one."""
         client = self.server.get_new_client()
+        self._block_expansion(client)
         # SET and promote three objects that fill the single segment.
         for i, k in enumerate(self.KEYS):
             payload = bytes([65 + i]) * self.OBJ
             client.execute_command('LO.SET', k, payload)
             assert client.execute_command('LO.GET', k) == payload
-        info = client.info('largeobj_largeobj_dram')
+        info = client.info('largeobj_dram')
         assert info['largeobj_cached_objects'] == 3
         assert info['largeobj_demotions_total'] == 0
-        assert info['largeobj_live_segments'] == 1
+        assert info['largeobj_dram_live_segments'] == 1
 
         hot = self.KEYS[0]
         for _ in range(10):
@@ -890,10 +956,10 @@ class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
         client.execute_command('LO.SET', 'ev_new', payload)
         assert client.execute_command('LO.GET', 'ev_new') == payload
 
-        info = client.info('largeobj_largeobj_dram')
+        info = client.info('largeobj_dram')
         assert info['largeobj_demotions_total'] == 1
         assert info['largeobj_cached_objects'] == 3
-        assert info['largeobj_live_segments'] == 1
+        assert info['largeobj_dram_live_segments'] == 1
         assert info['largeobj_scaling_expand_total'] == 0
         assert client.execute_command('LO.INFO', hot, 'TIER') == b'dram'
         assert client.execute_command('LO.INFO', 'ev_new', 'TIER') == b'dram'
@@ -921,7 +987,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             f" nvme-dir {data_dir}"
             f" nvme-staging-size 4194304"
             f" segment-size 1048576"
-            f" dram-maxmemory 1048576"
+            f" max-promote-size 983040"
             f" promote-min-hits 255"
             f" tiered-decay-time 0"
             f" max-open-fds 2"
@@ -939,23 +1005,23 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         for i, k in enumerate(self.KEYS):
             client.execute_command('LO.SET', k, self._payload(i))
-        info = client.info('largeobj_largeobj_fd')
+        info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 0
 
         for i, k in enumerate(self.KEYS):
             assert client.execute_command('LO.GET', k) == self._payload(i)
 
-        info = client.info('largeobj_largeobj_fd')
+        info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
         assert info['largeobj_fd_demotions_total'] == 3
         # Nothing was promoted, so these were all NVMe reads.
-        dram = client.info('largeobj_largeobj_dram')
+        dram = client.info('largeobj_dram')
         assert dram['largeobj_cached_objects'] == 0
 
         # A second pass reads everything back correctly through reopened fds.
         for i, k in enumerate(self.KEYS):
             assert client.execute_command('LO.GET', k) == self._payload(i)
-        info = client.info('largeobj_largeobj_fd')
+        info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
         demotions = info['largeobj_fd_demotions_total']
 
@@ -964,9 +1030,9 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         # its fd is one of the two cached.
         client.execute_command('DEL', self.KEYS[4])
         wait_for_equal(
-            lambda: client.info('largeobj_largeobj_fd')['largeobj_open_fds'], 1)
+            lambda: client.info('largeobj_fd')['largeobj_open_fds'], 1)
         assert client.execute_command('LO.GET', self.KEYS[0]) == self._payload(0)
-        info = client.info('largeobj_largeobj_fd')
+        info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
         assert info['largeobj_fd_demotions_total'] == demotions
 
@@ -976,11 +1042,11 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         for i, k in enumerate(self.KEYS[:2]):
             client.execute_command('LO.SET', k, self._payload(i))
             assert client.execute_command('LO.GET', k) == self._payload(i)
-        assert client.info('largeobj_largeobj_fd')['largeobj_open_fds'] == 2
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == 2
 
         client.execute_command('CONFIG', 'SET', 'largeobj.max-open-fds', '1')
         client.execute_command('LO.SET', self.KEYS[2], self._payload(2))
         assert client.execute_command('LO.GET', self.KEYS[2]) == self._payload(2)
-        info = client.info('largeobj_largeobj_fd')
+        info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 1
         assert info['largeobj_fd_demotions_total'] == 2

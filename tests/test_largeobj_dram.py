@@ -7,9 +7,12 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     """Dram-only mode: all objects live in DRAMPool, no NVMe."""
 
     def get_module_args(self, data_dir, direct_io):
+        # max-object-size must fit in one segment after talc per-chunk overhead.
+        # With seg=2M and chunk=4K the maximum is 1044480 (~1020 KiB).
         return (
             f"operating-mode Dram"
             f" segment-size 2097152"
+            f" max-object-size 1044480"
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
@@ -59,17 +62,20 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         result = client.execute_command('LO.GET', 'delkey')
         assert result is None
 
-    def test_dram_pool_exhaustion(self):
-        """An object larger than segment-size fails with pool exhausted."""
+    def test_object_larger_than_segment_rejected(self):
+        """An object larger than max-object-size is rejected.
+        Compare with test_max_object_size where max-object-size is lowered at
+        runtime via CONFIG SET.
+        """
         client = self.server.get_new_client()
-        # segment-size is 2MB. A 4MB object cannot be allocated.
+        # max-object-size is 1044480 (~1020 KiB). A 4MB object exceeds it.
         obj_size = 4 * 1024 * 1024
         payload = b'D' * obj_size
         try:
             client.execute_command('LO.SET', 'toobig', payload)
-            assert False, "Expected pool exhausted error"
+            assert False, "Expected max-object-size rejection"
         except ResponseError as e:
-            assert 'pool exhausted' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
 
     def test_multiple_objects(self):
         """Multiple small objects can coexist in DRAMPool."""
@@ -107,19 +113,6 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client.execute_command('DEL', 'dstkey2')
         assert client.execute_command('LO.GET', 'srckey2') == payload
 
-    def test_copy_pool_exhausted(self):
-        """COPY fails when DRAMPool cannot fit the duplicate."""
-        client = self.server.get_new_client()
-        # Fill most of the 2MB pool with a large object.
-        payload = b'F' * (1200 * 1024)
-        client.execute_command('LO.SET', 'bigkey', payload)
-        # COPY needs another 1200KB — pool is only 2MB total.
-        try:
-            client.execute_command('COPY', 'bigkey', 'bigcopy')
-            assert False, "Expected COPY to fail with pool exhausted"
-        except ResponseError:
-            pass  # Expected — pool cannot fit two 1200KB objects
-
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 
     def test_memory_usage(self):
@@ -146,6 +139,30 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         # Nonexistent key returns nil digest
         nil_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'noexist')
         assert nil_digest == [b'0' * 40]
+
+    # ─── max-object-size tests ───────────────────────────────────────────
+
+    def test_max_object_size(self):
+        """max-object-size rejects oversized SETs, allows at-limit SETs,
+        and does not affect reads of already-stored objects."""
+        client = self.server.get_new_client()
+        limit = 8192
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit))
+        # Oversized SET is rejected.
+        try:
+            client.execute_command('LO.SET', 'bigkey', b'X' * (limit + 1))
+            assert False, "Expected max object size rejection"
+        except ResponseError as e:
+            assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
+        # Rejected SET must not leave a phantom key.
+        assert client.execute_command('DBSIZE') == 0
+        assert client.execute_command('LO.GET', 'bigkey') is None
+        # At-limit SET succeeds.
+        assert client.execute_command('LO.SET', 'okkey', b'Y' * limit) == b'OK'
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
+        # Lowering limit below stored object size does not affect reads.
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit // 2))
+        assert client.execute_command('LO.GET', 'okkey') == b'Y' * limit
 
     # ─── SMART LOG tests ───────────────────────────────────────────────────
 
@@ -214,3 +231,44 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             assert False, "Expected wrong information field error"
         except ResponseError as e:
             assert 'invalid information value' in str(e).lower(), f"Unexpected error: {e}"
+
+
+class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):
+    """COPY fails when the pool cannot fit the duplicate and cannot expand.
+
+    Own class with a coarse chunk-size (64KB) so a large object co-locates in one
+    segment with negligible talc overhead (4KB chunks waste ~50% and would not
+    fit). Server maxmemory is the only expansion ceiling now, so we cap it just
+    above current usage and COPY's expansion crosses the watermark and fails.
+    """
+
+    def get_module_args(self, data_dir, direct_io):
+        # max-object-size must fit in one segment after talc overhead.
+        # With seg=2M and chunk=64K the max is 1966080 (~1920 KiB).
+        return (
+            f"operating-mode Dram"
+            f" segment-size 2097152"
+            f" max-object-size 1966080"
+            f" chunk-size 65536"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def test_copy_pool_exhausted(self):
+        client = self.server.get_new_client()
+        client.execute_command('FLUSHALL')
+        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
+        payload = b'F' * (1500 * 1024)
+        assert client.execute_command('LO.SET', 'bigkey', payload) == b'OK'
+        # Cap server maxmemory just above current used — no room for a 2nd segment.
+        used = int(client.info('memory')['used_memory'])
+        client.execute_command('CONFIG', 'SET', 'maxmemory', str(used + 256 * 1024))
+        try:
+            client.execute_command('COPY', 'bigkey', 'bigcopy')
+            assert False, "Expected COPY to fail — expansion would cross maxmemory"
+        except ResponseError:
+            pass  # Expected — cannot fit a second object without crossing the watermark
+        finally:
+            client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
+        # Source intact.
+        assert client.execute_command('LO.GET', 'bigkey') == payload

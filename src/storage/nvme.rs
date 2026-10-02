@@ -30,11 +30,9 @@ pub fn increase_nvme_disk_usage(bytes: u64) {
 /// FATAL on underflow: freeing more than is tracked means corrupt accounting, which
 /// must be accurate for capacity checks, so assert on the issue.
 pub fn decrease_nvme_disk_usage(bytes: u64) {
-    if let Err(tracked) =
-        NVME_DISK_USAGE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            cur.checked_sub(bytes)
-        })
-    {
+    if let Err(tracked) = NVME_DISK_USAGE.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        cur.checked_sub(bytes)
+    }) {
         panic!(
             "NVMe disk-usage underflow: tried to free {bytes} B but only {tracked} B tracked \
              — accounting is corrupt (double-free or size mismatch)"
@@ -49,7 +47,7 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
 pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
     let max = crate::nvme_maxmemory();
     NVME_DISK_USAGE
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             let next = cur.checked_add(bytes)?;
             if max == 0 || next <= max {
                 Some(next)
@@ -206,10 +204,13 @@ pub fn object_disk_len(chunk_iter: &mut super::ChunkIterator) -> u64 {
 /// `pool_buffer_ptr` passed as usize for Send safety (raw pointer is not Send).
 /// chunk-size config enforces min 4096, so every pool buffer can hold a full
 /// FileHeader page.
+#[allow(clippy::too_many_arguments)]
 pub async fn read_and_verify_file_header(
     fd: RawFd,
+    pool_id: uring::PoolType,
     iovec_index: u16,
     pool_buffer_ptr: usize,
+    use_fixed: bool,
     expected_object_id: ObjectId,
     expected_len: u64,
     crc32c_expected: Crc,
@@ -223,13 +224,14 @@ pub async fn read_and_verify_file_header(
         buf_ptr: pool_buffer_ptr as *mut u8,
         file_offset: 0,
         len: FILE_HEADER_SIZE,
+        use_fixed,
     };
-    let hdr_rx = uring::submit_read(fd, hdr_op);
-    // RecvError: the io_uring poller dropped the oneshot sender without calling
-    // send(). This only happens if the poller thread panicked or exited — the
-    // poller owns all senders in its pending HashMap. Since the poller is a
-    // single long-lived thread, its loss is permanent: no future NVMe I/O can
-    // complete. Increment metric and abort.
+    let hdr_rx = uring::submit_read(pool_id, fd, hdr_op);
+    // RecvError: this pool's io_uring poller dropped the oneshot sender without
+    // calling send(). This only happens if that poller thread panicked or exited
+    // — it owns all senders in its pending HashMap. Each pool has its own
+    // long-lived poller, so losing the one for `pool_id` is permanent: no future
+    // I/O on that ring can complete. Abort.
     match hdr_rx.await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
@@ -312,8 +314,9 @@ pub async fn write_file_header(
         buf_ptr: hdr_ptr,
         file_offset: 0,
         len: FILE_HEADER_SIZE,
+        use_fixed: nvme_pool.is_buf_io_uring_registered(buf),
     };
-    let hdr_rx = uring::submit_write(fd, hdr_op);
+    let hdr_rx = uring::submit_write(uring::PoolType::Nvme, fd, hdr_op);
     match hdr_rx.await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),

@@ -169,7 +169,15 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     // Reject zero-length values / 0-byte cases.
     if obj_len == 0 {
-        return Err(ValkeyError::Str("ERR object length must be > 0"));
+        return Err(ValkeyError::Str(errors::ERR_ZERO_LENGTH_OBJECT));
+    }
+
+    // Reject objects exceeding the configured max object size. The config
+    // constraint enforces max-object-size <= segment-size, so this also
+    // covers objects that would not fit in a single segment.
+    let max_obj_size = crate::max_object_size();
+    if obj_len > max_obj_size {
+        return Err(ValkeyError::Str(errors::ERR_OBJECT_TOO_LARGE));
     }
 
     // Dispatch to engine — it decides sync vs async internally.

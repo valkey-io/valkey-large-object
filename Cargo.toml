@@ -22,7 +22,10 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 lazy_static = "1"
 nvme-telem = "0.3.3"
 rand = "0.10"
-talc = { version = "4", default-features = false, features = ["lock_api"] }
+talc = { version = "5", default-features = false, features = ["counters"] }
+# For the `Allocator` trait talc's TalcCell implements (safe allocate/deallocate).
+# Pinned to the version talc itself uses so there is a single shared trait.
+allocator-api2 = { version = "0.4", default-features = false }
 
 [dev-dependencies]
 rstest = "0.23.0"

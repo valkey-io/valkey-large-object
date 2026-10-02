@@ -243,9 +243,9 @@ EFA `fi_write` has no alignment constraint — sends exact `len`.
 Without O_DIRECT (DRAM-only mode, or `direct-io no`), neither constraint applies.
 
 **Max object size enforcement:**
-- **`lo-max-object-size` (all modes):** Objects whose length exceeds this configurable limit are rejected at `LO.SET`, regardless of transport (TCP or EFA) or operating mode (Dram or Tiered). This is a single global cap on object size.
-- **TCP additionally:** Valkey's querybuf accumulates the whole payload before dispatch and cannot stream, so TCP is bounded by `lo-max-object-size` in the same way (§7.7).
-- **EFA:** Objects larger than a single buffer are chunked internally via multi-buffer parallel I/O (§7.3) using `lo-buffer-size`, still subject to `lo-max-object-size`.
+- **`max-object-size` (all modes):** Objects whose length exceeds this configurable limit are rejected at `LO.SET`, regardless of transport (TCP or EFA) or operating mode (Dram or Tiered). This is a single global cap on object size.
+- **TCP additionally:** Valkey's querybuf accumulates the whole payload before dispatch and cannot stream, so TCP is bounded by `max-object-size` in the same way (§7.7).
+- **EFA:** Objects larger than a single buffer are chunked internally via multi-buffer parallel I/O (§7.3) using `chunk-size`, still subject to `max-object-size`.
 - **NVMe capacity:** Objects exceeding available NVMe space are also rejected at `LO.SET`.
 
 ---
@@ -576,7 +576,7 @@ key "obj-A"
 Objects can be much larger than a single I/O buffer (e.g., 10GB object with 64MB buffers). The module handles this by streaming through multiple buffers in parallel — never allocating the full object in DRAM at once.
 
 **Transport-dependent behavior:**
-- **TCP:** Valkey's command dispatch accumulates the full payload in `querybuf` before calling the module handler. Replies use single-allocation `VM_ReplyWithStringBuffer`. There is no incremental/streaming API. **TCP rejects objects above `lo-max-object-size`.** Multi-buffer parallel I/O applies only to EFA.
+- **TCP:** Valkey's command dispatch accumulates the full payload in `querybuf` before calling the module handler. Replies use single-allocation `VM_ReplyWithStringBuffer`. There is no incremental/streaming API. **TCP rejects objects above `max-object-size`.** Multi-buffer parallel I/O applies only to EFA.
 - **EFA:** The module controls chunk size via async transport.read/transport.write. Multi-buffer parallel I/O is the primary large object path.
 
 ### 7.1 NVMe Representation: Single File Per Object
@@ -600,7 +600,7 @@ Object "key123" (10GB):
 
 The server decides chunk size — the client never specifies or sees it.
 
-**Server config:** `lo-buffer-size` (e.g., 8MB). This determines the allocation unit for all I/O operations.
+**Server config:** `chunk-size` (e.g., 8MB). This determines the allocation unit for all I/O operations.
 
 **LO.SET translation:**
 ```
@@ -621,7 +621,7 @@ Server does:   alloc 4-8 buffers (pipeline depth)
                EFA: transport.write each chunk to client at addr + i*chunk_size
 ```
 
-**Key invariant:** The client provides `total_len` and a destination (TCP socket or EFA region). The server partitions into `ceil(total_len / lo-buffer-size)` internal operations. The last operation uses `len = total_len % lo-buffer-size` (partial chunk). O_DIRECT write path pads the final write to the 4KB boundary on disk (§4.6). The chunk boundary is invisible to the client protocol.
+**Key invariant:** The client provides `total_len` and a destination (TCP socket or EFA region). The server partitions into `ceil(total_len / chunk-size)` internal operations. The last operation uses `len = total_len % chunk-size` (partial chunk). O_DIRECT write path pads the final write to the 4KB boundary on disk (§4.6). The chunk boundary is invisible to the client protocol.
 
 ### 7.3 Chunked Streaming I/O
 
@@ -810,12 +810,12 @@ This integrates with PR #42's CoalescingMap: the DRAMPool HashMap entry in `Fill
 
 | Config | Default | Meaning |
 |---|---|---|
-| `lo-max-buffers-per-op` (X) | 8 | Max buffers per operation = batch size. All X submitted simultaneously. |
-| `lo-min-buffers-per-op` (Y) | 2 | Min buffers to start (below = reject). Y=2 enables double-buffering. |
+| `max-buffers-per-op` (X) | 8 | Max buffers per operation = batch size. All X submitted simultaneously. |
+| `min-buffers-per-op` (Y) | 2 | Min buffers to start (below = reject). Y=2 enables double-buffering. |
 | `lo-max-streaming-ops` | 2 | Max concurrent streaming operations (prevents cascading) |
 
 > **Note (open tuning item):** the values above are placeholders. The maximum
-> buffers per operation (X) and the chunk size (`lo-buffer-size`) still need to be
+> buffers per operation (X) and the chunk size (`chunk-size`) still need to be
 > chosen empirically to optimize throughput/performance — they trade pipeline
 > depth against per-op pool pressure and SQE count, and the sweet spot depends on
 > object-size distribution and device behavior. To be settled with benchmarks.
@@ -849,7 +849,7 @@ Pool exhaustion mid-stream: impossible. Buffers are allocated once at the start 
 
 With pipelining (4–8 buffers in flight), only 4–8 buffers are checked out at once regardless of object size. Total SQE count determines total I/O time; pipeline depth determines pool pressure.
 
-**Recommended:** chunk_size = `lo-buffer-size` config value. No special "large object" buffer — reuse the same shared segment allocator. The chunking is purely an I/O scheduling pattern, not a storage decision.
+**Recommended:** chunk_size = `chunk-size` config value. No special "large object" buffer — reuse the same shared segment allocator. The chunking is purely an I/O scheduling pattern, not a storage decision.
 
 ### 7.5 DRAMPool for Large Objects
 
@@ -862,10 +862,10 @@ Objects larger than `max-promote-size` are **never promoted to DRAMPool**:
 ### 7.6 EFA Transport for Large Objects
 
 **Both cases resolve to the same thing: an upfront chunk→client-memory mapping.**
-The server always chunks the object by `lo-buffer-size` (chunk `i` covers logical
+The server always chunks the object by `chunk-size` (chunk `i` covers logical
 bytes `[i*chunk_size, (i+1)*chunk_size)`). Before any I/O, it computes a plan mapping
 each chunk to where it lands in client memory — `chunk_index → [(rkey, addr, len), …]`
-— using inputs all known at command time (`total_len`, `lo-buffer-size`, and the
+— using inputs all known at command time (`total_len`, `chunk-size`, and the
 client's destination). The I/O loop then just executes that plan. The two cases
 differ only in what the destination is: a single region (Case 2) or a list of
 regions (Case 1).
@@ -882,7 +882,7 @@ LO.GET key <n_regions> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
 ```
 
 - The server treats the regions as **one logical contiguous destination** (region1
-  then region2 …) and chunks that logical space by `lo-buffer-size` — the server
+  then region2 …) and chunks that logical space by `chunk-size` — the server
   owns the chunking; the client's region sizes need no alignment.
 - The upfront plan maps each chunk to its region(s): a chunk that fits inside one
   region is one transport post; a chunk that **straddles** a region boundary is split
@@ -925,9 +925,9 @@ Valkey's RESP command dispatch accumulates the full payload in `client->querybuf
 **Consequence:** A 10GB LO.SET over TCP requires 10GB in querybuf before the module even runs. This is untenable.
 
 **v1 behavior:**
-- `LO.SET`: reject with `ERR object exceeds lo-max-object-size` if payload > `lo-max-object-size` (configurable, applies to all modes and transports)
-- `LO.GET`: reject with the same error if a stored object's size somehow exceeds the current `lo-max-object-size`
-- Over TCP this is the only size bound (querybuf cannot stream); EFA clients are additionally chunked via multi-buffer parallel I/O (Cases 1/2 above) but remain subject to `lo-max-object-size`
+- `LO.SET`: reject with `ERR object exceeds max-object-size` if payload > `max-object-size` (configurable, applies to all modes and transports)
+- `LO.GET`: reject with the same error if a stored object's size somehow exceeds the current `max-object-size`
+- Over TCP this is the only size bound (querybuf cannot stream); EFA clients are additionally chunked via multi-buffer parallel I/O (Cases 1/2 above) but remain subject to `max-object-size`
 
 **Future (v2+):** If Valkey adds a streaming/incremental module API for reading from client socket and writing chunked replies, TCP could support larger objects. Until then, large objects require EFA.
 
@@ -1485,9 +1485,9 @@ this section owns the semantics.
 | `nvme-staging-size` | `64MB` | `1MB` | `1GiB` | Immutable | NVMePool staging segment size. Single segment of this size; sized for max concurrent I/O, not object capacity |
 | `nvme-maxmemory` | `10GB` | `1MB` | i64::MAX | Live | NVMe **disk** ceiling; SET-admission bound in Tiered (enforcement: §9.3) |
 | `max-promote-size` | `256MB` | `0` (disable) | `1TB` | Live | Promotion eligibility; objects above this never enter DRAMPool (detail: §7.5) |
-| `lo-max-object-size` | — | — | — | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
-| `lo-buffer-size` | `8MB` | — | — | Immutable | I/O chunk / allocation unit (detail: §7.2) |
-| `lo-max-buffers-per-op` / `lo-min-buffers-per-op` / `lo-max-streaming-ops` | 8 / 2 / 2 | — | — | — | Streaming pipeline depth (detail: §7.3.6) |
+| `max-object-size` | `512MB` | `1` | i64::MAX | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
+| `chunk-size` | `8MB` | `4096` | `256MB` | Immutable | I/O chunk / allocation unit (detail: §7.2) |
+| `max-buffers-per-op` / `min-buffers-per-op` | 8 / 2 | — | — | Live | Streaming pipeline depth (detail: §7.3.6) |
 | `worker-threads` | `2` | `1` | `32` | Immutable | tokio transport CQ-polling threads |
 | `scaling-poll-ms` | `5000` | `500` | — | Live | Scaling cron interval in milliseconds. How often the cron checks utilization and memory pressure to expand or shrink the pool |
 | `scaling-expand-watermark` | `80` | `1` | `99` | Live | Pool utilization % above which the cron adds a segment proactively. Prevents alloc failures on the hot path |

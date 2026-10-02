@@ -44,7 +44,7 @@ fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         return Ok(());
     };
     ctx.builder()
-        .add_section("largeobj_fd")
+        .add_section("fd")
         .field("open_fds", fds.len() as i64)?
         .field(
             "fd_demotions_total",
@@ -67,11 +67,12 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let util_pct = (allocated * 100).checked_div(capacity).unwrap_or(0) as i64;
 
     ctx.builder()
-        .add_section("largeobj_dram")
-        .field("live_segments", live as i64)?
+        .add_section("dram")
+        .field("dram_live_segments", live as i64)?
         .field("draining_segments", draining as i64)?
-        .field("unused_segments", unused as i64)?
+        .field("dram_unused_segments", unused as i64)?
         .field("allocated_bytes", allocated as i64)?
+        .field("dram_fragment_count", dram.fragment_count() as i64)?
         .field("capacity_bytes", capacity as i64)?
         .field("utilization_pct", util_pct)?
         .field("cached_objects", dram.object_count() as i64)?
@@ -104,8 +105,15 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "scaling_shrink_total",
             dram.shrink_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
-        .field("maxmemory_bytes", crate::dram_maxmemory() as i64)?
-        .field("segment_size_bytes", seg_size as i64)?
+        .field("dram_segment_size_bytes", seg_size as i64)?
+        .field(
+            "efa_registered_segments",
+            crate::efa_registered_segment_count() as i64,
+        )?
+        .field(
+            "dram_uring_registered_segments",
+            dram.io_uring_registered_count() as i64,
+        )?
         .build_section()?
         .build_info()
         .map(|_| ())
@@ -119,11 +127,16 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let (live, _draining, unused) = nvme.segment_counts();
 
     ctx.builder()
-        .add_section("largeobj_nvme_staging")
-        .field("live_segments", live as i64)?
-        .field("unused_segments", unused as i64)?
+        .add_section("nvme_staging")
+        .field("nvme_live_segments", live as i64)?
+        .field("nvme_unused_segments", unused as i64)?
+        .field("nvme_fragment_count", nvme.fragment_count() as i64)?
         .field("staging_size_bytes", crate::nvme_staging_size() as i64)?
-        .field("segment_size_bytes", crate::dram_segment_size() as i64)?
+        .field("nvme_segment_size_bytes", crate::dram_segment_size() as i64)?
+        .field(
+            "nvme_uring_registered_segments",
+            nvme.io_uring_registered_count() as i64,
+        )?
         .build_section()?
         .build_info()
         .map(|_| ())
