@@ -945,7 +945,7 @@ class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('LO.GET', k) == payload
         info = client.info('largeobj_dram')
         assert info['largeobj_cached_objects'] == 3
-        assert info['largeobj_demotions_total'] == 0
+        assert info['largeobj_reclaims_total'] == 0
         assert info['largeobj_dram_live_segments'] == 1
 
         hot = self.KEYS[0]
@@ -957,7 +957,7 @@ class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('LO.GET', 'ev_new') == payload
 
         info = client.info('largeobj_dram')
-        assert info['largeobj_demotions_total'] == 1
+        assert info['largeobj_reclaims_total'] == 1
         assert info['largeobj_cached_objects'] == 3
         assert info['largeobj_dram_live_segments'] == 1
         assert info['largeobj_scaling_expand_total'] == 0

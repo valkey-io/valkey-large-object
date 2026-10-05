@@ -35,7 +35,7 @@ Why this and not the alternatives:
 | LRU | Rejected | Scan churn from one-touch chunks flushes hot prefixes. |
 | Pure LFU (no aging) | Rejected | Stale hot objects are never displaced. |
 | LFU with time decay (Valkey style) | Chosen | Frequency wins the steady state, decay lets popularity move. Operators already understand `lfu-decay-time`. This is an LFRU in practice. |
-| W-TinyLFU / ARC | Rejected for now | Solves one-touch pollution through a sketch or ghost lists. Our object counts are small (DRAM divided by MB-scale objects) and the same protection comes from a small second-touch ghost table. Revisit only if measurements show the simple filter is insufficient. |
+| W-TinyLFU / ARC | Rejected for now | Solves one-touch pollution through a sketch or ghost lists. Our object counts are small (DRAM divided by MB-scale objects) and the same protection comes from a small second-touch admission filter. Revisit only if measurements show the simple filter is insufficient. |
 | Size-normalized score (GDSF) | Rejected | Benefit per byte is constant, see section 2. |
 | Cron-only demotion | Rejected | Leaves the cache frozen between ticks; a full pool would reject promotions for up to `scaling-poll-ms`. Inline demotion is bounded and runs only on misses. |
 
@@ -57,7 +57,7 @@ Three tuning values are constants in `src/storage/cache_policy.rs`, because no o
 | Constant | Value | Reason |
 |---|---|---|
 | `LFU_LOG_FACTOR` | 10 | Core's default for `lfu-log-factor`; almost never tuned. |
-| `GHOST_CAPACITY` | 65536 | `promote-min-hits 1` is the single off switch for admission. |
+| `ADMISSION_FILTER_CAPACITY` | 65536 | `promote-min-hits 1` is the single off switch for admission. |
 | `DEMOTE_MAX_VICTIMS` | 16 | A loop bound, not a policy knob. |
 
 ## 4. Design
@@ -81,28 +81,33 @@ Operations, all on `AccessStats` in `src/storage/cache_policy.rs`:
 
 ### 4.2 Where the score lives
 
-`ObjectContext` has `pub stats: AccessStats`. The tiered GET hit path calls `CachePolicy::record_hit`, which touches the score and counts the hit, with no write lock. The touch is not inside `get_object`, because `LO.INFO key TIER` and `COPY` also use `get_object` and are not cache accesses.
+`ObjectContext` has `pub stats: AccessStats`. The tiered GET hit path calls `CacheStats::record_hit`, which touches the score and counts the hit, with no write lock. The touch is not inside `get_object`, because `LO.INFO key TIER` and `COPY` also use `get_object` and are not cache accesses.
 
 Stats are keyed by `ObjectId`, not by key. An `LO.SET` mints a new OID and the free callback drops the old DRAM entry, so a rewritten object starts with fresh stats. A RENAME is invisible to the policy.
 
-### 4.3 Admission: second-touch ghost table
+### 4.3 Admission: second-touch filter
 
-A miss (object not in the DRAM map) consults a `GhostTable` before promoting:
+A miss (object not in the DRAM map) consults the `AdmissionFilter` before promoting:
 
 ```rust
-pub struct GhostTable {
-    hits: HashMap<ObjectId, u8>,   // misses seen for this OID
-    order: VecDeque<ObjectId>,     // FIFO, oldest dropped at capacity
-    capacity: usize,
+pub struct AdmissionFilter {
+    misses: Mutex<MissLog>,        // counts: HashMap<ObjectId, u8> + FIFO order
+    capacity: usize,               // oldest dropped at capacity
+    pub rejects: AtomicU64,
+}
+
+pub struct TieredCache {           // DRAMPool.cache, None in Dram mode
+    pub admission: AdmissionFilter,
+    pub stats: CacheStats,         // hits, misses, promotions
 }
 ```
 
-1. On a miss, `CachePolicy::admit(oid, obj_len)` calls `record_miss(oid)`, which returns the object's miss count, inserting it at 1 if absent and dropping the FIFO head when full. A repeat miss does not move an entry in the FIFO, so the window is the last `GHOST_CAPACITY` distinct missed objects.
-2. If the count is at least `promote-min-hits`, promote. Otherwise serve through the transient NVMePool path and count an admission reject. The ghost entry is not removed on promotion; it ages out FIFO. So an admitted object whose promotion fails is admitted again on its next miss, and an object demoted from DRAM while its ghost entry is still present is promoted again on its first miss (an ARC-style ghost hit).
-3. Objects above `max-promote-size` are refused without touching the ghost, since they can never be promoted.
-4. With `promote-min-hits 1`, `admit` returns true without touching the ghost, so admission is off and costs nothing. Misses in that time are not counted, so after the setting is raised those objects start from zero.
+1. On a miss, `AdmissionFilter::admit(oid, obj_len)` calls `track(oid)`, which returns the object's miss count, inserting it at 1 if absent and dropping the FIFO head when full. A repeat miss does not move an entry in the FIFO, so the window is the last `ADMISSION_FILTER_CAPACITY` distinct missed objects.
+2. If the count is at least `promote-min-hits`, promote. Otherwise serve through the transient NVMePool path and count an admission reject. The filter entry is not removed on promotion; it ages out FIFO. So an admitted object whose promotion fails is admitted again on its next miss, and an object reclaimed from DRAM while its filter entry is still present is promoted again on its first miss (an ARC-style ghost hit).
+3. Objects above `max-promote-size` are refused without touching the filter, since they can never be promoted.
+4. With `promote-min-hits 1`, `admit` returns true without touching the filter, so admission is off and costs nothing. Misses in that time are not counted, so after the setting is raised those objects start from zero.
 
-The ghost is a `Mutex` taken only in `admit`, never together with the objects lock. ObjectIds are never reused, so an entry for a deleted object just ages out. Nothing is preallocated, so a pool that never misses pays nothing for the table.
+The filter's miss log is a `Mutex` taken only in `track`, never together with the objects lock. ObjectIds are never reused, so an entry for a deleted object just ages out. Nothing is preallocated, so a pool that never misses pays nothing for the table.
 
 A GET that finds a `Filling` entry (another GET is promoting the same object) skips both `admit` and `try_promote_object`, so concurrent GETs on one object do not inflate its miss count.
 
@@ -112,13 +117,13 @@ A GET that finds a `Filling` entry (another GET is promoting the same object) sk
 
 ```
 buffers = alloc_exact(obj_len)
-if buffers is None and demote_for(obj_len):
+if buffers is None and make_room_for(obj_len):
     buffers = alloc_exact(obj_len)          // may still fail on fragmentation; caller falls back
 ```
 
-Expansion is deliberately not attempted here. Segments are registered with io_uring (`IORING_REGISTER_BUFFERS`) and EFA once at startup, and a segment added at runtime updates only the module's mirror table, so the first `ReadFixed` into it fails with EFAULT and the header-verify path panics. This bug predates this work and is already reachable through the scaling cron's proactive expand in Tiered mode with `dram-maxmemory 0`. Once runtime registration exists (`IORING_REGISTER_BUFFERS_UPDATE` plus `fi_mr_reg` on expand), add `try_expand` and a retry before `demote_for`, so the cache is never shrunk while it can still grow.
+Expansion is deliberately not attempted here. Segments are registered with io_uring (`IORING_REGISTER_BUFFERS`) and EFA once at startup, and a segment added at runtime updates only the module's mirror table, so the first `ReadFixed` into it fails with EFAULT and the header-verify path panics. This bug predates this work and is already reachable through the scaling cron's proactive expand in Tiered mode with `dram-maxmemory 0`. Once runtime registration exists (`IORING_REGISTER_BUFFERS_UPDATE` plus `fi_mr_reg` on expand), add `try_expand` and a retry before `make_room_for`, so the cache is never shrunk while it can still grow.
 
-`demote_for(need)` calls `demote_with(need, free_now, max_victims)`. Free space and the round limit are arguments so tests can set them; the sample size, decay time and clock are read live.
+`make_room_for(need)` calls the private `reclaim(need, free_now, max_victims)`. Free space and the round limit are arguments so tests can set them; the sample size, decay time and clock are read live.
 
 1. Take the write lock on the object map.
 2. Up to `DEMOTE_MAX_VICTIMS` times, until the freed bytes alone cover `need`: call `demote_one`, which probes `demote-sample-size` slots (every slot if the map is that small), skips any entry whose `Arc::strong_count > 1`, and removes the lowest `decayed_counter`. Stop early if no probed entry is demotable. Current free space is not subtracted from `need`: the first alloc already failed, so that space is fragmented, and whole victim-sized holes are what make the retry work.
@@ -131,7 +136,7 @@ Rules that fall out of the Arc model:
 2. An entry in `Filling` state is never demoted, because the promotion task holds an `Arc`.
 3. Demotion removes only the map's reference, as DEL does. The key and its NVMe file are untouched, and the next GET is a miss that goes through admission again.
 
-There is no mode guard inside `demote_for`. Its only caller is `try_promote_object`, which only the tiered GET handler reaches. The name states what it removes.
+There is no mode guard inside `make_room_for`. Its only caller is `try_promote_object`, which only the tiered GET handler reaches. The name states what it removes.
 
 Cost bound: at most `demote-sample-size` times `DEMOTE_MAX_VICTIMS` score reads and `DEMOTE_MAX_VICTIMS` removes under the write lock, on the miss path only (80 and 16 by default). It runs on the main thread, which is why it is bounded.
 
@@ -141,7 +146,7 @@ Known limitation: `DEMOTE_MAX_VICTIMS` is also a size ceiling. An object that ne
 
 ### 4.5 Data structure
 
-`HashMap` cannot be sampled at random, so both pools use `IndexedMap<V>`, an alias for `indexmap::IndexMap<ObjectId, V>`. It keeps entries in a dense `Vec` with a hash table of positions, so sampling a slot is a plain index with no hashing. Insert pushes to the end and `swap_remove` is O(1). `cache_policy::demote_one(map, samples, score)` probes up to `samples` slots, removes the lowest-scoring entry the `score` closure accepts, and returns it; both pools demote only through it. `retain` (used by `try_shrink`) is O(n).
+`HashMap` cannot be sampled at random, so both pools use `OIDIndexedMap<V>`, an alias for `indexmap::IndexMap<ObjectId, V>`. It keeps entries in a dense `Vec` with a hash table of positions, so sampling a slot is a plain index with no hashing. Insert pushes to the end and `swap_remove` is O(1). `cache_policy::demote_one(map, samples, score)` probes up to `samples` slots, removes the lowest-scoring entry the `score` closure accepts, and returns it; both pools demote only through it. `retain` (used by `try_shrink`) is O(n).
 
 ### 4.6 Interaction with existing mechanisms
 
@@ -157,11 +162,11 @@ Fields in the `largeobj_dram` INFO section (`add_section("dram")`; the module na
 cache_hits_total            tiered GET served from a Ready cached entry
 cache_misses_total          tiered GET that read from NVMe (absent, Filling, rejected, or no space)
 promotions_total            try_promote_object succeeded
-admission_rejects_total     miss served transiently because the ghost count was below promote-min-hits
-demotions_total             cached copies removed by demote_for
+admission_rejects_total     miss served transiently because the filter's miss count was below promote-min-hits
+reclaims_total              cached copies removed by make_room_for (DRAMPool, both modes)
 ```
 
-`cache_hits_total + cache_misses_total` is the number of tiered GETs. `cache_misses_total - promotions_total - admission_rejects_total` counts misses that were neither promoted nor rejected: objects above `max-promote-size`, a pool with no room even after demotion, or a concurrent promotion of the same object. `demotions_total` counts cached copies only, never keys.
+`cache_hits_total + cache_misses_total` is the number of tiered GETs. `cache_misses_total - promotions_total - admission_rejects_total` counts misses that were neither promoted nor rejected: objects above `max-promote-size`, a pool with no room even after reclaim, or a concurrent promotion of the same object. `reclaims_total` counts cached copies only, never keys.
 
 ### 4.8 FD pool
 
@@ -169,14 +174,14 @@ demotions_total             cached copies removed by demote_for
 
 ```rust
 struct FdEntry { fd: Arc<OwnedFd>, stats: AccessStats }
-fds: RwLock<IndexedMap<FdEntry>>
+fds: RwLock<OIDIndexedMap<FdEntry>>
 ```
 
 1. The `get_or_open` fast path touches `stats` under the read lock and hands out a clone. The re-check under the write lock (two concurrent first GETs on a cold object) does the same.
 2. Slow path, under the write lock: if `max-open-fds` is nonzero and `len >= cap`, remove the lowest-scoring sampled fd until there is room for the new one under the cap (normally one; more after the cap is lowered at runtime, since it is enforced on the next open). Unlike the DRAM pool, an fd held by an in-flight read is not skipped: demotion only drops the map's `Arc`, the reader's clone keeps the fd open until the read completes, and it closes then. Open fds can briefly exceed the cap by the number of such readers. Victims are chosen before `open()`, so if the open fails they are still demoted and counted, costing one reopen each.
 3. The DRAM pool keeps the held-entry skip because demotion there must free bytes for an allocation that happens right after; a held entry frees nothing until its reader finishes. The fd cap has no such follow-up, so the skip buys nothing.
 4. The next GET on a demoted fd reopens it, which costs one `open()` syscall, so a wrong fd demotion is far cheaper than a wrong DRAM demotion.
-5. No ghost table for fds: a miss costs a syscall, not DRAM, so first-touch admission is fine.
+5. No admission filter for fds: a miss costs a syscall, not DRAM, so first-touch admission is fine.
 
 `get_or_open_with` takes the cap as an argument so unit tests can set it without racing on the global config; the other settings are read live. `DEMOTE_MAX_VICTIMS` does not apply, since the fd loop demotes exactly the overflow.
 

@@ -115,7 +115,7 @@ lazy_static::lazy_static! {
     /// LFU counter decay: minutes per one-point decrement. 0 disables decay.
     static ref CFG_TIERED_DECAY_TIME: AtomicI64 = AtomicI64::new(1);
 
-    /// How many misses an object must accumulate in the ghost table before a GET
+    /// How many misses an object must accumulate in the admission filter before a GET
     /// promotes it into DRAMPool. Default: 2.
     static ref CFG_PROMOTE_MIN_HITS: AtomicI64 = AtomicI64::new(2);
 

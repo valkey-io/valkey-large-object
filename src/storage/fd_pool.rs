@@ -25,7 +25,7 @@ use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use super::cache_policy::{demote_one, now_minutes, AccessStats, IndexedMap};
+use super::cache_policy::{demote_one, now_minutes, AccessStats, OIDIndexedMap};
 use crate::data_type::ObjectId;
 
 /// One cached fd plus its LFU score.
@@ -35,7 +35,7 @@ struct FdEntry {
 }
 
 pub struct FdPool {
-    fds: RwLock<IndexedMap<FdEntry>>,
+    fds: RwLock<OIDIndexedMap<FdEntry>>,
     /// Cached fds dropped to stay under `max-open-fds`.
     pub demotions: AtomicU64,
 }
@@ -49,7 +49,7 @@ impl Default for FdPool {
 impl FdPool {
     pub fn new() -> Self {
         Self {
-            fds: RwLock::new(IndexedMap::new()),
+            fds: RwLock::new(OIDIndexedMap::new()),
             demotions: AtomicU64::new(0),
         }
     }

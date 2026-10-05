@@ -190,8 +190,8 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         None
     };
     // DRAMPool: always needed (both modes).
-    let policy = (mode == crate::OperatingMode::Tiered).then(cache_policy::CachePolicy::new);
-    let dram_pool = DRAMPool::new(dram_segment_count, dram_seg_size, policy);
+    let cache = (mode == crate::OperatingMode::Tiered).then(cache_policy::TieredCache::default);
+    let dram_pool = DRAMPool::new(dram_segment_count, dram_seg_size, cache);
     // io_uring engines: only in Tiered mode. TWO independent engines — one for
     // the DRAM ring, one for the NVMe ring — each registering ONLY its own pool's
     // segments. Ring creation + buffer registration happen on this (main) thread

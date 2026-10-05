@@ -14,7 +14,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use super::cache_policy::{demote_one, now_minutes, CachePolicy, IndexedMap, DEMOTE_MAX_VICTIMS};
+use super::cache_policy::{
+    demote_one, now_minutes, OIDIndexedMap, TieredCache, DEMOTE_MAX_VICTIMS,
+};
 use super::context::{ObjectContext, SegmentBuffer};
 use super::segment_pool::SegmentPool;
 use crate::data_type::ObjectId;
@@ -22,34 +24,37 @@ use crate::data_type::ObjectId;
 pub struct DRAMPool {
     pool: SegmentPool,
     /// Cached objects: ObjectId → Arc<ObjectContext>, plus a slot index so
-    /// demotion can sample at random.
+    /// reclaim can sample at random.
     /// RwLock: main thread reads (GET hit), tokio writes (promotion insert).
-    objects: RwLock<IndexedMap<Arc<ObjectContext>>>,
+    objects: RwLock<OIDIndexedMap<Arc<ObjectContext>>>,
     /// Cumulative count of successful expand operations since module load.
     pub expand_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
     pub shrink_count: AtomicU64,
-    /// Cache policy state (admission filter + accounting). `Some` in Tiered
-    /// mode, `None` in Dram mode where the DRAMPool is the data, not a cache.
-    pub policy: Option<CachePolicy>,
+    /// Cached objects removed by `make_room_for` to free space.
+    pub reclaims: AtomicU64,
+    /// Admission filter and cache stats. `Some` in Tiered mode, `None` in Dram
+    /// mode where the DRAMPool is the data, not a cache.
+    pub cache: Option<TieredCache>,
 }
 
 impl DRAMPool {
-    pub fn new(segment_count: usize, segment_size: usize, policy: Option<CachePolicy>) -> Self {
+    pub fn new(segment_count: usize, segment_size: usize, cache: Option<TieredCache>) -> Self {
         Self {
             pool: SegmentPool::new(segment_count, segment_size, super::uring::PoolType::Dram),
-            objects: RwLock::new(IndexedMap::new()),
+            objects: RwLock::new(OIDIndexedMap::new()),
             expand_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
-            policy,
+            reclaims: AtomicU64::new(0),
+            cache,
         }
     }
 
-    /// The cache policy. Tiered mode only; panics in Dram mode.
-    pub fn tiered_policy(&self) -> &CachePolicy {
-        self.policy
+    /// The Tiered cache state. Tiered mode only; panics in Dram mode.
+    pub fn tiered_cache(&self) -> &TieredCache {
+        self.cache
             .as_ref()
-            .expect("DRAMPool cache policy is Tiered-mode only")
+            .expect("DRAMPool tiered cache is Tiered-mode only")
     }
 
     // ─── Allocator ───────────────────────────────────────────────────────────
@@ -184,7 +189,7 @@ impl DRAMPool {
     /// buffers, then calls mark_ready().
     /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via
     /// alloc_exact_or_expand with all-or-nothing semantics.
-    /// If that fails (expansion refused at the maxmemory watermark), demotes
+    /// If that fails (expansion refused at the maxmemory watermark), reclaims
     /// cold cached copies and retries once. Size limits are checked in admit().
     pub fn try_promote_object(
         &self,
@@ -197,7 +202,10 @@ impl DRAMPool {
         // won't block GET readers waiting on get_object().
         let dummy = valkey_module::Context::dummy();
         let mut buffers = self.alloc_exact_or_expand(&dummy, obj_len);
-        if buffers.is_none() && self.demote_for(obj_len as usize) {
+        // No space: reclaim cold cached copies and retry once. Freed bytes may
+        // not be contiguous, so under fragmentation the retry can still fail
+        // and we skip promotion (the GET is served from NVMe).
+        if buffers.is_none() && self.make_room_for(obj_len as usize) {
             buffers = self.pool.alloc_exact(obj_len as usize);
         }
         let buffers = buffers?;
@@ -214,30 +222,26 @@ impl DRAMPool {
         // buf.len stays chunk_size for all buffers — must match alloc size for free().
         let obj_ctx = std::sync::Arc::new(super::context::ObjectContext::new_filling(buffers));
         objects.insert(oid, obj_ctx.clone());
-        self.tiered_policy()
+        self.tiered_cache()
+            .stats
             .promotions
             .fetch_add(1, Ordering::Relaxed);
         Some(obj_ctx)
     }
 
-    // ─── Demotion ────────────────────────────────────────────────────────────
+    // ─── Reclaim ─────────────────────────────────────────────────────────────
 
-    /// Demote up to `DEMOTE_MAX_VICTIMS` low-score cached copies (Tiered only; the
-    /// data stays on NVMe) to free `need` bytes. Demotes nothing if that plus free
-    /// space can't cover `need`. True if anything was demoted.
-    pub fn demote_for(&self, need: usize) -> bool {
-        let (count, _bytes) = self.demote_with(need, self.free_bytes(), DEMOTE_MAX_VICTIMS);
+    /// Reclaim up to `DEMOTE_MAX_VICTIMS` low-score cached copies (the data stays
+    /// on NVMe) to free `need` bytes. Reclaims nothing if that plus free space
+    /// can't cover `need`. True if anything was reclaimed.
+    pub fn make_room_for(&self, need: usize) -> bool {
+        let (count, _bytes) = self.reclaim(need, self.free_bytes(), DEMOTE_MAX_VICTIMS);
         count > 0
     }
 
-    /// Demotion loop with free space and the round limit explicit for tests.
-    /// Only entries whose sole `Arc` is in the map are demoted.
-    pub(crate) fn demote_with(
-        &self,
-        need: usize,
-        free_now: usize,
-        max_victims: usize,
-    ) -> (usize, usize) {
+    /// Reclaim loop with free space and the round limit explicit for tests.
+    /// Only entries whose sole `Arc` is in the map are reclaimed.
+    fn reclaim(&self, need: usize, free_now: usize, max_victims: usize) -> (usize, usize) {
         let samples = crate::demote_sample_size();
         let now_min = now_minutes();
         let decay_time = crate::tiered_decay_time();
@@ -271,16 +275,14 @@ impl DRAMPool {
             }
         }
         let count = victims.len();
-        self.tiered_policy()
-            .demotions
-            .fetch_add(count as u64, Ordering::Relaxed);
+        self.reclaims.fetch_add(count as u64, Ordering::Relaxed);
         (count, freed)
     }
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
 
     /// Unallocated bytes across live segments. Ignores talc overhead, so it is
-    /// an upper bound; used only to rule out hopeless demotions.
+    /// an upper bound; used only to rule out hopeless reclaims.
     fn free_bytes(&self) -> usize {
         let (live, _draining, _unused) = self.pool.segment_counts();
         (live * self.pool.segment_size).saturating_sub(self.pool.allocated_bytes())
@@ -409,7 +411,7 @@ mod tests {
     const BUF: u32 = 4096;
 
     fn pool() -> DRAMPool {
-        DRAMPool::new(1, 1 << 20, Some(CachePolicy::new()))
+        DRAMPool::new(1, 1 << 20, Some(TieredCache::default()))
     }
 
     /// A Ready context with one fake buffer. DRAM_POOL is unset in unit tests,
@@ -426,7 +428,7 @@ mod tests {
     fn demotes_lowest_score_and_skips_pinned() {
         let p = pool();
         // Empty map: nothing to sample.
-        assert_eq!(p.demote_with(1, 0, 16), (0, 0));
+        assert_eq!(p.reclaim(1, 0, 16), (0, 0));
         let hot = ctx(0);
         hot.stats.set(LFU_INIT_VAL + 10, now_minutes());
         let pinned = ctx(2); // counter 5 but held by us
@@ -434,7 +436,7 @@ mod tests {
         p.insert_object(ObjectId(2), ctx(1)); // counter 5
         p.insert_object(ObjectId(3), pinned.clone());
 
-        let (n, bytes) = p.demote_with(1, 0, 1);
+        let (n, bytes) = p.reclaim(1, 0, 1);
         assert_eq!((n, bytes), (1, BUF as usize));
         assert!(p.contains_object(&ObjectId(1)), "hot object must survive");
         assert!(
@@ -445,11 +447,11 @@ mod tests {
             p.contains_object(&ObjectId(3)),
             "pinned object must survive"
         );
-        assert_eq!(p.tiered_policy().demotions.load(Ordering::Relaxed), 1);
+        assert_eq!(p.reclaims.load(Ordering::Relaxed), 1);
 
         // Pin the hot entry too: every entry is now pinned, so nothing goes.
         let _hot = p.get_object(&ObjectId(1)).unwrap();
-        assert_eq!(p.demote_with(1, 0, 16), (0, 0));
+        assert_eq!(p.reclaim(1, 0, 16), (0, 0));
         assert_eq!(p.object_count(), 2);
     }
 
@@ -459,7 +461,7 @@ mod tests {
         for i in 0..4u16 {
             p.insert_object(ObjectId(i as u64), ctx(i));
         }
-        let (n, bytes) = p.demote_with(2 * BUF as usize, 0, 16);
+        let (n, bytes) = p.reclaim(2 * BUF as usize, 0, 16);
         assert_eq!((n, bytes), (2, 2 * BUF as usize));
         assert_eq!(p.object_count(), 2);
     }
@@ -471,11 +473,11 @@ mod tests {
             p.insert_object(ObjectId(i as u64), ctx(i));
         }
         // The 2-round cap frees 2 BUF, plus 1 BUF free: short of 4 BUF. Roll back.
-        assert_eq!(p.demote_with(4 * BUF as usize, BUF as usize, 2), (0, 0));
+        assert_eq!(p.reclaim(4 * BUF as usize, BUF as usize, 2), (0, 0));
         assert_eq!(p.object_count(), 4);
-        assert_eq!(p.tiered_policy().demotions.load(Ordering::Relaxed), 0);
+        assert_eq!(p.reclaims.load(Ordering::Relaxed), 0);
         // The same need with enough free space goes through.
-        let (n, _) = p.demote_with(4 * BUF as usize, 2 * BUF as usize, 2);
+        let (n, _) = p.reclaim(4 * BUF as usize, 2 * BUF as usize, 2);
         assert_eq!(n, 2);
         assert_eq!(p.object_count(), 2);
     }

@@ -76,16 +76,30 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("dram_fragment_count", dram.fragment_count() as i64)?
         .field("capacity_bytes", capacity as i64)?
         .field("utilization_pct", util_pct)?
-        .field("cached_objects", dram.object_count() as i64)?;
-    // Cache policy counters exist only in Tiered mode.
-    if let Some(policy) = &dram.policy {
-        let counts = policy.counts();
+        .field("cached_objects", dram.object_count() as i64)?
+        .field(
+            "reclaims_total",
+            dram.reclaims.load(Ordering::Relaxed) as i64,
+        )?;
+    // Cache counters exist only in Tiered mode.
+    if let Some(cache) = &dram.cache {
         section = section
-            .field("cache_hits_total", counts.hits as i64)?
-            .field("cache_misses_total", counts.misses as i64)?
-            .field("promotions_total", counts.promotions as i64)?
-            .field("admission_rejects_total", counts.admission_rejects as i64)?
-            .field("demotions_total", counts.demotions as i64)?;
+            .field(
+                "cache_hits_total",
+                cache.stats.hits.load(Ordering::Relaxed) as i64,
+            )?
+            .field(
+                "cache_misses_total",
+                cache.stats.misses.load(Ordering::Relaxed) as i64,
+            )?
+            .field(
+                "promotions_total",
+                cache.stats.promotions.load(Ordering::Relaxed) as i64,
+            )?
+            .field(
+                "admission_rejects_total",
+                cache.admission.rejects.load(Ordering::Relaxed) as i64,
+            )?;
     }
     section
         .field(

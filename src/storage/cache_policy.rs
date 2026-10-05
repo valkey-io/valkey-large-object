@@ -1,8 +1,8 @@
 //! Cache policy primitives shared by DRAMPool and FdPool (see
 //! `docs/CACHE_POLICY_DESIGN.md`): `AccessStats` (Valkey-style LFU score),
-//! `GhostTable` (second-touch admission), `IndexedMap` (an `IndexMap` with
-//! sampled demotion) and `CachePolicy` (DRAM admission and counters). Only
-//! `CachePolicy` locks (its ghost table); the pools call the rest under their own locks.
+//! `OIDIndexedMap` (an `IndexMap` with sampled demotion), and the Tiered-only
+//! `AdmissionFilter`, `CacheStats` and `TieredCache`. Only `AdmissionFilter`
+//! locks; the pools call the rest under their own locks.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -35,8 +35,8 @@ pub const LFU_INIT_VAL: u8 = 5;
 /// Counter growth factor (see `touch`). Valkey's default `lfu-log-factor`.
 pub const LFU_LOG_FACTOR: u64 = 10;
 
-/// Ghost table capacity in ObjectIds (about 24 bytes each).
-pub const GHOST_CAPACITY: usize = 65_536;
+/// Admission filter capacity in ObjectIds (about 24 bytes each).
+pub const ADMISSION_FILTER_CAPACITY: usize = 65_536;
 
 /// Most cached objects one promotion may demote to make room. Bounds the inline
 /// demotion loop on the main thread.
@@ -52,20 +52,21 @@ pub struct AccessStats(AtomicU32);
 
 impl AccessStats {
     pub fn new(now_min: u16) -> Self {
-        Self(AtomicU32::new(pack(LFU_INIT_VAL, now_min)))
+        Self(AtomicU32::new(Self::pack(LFU_INIT_VAL, now_min)))
     }
 
     /// Overwrite both fields. Lets tests place a counter without touching.
     #[cfg(test)]
     pub fn set(&self, counter: u8, now_min: u16) {
-        self.0.store(pack(counter, now_min), Ordering::Relaxed);
+        self.0
+            .store(Self::pack(counter, now_min), Ordering::Relaxed);
     }
 
     /// Counter after applying decay for the minutes elapsed since the last
     /// decay. This is what demotion ranks by. `decay_time == 0` disables decay.
     pub fn decayed_counter(&self, now_min: u16, decay_time: u64) -> u8 {
         let raw = self.0.load(Ordering::Relaxed);
-        decay(
+        Self::decay(
             (raw & COUNTER_MASK) as u8,
             ((raw >> MINUTES_SHIFT) & MINUTES_MASK) as u16,
             now_min,
@@ -81,133 +82,133 @@ impl AccessStats {
     pub fn touch(&self, now_min: u16, decay_time: u64) {
         let counter = self.decayed_counter(now_min, decay_time);
         let r: f64 = rand::rng().random_range(0.0..1.0);
-        let counter = log_incr(counter, r);
-        self.0.store(pack(counter, now_min), Ordering::Relaxed);
+        let counter = Self::log_incr(counter, r);
+        self.0
+            .store(Self::pack(counter, now_min), Ordering::Relaxed);
+    }
+
+    fn pack(counter: u8, now_min: u16) -> u32 {
+        ((now_min as u32) << MINUTES_SHIFT) | counter as u32
+    }
+
+    /// One point off per `decay_time` minutes since `last_min`, on a 16-bit
+    /// wrapping clock. `decay_time == 0` disables decay.
+    fn decay(counter: u8, last_min: u16, now_min: u16, decay_time: u64) -> u8 {
+        if decay_time == 0 {
+            return counter;
+        }
+        let periods = now_min.wrapping_sub(last_min) as u64 / decay_time;
+        counter.saturating_sub(periods.min(u8::MAX as u64) as u8)
+    }
+
+    /// Logarithmic increment. `r` is a uniform draw in `[0, 1)`. At `LFU_INIT_VAL`
+    /// the probability is 1.
+    fn log_incr(counter: u8, r: f64) -> u8 {
+        if counter == u8::MAX {
+            return counter;
+        }
+        let base = counter.saturating_sub(LFU_INIT_VAL) as f64;
+        let p = 1.0 / (base * LFU_LOG_FACTOR as f64 + 1.0);
+        if r < p {
+            counter + 1
+        } else {
+            counter
+        }
     }
 }
 
-fn pack(counter: u8, now_min: u16) -> u32 {
-    ((now_min as u32) << MINUTES_SHIFT) | counter as u32
-}
+// ─── AdmissionFilter ─────────────────────────────────────────────────────────
 
-/// One point off per `decay_time` minutes since `last_min`, on a 16-bit
-/// wrapping clock. `decay_time == 0` disables decay.
-fn decay(counter: u8, last_min: u16, now_min: u16, decay_time: u64) -> u8 {
-    if decay_time == 0 {
-        return counter;
-    }
-    let periods = now_min.wrapping_sub(last_min) as u64 / decay_time;
-    counter.saturating_sub(periods.min(u8::MAX as u64) as u8)
-}
-
-/// Logarithmic increment. `r` is a uniform draw in `[0, 1)`. At `LFU_INIT_VAL`
-/// the probability is 1.
-fn log_incr(counter: u8, r: f64) -> u8 {
-    if counter == u8::MAX {
-        return counter;
-    }
-    let base = counter.saturating_sub(LFU_INIT_VAL) as f64;
-    let p = 1.0 / (base * LFU_LOG_FACTOR as f64 + 1.0);
-    if r < p {
-        counter + 1
-    } else {
-        counter
-    }
-}
-
-// ─── GhostTable ──────────────────────────────────────────────────────────────
-
-/// Admission filter: miss counts for recently missed objects, in a FIFO of at
-/// most `capacity` entries. ObjectIds are never reused, so an entry for a
-/// deleted object just ages out. Not thread safe; the pool locks it.
+/// Second-touch admission for the DRAM cache: miss counts for recently missed
+/// objects, in a FIFO of at most `capacity` entries. ObjectIds are never
+/// reused, so an entry for a deleted object just ages out.
 #[derive(Debug)]
-pub struct GhostTable {
-    hits: HashMap<ObjectId, u8>,
-    order: VecDeque<ObjectId>,
+pub struct AdmissionFilter {
+    misses: Mutex<MissLog>,
     capacity: usize,
+    /// Tiered GET misses served transiently because the object had not yet
+    /// missed `promote-min-hits` times.
+    pub rejects: AtomicU64,
 }
 
-impl GhostTable {
+#[derive(Debug, Default)]
+struct MissLog {
+    counts: HashMap<ObjectId, u8>,
+    order: VecDeque<ObjectId>,
+}
+
+impl Default for AdmissionFilter {
+    fn default() -> Self {
+        Self::new(ADMISSION_FILTER_CAPACITY)
+    }
+}
+
+impl AdmissionFilter {
     /// Nothing is preallocated, so a pool that never misses pays nothing.
     pub fn new(capacity: usize) -> Self {
         Self {
-            hits: HashMap::new(),
-            order: VecDeque::new(),
+            misses: Mutex::new(MissLog::default()),
             capacity,
+            rejects: AtomicU64::new(0),
+        }
+    }
+
+    /// True once the object has missed `promote-min-hits` times. Oversize
+    /// objects are refused without being tracked. Entries stay after promotion
+    /// and age out FIFO (design doc §4.3).
+    pub fn admit(&self, oid: ObjectId, obj_len: u64) -> bool {
+        if obj_len > crate::max_promote_size() {
+            return false;
+        }
+        let min_hits = crate::promote_min_hits();
+        if min_hits <= 1 {
+            return true;
+        }
+        if self.track(oid) >= min_hits {
+            true
+        } else {
+            self.rejects.fetch_add(1, Ordering::Relaxed);
+            false
         }
     }
 
     /// Count a miss for `oid` and return its total misses, saturating at 255.
-    pub fn record_miss(&mut self, oid: ObjectId) -> u8 {
-        if let Some(n) = self.hits.get_mut(&oid) {
+    /// When full, the oldest entry is dropped first, so `counts` and `order`
+    /// always hold the same OIDs.
+    fn track(&self, oid: ObjectId) -> u8 {
+        let mut log = self
+            .misses
+            .lock()
+            .expect("AdmissionFilter lock unavailable");
+        if let Some(n) = log.counts.get_mut(&oid) {
             *n = n.saturating_add(1);
             return *n;
         }
-        self.make_room();
-        self.hits.insert(oid, 1);
-        self.order.push_back(oid);
-        1
-    }
-
-    /// Drop the oldest entry if the table is full. Entries are never removed
-    /// out of order, so `hits` and `order` always hold the same OIDs.
-    fn make_room(&mut self) {
-        if self.hits.len() >= self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.hits.remove(&old);
+        if log.counts.len() >= self.capacity {
+            if let Some(old) = log.order.pop_front() {
+                log.counts.remove(&old);
             }
         }
+        log.counts.insert(oid, 1);
+        log.order.push_back(oid);
+        1
     }
 }
 
-// ─── CachePolicy ─────────────────────────────────────────────────────────────
+// ─── TieredCache ─────────────────────────────────────────────────────────────
 
-/// DRAM cache policy state for Tiered mode: the admission filter and its
-/// counters. DRAMPool holds it as `Option`, `None` in Dram mode.
-pub struct CachePolicy {
+/// DRAM cache effectiveness counters. Tiered mode only.
+#[derive(Debug, Default)]
+pub struct CacheStats {
     /// Tiered GETs served from a Ready cached object.
     pub hits: AtomicU64,
     /// Tiered GETs that found no Ready cached object (absent or still Filling).
     pub misses: AtomicU64,
     /// Successful `try_promote_object` calls.
     pub promotions: AtomicU64,
-    /// Tiered GET misses served transiently because the object had not yet
-    /// accumulated `promote-min-hits` misses in the ghost table.
-    pub admission_rejects: AtomicU64,
-    /// Cached copies removed by `demote_for`; keys untouched.
-    pub demotions: AtomicU64,
-    /// Second-touch admission filter. Touched only on the miss path.
-    ghost: Mutex<GhostTable>,
 }
 
-/// Point-in-time copy of the `CachePolicy` counters, for INFO.
-#[derive(Debug)]
-pub struct PolicyCounts {
-    pub hits: u64,
-    pub misses: u64,
-    pub promotions: u64,
-    pub admission_rejects: u64,
-    pub demotions: u64,
-}
-
-impl Default for CachePolicy {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CachePolicy {
-    pub fn new() -> Self {
-        Self {
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            promotions: AtomicU64::new(0),
-            admission_rejects: AtomicU64::new(0),
-            demotions: AtomicU64::new(0),
-            ghost: Mutex::new(GhostTable::new(GHOST_CAPACITY)),
-        }
-    }
-
+impl CacheStats {
     /// Record a GET served from the cache: touch the object's LFU score and
     /// count the hit. Atomic only; no lock needed.
     pub fn record_hit(&self, stats: &AccessStats) {
@@ -219,40 +220,14 @@ impl CachePolicy {
     pub fn record_miss(&self) {
         self.misses.fetch_add(1, Ordering::Relaxed);
     }
+}
 
-    /// Second-touch admission: true once the object has missed `promote-min-hits`
-    /// times. Oversize objects are refused without touching the ghost table.
-    /// Entries stay after promotion and age out FIFO (design doc §4.3).
-    pub fn admit(&self, oid: ObjectId, obj_len: u64) -> bool {
-        if obj_len > crate::max_promote_size() {
-            return false;
-        }
-        let min_hits = crate::promote_min_hits();
-        if min_hits <= 1 {
-            return true;
-        }
-        let misses = self
-            .ghost
-            .lock()
-            .expect("CachePolicy.ghost lock unavailable")
-            .record_miss(oid);
-        if misses >= min_hits {
-            true
-        } else {
-            self.admission_rejects.fetch_add(1, Ordering::Relaxed);
-            false
-        }
-    }
-
-    pub fn counts(&self) -> PolicyCounts {
-        PolicyCounts {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            promotions: self.promotions.load(Ordering::Relaxed),
-            admission_rejects: self.admission_rejects.load(Ordering::Relaxed),
-            demotions: self.demotions.load(Ordering::Relaxed),
-        }
-    }
+/// State that exists only when DRAM caches NVMe (Tiered mode). DRAMPool holds
+/// it as `Option`, `None` in Dram mode.
+#[derive(Debug, Default)]
+pub struct TieredCache {
+    pub admission: AdmissionFilter,
+    pub stats: CacheStats,
 }
 
 // ─── Sampled victim selection ────────────────────────────────────────────────
@@ -284,17 +259,17 @@ where
     best.map(|(slot, _)| slot)
 }
 
-// ─── IndexedMap ──────────────────────────────────────────────────────────────
+// ─── OIDIndexedMap ─────────────────────────────────────────────────────────────
 
 /// A map from `ObjectId` that can also be sampled by slot. `IndexMap` keeps
 /// entries in a dense `Vec`, so a sample is a direct index with no hashing,
 /// and `swap_remove` is O(1).
-pub type IndexedMap<V> = IndexMap<ObjectId, V>;
+pub type OIDIndexedMap<V> = IndexMap<ObjectId, V>;
 
 /// Remove and return the lowest-scoring entry among up to `samples` slots
 /// (see `sample_victim`). `score` returns `None` for a pinned entry.
 pub fn demote_one<V, F>(
-    map: &mut IndexedMap<V>,
+    map: &mut OIDIndexedMap<V>,
     samples: usize,
     mut score: F,
 ) -> Option<(ObjectId, V)>
@@ -352,21 +327,25 @@ mod tests {
         assert_eq!(s.decayed_counter(5, 1), LFU_INIT_VAL);
     }
 
-    // ─── GhostTable ───
+    // ─── AdmissionFilter ───
 
     #[test]
-    fn ghost_counts_misses_and_drops_oldest() {
-        let mut g = GhostTable::new(3);
-        assert_eq!(g.record_miss(ObjectId(1)), 1);
-        assert_eq!(g.record_miss(ObjectId(1)), 2);
+    fn filter_counts_misses_and_drops_oldest() {
+        let f = AdmissionFilter::new(3);
+        let len = |f: &AdmissionFilter| {
+            let log = f.misses.lock().unwrap();
+            (log.counts.len(), log.order.len())
+        };
+        assert_eq!(f.track(ObjectId(1)), 1);
+        assert_eq!(f.track(ObjectId(1)), 2);
         for i in 2..=4 {
-            g.record_miss(ObjectId(i));
+            f.track(ObjectId(i));
         }
         // Full at 3: OID 1 was the oldest and is gone; OID 4 is still counted.
-        assert_eq!((g.hits.len(), g.order.len()), (3, 3));
-        assert_eq!(g.record_miss(ObjectId(4)), 2);
-        assert_eq!(g.record_miss(ObjectId(1)), 1);
-        assert_eq!((g.hits.len(), g.order.len()), (3, 3));
+        assert_eq!(len(&f), (3, 3));
+        assert_eq!(f.track(ObjectId(4)), 2);
+        assert_eq!(f.track(ObjectId(1)), 1);
+        assert_eq!(len(&f), (3, 3));
     }
 
     // ─── sample_victim ───
@@ -409,7 +388,7 @@ mod tests {
 
     #[test]
     fn demote_one_removes_lowest_unpinned() {
-        let mut m: IndexedMap<u8> = IndexedMap::new();
+        let mut m: OIDIndexedMap<u8> = OIDIndexedMap::new();
         for (i, score) in [50u8, 3, 20, 7].into_iter().enumerate() {
             m.insert(ObjectId(i as u64), score);
         }
