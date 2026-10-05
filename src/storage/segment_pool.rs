@@ -123,16 +123,39 @@ impl SegmentPool {
     /// object can exceed `segment_size` — oversized ones are rejected at SET
     /// admission (`lo_set`) and never reach here. Used for DRAM ObjectContext.
     pub(super) fn alloc_exact(&self, size: usize) -> Option<Vec<SegmentBuffer>> {
+        self.alloc_object_in_one_segment(&Self::chunk_sizes(size), None)
+    }
+
+    /// `alloc_exact` in segment `seg_idx` only. None if that segment is gone,
+    /// draining, or cannot fit the object.
+    pub(super) fn alloc_exact_in(&self, seg_idx: usize, size: usize) -> Option<Vec<SegmentBuffer>> {
+        self.alloc_object_in_one_segment(&Self::chunk_sizes(size), Some(seg_idx))
+    }
+
+    /// The segment `alloc_exact(size)` would pick if it had room (least-loaded
+    /// live one), and how many bytes it is short. Short is 0 if the bytes fit
+    /// and only talc overhead blocked the alloc.
+    pub(super) fn reclaim_target(&self, size: usize) -> Option<(usize, usize)> {
+        let total: usize = Self::chunk_sizes(size).iter().sum();
+        let (i, cur) = self.find_shrink_victim()?;
+        Some((i, (cur + total).saturating_sub(self.segment_size)))
+    }
+
+    /// Per-chunk aligned sizes: first N-1 are chunk_size, last is trimmed.
+    fn chunk_sizes(size: usize) -> Vec<usize> {
         assert!(size > 0, "alloc_exact: size must be > 0");
         let chunk_size = crate::chunk_size();
         let total_chunks = size.div_ceil(chunk_size);
-        // Per-chunk aligned sizes: first N-1 are chunk_size, last is trimmed.
-        let mut sizes: Vec<usize> = Vec::with_capacity(total_chunks);
-        for i in 0..total_chunks {
-            let user_len = super::chunk_user_data_len(i, total_chunks, size, chunk_size);
-            sizes.push(super::align_up(user_len));
-        }
-        self.alloc_object_in_one_segment(&sizes)
+        (0..total_chunks)
+            .map(|i| {
+                super::align_up(super::chunk_user_data_len(
+                    i,
+                    total_chunks,
+                    size,
+                    chunk_size,
+                ))
+            })
+            .collect()
     }
 
     /// Allocate every chunk of the object from ONE least-loaded eligible segment.
@@ -141,34 +164,34 @@ impl SegmentPool {
     /// talc's per-chunk boundary-tag overhead — none can, and `None` = pool full,
     /// which the caller handles via reactive expand. Keeps an object co-located —
     /// see `alloc_exact`.
-    fn alloc_object_in_one_segment(&self, sizes: &[usize]) -> Option<Vec<SegmentBuffer>> {
+    /// `target` pins the segment (reclaim retry); `None` picks the least-loaded.
+    fn alloc_object_in_one_segment(
+        &self,
+        sizes: &[usize],
+        target: Option<usize>,
+    ) -> Option<Vec<SegmentBuffer>> {
         assert!(
             !sizes.is_empty(),
             "alloc_object_in_one_segment: empty sizes"
         );
         let total: usize = sizes.iter().sum();
         let st = self.state.lock().expect("state lock unavailable");
-        // Single O(N) pass: least-loaded eligible segment that fits the object's
-        // TOTAL size (same picker as alloc_one, byte filter widened to `total`).
-        let (_, seg_idx) = st
-            .slots
-            .iter()
-            .enumerate()
-            .filter_map(|(i, opt)| {
-                let seg = opt.as_ref()?;
-                if seg.draining.load(std::sync::atomic::Ordering::Acquire) {
-                    return None;
-                }
-                let cur = seg
-                    .allocated_bytes
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                if cur + total > seg.size {
-                    return None;
-                }
-                Some((cur, i))
-            })
-            .min_by_key(|&(cur, _)| cur)?;
-        let seg = st.slots[seg_idx].as_ref().unwrap();
+        // Segments are uniform, so if the least-loaded one can't fit, none can
+        // (same picker as alloc_one). `target` pins the segment instead.
+        let seg_idx = match target {
+            Some(i) => i,
+            None => Self::least_loaded(&st)?.0,
+        };
+        let seg = st.slots.get(seg_idx)?.as_ref()?;
+        if seg.draining.load(std::sync::atomic::Ordering::Acquire)
+            || seg
+                .allocated_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                + total
+                > seg.size
+        {
+            return None;
+        }
         let seg_base = seg.base;
         let talc = seg.talc.lock().expect("segment talc lock unavailable");
         let mut buffers: Vec<SegmentBuffer> = Vec::with_capacity(sizes.len());
@@ -498,20 +521,23 @@ impl SegmentPool {
     /// Returns `(slot_idx, allocated_bytes)` without marking the segment draining.
     pub fn find_shrink_victim(&self) -> Option<(usize, usize)> {
         let st = self.state.lock().expect("state lock unavailable");
+        Self::least_loaded(&st)
+    }
+
+    /// Least-loaded non-draining segment as `(slot_idx, allocated_bytes)`. The
+    /// allocator's pick, the shrink victim, and the reclaim target are all this.
+    fn least_loaded(st: &SegmentState) -> Option<(usize, usize)> {
         st.slots
             .iter()
             .enumerate()
             .filter_map(|(i, opt)| {
-                opt.as_ref().and_then(|seg| {
-                    if !seg.draining.load(std::sync::atomic::Ordering::Relaxed) {
-                        Some((
-                            i,
-                            seg.allocated_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ))
-                    } else {
-                        None
-                    }
+                let seg = opt.as_ref()?;
+                (!seg.draining.load(std::sync::atomic::Ordering::Acquire)).then(|| {
+                    (
+                        i,
+                        seg.allocated_bytes
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
                 })
             })
             .min_by_key(|&(_, bytes)| bytes)
@@ -756,6 +782,37 @@ mod tests {
     use super::*;
 
     // ── alloc_exact ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_reclaim_target_is_least_loaded_with_shortfall() {
+        crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
+        let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
+        let a = pool.alloc_exact(4096 * 4).unwrap(); // seg 0: 16 KiB
+        let b = pool.alloc_exact(4096 * 2).unwrap(); // seg 1: 8 KiB (least loaded)
+        assert_eq!((a[0].segment_idx, b[0].segment_idx), (0, 1));
+        // 60 KiB into seg 1 (8 KiB used of 64 KiB) is 4 KiB short.
+        assert_eq!(pool.reclaim_target(4096 * 15), Some((1, 4096)));
+        // Fits by bytes: nothing short.
+        assert_eq!(pool.reclaim_target(4096), Some((1, 0)));
+        pool.free_n(&a);
+        pool.free_n(&b);
+    }
+
+    #[test]
+    fn test_alloc_exact_in_uses_only_the_target_segment() {
+        crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
+        let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
+        let a = pool.alloc_exact(4096 * 4).unwrap(); // seg 0 now the fuller one
+                                                     // Pinned to seg 0 even though seg 1 is emptier.
+        let b = pool.alloc_exact_in(0, 4096 * 2).unwrap();
+        assert!(b.iter().all(|buf| buf.segment_idx == 0));
+        // Does not fit in seg 0, and never falls back to seg 1.
+        assert!(pool.alloc_exact_in(0, 65536).is_none());
+        // No such segment.
+        assert!(pool.alloc_exact_in(5, 4096).is_none());
+        pool.free_n(&a);
+        pool.free_n(&b);
+    }
 
     #[test]
     fn test_alloc_exact_single_chunk_trimmed() {

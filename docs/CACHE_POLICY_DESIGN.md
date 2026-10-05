@@ -58,7 +58,7 @@ Three tuning values are constants in `src/storage/cache_policy.rs`, because no o
 |---|---|---|
 | `LFU_LOG_FACTOR` | 10 | Core's default for `lfu-log-factor`; almost never tuned. |
 | `ADMISSION_FILTER_CAPACITY` | 65536 | `promote-min-hits 1` is the single off switch for admission. |
-| `DEMOTE_MAX_VICTIMS` | 16 | A loop bound, not a policy knob. |
+| `RECLAIM_MAX_VICTIMS` | 16 | A loop bound, not a policy knob. |
 
 ## 4. Design
 
@@ -111,42 +111,42 @@ The filter's miss log is a `Mutex` taken only in `track`, never together with th
 
 A GET that finds a `Filling` entry (another GET is promoting the same object) skips both `admit` and `try_promote_object`, so concurrent GETs on one object do not inflate its miss count.
 
-### 4.4 Demotion: bounded, sampled, inline
+### 4.4 Reclaim: one segment, bounded, sampled
 
-`DRAMPool::try_promote_object` does `alloc_exact(obj_len)` (all-or-nothing) before taking the write lock. When that fails:
+`DRAMPool::try_promote_object` allocates (all-or-nothing) before taking the write lock. When that fails:
 
 ```
-buffers = alloc_exact(obj_len)
-if buffers is None and make_room_for(obj_len):
-    buffers = alloc_exact(obj_len)          // may still fail on fragmentation; caller falls back
+buffers = alloc_exact_or_expand(obj_len)
+    or make_room_for(obj_len)               // None: caller falls back to NVMe
 ```
 
-Expansion is deliberately not attempted here. Segments are registered with io_uring (`IORING_REGISTER_BUFFERS`) and EFA once at startup, and a segment added at runtime updates only the module's mirror table, so the first `ReadFixed` into it fails with EFAULT and the header-verify path panics. This bug predates this work and is already reachable through the scaling cron's proactive expand in Tiered mode with `dram-maxmemory 0`. Once runtime registration exists (`IORING_REGISTER_BUFFERS_UPDATE` plus `fi_mr_reg` on expand), add `try_expand` and a retry before `make_room_for`, so the cache is never shrunk while it can still grow.
+Every object lives in one segment (`alloc_exact`), so freeing bytes spread over several segments cannot help. `make_room_for` works on one segment:
 
-`make_room_for(need)` calls the private `reclaim(need, free_now, max_victims)`. Free space and the round limit are arguments so tests can set them; the sample size, decay time and clock are read live.
+1. `SegmentPool::reclaim_target(obj_len)` returns the segment `alloc_exact` would pick (the least loaded live one) and how many bytes it is short, using the same per-chunk aligned sizes as the alloc. Short is 0 when the bytes fit but talc's per-chunk tags blocked the alloc; reclaim then frees at least one victim.
+2. `reclaim_in(seg, short, RECLAIM_MAX_VICTIMS)` takes the write lock on the object map. Until the victims' bytes cover `short`, it samples `demote-sample-size` OIDs from that segment's index (every one if there are that few), skips any entry whose `Arc::strong_count > 1`, and removes the lowest `decayed_counter`. It stops at the first fit, so it takes the fewest victims, never more.
+3. If the segment runs out of unpinned entries or the cap is hit first, every victim goes back under the same lock and nothing is reclaimed. Readers wait on the lock, so none of them sees the entries missing.
+4. The lock is released, then the victims drop. Each had a strong count of 1 under the lock, and cloning needs the lock, so this is the last reference and `ObjectContext::Drop` returns the buffers to talc.
+5. `SegmentPool::alloc_exact_in(seg, obj_len)` allocates in that segment only.
 
-1. Take the write lock on the object map.
-2. Up to `DEMOTE_MAX_VICTIMS` times, until the freed bytes alone cover `need`: call `demote_one`, which probes `demote-sample-size` slots (every slot if the map is that small), skips any entry whose `Arc::strong_count > 1`, and removes the lowest `decayed_counter`. Stop early if no probed entry is demotable. Current free space is not subtracted from `need`: the first alloc already failed, so that space is fragmented, and whole victim-sized holes are what make the retry work.
-3. If the freed bytes plus the pool's free bytes are still below `need`, put every victim back under the same lock and demote nothing. Readers wait on the lock, so none of them sees the entries missing.
-4. Release the lock, then drop the victims. Each had a strong count of 1 under the lock, and cloning needs the lock, so this is the last reference and `ObjectContext::Drop` returns the buffers to talc before the retry alloc.
+Segment `allocated_bytes` is talc's count of requested layout sizes, and each victim's buffers are all in `seg`, so once the victims cover `short` the alloc's byte check passes. The alloc can still fail if talc cannot place a chunk in the freed holes (its tags, or tail holes smaller than a chunk), or if another promotion takes the room first. The caller then serves from NVMe.
 
 Rules that fall out of the Arc model:
 
-1. An entry with an in-flight reader is never demoted. The reader finishes on the buffers it holds.
-2. An entry in `Filling` state is never demoted, because the promotion task holds an `Arc`.
-3. Demotion removes only the map's reference, as DEL does. The key and its NVMe file are untouched, and the next GET is a miss that goes through admission again.
+1. An entry with an in-flight reader is never reclaimed. The reader finishes on the buffers it holds.
+2. An entry in `Filling` state is never reclaimed, because the promotion task holds an `Arc`.
+3. Reclaim removes only the map's reference, as DEL does. The key and its NVMe file are untouched, and the next GET is a miss that goes through admission again.
 
 There is no mode guard inside `make_room_for`. Its only caller is `try_promote_object`, which only the tiered GET handler reaches. The name states what it removes.
 
-Cost bound: at most `demote-sample-size` times `DEMOTE_MAX_VICTIMS` score reads and `DEMOTE_MAX_VICTIMS` removes under the write lock, on the miss path only (80 and 16 by default). It runs on the main thread, which is why it is bounded.
+Cost: picking the segment is one pass over the segment slots, as the allocator already does. Under the write lock, at most `demote-sample-size` times `RECLAIM_MAX_VICTIMS` index probes (each one hash lookup into the object map) and `RECLAIM_MAX_VICTIMS` removes (80 and 16 by default), independent of how many objects are cached. Usually far fewer, since the loop stops at the first fit.
 
-The retry alloc can still fail after demotions; the caller then falls back to the transient read, and the freed space helps the next promotion. `alloc_exact` trims each object's last buffer to its tail, so a victim frees full-chunk holes plus one smaller hole. When the new object is larger than its victims, those tail holes cannot hold a full chunk unless they merge with neighboring free space, so mixed object sizes make a failed retry more likely than the byte count suggests. The free-bytes figure in step 3 also ignores allocator overhead, so it cannot rule out every failed retry.
-
-Known limitation: `DEMOTE_MAX_VICTIMS` is also a size ceiling. An object that needs more than 16 victims' worth of space beyond the current free bytes (a 64 MiB object into a pool of 64 KiB objects) is never promoted and stays on NVMe. Step 3 makes that a no-op instead of demoting 16 entries on every miss. If object sizes turn out to vary widely, bound the loop by bytes examined instead of a victim count.
+Known limitation: `RECLAIM_MAX_VICTIMS` is also a size ceiling. An object that needs more than 16 victims from its target segment (a 64 MiB object into a segment of 64 KiB objects) is never promoted and stays on NVMe. Step 3 makes that a no-op instead of reclaiming on every miss. If object sizes turn out to vary widely, bound the loop by bytes examined instead of a victim count.
 
 ### 4.5 Data structure
 
-`HashMap` cannot be sampled at random, so both pools use `OIDIndexedMap<V>`, an alias for `indexmap::IndexMap<ObjectId, V>`. It keeps entries in a dense `Vec` with a hash table of positions, so sampling a slot is a plain index with no hashing. Insert pushes to the end and `swap_remove` is O(1). `cache_policy::demote_one(map, samples, score)` probes up to `samples` slots, removes the lowest-scoring entry the `score` closure accepts, and returns it; both pools demote only through it. `retain` (used by `try_shrink`) is O(n).
+`HashMap` cannot be sampled at random, so both pools use `OIDIndexedMap<V>`, an alias for `indexmap::IndexMap<ObjectId, V>`. It keeps entries in a dense `Vec` with a hash table of positions, so sampling a slot is a plain index with no hashing. Insert pushes to the end and `swap_remove` is O(1). `cache_policy::demote_one(map, samples, score)` probes up to `samples` slots, removes the lowest-scoring entry the `score` closure accepts, and returns it; the fd pool demotes through it.
+
+DRAMPool keeps two maps under one lock, changed together only through `ObjectMaps::insert` and `remove`: `all` (OID to `Arc<ObjectContext>`) and `by_segment[s]` (an `OIDIndexedMap<()>` of the OIDs whose first buffer is in segment `s`). The index holds `()`, not a second `Arc`, so `strong_count` still means "only the map holds it". Reclaim samples `by_segment[seg]` with the same `sample_victim` and looks each probe up in `all`. Both updates are O(1). Tiered objects never span segments, so the first buffer names the only segment; a Dram-mode COPY can split an object (a known bug in `ObjectContext::try_clone`), but Dram mode only shrinks empty segments, so `try_shrink` can still drain `by_segment[seg]` directly in O(objects in that segment). If Dram shrink ever relocates live data, fix `try_clone` first.
 
 ### 4.6 Interaction with existing mechanisms
 
@@ -179,11 +179,11 @@ fds: RwLock<OIDIndexedMap<FdEntry>>
 
 1. The `get_or_open` fast path touches `stats` under the read lock and hands out a clone. The re-check under the write lock (two concurrent first GETs on a cold object) does the same.
 2. Slow path, under the write lock: if `max-open-fds` is nonzero and `len >= cap`, remove the lowest-scoring sampled fd until there is room for the new one under the cap (normally one; more after the cap is lowered at runtime, since it is enforced on the next open). Unlike the DRAM pool, an fd held by an in-flight read is not skipped: demotion only drops the map's `Arc`, the reader's clone keeps the fd open until the read completes, and it closes then. Open fds can briefly exceed the cap by the number of such readers. Victims are chosen before `open()`, so if the open fails they are still demoted and counted, costing one reopen each.
-3. The DRAM pool keeps the held-entry skip because demotion there must free bytes for an allocation that happens right after; a held entry frees nothing until its reader finishes. The fd cap has no such follow-up, so the skip buys nothing.
+3. The DRAM pool keeps the held-entry skip because reclaim there must free bytes for an allocation that happens right after; a held entry frees nothing until its reader finishes. The fd cap has no such follow-up, so the skip buys nothing.
 4. The next GET on a demoted fd reopens it, which costs one `open()` syscall, so a wrong fd demotion is far cheaper than a wrong DRAM demotion.
 5. No admission filter for fds: a miss costs a syscall, not DRAM, so first-touch admission is fine.
 
-`get_or_open_with` takes the cap as an argument so unit tests can set it without racing on the global config; the other settings are read live. `DEMOTE_MAX_VICTIMS` does not apply, since the fd loop demotes exactly the overflow.
+`get_or_open_with` takes the cap as an argument so unit tests can set it without racing on the global config; the other settings are read live. `RECLAIM_MAX_VICTIMS` does not apply, since the fd loop demotes exactly the overflow.
 
 INFO section `largeobj_fd` (Tiered only): `open_fds`, `fd_demotions_total`.
 

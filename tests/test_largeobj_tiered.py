@@ -972,6 +972,79 @@ class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('LO.GET', demoted) == bytes([65 + idx]) * self.OBJ
 
 
+class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
+    """Reclaim frees room in one segment, the least loaded, and allocates there.
+    Two 1 MiB segments: three 256 KiB objects fill segment 0, and the pool
+    expands once for the fourth. Segment 1 then gets the coldest objects, so a
+    reclaim that looked across the whole pool would take one of those. The
+    target is segment 0 (768 KiB vs 832 KiB) and its 3 entries are fewer than
+    the default demote-sample-size (5), so the victim choice there is exact.
+    The expand watermark is raised so the scaling cron never adds a third
+    segment (2 MiB, at most 78% full)."""
+
+    OBJ = 256 * 1024
+    SMALL = 64 * 1024
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 4194304"
+            f" segment-size 1048576"
+            f" max-promote-size 262144"
+            f" promote-min-hits 1"
+            f" tiered-decay-time 0"
+            f" scaling-expand-watermark 95"
+            f" chunk-size 65536"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def _promote(self, client, key, payload):
+        client.execute_command('LO.SET', key, payload)
+        assert client.execute_command('LO.GET', key) == payload
+        assert client.execute_command('LO.INFO', key, 'TIER') == b'dram'
+
+    def test_reclaims_only_in_target_segment(self):
+        client = self.server.get_new_client()
+        # Segment 0: A, B, C (768 KiB). No maxmemory yet, so D expands the pool.
+        for k in ('A', 'B', 'C', 'D'):
+            self._promote(client, k, k.encode() * self.OBJ)
+        info = client.info('largeobj_dram')
+        assert info['largeobj_dram_live_segments'] == 2
+        assert info['largeobj_scaling_expand_total'] == 1
+        assert info['largeobj_reclaims_total'] == 0
+
+        # No more growth. Segment 1 (D, 256 KiB) is the less loaded one, so E,
+        # H and F all land there: 256 + 256 + 64 + 256 = 832 KiB.
+        TestLargeObjTieredDemotion._block_expansion(self, client)
+        self._promote(client, 'E', b'E' * self.OBJ)
+        self._promote(client, 'H', b'H' * self.SMALL)
+        self._promote(client, 'F', b'F' * self.OBJ)
+        info = client.info('largeobj_dram')
+        assert info['largeobj_cached_objects'] == 7
+        assert info['largeobj_dram_live_segments'] == 2
+
+        # One hit takes A and B from the initial LFU counter 5 to 6 (the first
+        # increment is certain). C and everything in segment 1 stay at 5.
+        for k in ('A', 'B'):
+            assert client.execute_command('LO.GET', k) == k.encode() * self.OBJ
+
+        # G fits nowhere. The target is segment 0 (least loaded); its coldest
+        # entry is C, so exactly C goes, even though segment 1 is just as cold.
+        self._promote(client, 'G', b'G' * self.OBJ)
+        info = client.info('largeobj_dram')
+        assert info['largeobj_reclaims_total'] == 1, "no over-reclaim"
+        assert info['largeobj_cached_objects'] == 7
+        assert info['largeobj_dram_live_segments'] == 2
+        assert info['largeobj_scaling_expand_total'] == 1
+        assert client.execute_command('LO.INFO', 'C', 'TIER') == b'nvme'
+        for k in ('A', 'B', 'D', 'E', 'H', 'F'):
+            assert client.execute_command('LO.INFO', k, 'TIER') == b'dram', k
+        # The reclaimed copy still reads back from NVMe.
+        assert client.execute_command('LO.GET', 'C') == b'C' * self.OBJ
+
+
 class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
     """max-open-fds 2 with promotion effectively off (promote-min-hits 255), so
     every GET reads through the fd pool. Decay off so scores are stable across

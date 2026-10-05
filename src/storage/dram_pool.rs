@@ -15,18 +15,77 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::cache_policy::{
-    demote_one, now_minutes, OIDIndexedMap, TieredCache, DEMOTE_MAX_VICTIMS,
+    now_minutes, sample_victim, OIDIndexedMap, TieredCache, RECLAIM_MAX_VICTIMS,
 };
 use super::context::{ObjectContext, SegmentBuffer};
 use super::segment_pool::SegmentPool;
 use crate::data_type::ObjectId;
 
+/// Cached objects plus a per-segment index of the same OIDs, so reclaim can
+/// sample one segment. Both change together, only through `insert`/`remove`.
+#[derive(Default)]
+struct ObjectMaps {
+    all: OIDIndexedMap<Arc<ObjectContext>>,
+    /// `by_segment[s]`: OIDs whose first buffer is in segment `s`. Tiered
+    /// objects never span segments, so that is the only segment they use.
+    by_segment: Vec<OIDIndexedMap<()>>,
+}
+
+impl ObjectMaps {
+    fn insert(&mut self, oid: ObjectId, ctx: Arc<ObjectContext>) {
+        let s = ctx.buffers[0].segment_idx as usize;
+        if s >= self.by_segment.len() {
+            self.by_segment.resize_with(s + 1, OIDIndexedMap::new);
+        }
+        self.by_segment[s].insert(oid, ());
+        let old = self.all.insert(oid, ctx);
+        debug_assert!(old.is_none(), "OIDs are never reused");
+    }
+
+    fn remove(&mut self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
+        let ctx = self.all.swap_remove(oid)?;
+        self.by_segment[ctx.buffers[0].segment_idx as usize].swap_remove(oid);
+        Some(ctx)
+    }
+
+    /// Remove every object in segment `seg` (shrink). The index is complete for
+    /// any segment shrink can pick: Tiered objects never span segments, and
+    /// Dram mode only shrinks empty segments, so a split Dram COPY never meets
+    /// this. Revisit if Dram shrink ever relocates live data.
+    fn remove_segment(&mut self, seg: usize) {
+        let Some(ids) = self.by_segment.get_mut(seg) else {
+            return;
+        };
+        for oid in std::mem::take(ids).into_keys() {
+            self.all.swap_remove(&oid);
+        }
+    }
+
+    /// Remove and return the lowest-scoring unpinned object among up to
+    /// `samples` drawn from segment `seg`.
+    fn take_victim(
+        &mut self,
+        seg: usize,
+        samples: usize,
+        now_min: u16,
+        decay_time: u64,
+    ) -> Option<(ObjectId, Arc<ObjectContext>)> {
+        let ids = self.by_segment.get_mut(seg)?;
+        let slot = sample_victim(ids.len(), samples, |s| {
+            let ctx = self.all.get(ids.get_index(s)?.0)?;
+            (Arc::strong_count(ctx) == 1).then(|| ctx.stats.decayed_counter(now_min, decay_time))
+        })?;
+        let (oid, ()) = ids.swap_remove_index(slot)?;
+        Some((oid, self.all.swap_remove(&oid)?))
+    }
+}
+
 pub struct DRAMPool {
     pool: SegmentPool,
-    /// Cached objects: ObjectId → Arc<ObjectContext>, plus a slot index so
-    /// reclaim can sample at random.
+    /// Cached objects: ObjectId → Arc<ObjectContext>, plus a per-segment index
+    /// so reclaim can sample one segment at random.
     /// RwLock: main thread reads (GET hit), tokio writes (promotion insert).
-    objects: RwLock<OIDIndexedMap<Arc<ObjectContext>>>,
+    objects: RwLock<ObjectMaps>,
     /// Cumulative count of successful expand operations since module load.
     pub expand_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
@@ -42,7 +101,7 @@ impl DRAMPool {
     pub fn new(segment_count: usize, segment_size: usize, cache: Option<TieredCache>) -> Self {
         Self {
             pool: SegmentPool::new(segment_count, segment_size, super::uring::PoolType::Dram),
-            objects: RwLock::new(OIDIndexedMap::new()),
+            objects: RwLock::new(ObjectMaps::default()),
             expand_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
             reclaims: AtomicU64::new(0),
@@ -138,6 +197,7 @@ impl DRAMPool {
             .objects
             .read()
             .expect("DRAMPool.objects lock unavailable")
+            .all
             .get(oid)
             .cloned()?;
 
@@ -163,7 +223,7 @@ impl DRAMPool {
         self.objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
-            .swap_remove(oid)
+            .remove(oid)
     }
 
     /// Check if object exists (coalesce check — is promotion in progress?).
@@ -171,6 +231,7 @@ impl DRAMPool {
         self.objects
             .read()
             .expect("DRAMPool.objects lock unavailable")
+            .all
             .contains_key(oid)
     }
 
@@ -179,6 +240,7 @@ impl DRAMPool {
         self.objects
             .read()
             .expect("DRAMPool.objects lock unavailable")
+            .all
             .len()
     }
 
@@ -190,7 +252,8 @@ impl DRAMPool {
     /// Multi-buffer: allocates ceil(obj_len / chunk_size) buffers via
     /// alloc_exact_or_expand with all-or-nothing semantics.
     /// If that fails (expansion refused at the maxmemory watermark), reclaims
-    /// cold cached copies and retries once. Size limits are checked in admit().
+    /// cold cached copies in one segment and allocates there. Size limits are
+    /// checked in admit().
     pub fn try_promote_object(
         &self,
         oid: ObjectId,
@@ -201,21 +264,19 @@ impl DRAMPool {
         // Alloc BEFORE write lock -- talc scan under memory pressure
         // won't block GET readers waiting on get_object().
         let dummy = valkey_module::Context::dummy();
-        let mut buffers = self.alloc_exact_or_expand(&dummy, obj_len);
-        // No space: reclaim cold cached copies and retry once. Freed bytes may
-        // not be contiguous, so under fragmentation the retry can still fail
-        // and we skip promotion (the GET is served from NVMe).
-        if buffers.is_none() && self.make_room_for(obj_len as usize) {
-            buffers = self.pool.alloc_exact(obj_len as usize);
-        }
-        let buffers = buffers?;
+        // No space: reclaim in one segment and allocate there. That can still
+        // fail (talc fragmentation, or a racing alloc takes the room); then we
+        // skip promotion and the GET is served from NVMe.
+        let buffers = self
+            .alloc_exact_or_expand(&dummy, obj_len)
+            .or_else(|| self.make_room_for(obj_len as usize))?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self
             .objects
             .write()
             .expect("DRAMPool.objects lock unavailable");
-        if objects.contains_key(&oid) {
+        if objects.all.contains_key(&oid) {
             self.free_n(&buffers);
             return None;
         }
@@ -231,62 +292,58 @@ impl DRAMPool {
 
     // ─── Reclaim ─────────────────────────────────────────────────────────────
 
-    /// Reclaim up to `DEMOTE_MAX_VICTIMS` low-score cached copies (the data stays
-    /// on NVMe) to free `need` bytes. Reclaims nothing if that plus free space
-    /// can't cover `need`. True if anything was reclaimed.
-    pub fn make_room_for(&self, need: usize) -> bool {
-        let (count, _bytes) = self.reclaim(need, self.free_bytes(), DEMOTE_MAX_VICTIMS);
-        count > 0
+    /// Reclaim cold cached copies (the data stays on NVMe) from the segment
+    /// `alloc_exact` would pick, then allocate `obj_len` there. That segment
+    /// is the least loaded, so it needs the fewest victims. None if it cannot
+    /// be made to fit.
+    fn make_room_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
+        let (seg, short) = self.pool.reclaim_target(obj_len)?;
+        // short == 0: the bytes fit but talc overhead blocked the alloc, so
+        // free at least one victim.
+        let victims = self.reclaim_in(seg, short.max(1), RECLAIM_MAX_VICTIMS)?;
+        // Each victim's Arc is its last: dropping returns its buffers to `seg`.
+        drop(victims);
+        self.pool.alloc_exact_in(seg, obj_len)
     }
 
-    /// Reclaim loop with free space and the round limit explicit for tests.
-    /// Only entries whose sole `Arc` is in the map are reclaimed.
-    fn reclaim(&self, need: usize, free_now: usize, max_victims: usize) -> (usize, usize) {
+    /// Remove the lowest-scoring unpinned objects in segment `seg` until their
+    /// bytes cover `need`, at most `max_victims`. All or nothing: if they fall
+    /// short, every victim goes back and this returns None. The victims are
+    /// returned so they drop after the write lock is released.
+    fn reclaim_in(
+        &self,
+        seg: usize,
+        need: usize,
+        max_victims: usize,
+    ) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
         let samples = crate::demote_sample_size();
         let now_min = now_minutes();
         let decay_time = crate::tiered_decay_time();
-        let mut victims: Vec<(ObjectId, Arc<ObjectContext>)> = Vec::new();
+        let mut objects = self
+            .objects
+            .write()
+            .expect("DRAMPool.objects lock unavailable");
+        let mut victims = Vec::new();
         let mut freed = 0usize;
-        {
-            let mut objects = self
-                .objects
-                .write()
-                .expect("DRAMPool.objects lock unavailable");
-            // Loop until victims alone cover `need`, but roll back only if
-            // victims plus `free_now` fall short: `free_now` is an upper bound.
-            for _ in 0..max_victims {
-                if freed >= need {
-                    break;
-                }
-                let Some((oid, ctx)) = demote_one(&mut objects, samples, |ctx| {
-                    (Arc::strong_count(ctx) == 1)
-                        .then(|| ctx.stats.decayed_counter(now_min, decay_time))
-                }) else {
-                    break;
-                };
-                freed += ctx.buffers.iter().map(|b| b.len as usize).sum::<usize>();
-                victims.push((oid, ctx));
-            }
-            if freed.saturating_add(free_now) < need {
-                for (oid, ctx) in victims {
-                    objects.insert(oid, ctx);
-                }
-                return (0, 0);
-            }
+        while freed < need && victims.len() < max_victims {
+            let Some((oid, ctx)) = objects.take_victim(seg, samples, now_min, decay_time) else {
+                break;
+            };
+            freed += ctx.buffers.iter().map(|b| b.len as usize).sum::<usize>();
+            victims.push((oid, ctx));
         }
-        let count = victims.len();
-        self.reclaims.fetch_add(count as u64, Ordering::Relaxed);
-        (count, freed)
+        if freed < need {
+            for (oid, ctx) in victims {
+                objects.insert(oid, ctx);
+            }
+            return None;
+        }
+        self.reclaims
+            .fetch_add(victims.len() as u64, Ordering::Relaxed);
+        Some(victims)
     }
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
-
-    /// Unallocated bytes across live segments. Ignores talc overhead, so it is
-    /// an upper bound; used only to rule out hopeless reclaims.
-    fn free_bytes(&self) -> usize {
-        let (live, _draining, _unused) = self.pool.segment_counts();
-        (live * self.pool.segment_size).saturating_sub(self.pool.allocated_bytes())
-    }
 
     pub fn utilization_ratio(&self) -> f64 {
         self.pool.utilization_ratio()
@@ -390,11 +447,7 @@ impl DRAMPool {
         self.objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
-            .retain(|_oid, ctx| {
-                ctx.buffers
-                    .iter()
-                    .all(|b| b.segment_idx as usize != victim_idx)
-            });
+            .remove_segment(victim_idx);
 
         self.shrink_count.fetch_add(1, Ordering::Relaxed);
         true
@@ -411,74 +464,135 @@ mod tests {
     const BUF: u32 = 4096;
 
     fn pool() -> DRAMPool {
-        DRAMPool::new(1, 1 << 20, Some(TieredCache::default()))
+        DRAMPool::new(2, 1 << 20, Some(TieredCache::default()))
     }
 
-    /// A Ready context with one fake buffer. DRAM_POOL is unset in unit tests,
-    /// so Drop does not try to free it.
-    fn ctx(slot: u16) -> Arc<ObjectContext> {
+    /// A Ready context with one fake buffer in segment `seg`. DRAM_POOL is
+    /// unset in unit tests, so Drop does not try to free it.
+    fn ctx(seg: u16, slot: u16) -> Arc<ObjectContext> {
         Arc::new(ObjectContext::new_ready(vec![SegmentBuffer {
-            segment_idx: 0,
+            segment_idx: seg,
             offset: slot as u64 * BUF as u64,
             len: BUF,
         }]))
     }
 
-    #[test]
-    fn demotes_lowest_score_and_skips_pinned() {
-        let p = pool();
-        // Empty map: nothing to sample.
-        assert_eq!(p.reclaim(1, 0, 16), (0, 0));
-        let hot = ctx(0);
-        hot.stats.set(LFU_INIT_VAL + 10, now_minutes());
-        let pinned = ctx(2); // counter 5 but held by us
-        p.insert_object(ObjectId(1), hot);
-        p.insert_object(ObjectId(2), ctx(1)); // counter 5
-        p.insert_object(ObjectId(3), pinned.clone());
+    fn oids(victims: &[(ObjectId, Arc<ObjectContext>)]) -> Vec<u64> {
+        let mut v: Vec<u64> = victims.iter().map(|(oid, _)| oid.0).collect();
+        v.sort();
+        v
+    }
 
-        let (n, bytes) = p.reclaim(1, 0, 1);
-        assert_eq!((n, bytes), (1, BUF as usize));
+    /// Every cached object is indexed under its first buffer's segment, and
+    /// the index holds nothing else.
+    fn assert_index_consistent(p: &DRAMPool) {
+        let m = p.objects.read().unwrap();
+        for (oid, ctx) in &m.all {
+            let s = ctx.buffers[0].segment_idx as usize;
+            assert!(m.by_segment[s].contains_key(oid), "{oid:?} not indexed");
+        }
+        let indexed: usize = m.by_segment.iter().map(|ids| ids.len()).sum();
+        assert_eq!(indexed, m.all.len());
+    }
+
+    #[test]
+    fn reclaims_lowest_unpinned_in_target_segment_only() {
+        let p = pool();
+        // Empty segment: nothing to take.
+        assert!(p.reclaim_in(0, 1, 16).is_none());
+        let hot = ctx(0, 0);
+        hot.stats.set(LFU_INIT_VAL + 10, now_minutes());
+        let pinned = ctx(0, 2); // counter 5 but held by us
+        p.insert_object(ObjectId(1), hot);
+        p.insert_object(ObjectId(2), ctx(0, 1)); // counter 5
+        p.insert_object(ObjectId(3), pinned.clone());
+        // Colder than anything in segment 0, but in another segment.
+        let other = ctx(1, 0);
+        other.stats.set(0, now_minutes());
+        p.insert_object(ObjectId(10), other);
+
+        let victims = p.reclaim_in(0, BUF as usize, 16).unwrap();
+        assert_eq!(oids(&victims), vec![2], "cold object is the victim");
         assert!(p.contains_object(&ObjectId(1)), "hot object must survive");
-        assert!(
-            !p.contains_object(&ObjectId(2)),
-            "cold object is the victim"
-        );
         assert!(
             p.contains_object(&ObjectId(3)),
             "pinned object must survive"
         );
+        assert!(
+            p.contains_object(&ObjectId(10)),
+            "other segment is untouched"
+        );
         assert_eq!(p.reclaims.load(Ordering::Relaxed), 1);
+        drop(victims);
+        assert_index_consistent(&p);
 
-        // Pin the hot entry too: every entry is now pinned, so nothing goes.
+        // Pin the hot entry too: segment 0 is all pinned, so nothing goes.
         let _hot = p.get_object(&ObjectId(1)).unwrap();
-        assert_eq!(p.reclaim(1, 0, 16), (0, 0));
-        assert_eq!(p.object_count(), 2);
+        assert!(p.reclaim_in(0, BUF as usize, 16).is_none());
+        assert_eq!(p.object_count(), 3);
+        assert_index_consistent(&p);
     }
 
     #[test]
     fn stops_once_need_is_covered() {
         let p = pool();
         for i in 0..4u16 {
-            p.insert_object(ObjectId(i as u64), ctx(i));
+            p.insert_object(ObjectId(i as u64), ctx(0, i));
         }
-        let (n, bytes) = p.reclaim(2 * BUF as usize, 0, 16);
-        assert_eq!((n, bytes), (2, 2 * BUF as usize));
+        let victims = p.reclaim_in(0, 2 * BUF as usize, 16).unwrap();
+        assert_eq!(victims.len(), 2, "no over-reclaim past the first fit");
         assert_eq!(p.object_count(), 2);
+        assert_eq!(p.reclaims.load(Ordering::Relaxed), 2);
     }
 
     #[test]
-    fn demotes_nothing_when_victims_cannot_cover_need() {
+    fn rolls_back_when_segment_cannot_cover_need() {
         let p = pool();
         for i in 0..4u16 {
-            p.insert_object(ObjectId(i as u64), ctx(i));
+            p.insert_object(ObjectId(i as u64), ctx(0, i));
+            p.insert_object(ObjectId(100 + i as u64), ctx(1, i));
         }
-        // The 2-round cap frees 2 BUF, plus 1 BUF free: short of 4 BUF. Roll back.
-        assert_eq!(p.reclaim(4 * BUF as usize, BUF as usize, 2), (0, 0));
-        assert_eq!(p.object_count(), 4);
+        // Segment 0 holds 4 BUF; other segments' bytes do not count.
+        assert!(p.reclaim_in(0, 5 * BUF as usize, 16).is_none());
+        // The victim cap stops short of 3 BUF.
+        assert!(p.reclaim_in(0, 3 * BUF as usize, 2).is_none());
+        assert_eq!(p.object_count(), 8);
         assert_eq!(p.reclaims.load(Ordering::Relaxed), 0);
-        // The same need with enough free space goes through.
-        let (n, _) = p.reclaim(4 * BUF as usize, 2 * BUF as usize, 2);
-        assert_eq!(n, 2);
+        assert_index_consistent(&p);
+
+        // Exactly what segment 0 holds goes through, and only segment 0 pays.
+        let victims = p.reclaim_in(0, 4 * BUF as usize, 16).unwrap();
+        assert_eq!(oids(&victims), vec![0, 1, 2, 3]);
+        assert!((100..104).all(|i| p.contains_object(&ObjectId(i))));
+        drop(victims);
+        assert_index_consistent(&p);
+    }
+
+    #[test]
+    fn index_tracks_insert_remove_and_shrink() {
+        let p = pool();
+        p.insert_object(ObjectId(1), ctx(0, 0));
+        p.insert_object(ObjectId(2), ctx(1, 0));
+        p.insert_object(ObjectId(3), ctx(1, 1));
+        assert_index_consistent(&p);
+
+        p.remove_object(&ObjectId(2));
+        // Remove then insert in another segment: the index entry moves with it.
+        p.remove_object(&ObjectId(1));
+        p.insert_object(ObjectId(1), ctx(1, 2));
+        assert_index_consistent(&p);
+        assert!(p.objects.read().unwrap().by_segment[0].is_empty());
+
+        // Shrink drains one segment's index and leaves the others alone.
+        p.insert_object(ObjectId(4), ctx(0, 3));
+        p.insert_object(ObjectId(5), ctx(0, 4));
+        p.objects.write().unwrap().remove_segment(0);
+        assert!(!p.contains_object(&ObjectId(4)));
+        assert!(!p.contains_object(&ObjectId(5)));
+        assert_eq!(p.object_count(), 2, "segment 1 objects survive");
+        assert_index_consistent(&p);
+        // A segment that never held anything is a no-op.
+        p.objects.write().unwrap().remove_segment(7);
         assert_eq!(p.object_count(), 2);
     }
 }
