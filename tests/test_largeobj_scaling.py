@@ -87,11 +87,11 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         before = info_largeobj(client)
         expand_before = before.get('largeobj_scaling_expand_total', 0)
 
-        r = client.execute_command('LO.SET', 'key_a', b'A' * obj_size)
-        assert r == b'OK', f"First LO.SET failed: {r}"
+        r = client.execute_command('BLOB.SET', 'key_a', b'A' * obj_size)
+        assert r == b'OK', f"First BLOB.SET failed: {r}"
 
-        r = client.execute_command('LO.SET', 'key_b', b'B' * obj_size)
-        assert r == b'OK', f"Second LO.SET failed (expand may not have fired): {r}"
+        r = client.execute_command('BLOB.SET', 'key_b', b'B' * obj_size)
+        assert r == b'OK', f"Second BLOB.SET failed (expand may not have fired): {r}"
 
         after = info_largeobj(client)
         assert after.get('largeobj_scaling_expand_total', 0) > expand_before, \
@@ -107,17 +107,17 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         keys_payloads = [(f'key_{i}', bytes([i % 256]) * obj_size) for i in range(4)]
 
         for key, payload in keys_payloads:
-            client.execute_command('LO.SET', key, payload)
+            client.execute_command('BLOB.SET', key, payload)
 
         for key, payload in keys_payloads:
-            got = client.execute_command('LO.GET', key)
+            got = client.execute_command('BLOB.GET', key)
             assert got == payload, f"Data mismatch for {key} after expand"
 
     def test_maxmemory_0_no_explicit_cap(self):
         """No module-level DRAM cap; the pool grows up to the server maxmemory ceiling."""
         client = self.server.get_new_client()
         for i in range(3):
-            r = client.execute_command('LO.SET', f'key_{i}', b'X' * (100 * 1024))
+            r = client.execute_command('BLOB.SET', f'key_{i}', b'X' * (100 * 1024))
             assert r == b'OK', f"SET {i} failed: {r}"
 
     def test_live_data_survives_memory_pressure(self):
@@ -131,7 +131,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         payloads = {f'dram_{i}': bytes([i % 256]) * obj_size for i in range(5)}
 
         for key, payload in payloads.items():
-            r = client.execute_command('LO.SET', key, payload)
+            r = client.execute_command('BLOB.SET', key, payload)
             assert r == b'OK', f"SET {key} failed: {r}"
 
         mem_info = client.execute_command('INFO', 'memory')
@@ -143,7 +143,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
 
         for key, payload in payloads.items():
             if client.execute_command('EXISTS', key) == 1:
-                got = client.execute_command('LO.GET', key)
+                got = client.execute_command('BLOB.GET', key)
                 assert got == payload, f"{key} data corrupted under pressure"
 
     def test_efa_set_triggers_reactive_expand(self):
@@ -158,7 +158,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         # object co-locates in its own segment, so a later one forces a new segment). Bounded
         # loop so a packing change can't hang the test.
         for i in range(8):
-            client.execute_command('LO.SET', f'filler_{i}', b'F' * (950 * 1024))
+            client.execute_command('BLOB.SET', f'filler_{i}', b'F' * (950 * 1024))
             if info_largeobj(client).get('largeobj_scaling_expand_total', 0) > expand_before:
                 break
         assert info_largeobj(client).get('largeobj_scaling_expand_total', 0) > expand_before, \
@@ -168,10 +168,10 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         # (exercises cmd_set_dram_efa's alloc/expand path).
         process, address, rkey, remote_addr, length = self.start_target('--read')
         try:
-            client.execute_command('LO.HELLO', address)
-            result = client.execute_command('LO.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr, length)
+            client.execute_command('BLOB.HELLO', address)
+            result = client.execute_command('BLOB.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr, length)
             assert result == b'OK', f"EFA SET failed: {result}"
-            assert client.execute_command('LO.GET', 'efa_key') == EFA_PATTERN
+            assert client.execute_command('BLOB.GET', 'efa_key') == EFA_PATTERN
         finally:
             process.kill()
         # The EFA SET succeeded in a pool that had already expanded (multi-segment),
@@ -222,8 +222,8 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
         expand_before = before.get('largeobj_scaling_expand_total', 0)
 
         # Fill >50% of one 1MB segment (600KB ≈ 59% of 1MB).
-        r = client.execute_command('LO.SET', 'probe', b'P' * (600 * 1024))
-        assert r == b'OK', "LO.SET failed"
+        r = client.execute_command('BLOB.SET', 'probe', b'P' * (600 * 1024))
+        assert r == b'OK', "BLOB.SET failed"
 
         # No more SETs. Wait for cron to observe utilization > 50% and expand.
         wait_for_true(
@@ -261,7 +261,7 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
         obj_size = 900 * 1024
         # Land the first object (pool starts at 1 segment, fits 900KB).
-        client.execute_command('LO.SET', 'key_a', b'A' * obj_size)
+        client.execute_command('BLOB.SET', 'key_a', b'A' * obj_size)
 
         # Cap server maxmemory just above current used_memory, leaving less than
         # one segment (1MB) of headroom — so the next object cannot expand.
@@ -269,7 +269,7 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         client.execute_command('CONFIG', 'SET', 'maxmemory', str(used + 256 * 1024))
 
         try:
-            client.execute_command('LO.SET', 'key_b', b'B' * obj_size)
+            client.execute_command('BLOB.SET', 'key_b', b'B' * obj_size)
             assert False, "Expected rejection: expansion would cross server maxmemory watermark"
         except ResponseError:
             pass
@@ -299,11 +299,11 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         obj_size = 900 * 1024
 
-        client.execute_command('LO.SET', 'key_a', b'A' * obj_size)
-        client.execute_command('LO.SET', 'key_b', b'B' * obj_size)
+        client.execute_command('BLOB.SET', 'key_a', b'A' * obj_size)
+        client.execute_command('BLOB.SET', 'key_b', b'B' * obj_size)
 
-        assert client.execute_command('LO.GET', 'key_a') == b'A' * obj_size
-        assert client.execute_command('LO.GET', 'key_b') == b'B' * obj_size
+        assert client.execute_command('BLOB.GET', 'key_a') == b'A' * obj_size
+        assert client.execute_command('BLOB.GET', 'key_b') == b'B' * obj_size
         # The expanded DRAM segment joins its ring's io_uring table (per-pool).
         wait_uring_registered_matches_live(client)
 
@@ -313,11 +313,11 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
         obj_size = 800 * 1024
 
         for i in range(4):
-            r = client.execute_command('LO.SET', f'key_{i}', bytes([i % 256]) * obj_size)
+            r = client.execute_command('BLOB.SET', f'key_{i}', bytes([i % 256]) * obj_size)
             assert r == b'OK', f"SET key_{i} failed: {r}"
 
         for i in range(4):
-            got = client.execute_command('LO.GET', f'key_{i}')
+            got = client.execute_command('BLOB.GET', f'key_{i}')
             assert got == bytes([i % 256]) * obj_size, f"Data mismatch for key_{i}"
         wait_uring_registered_matches_live(client)
 
@@ -327,10 +327,10 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
         obj_size = 900 * 1024
 
         for key, fill in [('key_a', b'A'), ('key_b', b'B'), ('key_c', b'C'), ('key_d', b'D')]:
-            client.execute_command('LO.SET', key, fill * obj_size)
+            client.execute_command('BLOB.SET', key, fill * obj_size)
 
         for key, fill in [('key_a', b'A'), ('key_b', b'B'), ('key_c', b'C'), ('key_d', b'D')]:
-            assert client.execute_command('LO.GET', key) == fill * obj_size
+            assert client.execute_command('BLOB.GET', key) == fill * obj_size
         wait_uring_registered_matches_live(client)
 
 
@@ -391,8 +391,8 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
 
         keys = [f'shrink_key_{i}' for i in range(4)]
         for key in keys:
-            r = client.execute_command('LO.SET', key, b'S' * obj_size)
-            assert r == b'OK', f"LO.SET {key} failed: {r}"
+            r = client.execute_command('BLOB.SET', key, b'S' * obj_size)
+            assert r == b'OK', f"BLOB.SET {key} failed: {r}"
 
         before = info_largeobj(client)
         shrink_before = before.get('largeobj_scaling_shrink_total', 0)
@@ -425,7 +425,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         self._assert_no_pressure(client)
 
         for i in range(4):
-            client.execute_command('LO.SET', f'pre_shrink_{i}', b'P' * obj_size)
+            client.execute_command('BLOB.SET', f'pre_shrink_{i}', b'P' * obj_size)
 
         before = info_largeobj(client)
         shrink_before = before.get('largeobj_scaling_shrink_total', 0)
@@ -446,8 +446,8 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
 
         client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
 
-        r = client.execute_command('LO.SET', 'post_shrink', b'Q' * obj_size)
-        assert r == b'OK', f"LO.SET after shrink+expand failed: {r}"
+        r = client.execute_command('BLOB.SET', 'post_shrink', b'Q' * obj_size)
+        assert r == b'OK', f"BLOB.SET after shrink+expand failed: {r}"
 
         for i in range(4):
             assert client.execute_command('EXISTS', f'pre_shrink_{i}') == 1, \
@@ -496,10 +496,10 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         # ~full-segment objects, GET both to promote them — each fills its own DRAM segment, so
         # promoting the second forces a reactive expand, and with the fabric up try_expand
         # EFA-registers that new segment (the path under test).
-        client.execute_command('LO.SET', 'key_a', b'A' * (900 * 1024))
-        client.execute_command('LO.SET', 'key_b', b'B' * (900 * 1024))
-        assert client.execute_command('LO.GET', 'key_a') == b'A' * (900 * 1024)
-        assert client.execute_command('LO.GET', 'key_b') == b'B' * (900 * 1024)
+        client.execute_command('BLOB.SET', 'key_a', b'A' * (900 * 1024))
+        client.execute_command('BLOB.SET', 'key_b', b'B' * (900 * 1024))
+        assert client.execute_command('BLOB.GET', 'key_a') == b'A' * (900 * 1024)
+        assert client.execute_command('BLOB.GET', 'key_b') == b'B' * (900 * 1024)
 
         expand_after = info_largeobj(client).get('largeobj_scaling_expand_total', 0)
         assert expand_after > expand_before, "expected an expansion (new EFA-registered segment)"
@@ -557,5 +557,5 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         # io_uring tables also dropped the released segment, per-pool.
         wait_uring_registered_matches_live(client, timeout=self.SHRINK_TIMEOUT_S)
         # The objects survive (Tiered: data on NVMe) and read back correctly after release.
-        assert client.execute_command('LO.GET', 'key_a') == b'A' * (900 * 1024)
-        assert client.execute_command('LO.GET', 'key_b') == b'B' * (900 * 1024)
+        assert client.execute_command('BLOB.GET', 'key_a') == b'A' * (900 * 1024)
+        assert client.execute_command('BLOB.GET', 'key_b') == b'B' * (900 * 1024)
