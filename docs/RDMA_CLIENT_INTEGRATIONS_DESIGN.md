@@ -96,7 +96,7 @@ import torch
 
 ### glide-rdma
 
-New leaf crate to glide-core that contains the components needed for establishing the client host as a RDMA target, registering a block of memory the server will RDMA against, minting a key for the server to access that memory, and building the RESP commands glide-core sends to a valkey server node with the [ValkeyLargeObj module](https://github.com/KarthikSubbarao/ValkeyLargeObj) installed: `LO.HELLO`, `LO.GET`, and `LO.SET`. This crate depends on libfabric to open the fabric endpoint and register memory, but the server performs all of the actual data transfer.
+New leaf crate to glide-core that contains the components needed for establishing the client host as a RDMA target, registering a block of memory the server will RDMA against, minting a key for the server to access that memory, and building the RESP commands glide-core sends to a valkey server node with the [valkey-large-object module](https://github.com/KarthikSubbarao/valkey-large-object) installed: `BLOB.HELLO`, `BLOB.GET`, and `BLOB.SET`. This crate depends on libfabric to open the fabric endpoint and register memory, but the server performs all of the actual data transfer.
 
 - diagram of main glide-rdma components
     
@@ -111,7 +111,7 @@ New leaf crate to glide-core that contains the components needed for establishin
       subgraph WIRE["glide-rdma — wire format, builds without libfabric"]
         direction TB
         FC["FabricConfig + Provider<br/>which card to open and how"]
-        CMD["RdmaCommand<br/>LO.HELLO / LO.GET / LO.SET, as a name and arguments"]
+        CMD["RdmaCommand<br/>BLOB.HELLO / BLOB.GET / BLOB.SET, as a name and arguments"]
         ADV["RegionRef<br/>the remote key and address permitting one transfer"]
         HS["Handshake<br/>the fabric addresses the server answered with"]
         RCPT["ReadReceipt<br/>bytes moved, and the server's checksum when it sends one"]
@@ -130,7 +130,7 @@ New leaf crate to glide-core that contains the components needed for establishin
 
       CONN -->|"sends its commands through"| PROTO
       PROTO -->|builds| CMD
-      PROTO -->|"parses the LO.HELLO reply into"| HS
+      PROTO -->|"parses the BLOB.HELLO reply into"| HS
       PROTO -->|"parses a transfer reply into"| RCPT
       RCPT -.->|"a read is verified against"| CK
 
@@ -151,13 +151,13 @@ New leaf crate to glide-core that contains the components needed for establishin
 
 Allows for building `glide-core` with large object RDMA capability using `--features rdma`.
 
-The [server module lists `LO.HELLO` as a write command](https://github.com/KarthikSubbarao/ValkeyLargeObj/blob/main/src/lib.rs#L453), so RDMA transfers will be between only the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards), not replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. Should not prevent RESP command pipelining.
+The [server module lists `BLOB.HELLO` as a write command](https://github.com/KarthikSubbarao/valkey-large-object/blob/main/src/lib.rs#L453), so RDMA transfers will be between only the client and primary nodes (in non-cluster mode, there’s only one; in cluster mode, there are multiple for the different shards), not replica nodes. Allows only one in-flight transfer per connection at a time with the RESP channel used as the control plane to coordinate with the valkey node. Should not prevent RESP command pipelining.
 
-RDMA handshakes occur on the first transfer (`LO.GET` or `LO.SET` command). There should be only one `LO.HELLO` per RESP connection. The server module [tracks RDMA sessions by each connection's `client_id`](https://github.com/KarthikSubbarao/ValkeyLargeObj/blob/main/src/transport/session.rs#L88), so the client should also pair an RDMA session with its own RESP connection. This way, RDMA sessions are kept in sync whenever a RESP connection must be replaced or a new one must be created or removed due to cluster topology changes.
+RDMA handshakes occur on the first transfer (`BLOB.GET` or `BLOB.SET` command). There should be only one `BLOB.HELLO` per RESP connection. The server module [tracks RDMA sessions by each connection's `client_id`](https://github.com/KarthikSubbarao/valkey-large-object/blob/main/src/transport/session.rs#L88), so the client should also pair an RDMA session with its own RESP connection. This way, RDMA sessions are kept in sync whenever a RESP connection must be replaced or a new one must be created or removed due to cluster topology changes.
 
 RDMA is not compatible with the other optional configurations for compression, `lazy_connect`, or `read_only`. 
 
-RDMA transfers are not abortable and `glide-core` applies no timeout to `LO.GET` or `LO.SET` commands. Callers that wish to cancel a transfer must close the client. Note that at the time of writing this doc, `LO.GET` doesn't accept a `length` argument and may instead receive an error from the server if the given memory window isn't large enough to accommodate the object.
+RDMA transfers are not abortable and `glide-core` applies no timeout to `BLOB.GET` or `BLOB.SET` commands. Callers that wish to cancel a transfer must close the client. Note that at the time of writing this doc, `BLOB.GET` doesn't accept a `length` argument and may instead receive an error from the server if the given memory window isn't large enough to accommodate the object.
 
 ### glide-ffi
 
@@ -254,6 +254,6 @@ vllm serve <model> --kv-transfer-config '{
 
 ## Implementation
 
-For the direct integration, we would subclass [SecondaryTierManager](https://github.com/vllm-project/vllm/blob/main/vllm/v1/kv_offload/tiering/base.py#L121) to create `ValkeyRdmaTierManager` that uses a pool of glide-sync clients to send `LO.*` commands. We can use the [file system](https://github.com/vllm-project/vllm/blob/df42d112ee88dd4a9b64efbad55621af6a66a44b/vllm/v1/kv_offload/tiering/fs/manager.py) and [object store](https://github.com/vllm-project/vllm/blob/df42d112ee88dd4a9b64efbad55621af6a66a44b/vllm/v1/kv_offload/tiering/obj/manager.py) secondary tier manager implementations as reference. Then [register](https://github.com/vllm-project/vllm/blob/main/vllm/v1/kv_offload/tiering/factory.py) the tier to make it available as an option to vLLM.
+For the direct integration, we would subclass [SecondaryTierManager](https://github.com/vllm-project/vllm/blob/main/vllm/v1/kv_offload/tiering/base.py#L121) to create `ValkeyRdmaTierManager` that uses a pool of glide-sync clients to send `BLOB.*` commands. We can use the [file system](https://github.com/vllm-project/vllm/blob/df42d112ee88dd4a9b64efbad55621af6a66a44b/vllm/v1/kv_offload/tiering/fs/manager.py) and [object store](https://github.com/vllm-project/vllm/blob/df42d112ee88dd4a9b64efbad55621af6a66a44b/vllm/v1/kv_offload/tiering/obj/manager.py) secondary tier manager implementations as reference. Then [register](https://github.com/vllm-project/vllm/blob/main/vllm/v1/kv_offload/tiering/factory.py) the tier to make it available as an option to vLLM.
 
 Note that the `kv_offload` feature still appears to be under active development and these details may change if/when we decide to prioritize this vLLM direct integration path.

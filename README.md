@@ -1,4 +1,4 @@
-# ValkeyLargeObj
+# valkey-large-object
 
 A Valkey module for storing large objects (KV cache tensors, embeddings, blobs) with a tiered DRAM + NVMe architecture, io_uring zero-copy I/O, and optional EFA RDMA transport to GPU memory.
 
@@ -18,17 +18,19 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 
 | Command | Description |
 |---------|-------------|
-| `LO.SET key <data>` | Store object (TCP). Data length is implicit. |
-| `LO.SET key len rkey remote_addr` | Store object (EFA). Server reads `len` bytes from client GPU via RDMA. |
-| `LO.GET key` | Retrieve object. Returns bulk string (TCP) or DMA to client GPU (EFA). |
-| `LO.HELLO` | Establish EFA/RDMA session for GPU-direct DMA transfers. |
+| `BLOB.SET key <data>` | Store object (TCP). Data length is implicit. |
+| `BLOB.SET key total_len rkey1 addr1 len1 ...` | Store object (EFA). Server reads `total_len` bytes from the client's memory addresses via RDMA. |
+| `BLOB.GET key` | Retrieve object over TCP. Returns a bulk string. |
+| `BLOB.GET key rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory addresses. Replies `[obj_len, crc32c]`. |
+| `BLOB.HELLO client_efa_addr_hex` | Establish EFA/RDMA session for GPU-direct DMA transfers. |
+| `BLOB.INFO key [LEN\|CRC\|TIER]` | Object metadata. No transport involved. |
 | `DEL key` | Native Valkey DEL. Triggers module free callback (cleans up NVMe file + pool buffers). |
 
 ## Build
 
 ```bash
 cargo build --release
-# Output: target/release/libvalkey_largeobj.so
+# Output: target/release/libvalkey_large_object.so
 ```
 
 ## Run
@@ -36,7 +38,7 @@ cargo build --release
 ### Dram mode (default)
 ```bash
 valkey-server --port 7380 \
-    --loadmodule ./target/release/libvalkey_largeobj.so \
+    --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Dram \
         dram-maxmemory 1gb \
         segment-size 64mb
@@ -45,7 +47,7 @@ valkey-server --port 7380 \
 ### Tiered mode (DRAM cache + NVMe persistence)
 ```bash
 valkey-server --port 7380 \
-    --loadmodule ./target/release/libvalkey_largeobj.so \
+    --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Tiered \
         nvme-dir /mnt/nvme-data \
         dram-maxmemory 1gb \
@@ -70,7 +72,7 @@ valkey-server --port 7380 \
 | `demote-sample-size` | 5 | Yes | Tiered: cached entries sampled per demotion; the lowest LFU score goes. Range 1-64. |
 | `max-open-fds` | 1024 | Yes | Tiered: cap on cached read fds. 0 = unlimited. |
 | `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. |
-| `bench-mode` | no | Yes | LO.GET returns integer size instead of bulk data (isolates NVMe throughput). |
+| `bench-mode` | no | Yes | BLOB.GET returns integer size instead of bulk data (isolates NVMe throughput). |
 | `direct-io` | yes | Immutable | Use O_DIRECT for NVMe files. Disable for ASAN builds. |
 | `fabric-provider` | `Emulated` | Immutable | libfabric provider for the DMA path: `Emulated` (libfabric over TCP, runs anywhere) or `EfaDirect` (EFA hardware RDMA). |
 | `fabric-interfaces` | (empty) | Immutable | Comma-separated fabric domains to serve on. Empty = every domain the provider discovers. |

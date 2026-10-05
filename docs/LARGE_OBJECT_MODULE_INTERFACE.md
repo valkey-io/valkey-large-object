@@ -4,7 +4,7 @@
 
 **One `.so`** — single Valkey module with three internal layers:
 
-- **Data Type** — Valkey keyspace: LoValue struct, commands (LO.HELLO, LO.GET, LO.SET), native DEL free callback, OID generation
+- **Data Type** — Valkey keyspace: LoValue struct, commands (BLOB.HELLO, BLOB.GET, BLOB.SET), native DEL free callback, OID generation
 - **Engine** — Routes commands through (OperatingMode × Transport) matrix. Decides sync vs async. Owns the `EngineResult` pattern.
 - **Storage** — SegmentPool + talc allocator, DRAMPool, NVMePool, io_uring (ReadFixed/WriteFixed), FdPool
 - **Transport** — EFA/libfabric (callback-based, oneshot bridge to tokio)

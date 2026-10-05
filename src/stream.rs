@@ -228,7 +228,7 @@ impl Target<'_> {
     }
 
     /// GET reply after the loop: collected bytes, or obj_len in bench mode.
-    /// Only valid on `TcpReply`; the EFA GET reply is the bare CRC built by the caller.
+    /// Only valid on `TcpReply`; the EFA GET reply is [obj_len, crc32c] built by the caller.
     pub fn into_reply(self, obj_len: u64) -> ValkeyValue {
         match self {
             Target::TcpReply { reply, bench } => {

@@ -1,21 +1,27 @@
-//! A raw libfabric passive peer for integration tests. Registers one buffer, exposes it, prints
-//! the advertisement, and polls until bytes land. Copied/modified from vdma's
-//! `examples/one_target.rs`.
+//! A raw libfabric passive peer for integration tests. Registers one or more buffers, exposes
+//! them, prints an advertisement per region, and polls until bytes land. Copied/modified from
+//! vdma's `examples/one_target.rs`.
 //!
 //! ```text
-//! # prints: advertisement: <address-hex> <rkey> <remote-addr>
+//! # prints, once per region: advertisement: <address-hex> <rkey> <remote-addr> <len>
 //! cargo run --features test-harness --bin fabric_target -- 127.0.0.1
 //! # against a module started with fabric-provider Emulated:
-//! LO.HELLO <address-hex>
-//! LO.GET key <rkey> <remote-addr>            # writes the object into the target's buffer
+//! BLOB.HELLO <address-hex>
+//! BLOB.GET key 1 <rkey> <remote-addr> <len>    # writes the object into the target's buffer
 //! ```
 //!
-//! `--read` prefills the buffer and serves it for `LO.SET key <len> <rkey> <remote-addr>` instead.
-//! This holds the buffer open and lets the initiator do the verifying.
+//! `--read` prefills the buffers and serves them for
+//! `BLOB.SET key <len> 1 <rkey> <remote-addr> <len>` instead. This holds the buffers open and lets
+//! the initiator do the verifying.
+//!
+//! `--split=<size1>,<size2>[,...]` registers N separate allocations of the given sizes instead of
+//! one buffer, each with its own registration and so its own rkey, and advertises one line per
+//! region. The sizes must sum to `BUFFER_LEN` and may be unequal (`--split=1024,3072`). Regions
+//! are advertised in registration order, which is the order the object's bytes span them.
 //!
 //! `--efa` opens the `efa-direct` fabric instead of tcp loopback. There a target must hold the
 //! initiator's address before it can be RMA'd against, so it takes one as its only positional.
-//! `LO.HELLO` can't supply it, since HELLO needs the target's address first. The module logs each
+//! `BLOB.HELLO` can't supply it, since HELLO needs the target's address first. The module logs each
 //! service's address at load (`largeobj: fabric service N address <hex>`).
 
 use std::ffi::CString;
@@ -36,12 +42,16 @@ use dma_libfabric_protocol::{checksum, decode_hex, encode_hex};
 
 const BUFFER_LEN: usize = 4096;
 
-/// That which `one_transfer` writes and `read_from_peer` fetches.
-const PATTERN: u8 = 0xab;
+/// Position-dependent payload: cycling 0x00..0xFF so that byte-ordering across multi-region
+/// splits is verified, not just fill. Must match the Python test's PATTERN.
+fn generate_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 256) as u8).collect()
+}
 
 /// Everything opened, closed on drop in reverse construction order.
 struct Target {
-    memory_region: *mut fid_mr,
+    /// One registration per advertised region, in registration order.
+    memory_regions: Vec<*mut fid_mr>,
     endpoint: *mut fid_ep,
     completion_queue: *mut fid_cq,
     address_vector: *mut fid_av,
@@ -54,8 +64,13 @@ impl Drop for Target {
     fn drop(&mut self) {
         // SAFETY: each fid is closed once, in reverse order, and null when never opened.
         unsafe {
+            // Registrations come first — they were opened last, and they borrow the domain.
+            for memory_region in self.memory_regions.drain(..).rev() {
+                if !memory_region.is_null() {
+                    fi_close(memory_region.cast());
+                }
+            }
             for fid in [
-                self.memory_region.cast::<c_void>(),
                 self.endpoint.cast::<c_void>(),
                 self.completion_queue.cast::<c_void>(),
                 self.address_vector.cast::<c_void>(),
@@ -81,6 +96,35 @@ fn check(code: i32, what: &str) -> Result<(), String> {
     Err(format!("{what} failed: {code}"))
 }
 
+/// The region sizes to register, from a `--split=a,b,...` spec; absent, one whole-buffer
+/// region. The sizes must sum to `BUFFER_LEN`, since the object is exactly that long.
+fn region_sizes(split: Option<&str>) -> Result<Vec<usize>, String> {
+    let Some(spec) = split else {
+        return Ok(vec![BUFFER_LEN]);
+    };
+    let mut sizes = Vec::new();
+    for field in spec.split(',') {
+        let size: usize = field
+            .trim()
+            .parse()
+            .map_err(|_| format!("--split: {field:?} is not a size"))?;
+        if 0 == size {
+            return Err("--split: a region size must be > 0".to_string());
+        }
+        sizes.push(size);
+    }
+    if sizes.is_empty() {
+        return Err("--split: at least one region size is required".to_string());
+    }
+    let total: usize = sizes.iter().sum();
+    if BUFFER_LEN != total {
+        return Err(format!(
+            "--split: sizes total {total}, must total BUFFER_LEN {BUFFER_LEN}"
+        ));
+    }
+    Ok(sizes)
+}
+
 fn main() -> Result<(), String> {
     let (flags, positional): (Vec<String>, Vec<String>) = std::env::args()
         .skip(1)
@@ -88,6 +132,8 @@ fn main() -> Result<(), String> {
     // Serve the buffer for a remote read rather than wait for a remote write.
     let serve_read = flags.iter().any(|flag| "--read" == flag);
     let use_efa = flags.iter().any(|flag| "--efa" == flag);
+    let split = flags.iter().find_map(|flag| flag.strip_prefix("--split="));
+    let sizes = region_sizes(split)?;
     let mut arguments = positional.into_iter();
     // An EFA endpoint binds to the device and advertises its own fabric address, so there is no
     // source to pin — the first positional is the initiator's address instead.
@@ -95,7 +141,7 @@ fn main() -> Result<(), String> {
     let initiator = arguments.next();
 
     let mut target = Target {
-        memory_region: ptr::null_mut(),
+        memory_regions: Vec::with_capacity(sizes.len()),
         endpoint: ptr::null_mut(),
         completion_queue: ptr::null_mut(),
         address_vector: ptr::null_mut(),
@@ -221,34 +267,59 @@ fn main() -> Result<(), String> {
     };
 
     // Remote-accessible, unlike the initiator's local-only operands. Prefilled when the initiator is
-    // the one fetching it.
-    let buffer = vec![if serve_read { PATTERN } else { 0 }; BUFFER_LEN];
-    let pointer = buffer.as_ptr().cast_mut();
-    // SAFETY: `buffer` outlives the registration, which `target` closes before this returns.
-    let remote_key = unsafe {
-        check(
-            fi_mr_reg(
-                target.domain,
-                pointer.cast::<c_void>(),
-                BUFFER_LEN,
-                u64::from(FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE),
-                0,
-                0,
-                0,
-                &mut target.memory_region,
-                ptr::null_mut(),
-            ),
-            "fi_mr_reg",
-        )?;
-        fi_mr_key(target.memory_region)
-    };
-    // On FI_MR_VIRT_ADDR providers like efa the remote address is the buffer's virtual address; on
-    // tcp it is an offset into the region, so 0.
-    let remote_address = if uses_virtual_addressing {
-        pointer as u64
+    // the one fetching it. One allocation per region, all allocated before the first registration
+    // because a registration holds a raw pointer into its buffer.
+    let pattern = generate_pattern(BUFFER_LEN);
+    let buffers: Vec<Vec<u8>> = if serve_read {
+        // Prefill each region with its slice of the position-dependent pattern.
+        let mut offset = 0;
+        sizes
+            .iter()
+            .map(|&size| {
+                let buf = pattern[offset..offset + size].to_vec();
+                offset += size;
+                buf
+            })
+            .collect()
     } else {
-        0
+        sizes.iter().map(|&size| vec![0u8; size]).collect()
     };
+
+    let mut advertisements = Vec::with_capacity(buffers.len());
+    for (index, buffer) in buffers.iter().enumerate() {
+        let pointer = buffer.as_ptr().cast_mut();
+        let mut memory_region: *mut fid_mr = ptr::null_mut();
+        // SAFETY: `buffers` outlives the registrations, which `target` closes before this returns.
+        let remote_key = unsafe {
+            check(
+                fi_mr_reg(
+                    target.domain,
+                    pointer.cast::<c_void>(),
+                    buffer.len(),
+                    u64::from(FI_REMOTE_READ | FI_REMOTE_WRITE | FI_READ | FI_WRITE),
+                    0,
+                    // requested_key, distinct per region: the tcp provider hands this back as
+                    // the rkey, so reusing one fails the second registration with FI_ENOKEY.
+                    // A provider honouring FI_MR_PROV_KEY (efa) assigns its own and ignores it.
+                    index as u64,
+                    0,
+                    &mut memory_region,
+                    ptr::null_mut(),
+                ),
+                "fi_mr_reg",
+            )?;
+            target.memory_regions.push(memory_region);
+            fi_mr_key(memory_region)
+        };
+        // On FI_MR_VIRT_ADDR providers like efa the remote address is the buffer's virtual address;
+        // on tcp it is an offset into the region, so 0 — each region has its own offset space.
+        let remote_address = if uses_virtual_addressing {
+            pointer as u64
+        } else {
+            0
+        };
+        advertisements.push((remote_key, remote_address, buffer.len()));
+    }
 
     // SAFETY: writes `length` bytes of address into `address`, after asking for the size.
     let address = unsafe {
@@ -288,21 +359,29 @@ fn main() -> Result<(), String> {
         }
     }
 
-    println!(
-        "advertisement: {} {remote_key} {remote_address}",
-        encode_hex(&address)
-    );
+    // One line per region, in the order the object's bytes span them. The initiator carries these
+    // into BLOB.GET / BLOB.SET as its (rkey, addr, len) triples.
+    let address_hex = encode_hex(&address);
+    for (remote_key, remote_address, length) in &advertisements {
+        println!("advertisement: {address_hex} {remote_key} {remote_address} {length}");
+    }
+    // The object spans the regions in order, so its bytes are their contents concatenated.
+    let contents = |buffers: &[Vec<u8>]| -> Vec<u8> { buffers.concat() };
     if serve_read {
         println!(
-            "serving {BUFFER_LEN} bytes of {PATTERN:#04x} for a remote read, crc {:#010x} — the initiator verifies",
-            checksum(&buffer)
+            "serving {BUFFER_LEN} bytes (cycling 0x00..0xFF) across {} region(s) for a remote read, crc {:#010x} — the initiator verifies",
+            advertisements.len(),
+            checksum(&contents(&buffers))
         );
     } else {
-        println!("waiting for a transfer into {BUFFER_LEN} bytes...");
+        println!(
+            "waiting for a transfer into {BUFFER_LEN} bytes across {} region(s)...",
+            advertisements.len()
+        );
     }
 
     // Under FI_PROGRESS_MANUAL nothing services the inbound RMA unless the queue is polled, and the
-    // write raises no completion here — so poll for progress, watch the buffer for arrival.
+    // write raises no completion here — so poll for progress, watch the buffers for arrival.
     let deadline = Instant::now() + Duration::from_secs(300);
     while Instant::now() < deadline {
         // SAFETY: a one-entry read into an owned value; the queue is live until `target` drops.
@@ -314,21 +393,30 @@ fn main() -> Result<(), String> {
                 1,
             );
         }
-        // A read leaves nothing behind here, so there is no arrival to watch for: hold the buffer
+        // A read leaves nothing behind here, so there is no arrival to watch for: hold the buffers
         // open and keep polling until the window closes.
         if serve_read {
             std::thread::sleep(Duration::from_millis(1));
             continue;
         }
+        // Every region has to fill, not just the first: a split transfer that dropped its tail
+        // would otherwise look like success.
         // Volatile: the NIC writes these bytes outside the compiler's model.
-        // SAFETY: in bounds of the live registered buffer.
-        let landed =
-            (0..BUFFER_LEN).all(|index| PATTERN == unsafe { pointer.add(index).read_volatile() });
+        // SAFETY: each index is in bounds of its own live registered buffer.
+        let mut offset = 0;
+        let landed = buffers.iter().all(|buffer| {
+            let pointer = buffer.as_ptr();
+            let matches = (0..buffer.len()).all(|index| {
+                pattern[offset + index] == unsafe { pointer.add(index).read_volatile() }
+            });
+            offset += buffer.len();
+            matches
+        });
         if landed {
             // The CRC the initiator also prints, so the pair cross-checks.
             println!(
                 "received {BUFFER_LEN} bytes, crc {:#010x} — payload verified",
-                checksum(&buffer)
+                checksum(&contents(&buffers))
             );
             return Ok(());
         }

@@ -23,7 +23,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use valkey_module::{ValkeyError, ValkeyValue, VALKEY_OK};
+use valkey_module::{NotifyEvent, ValkeyError, ValkeyValue, VALKEY_OK};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
@@ -68,8 +68,9 @@ pub enum Transport {
     Tcp,
     Efa {
         session: Arc<Session>,
-        rkey: u64,
-        remote_addr: u64,
+        /// The client's memory regions, in the order it listed them. ChunkIterator
+        /// consumes them front to back and straddles their boundaries.
+        addrs: Vec<storage::ClientEFAAddress>,
     },
 }
 
@@ -144,6 +145,15 @@ fn collect_dram_bytes(
     data
 }
 
+/// The EFA GET success reply: a two-element array `[obj_len, crc32c]`. The regions may
+/// cover more than the object, so `obj_len` is how the client bounds the valid bytes.
+fn efa_get_reply(obj_len: u64, crc32c: Crc) -> ValkeyValue {
+    ValkeyValue::Array(vec![
+        ValkeyValue::Integer(obj_len as i64),
+        ValkeyValue::Integer(crc32c as i64),
+    ])
+}
+
 /// Outcome of `commit_lo_value` — distinguishes a successful write from a stale discard.
 enum CommitOutcome {
     /// Value was written and attached to the key.
@@ -166,22 +176,30 @@ fn commit_lo_value(
     let ctx = thread_ctx.lock();
     let key_str = ctx.create_string(key_name.to_vec());
     let key = ctx.open_key_writable(&key_str);
-    if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
-        if existing.object_id > object_id {
+    // One lookup drives both the version guard and the create/update event.
+    let event = match key.get_value::<LoValue>(&LO_TYPE) {
+        Ok(Some(existing)) if existing.object_id > object_id => {
             return Ok(CommitOutcome::StaleDiscarded);
         }
-    }
+        Ok(Some(_)) => EVENT_UPDATE,
+        _ => EVENT_CREATE,
+    };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key_str);
     Ok(CommitOutcome::ValueSet)
 }
+
+/// Keyspace event names published after a successful BLOB.SET.
+pub(crate) const EVENT_CREATE: &str = "largeobj.create";
+pub(crate) const EVENT_UPDATE: &str = "largeobj.update";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute LO.GET with mode + transport routing.
+/// Execute BLOB.GET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_get(
     ctx: &valkey_module::Context,
@@ -444,7 +462,7 @@ fn cmd_get_tiered(
 enum GetTarget {
     /// TCP: accumulate chunks into a reply buffer; reply the collected bytes.
     Tcp,
-    /// EFA: fi_write each chunk to the client; reply the bare object CRC.
+    /// EFA: fi_write each chunk to the client; reply [obj_len, crc32c].
     Efa(Arc<Session>),
 }
 
@@ -462,17 +480,10 @@ fn cmd_get_transport_parts(
             ChunkIterator::new(obj_len, chunk_size, batch_width, None),
             GetTarget::Tcp,
         ),
-        Transport::Efa {
-            session,
-            rkey,
-            remote_addr,
-        } => {
-            let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
-            (
-                ChunkIterator::new(obj_len, chunk_size, batch_width, Some(efa_addrs)),
-                GetTarget::Efa(session),
-            )
-        }
+        Transport::Efa { session, addrs } => (
+            ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs)),
+            GetTarget::Efa(session),
+        ),
     }
 }
 
@@ -480,7 +491,7 @@ fn cmd_get_transport_parts(
 /// set) and serve-and-discard streaming (`progress` None). `source_pool` is the
 /// pool backing the buffers the NvmeSource reads into (DRAM for promotion, NVMe for
 /// streaming). Builds the job + source, runs the driver, and replies: TCP the
-/// collected bytes, EFA the bare object CRC. A latched target error (promotion
+/// collected bytes, EFA [obj_len, crc32c]. A latched target error (promotion
 /// continue-filling) or a run error maps through `reply_stream_err`.
 #[allow(clippy::too_many_arguments)]
 async fn cmd_get_tiered_run(
@@ -514,7 +525,7 @@ async fn cmd_get_tiered_run(
         buffers,
         pool: source_pool,
     };
-    // Build the target, run the driver, reply — TCP: collected bytes; EFA: bare CRC.
+    // Build the target, run the driver, reply — TCP: collected bytes; EFA: [obj_len, crc32c].
     let outcome = match &target {
         GetTarget::Tcp => {
             let tgt = crate::stream::Target::tcp_reply(obj_len, crate::bench_mode());
@@ -528,7 +539,7 @@ async fn cmd_get_tiered_run(
             };
             crate::stream::run_get(&job, chunk_iter, &source, &tgt, progress)
                 .await
-                .map(|target_err| (target_err, ValkeyValue::Integer(crc32c_expected as i64)))
+                .map(|target_err| (target_err, efa_get_reply(obj_len, crc32c_expected)))
         }
     };
     match outcome {
@@ -544,7 +555,7 @@ async fn cmd_get_tiered_run(
 // SET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute LO.SET with mode + transport routing.
+/// Execute BLOB.SET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_set(
     ctx: &valkey_module::Context,
@@ -638,11 +649,17 @@ fn cmd_set_dram_tcp(
         crc32c: crc,
         file: None,
     };
+    let event = if key.is_empty() {
+        EVENT_CREATE
+    } else {
+        EVENT_UPDATE
+    };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         dram_pool.remove_object(&object_id);
         info::SET_VALUE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, event, key_name);
     VALKEY_OK
 }
 
@@ -652,8 +669,8 @@ pub enum DataSource {
     /// EFA: data pulled from client GPU via session.read.
     Efa {
         session: Arc<Session>,
-        rkey: u64,
-        remote_addr: u64,
+        /// The client's memory regions, in the order it listed them.
+        addrs: Vec<storage::ClientEFAAddress>,
     },
 }
 
@@ -688,19 +705,14 @@ fn cmd_set_dram_efa(
     };
     match data_source {
         DataSource::Tcp(_) => unreachable!("Dram+TCP SET routed to sync path"),
-        DataSource::Efa {
-            session,
-            rkey,
-            remote_addr,
-        } => {
+        DataSource::Efa { session, addrs } => {
             // EFA SET: parallel reads into all buffers, then sequential CRC pass.
             crate::runtime_handle().spawn(async move {
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 let dram_pool = storage::get_dram_pool();
-                let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
                 let chunk_iter =
-                    ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(efa_addrs));
+                    ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(addrs));
                 // Dram EFA SET: EFA-read every chunk into the DRAM buffers via the
                 // ONE streaming driver (source=EFA client, target=DRAM resident).
                 let job = crate::stream::StreamJob::for_dram(obj_len, chunk_size, 0, buffers.len());
@@ -802,13 +814,8 @@ fn cmd_set_tiered(
                 .await;
             });
         }
-        DataSource::Efa {
-            session,
-            rkey,
-            remote_addr,
-        } => {
-            let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
-            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(efa_addrs));
+        DataSource::Efa { session, addrs } => {
+            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs));
             crate::runtime_handle().spawn(async move {
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -1002,11 +1009,7 @@ fn cmd_get_from_dram(
                 ))));
             }
         }
-        Transport::Efa {
-            session,
-            rkey,
-            remote_addr,
-        } => {
+        Transport::Efa { session, addrs } => {
             // EFA: write every DRAM buffer to the client via the ONE streaming
             // driver (source=DRAM resident, target=EFA client).
             let obj_ctx = obj_ctx.clone();
@@ -1014,9 +1017,8 @@ fn cmd_get_from_dram(
                 let _keep_alive = (&obj_ctx, file);
                 let dram_pool = storage::get_dram_pool();
                 let chunk_size = crate::chunk_size();
-                let efa_addrs = single_efa_addrs(rkey, remote_addr, obj_len);
                 let chunk_iter =
-                    ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(efa_addrs));
+                    ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(addrs));
                 let job = crate::stream::StreamJob::for_dram(
                     obj_len,
                     chunk_size,
@@ -1029,24 +1031,14 @@ fn cmd_get_from_dram(
                 };
                 let target = crate::stream::Target::EfaWrite { session };
                 match crate::stream::run_get(&job, chunk_iter, &source, &target, None).await {
-                    // Bare object CRC on clean success; a Dram GET has no progress
+                    // [obj_len, crc32c] on clean success; a Dram GET has no progress
                     // hook, so a target error already surfaced as Err below.
                     Ok(_) => {
-                        thread_ctx.reply(Ok(ValkeyValue::Integer(crc32c as i64)));
+                        thread_ctx.reply(Ok(efa_get_reply(obj_len, crc32c)));
                     }
                     Err(e) => crate::stream::reply_stream_err(&thread_ctx, e),
                 }
             });
         }
     }
-}
-
-// ─── EFA Transport Helpers ───────────────────────────────────────────────────
-
-/// Wrap a single contiguous EFA address as a ClientEFAAddress list.
-/// Temporary: once multi-address support lands, callers will receive
-/// Vec<ClientEFAAddress> directly from the transport layer. For now, we
-/// perform the transformation to Vec in this function.
-fn single_efa_addrs(rkey: u64, remote_addr: u64, obj_len: u64) -> Vec<storage::ClientEFAAddress> {
-    vec![(remote_addr, obj_len as usize, rkey)]
 }

@@ -1,13 +1,13 @@
 [package]
-name = "valkey-largeobj"
+name = "valkey-large-object"
 version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 description = "Valkey Large Object Module — NVMe + EFA storage for KV cache tensors"
-repository = "https://github.com/KarthikSubbarao/ValkeyLargeObj"
+repository = "https://github.com/KarthikSubbarao/valkey-large-object"
 
 [dependencies]
-valkey-module = { version = "0.1.5", features = ["min-valkey-compatibility-version-8-0"] }
+valkey-module = { version = "0.1.14", features = ["min-valkey-compatibility-version-8-0"] }
 valkey-module-macros = "0"
 linkme = "0"
 libc = "0.2"
@@ -32,7 +32,7 @@ rstest = "0.23.0"
 
 [lib]
 crate-type = ["cdylib"]
-name = "valkey_largeobj"
+name = "valkey_large_object"
 
 # The passive libfabric peer for integration tests.
 [[bin]]
@@ -50,5 +50,5 @@ debug = 2
 
 [features]
 default = []
-enable-system-alloc = ["valkey-module/enable-system-alloc"]
+enable-system-alloc = ["valkey-module/enable-system-alloc", "valkey-module/test-shims"]
 test-harness = []
