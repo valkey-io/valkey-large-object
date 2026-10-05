@@ -81,9 +81,9 @@ Operations, all on `AccessStats` in `src/storage/cache_policy.rs`:
 
 ### 4.2 Where the score lives
 
-`ObjectContext` has `pub stats: AccessStats`. The tiered GET hit path calls `CacheStats::record_hit`, which touches the score and counts the hit, with no write lock. The touch is not inside `get_object`, because `LO.INFO key TIER` and `COPY` also use `get_object` and are not cache accesses.
+`ObjectContext` has `pub stats: AccessStats`. The tiered GET hit path calls `CacheStats::record_hit`, which touches the score and counts the hit, with no write lock. The touch is not inside `get_object`, because `BLOB.INFO key TIER` and `COPY` also use `get_object` and are not cache accesses.
 
-Stats are keyed by `ObjectId`, not by key. An `LO.SET` mints a new OID and the free callback drops the old DRAM entry, so a rewritten object starts with fresh stats. A RENAME is invisible to the policy.
+Stats are keyed by `ObjectId`, not by key. An `BLOB.SET` mints a new OID and the free callback drops the old DRAM entry, so a rewritten object starts with fresh stats. A RENAME is invisible to the policy.
 
 ### 4.3 Admission: second-touch filter
 

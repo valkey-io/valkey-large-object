@@ -841,12 +841,12 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         payload = b'T' * 4096
         base = dram()
 
-        client.execute_command('LO.SET', 'basic_key', payload)
+        client.execute_command('BLOB.SET', 'basic_key', payload)
         assert dram() == base
 
         # GET 1: rejected by admission, served transiently.
-        assert client.execute_command('LO.GET', 'basic_key') == payload
-        assert client.execute_command('LO.INFO', 'basic_key', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.GET', 'basic_key') == payload
+        assert client.execute_command('BLOB.INFO', 'basic_key', 'TIER') == b'nvme'
         after1 = dram()
         assert after1['largeobj_cache_misses_total'] == 1
         assert after1['largeobj_admission_rejects_total'] == 1
@@ -854,8 +854,8 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         assert after1['largeobj_cached_objects'] == 0
 
         # GET 2: second touch, promoted. mark_ready runs before the reply.
-        assert client.execute_command('LO.GET', 'basic_key') == payload
-        assert client.execute_command('LO.INFO', 'basic_key', 'TIER') == b'dram'
+        assert client.execute_command('BLOB.GET', 'basic_key') == payload
+        assert client.execute_command('BLOB.INFO', 'basic_key', 'TIER') == b'dram'
         after2 = dram()
         assert after2['largeobj_cache_misses_total'] == 2
         assert after2['largeobj_admission_rejects_total'] == 1
@@ -864,7 +864,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         assert after2['largeobj_cache_hits_total'] == 0
 
         # GET 3: plain hit, nothing on the miss side moves.
-        assert client.execute_command('LO.GET', 'basic_key') == payload
+        assert client.execute_command('BLOB.GET', 'basic_key') == payload
         after3 = dram()
         assert after3['largeobj_cache_hits_total'] == 1
         assert after3['largeobj_cache_misses_total'] == 2
@@ -874,9 +874,9 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         # Oversize: three misses, no rejects, no promotion.
         client.execute_command('CONFIG', 'SET', 'largeobj.max-promote-size', '4096')
         big = b'O' * 8192
-        client.execute_command('LO.SET', 'big_key', big)
+        client.execute_command('BLOB.SET', 'big_key', big)
         for _ in range(3):
-            assert client.execute_command('LO.GET', 'big_key') == big
+            assert client.execute_command('BLOB.GET', 'big_key') == big
         after4 = dram()
         assert after4['largeobj_cache_misses_total'] == 5
         assert after4['largeobj_admission_rejects_total'] == 1
@@ -889,19 +889,19 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         payload = b'R' * 4096
 
         client.execute_command('CONFIG', 'SET', 'largeobj.promote-min-hits', '1')
-        client.execute_command('LO.SET', 'one_key', payload)
+        client.execute_command('BLOB.SET', 'one_key', payload)
         rejects = client.info('largeobj_dram')['largeobj_admission_rejects_total']
-        assert client.execute_command('LO.GET', 'one_key') == payload
-        assert client.execute_command('LO.INFO', 'one_key', 'TIER') == b'dram'
+        assert client.execute_command('BLOB.GET', 'one_key') == payload
+        assert client.execute_command('BLOB.INFO', 'one_key', 'TIER') == b'dram'
         assert client.info('largeobj_dram')['largeobj_admission_rejects_total'] == rejects
 
         client.execute_command('CONFIG', 'SET', 'largeobj.promote-min-hits', '3')
-        client.execute_command('LO.SET', 'three_key', payload)
+        client.execute_command('BLOB.SET', 'three_key', payload)
         for _ in range(2):
-            assert client.execute_command('LO.GET', 'three_key') == payload
-            assert client.execute_command('LO.INFO', 'three_key', 'TIER') == b'nvme'
-        assert client.execute_command('LO.GET', 'three_key') == payload
-        assert client.execute_command('LO.INFO', 'three_key', 'TIER') == b'dram'
+            assert client.execute_command('BLOB.GET', 'three_key') == payload
+            assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.GET', 'three_key') == payload
+        assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'dram'
 
 
 # ─── Inline demotion ────────────────────────────────────────────────────────
@@ -952,8 +952,8 @@ class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
         # SET and promote three objects that fill the single segment.
         for i, k in enumerate(self.KEYS):
             payload = bytes([65 + i]) * self.OBJ
-            client.execute_command('LO.SET', k, payload)
-            assert client.execute_command('LO.GET', k) == payload
+            client.execute_command('BLOB.SET', k, payload)
+            assert client.execute_command('BLOB.GET', k) == payload
         info = client.info('largeobj_dram')
         assert info['largeobj_cached_objects'] == 3
         assert info['largeobj_reclaims_total'] == 0
@@ -961,26 +961,26 @@ class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
 
         hot = self.KEYS[0]
         for _ in range(10):
-            assert client.execute_command('LO.GET', hot) == b'A' * self.OBJ
+            assert client.execute_command('BLOB.GET', hot) == b'A' * self.OBJ
 
         payload = b'N' * self.OBJ
-        client.execute_command('LO.SET', 'ev_new', payload)
-        assert client.execute_command('LO.GET', 'ev_new') == payload
+        client.execute_command('BLOB.SET', 'ev_new', payload)
+        assert client.execute_command('BLOB.GET', 'ev_new') == payload
 
         info = client.info('largeobj_dram')
         assert info['largeobj_reclaims_total'] == 1
         assert info['largeobj_cached_objects'] == 3
         assert info['largeobj_dram_live_segments'] == 1
         assert info['largeobj_scaling_expand_total'] == 0
-        assert client.execute_command('LO.INFO', hot, 'TIER') == b'dram'
-        assert client.execute_command('LO.INFO', 'ev_new', 'TIER') == b'dram'
-        tiers = [client.execute_command('LO.INFO', k, 'TIER') for k in self.KEYS[1:]]
+        assert client.execute_command('BLOB.INFO', hot, 'TIER') == b'dram'
+        assert client.execute_command('BLOB.INFO', 'ev_new', 'TIER') == b'dram'
+        tiers = [client.execute_command('BLOB.INFO', k, 'TIER') for k in self.KEYS[1:]]
         assert tiers.count(b'nvme') == 1, tiers
 
         # The demoted copy is still on NVMe and reads back intact.
         demoted = self.KEYS[1:][tiers.index(b'nvme')]
         idx = self.KEYS.index(demoted)
-        assert client.execute_command('LO.GET', demoted) == bytes([65 + idx]) * self.OBJ
+        assert client.execute_command('BLOB.GET', demoted) == bytes([65 + idx]) * self.OBJ
 
 
 class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
@@ -1012,9 +1012,9 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
         )
 
     def _promote(self, client, key, payload):
-        client.execute_command('LO.SET', key, payload)
-        assert client.execute_command('LO.GET', key) == payload
-        assert client.execute_command('LO.INFO', key, 'TIER') == b'dram'
+        client.execute_command('BLOB.SET', key, payload)
+        assert client.execute_command('BLOB.GET', key) == payload
+        assert client.execute_command('BLOB.INFO', key, 'TIER') == b'dram'
 
     def test_reclaims_only_in_target_segment(self):
         client = self.server.get_new_client()
@@ -1039,7 +1039,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
         # One hit takes A and B from the initial LFU counter 5 to 6 (the first
         # increment is certain). C and everything in segment 1 stay at 5.
         for k in ('A', 'B'):
-            assert client.execute_command('LO.GET', k) == k.encode() * self.OBJ
+            assert client.execute_command('BLOB.GET', k) == k.encode() * self.OBJ
 
         # G fits nowhere. The target is segment 0 (least loaded); its coldest
         # entry is C, so exactly C goes, even though segment 1 is just as cold.
@@ -1049,11 +1049,11 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_cached_objects'] == 7
         assert info['largeobj_dram_live_segments'] == 2
         assert info['largeobj_scaling_expand_total'] == 1
-        assert client.execute_command('LO.INFO', 'C', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'C', 'TIER') == b'nvme'
         for k in ('A', 'B', 'D', 'E', 'H', 'F'):
-            assert client.execute_command('LO.INFO', k, 'TIER') == b'dram', k
+            assert client.execute_command('BLOB.INFO', k, 'TIER') == b'dram', k
         # The reclaimed copy still reads back from NVMe.
-        assert client.execute_command('LO.GET', 'C') == b'C' * self.OBJ
+        assert client.execute_command('BLOB.GET', 'C') == b'C' * self.OBJ
 
 
 class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
@@ -1088,12 +1088,12 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         exactly the overflow, and every read still returns the right bytes."""
         client = self.server.get_new_client()
         for i, k in enumerate(self.KEYS):
-            client.execute_command('LO.SET', k, self._payload(i))
+            client.execute_command('BLOB.SET', k, self._payload(i))
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 0
 
         for i, k in enumerate(self.KEYS):
-            assert client.execute_command('LO.GET', k) == self._payload(i)
+            assert client.execute_command('BLOB.GET', k) == self._payload(i)
 
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
@@ -1104,7 +1104,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
 
         # A second pass reads everything back correctly through reopened fds.
         for i, k in enumerate(self.KEYS):
-            assert client.execute_command('LO.GET', k) == self._payload(i)
+            assert client.execute_command('BLOB.GET', k) == self._payload(i)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
         demotions = info['largeobj_fd_demotions_total']
@@ -1115,7 +1115,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         client.execute_command('DEL', self.KEYS[4])
         wait_for_equal(
             lambda: client.info('largeobj_fd')['largeobj_open_fds'], 1)
-        assert client.execute_command('LO.GET', self.KEYS[0]) == self._payload(0)
+        assert client.execute_command('BLOB.GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
         assert info['largeobj_fd_demotions_total'] == demotions
@@ -1126,24 +1126,24 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         later read of KEYS[0] is a cache hit that demotes nothing."""
         client = self.server.get_new_client()
         for i, k in enumerate(self.KEYS[:3]):
-            client.execute_command('LO.SET', k, self._payload(i))
+            client.execute_command('BLOB.SET', k, self._payload(i))
 
         # The first read opens the fd; the next two touch its score. The first
         # touch on a fresh entry always increments, so KEYS[0] outscores KEYS[1].
         for _ in range(3):
-            assert client.execute_command('LO.GET', self.KEYS[0]) == self._payload(0)
-        assert client.execute_command('LO.GET', self.KEYS[1]) == self._payload(1)
+            assert client.execute_command('BLOB.GET', self.KEYS[0]) == self._payload(0)
+        assert client.execute_command('BLOB.GET', self.KEYS[1]) == self._payload(1)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
         assert info['largeobj_fd_demotions_total'] == 0
 
-        assert client.execute_command('LO.GET', self.KEYS[2]) == self._payload(2)
+        assert client.execute_command('BLOB.GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
         assert info['largeobj_fd_demotions_total'] == 1
 
         # KEYS[0] survived, so reading it again needs no open and no demotion.
-        assert client.execute_command('LO.GET', self.KEYS[0]) == self._payload(0)
+        assert client.execute_command('BLOB.GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
         assert info['largeobj_fd_demotions_total'] == 1
@@ -1152,13 +1152,13 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         """CONFIG SET to a smaller cap takes effect on the next open."""
         client = self.server.get_new_client()
         for i, k in enumerate(self.KEYS[:2]):
-            client.execute_command('LO.SET', k, self._payload(i))
-            assert client.execute_command('LO.GET', k) == self._payload(i)
+            client.execute_command('BLOB.SET', k, self._payload(i))
+            assert client.execute_command('BLOB.GET', k) == self._payload(i)
         assert client.info('largeobj_fd')['largeobj_open_fds'] == 2
 
         client.execute_command('CONFIG', 'SET', 'largeobj.max-open-fds', '1')
-        client.execute_command('LO.SET', self.KEYS[2], self._payload(2))
-        assert client.execute_command('LO.GET', self.KEYS[2]) == self._payload(2)
+        client.execute_command('BLOB.SET', self.KEYS[2], self._payload(2))
+        assert client.execute_command('BLOB.GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 1
         assert info['largeobj_fd_demotions_total'] == 2
