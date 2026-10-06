@@ -77,7 +77,7 @@ The NVMe SMART log, polled every `smartlog-poll-secs` and summed across controll
 
 ## `largeobj_efa`
 
-DMA sessions and traffic over the fabric. Present in both modes, and all 0 when no fabric is available. Bytes are the RDMA payload of successful transfers: no transport headers or retransmissions.
+DMA sessions and traffic over the fabric. Present in both modes, and all 0 when no fabric is available. Bytes are the RDMA payload of successful transfers: no transport headers or retransmissions. Times run from submission to completion as the module sees them, including any wait behind `fabric-max-in-flight` and for the request's task to run again, so they aren't wire latency.
 
 | Field | Type | Description |
 |---|---|---|
@@ -85,9 +85,9 @@ DMA sessions and traffic over the fabric. Present in both modes, and all 0 when 
 | `efa_read_bytes_total` | counter | Bytes pulled from client memory by successful reads (the `BLOB.SET` path). |
 | `efa_write_bytes_total` | counter | Bytes pushed into client memory by successful writes (the `BLOB.GET` path). |
 | `efa_reads_total` | counter | Successful reads, one per client address of each chunk. |
-| `efa_read_usec_total` | counter | Total time of those reads, submission to completion, including the checksum of what landed and any wait behind `fabric-max-in-flight`. The module's view, not wire latency. |
+| `efa_read_usec_total` | counter | Total time of those reads, including the checksum of what landed. |
 | `efa_writes_total` | counter | Successful writes, one per client address of each chunk. |
-| `efa_write_usec_total` | counter | Total time of those writes, submission to completion, including any wait behind `fabric-max-in-flight`. |
+| `efa_write_usec_total` | counter | Total time of those writes. |
 
 Failed transfers count only in `efa_read_errors` and `efa_write_errors`, once per failed request.
 
