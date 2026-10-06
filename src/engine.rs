@@ -167,6 +167,8 @@ enum CommitOutcome {
 /// (with `file: Some`/`None`), does any accounting BEFORE calling, and handles its
 /// own cleanup/metric/reply on each outcome. On `StaleDiscarded`/`Err` the moved-in
 /// `LoValue` drops here; for NVMe that drops its `ObjectFile` → unlink + budget release.
+/// The one exception is INFO `live_objects`, counted here while the lock is held so
+/// that a DEL can't free the value before it's counted.
 fn commit_lo_value(
     ctx: &valkey_module::ContextGuard,
     key_name: &[u8],
@@ -186,6 +188,7 @@ fn commit_lo_value(
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    crate::data_type::record_attached();
     ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key_str);
     Ok(CommitOutcome::ValueSet)
 }
@@ -652,6 +655,7 @@ fn cmd_set_dram_tcp(
         info::SET_VALUE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    crate::data_type::record_attached();
     ctx.notify_keyspace_event(NotifyEvent::MODULE, event, key_name);
     VALKEY_OK
 }

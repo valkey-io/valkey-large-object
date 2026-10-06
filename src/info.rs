@@ -1,9 +1,10 @@
-//! INFO largeobj — pool and error statistics exposed via `INFO largeobj`.
+//! INFO largeobj — pool, I/O and error statistics exposed via `INFO largeobj`.
 //!
 //! Add new subsections by adding a `fn *_section(ctx) -> ValkeyResult<()>` and
 //! calling it from `info_sections`. Each section is a discrete group of fields.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use valkey_module::{InfoContext, ValkeyResult};
 
 use crate::smartlog::{snapshot_for_info, CRITICAL_WARNING_BITS};
@@ -28,6 +29,89 @@ pub static SET_VALUE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
 pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// ─── I/O Metrics ─────────────────────────────────────────────────────────────
+
+/// Count and total duration of one kind of I/O. `usec_total / count` is the mean.
+#[derive(Default)]
+pub struct IoStats {
+    count: AtomicU64,
+    usec: AtomicU64,
+}
+
+impl IoStats {
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            usec: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one I/O that started at `started` and has just completed.
+    pub fn record(&self, started: Instant) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.usec
+            .fetch_add(nearest_usec(started.elapsed()), Ordering::Relaxed);
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    pub fn usec_total(&self) -> u64 {
+        self.usec.load(Ordering::Relaxed)
+    }
+}
+
+/// Rounded rather than truncated, so sub-microsecond I/Os don't bias the mean
+/// low. Summing whole microseconds rather than nanoseconds keeps the total from
+/// wrapping even with thousands of transfers in flight for years.
+fn nearest_usec(elapsed: Duration) -> u64 {
+    u64::try_from((elapsed.as_nanos() + 500) / 1_000).unwrap_or(u64::MAX)
+}
+
+/// One direction of EFA traffic: successful transfers and their payload bytes.
+#[derive(Default)]
+pub struct EfaStats {
+    transfers: IoStats,
+    bytes: AtomicU64,
+}
+
+impl EfaStats {
+    pub const fn new() -> Self {
+        Self {
+            transfers: IoStats::new(),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one successful transfer of `len` bytes that started at `started`.
+    pub fn record(&self, started: Instant, len: u64) {
+        self.transfers.record(started);
+        self.bytes.fetch_add(len, Ordering::Relaxed);
+    }
+}
+
+/// io_uring reads and writes of NVMe object files on either ring, timed from
+/// SQE push to CQE reap. Every reaped CQE counts, including failed and short I/Os.
+pub static NVME_READS: IoStats = IoStats::new();
+pub static NVME_WRITES: IoStats = IoStats::new();
+
+/// Successful EFA transfers, timed from submission to completion, one per client
+/// address of a chunk. Reads pull client memory (the SET path); writes push into
+/// it (the GET path). The time includes any wait behind `fabric-max-in-flight`.
+pub static EFA_READS: EfaStats = EfaStats::new();
+pub static EFA_WRITES: EfaStats = EfaStats::new();
+
+/// `part` as a percentage of `whole` to two decimals ("99.99"), or "0.00" when
+/// `whole` is 0. The same `%.2f` Valkey uses for `expired_stale_perc` and
+/// `current_fork_perc`, without the `%` some of its memory fields append.
+fn pct(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        return "0.00".to_string();
+    }
+    format!("{:.2}", part as f64 * 100.0 / whole as f64)
+}
+
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
     if let Err(e) = info_sections(ctx) {
@@ -39,8 +123,10 @@ fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     core_metrics_section(ctx)?;
     dram_pool_section(ctx)?;
     nvme_staging_section(ctx)?;
+    nvme_section(ctx)?;
     fd_pool_section(ctx)?;
     smartlog_section(ctx)?;
+    efa_section(ctx)?;
     error_metrics_section(ctx)?;
     Ok(())
 }
@@ -93,7 +179,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let seg_size = crate::dram_segment_size();
     let capacity = (total - draining) * seg_size;
     let allocated = dram.allocated_bytes();
-    let util_pct = (allocated * 100).checked_div(capacity).unwrap_or(0) as i64;
+    let util_pct = pct(allocated as u64, capacity as u64);
 
     let mut section = ctx
         .builder()
@@ -159,6 +245,10 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     };
 
     let (total, _draining, unused) = nvme.segment_counts();
+    // Against the pool as built (whole segments), which can exceed
+    // nvme-staging-size when that isn't a multiple of segment-size.
+    let capacity = total * crate::dram_segment_size();
+    let util_pct = pct(nvme.allocated_bytes() as u64, capacity as u64);
 
     ctx.builder()
         .add_section("nvme_staging")
@@ -166,11 +256,36 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("nvme_unused_segments", unused as i64)?
         .field("nvme_fragment_count", nvme.fragment_count() as i64)?
         .field("nvme_staging_size_bytes", crate::nvme_staging_size() as i64)?
+        .field("staging_utilization_pct", util_pct)?
         .field("nvme_segment_size_bytes", crate::dram_segment_size() as i64)?
         .field(
             "nvme_uring_registered_segments",
             nvme.io_uring_registered_count() as i64,
         )?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
+/// NVMe object files, Tiered mode only: disk budget, object count and io_uring
+/// I/O timing.
+fn nvme_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    if operating_mode() != OperatingMode::Tiered {
+        return Ok(());
+    }
+    let used = storage::nvme::nvme_disk_usage();
+    // nvme-maxmemory 0 means unlimited: no budget to be a percentage of.
+    let util_pct = pct(used, crate::nvme_maxmemory());
+
+    ctx.builder()
+        .add_section("nvme")
+        .field("nvme_disk_used_bytes", used)?
+        .field("nvme_disk_utilization_pct", util_pct)?
+        .field("live_objects", crate::data_type::live_objects())?
+        .field("nvme_reads_total", NVME_READS.count())?
+        .field("nvme_read_usec_total", NVME_READS.usec_total())?
+        .field("nvme_writes_total", NVME_WRITES.count())?
+        .field("nvme_write_usec_total", NVME_WRITES.usec_total())?
         .build_section()?
         .build_info()
         .map(|_| ())
@@ -242,6 +357,29 @@ fn smartlog_section(ctx: &InfoContext) -> ValkeyResult<()> {
     warnings.build_section()?.build_info().map(|_| ())
 }
 
+/// EFA sessions and traffic, in both modes. Emitted as zeros where no fabric
+/// is available, so consumers can depend on a fixed key set.
+fn efa_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    ctx.builder()
+        .add_section("efa")
+        .field("efa_sessions", crate::transport::session::count() as u64)?
+        .field(
+            "efa_read_bytes_total",
+            EFA_READS.bytes.load(Ordering::Relaxed),
+        )?
+        .field(
+            "efa_write_bytes_total",
+            EFA_WRITES.bytes.load(Ordering::Relaxed),
+        )?
+        .field("efa_reads_total", EFA_READS.transfers.count())?
+        .field("efa_read_usec_total", EFA_READS.transfers.usec_total())?
+        .field("efa_writes_total", EFA_WRITES.transfers.count())?
+        .field("efa_write_usec_total", EFA_WRITES.transfers.usec_total())?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
 fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
     ctx.builder()
         .add_section("error_metrics")
@@ -284,4 +422,49 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .build_section()?
         .build_info()
         .map(|_| ())
+}
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pct_has_two_decimals() {
+        assert_eq!(pct(0, 0), "0.00");
+        assert_eq!(pct(5, 0), "0.00");
+        assert_eq!(pct(0, 4096), "0.00");
+        assert_eq!(pct(1, 3), "33.33");
+        assert_eq!(pct(2, 3), "66.67");
+        assert_eq!(pct(1, 7), "14.29");
+        assert_eq!(pct(1, 8), "12.50");
+        assert_eq!(pct(9_999, 10_000), "99.99");
+        assert_eq!(pct(4096, 4096), "100.00");
+        assert_eq!(pct(1, 1_000_000), "0.00");
+        assert_eq!(pct(u64::MAX, u64::MAX), "100.00");
+    }
+
+    #[test]
+    fn test_io_stats_round_each_io_to_the_nearest_usec() {
+        assert_eq!(nearest_usec(Duration::from_nanos(0)), 0);
+        assert_eq!(nearest_usec(Duration::from_nanos(499)), 0);
+        assert_eq!(nearest_usec(Duration::from_nanos(500)), 1);
+        assert_eq!(nearest_usec(Duration::from_nanos(1_499)), 1);
+        assert_eq!(nearest_usec(Duration::from_micros(250)), 250);
+        assert_eq!(nearest_usec(Duration::MAX), u64::MAX);
+        let stats = IoStats::new();
+        assert_eq!((stats.count(), stats.usec_total()), (0, 0));
+        stats.record(Instant::now());
+        assert_eq!(stats.count(), 1);
+    }
+
+    #[test]
+    fn test_efa_stats_record_count_and_bytes() {
+        let efa = EfaStats::new();
+        efa.record(Instant::now(), 4096);
+        efa.record(Instant::now(), 1024);
+        assert_eq!(efa.transfers.count(), 2);
+        assert_eq!(efa.bytes.load(Ordering::Relaxed), 5120);
+    }
 }

@@ -41,6 +41,22 @@ impl ObjectId {
     }
 }
 
+// ─── Live Objects ────────────────────────────────────────────────────────────
+
+/// Objects currently held by keys. Every path that attaches a `LoValue` to a key
+/// (BLOB.SET commit, COPY) calls `record_attached`; the free callback takes it
+/// back, so a DEL counts once lazyfree has run. INFO `live_objects`.
+static LIVE_OBJECTS: AtomicU64 = AtomicU64::new(0);
+
+/// Count a `LoValue` that was just attached to a key.
+pub fn record_attached() {
+    LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn live_objects() -> u64 {
+    LIVE_OBJECTS.load(Ordering::Relaxed)
+}
+
 // ─── Tier ────────────────────────────────────────────────────────────────────
 
 /// Storage tier an object is currently served from. Reported by `BLOB.INFO`.
@@ -201,6 +217,9 @@ impl Drop for LoValue {
 /// the arena once the last reader drops it.
 unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     let lo = Box::from_raw(value as *mut LoValue);
+    // Saturating: a value attached by a path that skipped `record_attached`
+    // must not wrap the gauge.
+    let _ = LIVE_OBJECTS.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
     // Drop the DRAM cache entry.
     crate::storage::get_dram_pool().remove_object(&lo.object_id);
     // `lo` (and its Option<Arc<ObjectFile>>) drops here; teardown fires on last ref.
@@ -234,7 +253,11 @@ unsafe extern "C" fn lo_copy(
 ) -> *mut std::ffi::c_void {
     let src = &*(value as *const LoValue);
     match src.create_copy() {
-        Some(new_val) => Box::into_raw(Box::new(new_val)) as *mut std::ffi::c_void,
+        Some(new_val) => {
+            // Valkey attaches the copy to the destination key.
+            record_attached();
+            Box::into_raw(Box::new(new_val)) as *mut std::ffi::c_void
+        }
         None => std::ptr::null_mut(),
     }
 }

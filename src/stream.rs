@@ -65,6 +65,7 @@
 
 use std::os::unix::io::RawFd;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -748,14 +749,15 @@ pub(crate) async fn efa_transfer_addrs(
 ) -> Result<u32, ValkeyError> {
     // TODO: Track specific EFA error types (e.g. timeout, connection reset) before
     // collapsing to the generic ERR_EFA_READ/ERR_EFA_WRITE reply string.
-    let err_str = match direction {
-        EfaDirection::Write => crate::errors::ERR_EFA_WRITE,
-        EfaDirection::Read => crate::errors::ERR_EFA_READ,
+    let (err_str, stats) = match direction {
+        EfaDirection::Write => (crate::errors::ERR_EFA_WRITE, &crate::info::EFA_WRITES),
+        EfaDirection::Read => (crate::errors::ERR_EFA_READ, &crate::info::EFA_READS),
     };
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
     let mut sub_lens: Vec<usize> = Vec::with_capacity(addrs.len());
     for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
+        let started = Instant::now();
         let transfer = match direction {
             EfaDirection::Write => {
                 session.write((buf_ptr + buf_offset) as *mut u8, len, rkey, addr)
@@ -764,12 +766,14 @@ pub(crate) async fn efa_transfer_addrs(
         }
         .map_err(|_| ValkeyError::Str(err_str))?;
         sub_lens.push(len);
-        indexed_futures.push(async move { (i, transfer.await) });
+        indexed_futures.push(async move { (i, started, transfer.await) });
         buf_offset += len;
     }
     let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
-    while let Some((idx, (outcome, _operand))) = indexed_futures.next().await {
+    while let Some((idx, started, (outcome, _operand))) = indexed_futures.next().await {
         let done = outcome.map_err(|_| ValkeyError::Str(err_str))?;
+        // Successful transfers only, so a failure can't skew bytes or latency.
+        stats.record(started, sub_lens[idx] as u64);
         results[idx] = match direction {
             // SET path: transport must provide a checksum for CRC combination.
             EfaDirection::Read => Some(

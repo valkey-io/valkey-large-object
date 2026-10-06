@@ -5,6 +5,7 @@ import os
 import subprocess
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkeytestframework.util.waiters import wait_for_equal
 
 
 # A tcp-provider fabric address: FI_SOCKADDR_IN for 127.0.0.1:1. The server only records it until
@@ -258,6 +259,47 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             self.verify_error_response(
                 client, f'BLOB.SET key {TARGET_LEN} {first}',
                 'client address space smaller than object length')
+        finally:
+            process.kill()
+
+    def test_info_efa_traffic(self):
+        """INFO counts what crossed EFA: a GET pushes out (writes) and a SET pulls in (reads),
+        one transfer per client address. TCP traffic counts nowhere, and the session goes when
+        its connection does."""
+        sizes = [1024, 3072]
+        process, regions = self.start_target('--read', split=sizes)
+        try:
+            client = self.server.get_new_client()
+
+            def efa():
+                return client.info('largeobj_efa')
+
+            client.execute_command('BLOB.SET', 'key', PATTERN)
+            assert client.execute_command('BLOB.GET', 'key') == PATTERN
+            assert set(efa().values()) == {0}
+
+            client.execute_command('BLOB.HELLO', regions[0].address)
+            assert efa()['largeobj_efa_sessions'] == 1
+            assert client.execute_command('BLOB.GET', 'key', *address_args(regions)) == [
+                TARGET_LEN, crc32c.crc32c(PATTERN)]
+            get = efa()
+            assert get['largeobj_efa_write_bytes_total'] == TARGET_LEN
+            assert get['largeobj_efa_writes_total'] == len(sizes)
+            assert get['largeobj_efa_write_usec_total'] > 0
+            assert get['largeobj_efa_read_bytes_total'] == 0
+            assert get['largeobj_efa_reads_total'] == 0
+
+            assert client.execute_command(
+                'BLOB.SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
+            both = efa()
+            assert both['largeobj_efa_read_bytes_total'] == TARGET_LEN
+            assert both['largeobj_efa_reads_total'] == len(sizes)
+            assert both['largeobj_efa_read_usec_total'] > 0
+            assert both['largeobj_efa_write_bytes_total'] == TARGET_LEN
+
+            client.close()
+            observer = self.server.get_new_client()
+            wait_for_equal(lambda: observer.info('largeobj_efa')['largeobj_efa_sessions'], 0)
         finally:
             process.kill()
 

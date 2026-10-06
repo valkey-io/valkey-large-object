@@ -81,6 +81,10 @@ valkey-server --port 7380 \
 
 All size parameters accept memory notation (`64mb`, `1gb`, etc.).
 
+## Metrics
+
+`INFO largeobj` reports pool, I/O, EFA, NVMe health and error statistics. See [docs/METRICS.md](docs/METRICS.md) for every field.
+
 ## Test
 
 ```bash

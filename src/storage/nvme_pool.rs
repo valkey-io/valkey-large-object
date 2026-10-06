@@ -77,6 +77,11 @@ impl NVMePool {
         self.pool.segment_counts()
     }
 
+    /// Bytes allocated to in-flight requests. Used by INFO largeobj.
+    pub fn allocated_bytes(&self) -> usize {
+        self.pool.allocated_bytes()
+    }
+
     /// Total free-gap count across the staging pool's segments (talc fragmentation signal).
     pub fn fragment_count(&self) -> usize {
         self.pool.fragment_count()

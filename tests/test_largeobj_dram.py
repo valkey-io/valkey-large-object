@@ -207,6 +207,21 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client.delete('blob', 'blob_copy')
         wait_for_true(lambda: num_objects() == 0)
 
+    # ─── INFO largeobj tests ───────────────────────────────────────────────
+
+    def test_info_sections_by_mode(self):
+        """The NVMe sections are Tiered-only. The EFA section is always present, zeroed
+        while nothing has moved over EFA."""
+        client = self.server.get_new_client()
+        client.execute_command('BLOB.SET', 'key', b'A' * 4096)
+        assert client.execute_command('BLOB.GET', 'key') == b'A' * 4096
+        assert client.info('largeobj_nvme') == {}
+        assert client.info('largeobj_nvme_staging') == {}
+        efa = client.info('largeobj_efa')
+        for field in ('sessions', 'read_bytes_total', 'write_bytes_total',
+                      'reads_total', 'read_usec_total', 'writes_total', 'write_usec_total'):
+            assert efa[f'largeobj_efa_{field}'] == 0, field
+
     # ─── BLOB.INFO tests ───────────────────────────────────────────────────
 
     def test_info(self):

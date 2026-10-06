@@ -13,6 +13,7 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use tokio::sync::oneshot;
@@ -89,6 +90,8 @@ enum PendingOp {
         /// True if issued as ReadFixed — counts against `fixed_in_flight`, which
         /// gates the whole-table re-registration (see `poller_loop`).
         fixed: bool,
+        /// When the SQE was pushed, for INFO `nvme_read_usec_total`.
+        submitted_at: Instant,
     },
     Write {
         tx: oneshot::Sender<Result<(), StorageError>>,
@@ -96,6 +99,8 @@ enum PendingOp {
         expected_bytes: u64,
         /// True if issued as WriteFixed — counts against `fixed_in_flight`.
         fixed: bool,
+        /// When the SQE was pushed, for INFO `nvme_write_usec_total`.
+        submitted_at: Instant,
     },
 }
 
@@ -104,6 +109,15 @@ impl PendingOp {
     fn is_fixed(&self) -> bool {
         match self {
             PendingOp::Read { fixed, .. } | PendingOp::Write { fixed, .. } => *fixed,
+        }
+    }
+
+    /// Credit this op's SQE-push-to-CQE-reap time to INFO. Called for every
+    /// reaped CQE, failed or short ones included: they still occupied the device.
+    fn record_completion(&self) {
+        match self {
+            PendingOp::Read { submitted_at, .. } => crate::info::NVME_READS.record(*submitted_at),
+            PendingOp::Write { submitted_at, .. } => crate::info::NVME_WRITES.record(*submitted_at),
         }
     }
 
@@ -373,6 +387,7 @@ impl UringEngine {
                                 tx,
                                 expected_bytes: op.len,
                                 fixed: issue_fixed,
+                                submitted_at: Instant::now(),
                             },
                         )
                     }
@@ -405,6 +420,7 @@ impl UringEngine {
                                 tx,
                                 expected_bytes: op.len,
                                 fixed: issue_fixed,
+                                submitted_at: Instant::now(),
                             },
                         )
                     }
@@ -468,6 +484,7 @@ impl UringEngine {
                     if op.is_fixed() {
                         fixed_in_flight -= 1;
                     }
+                    op.record_completion();
                     match op {
                         PendingOp::Read {
                             tx, expected_bytes, ..
