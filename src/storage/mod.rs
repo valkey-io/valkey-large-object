@@ -91,13 +91,6 @@ pub(crate) fn chunk_user_data_len(
     }
 }
 
-// ─── TryClone Trait ──────────────────────────────────────────────────────────
-
-/// Fallible deep-copy. Like Clone but returns None on failure modes when not possible.
-pub trait TryClone: Sized {
-    fn try_clone(&self) -> Option<Self>;
-}
-
 // ─── Error Types ─────────────────────────────────────────────────────────────
 
 #[derive(Debug)]

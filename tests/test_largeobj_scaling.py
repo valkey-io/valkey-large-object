@@ -100,6 +100,27 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         # confirms submit_reregister's engine-none guard no-ops here (even after expand).
         assert after.get('largeobj_dram_uring_registered_segments') == 0
 
+    def test_copy_lands_in_one_segment(self):
+        """Dram COPY allocates the whole copy in one segment, not chunk by chunk.
+
+        Source is 600KB in segment A (1MB), A chunk-by-chunk copy would put about
+        6 chunks in A and the rest in a new segment B. After DEL of the source, A 
+        would still hold part of the copy, so neither segment has room for a 900KB
+        object and a third segment is needed. With a one-segment copy, A is empty
+        after the DEL and takes it.
+        """
+        client = self.server.get_new_client()
+        src = b'S' * (600 * 1024)
+        assert client.execute_command('BLOB.SET', 'src', src) == b'OK'
+        assert client.execute_command('COPY', 'src', 'dst') == 1
+        assert client.execute_command('BLOB.GET', 'dst') == src
+        assert info_largeobj(client)['largeobj_dram_live_segments'] == 2
+        client.execute_command('DEL', 'src')
+        wait_for_true(lambda: info_largeobj(client)['largeobj_cached_objects'] == 1)
+        assert client.execute_command('BLOB.SET', 'big', b'B' * (900 * 1024)) == b'OK'
+        assert info_largeobj(client)['largeobj_dram_live_segments'] == 2, \
+            "copy was split across segments, so a 900KB SET needed a third"
+
     def test_expand_data_integrity(self):
         """Data written before and after a reactive expand is returned correctly."""
         client = self.server.get_new_client()

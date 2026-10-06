@@ -42,23 +42,6 @@ pub struct SegmentBuffer {
     pub len: u32,
 }
 
-impl super::TryClone for SegmentBuffer {
-    fn try_clone(&self) -> Option<Self> {
-        let pool = crate::storage::get_dram_pool();
-        let dummy = valkey_module::Context::dummy();
-        let new_buf = pool
-            .alloc_exact_or_expand(&dummy, self.len as u64)?
-            .remove(0);
-        let src_ptr = pool.buffer_ptr(self);
-        let dst_ptr = pool.buffer_ptr(&new_buf);
-        // SAFETY: src and dst are non-overlapping regions within pool segment(s).
-        unsafe {
-            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, self.len as usize);
-        }
-        Some(new_buf)
-    }
-}
-
 // ─── Object State ────────────────────────────────────────────────────────────
 
 /// Atomic state for ObjectContext. `#[repr(u8)]` for use with AtomicU8.
@@ -166,20 +149,31 @@ impl Drop for ObjectContext {
     }
 }
 
-impl super::TryClone for ObjectContext {
-    /// Deep-copies all buffers into new DRAMPool allocations.
-    /// Returns Some(new Ready ObjectContext) on success.
-    /// Returns None if object is Filling (incomplete) or pool is full.
-    fn try_clone(&self) -> Option<Self> {
+impl ObjectContext {
+    /// Deep-copy into a new DRAMPool allocation for COPY. `obj_len` is the
+    /// object's user length (LoValue.len), which reproduces the source layout.
+    /// Allocates the whole object at once so the copy stays in one segment.
+    /// Returns None if the object is Filling (incomplete) or the pool is full.
+    pub fn try_clone(&self, obj_len: u64) -> Option<Self> {
         // Cannot copy an object that is still being promoted (buffers incomplete).
         if !self.is_ready() {
             return None;
         }
-        let mut new_buffers = Vec::with_capacity(self.buffers.len());
-        for buf in &self.buffers {
-            new_buffers.push(buf.try_clone()?);
+        let pool = crate::storage::get_dram_pool();
+        let dummy_context = valkey_module::Context::dummy();
+        let new_buffers = pool.alloc_exact_or_expand(&dummy_context, obj_len)?;
+        let copy = Self::new_ready(new_buffers);
+        for (src, dst) in self.buffers.iter().zip(&copy.buffers) {
+            // SAFETY: src and dst are distinct live allocations of src.len bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pool.buffer_ptr(src),
+                    pool.buffer_ptr(dst),
+                    src.len as usize,
+                );
+            }
         }
-        Some(Self::new_ready(new_buffers))
+        Some(copy)
     }
 }
 

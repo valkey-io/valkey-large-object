@@ -137,13 +137,12 @@ impl LoValue {
 
     /// Dram mode: deep-copy ObjectContext via try_clone, insert with new OID.
     fn create_copy_dram(&self) -> Option<LoValue> {
-        use crate::storage::TryClone;
         let dram_pool = crate::storage::get_dram_pool();
         let src_ctx = dram_pool
             .get_object(&self.object_id)
             .expect("Dram COPY: LoValue exists but ObjectContext missing");
         // Returns None if object is Filling (incomplete) or pool is full.
-        let new_ctx = src_ctx.try_clone()?;
+        let new_ctx = src_ctx.try_clone(self.len)?;
         let new_oid = ObjectId::next();
         dram_pool.insert_object(new_oid, std::sync::Arc::new(new_ctx));
         Some(LoValue {
