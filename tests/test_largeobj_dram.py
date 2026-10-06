@@ -1,6 +1,7 @@
 import os
 from valkey import ResponseError
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkeytestframework.util.waiters import wait_for_true
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
 
 class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
@@ -191,6 +192,19 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         """Dram mode never starts the SMART log poller"""
         client = self.server.get_new_client()
         assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog_usage')
+
+    def test_num_objects(self):
+        """INFO num_objects counts LargeObject keys through SET, overwrite, COPY
+        and DEL, and ignores core keys. Frees run async, so decrements are awaited."""
+        client = self.server.get_new_client()
+        count = lambda: info_largeobj(client)['largeobj_num_objects']
+        client.execute_command('BLOB.SET', 'cnt_a', b'A' * 1024)
+        client.execute_command('BLOB.SET', 'cnt_a', b'B' * 1024)
+        client.execute_command('COPY', 'cnt_a', 'cnt_b')
+        client.set('cnt_core', 'v')
+        wait_for_true(lambda: count() == 2)
+        client.delete('cnt_a', 'cnt_b')
+        wait_for_true(lambda: count() == 0)
 
     # ─── BLOB.INFO tests ───────────────────────────────────────────────────
 

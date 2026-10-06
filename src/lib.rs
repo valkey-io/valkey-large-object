@@ -80,7 +80,7 @@ lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     static ref CFG_NVME_DIR: Mutex<String> = Mutex::new(String::new());
 
-    /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 64MB.
+    /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 1GiB.
     /// Used in Tiered mode for read/write staging. Split into uniform
     /// `segment-size` segments: count = ceil(nvme-staging-size / segment-size)
     /// (ceiling so actual staging is never less than requested). Immutable after load.
@@ -106,6 +106,11 @@ lazy_static::lazy_static! {
     /// Scaling cron poll interval in milliseconds. Controls how often the scaling
     /// timer fires to check utilization and memory pressure. Default: 5000ms.
     static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(5000);
+
+    /// Main-thread time, in microseconds, one scaling-cron tick may spend
+    /// scanning for and deleting reclaim-list keys. Default: 1000us.
+    static ref CFG_RECLAIM_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(1000);
+    static ref CFG_RECLAIM_POLL_MS: AtomicI64 = AtomicI64::new(100);
 
     /// NVMe SMART poll interval in seconds (Tiered mode). 0 disables polling
     /// entirely: no background reads, and the INFO section never appears.
@@ -260,6 +265,14 @@ pub fn bench_mode() -> bool {
 
 pub fn scaling_poll_ms() -> u64 {
     CFG_SCALING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn reclaim_scan_budget_us() -> u64 {
+    CFG_RECLAIM_SCAN_BUDGET_US.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn reclaim_poll_ms() -> u64 {
+    CFG_RECLAIM_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn smartlog_poll_secs() -> u64 {
@@ -703,6 +716,10 @@ valkey_module! {
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["reclaim-scan-budget-us", &*CFG_RECLAIM_SCAN_BUDGET_US, 1_000, 100, 100_000,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["reclaim-poll-ms", &*CFG_RECLAIM_POLL_MS, 100, 10, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
             ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, 60, 0, 86_400,
              ConfigurationFlags::IMMUTABLE, None, None],

@@ -15,6 +15,8 @@ use super::get_dram_pool;
 /// 2. Delete keys on the reclaim list.
 ///    While a shrink is unfinished (a segment draining or reclaim-list keys
 ///    left), stop here: one shrink at a time, no expand or shrink on top.
+///    While reclaim-list keys remain, the cron re-arms at `reclaim-poll-ms`
+///    instead of `scaling-poll-ms`, so cleanup runs in short, frequent slices.
 /// 3. Proactive expand: if pool utilization exceeds the expand watermark,
 ///    add a segment before the hot path stalls on segment creation.
 /// 4. Proactive shrink: if server memory pressure exceeds the shrink watermark,
@@ -24,7 +26,6 @@ pub fn scaling_cron(ctx: &Context) {
     let expand_watermark = crate::scaling_expand_watermark();
     let shrink_watermark = crate::scaling_shrink_watermark();
     let poll_ms = crate::scaling_poll_ms();
-
     let pool = get_dram_pool();
 
     // 1. Complete draining of any segments whose refcount hit 0.
@@ -37,7 +38,7 @@ pub fn scaling_cron(ctx: &Context) {
     // A SET that needs room meanwhile still expands reactively.
     let (_, draining, _) = pool.segment_counts();
     if draining > 0 || !super::reclaim::RECLAIM_LIST.is_empty() {
-        rearm_scaling_cron(ctx, poll_ms);
+        rearm_scaling_cron(ctx, next_poll_ms());
         return;
     }
 
@@ -95,7 +96,17 @@ pub fn scaling_cron(ctx: &Context) {
         pool.release_drained_segments();
     }
 
-    rearm_scaling_cron(ctx, poll_ms);
+    // A Dram shrink just filled the reclaim list: start cleanup on the fast tick.
+    rearm_scaling_cron(ctx, next_poll_ms());
+}
+
+/// `reclaim-poll-ms` while reclaim-list keys remain, else `scaling-poll-ms`.
+fn next_poll_ms() -> u64 {
+    if super::reclaim::RECLAIM_LIST.is_empty() {
+        crate::scaling_poll_ms()
+    } else {
+        crate::reclaim_poll_ms()
+    }
 }
 
 /// Re-arm the scaling cron for the next tick.

@@ -41,6 +41,19 @@ def wait_uring_registered_matches_live(client, timeout=10):
     wait_for_true(_match, timeout=timeout)
 
 
+def apply_shrink_pressure(client):
+    """Cap maxmemory at 85% of used_memory (ratio ~1.18, above the shrink
+    watermark). noeviction: core frees nothing, only the module shrink can."""
+    client.config_set('maxmemory-policy', 'noeviction')
+    client.config_set('maxmemory', int(client.info('memory')['used_memory'] * 0.85))
+
+
+def shrink_settled(client):
+    """No segment draining and every reclaimed key deleted."""
+    info = info_largeobj(client)
+    return info['largeobj_draining_segments'] == 0 and info['largeobj_pending_reclaims'] == 0
+
+
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
 
 class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
@@ -281,117 +294,104 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
 
 class TestDramShrink(ValkeyLargeObjTestCaseBase):
-    """Dram mode: under server memory pressure the scaling cron drains a segment,
-    deletes the keys whose objects live on it, and releases it — so used_memory
-    drops and core data types can be written again.
+    """Dram mode: under server memory pressure the scaling cron reclaims a segment
+    by deleting the keys whose objects live on it, so core data types fit again.
     """
 
-    SHRINK_TIMEOUT_S = 20
+    TIMEOUT_S = 20
+    # 900KB objects in 1MB segments: one object per segment, so each shrink
+    # reclaims exactly one key.
+    PAYLOADS = {f'dshrink_{i}': bytes([i]) * (900 * 1024) for i in range(4)}
 
     def get_module_args(self, data_dir, direct_io):
+        # Expand watermark 95 (above one object's ~88% of a segment): no proactive
+        # expand, so the pool holds exactly one segment per object and no empty
+        # segment the shrink could pick instead.
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
             f" max-object-size 983040"
             f" scaling-poll-ms 1000"
+            f" scaling-expand-watermark 95"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
         )
 
+    def _write_payloads(self, client):
+        for key, payload in self.PAYLOADS.items():
+            assert client.execute_command('BLOB.SET', key, payload) == b'OK'
+
     def test_shrink_deletes_victim_keys_and_frees_memory(self):
         client = self.server.get_new_client()
-        mem_info = client.execute_command('INFO', 'memory')
-        assert int(mem_info.get(b'maxmemory') or mem_info.get('maxmemory', 0)) == 0
+        self._write_payloads(client)
+        client.set('core_seed', 'v')  # Dram shrink runs only when a non-LargeObject key exists
+        before = info_largeobj(client)
 
-        # 900KB objects in 1MB segments: one object per segment.
-        payloads = {f'dshrink_{i}': bytes([i]) * (900 * 1024) for i in range(4)}
-        for key, payload in payloads.items():
-            assert client.execute_command('BLOB.SET', key, payload) == b'OK'
-        # A non-LargeObject key: Dram shrink only runs when one exists.
-        assert client.set('core_seed', 'v') is True
-        live_before = info_largeobj(client)['largeobj_dram_live_segments']
-        shrink_before = info_largeobj(client).get('largeobj_scaling_shrinks', 0)
-        reclaim_before = info_largeobj(client)['largeobj_reclaims']
-
-        # Pressure: noeviction so core deletes nothing; only the module shrink can
-        # free memory. maxmemory = used * 0.85 puts the ratio (~1.18) above the watermark.
-        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
-        mem_info = client.execute_command('INFO', 'memory')
-        used = int(mem_info.get(b'used_memory') or mem_info.get('used_memory'))
-        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used * 0.85)))
+        apply_shrink_pressure(client)
         with pytest.raises(ResponseError):
-            client.execute_command('SET', 'core_key', 'v')
+            client.set('core_key', 'v')
+        wait_for_true(lambda: info_largeobj(client)['largeobj_scaling_shrinks']
+                      > before['largeobj_scaling_shrinks'], timeout=self.TIMEOUT_S)
+        # SET raises OOM until the shrink has freed enough memory.
+        wait_for_true(lambda: client.set('core_key', 'v'), ignore_exception=ResponseError,
+                      timeout=self.TIMEOUT_S)
 
-        wait_for_true(
-            lambda: info_largeobj(client).get('largeobj_scaling_shrinks', 0) > shrink_before,
-            timeout=self.SHRINK_TIMEOUT_S,
-        )
-        # Core writes succeed once the module has released enough segments.
-        def _core_set_ok():
-            try:
-                return client.set('core_key', 'v') is True
-            except ResponseError:
-                return False
-        wait_for_true(_core_set_ok, timeout=self.SHRINK_TIMEOUT_S)
-        wait_for_true(
-            lambda: info_largeobj(client).get('largeobj_draining_segments', 1) == 0,
-            timeout=self.SHRINK_TIMEOUT_S,
-        )
+        # Lift the pressure so no further shrink starts, then wait for the last
+        # one to finish: segment released and its keys deleted.
+        client.config_set('maxmemory', 0)
+        wait_for_true(lambda: shrink_settled(client), timeout=self.TIMEOUT_S)
 
-        info = info_largeobj(client)
-        shrinks = info['largeobj_scaling_shrinks'] - shrink_before
-        assert info['largeobj_dram_live_segments'] == live_before - shrinks
-        # One object per segment: each shrink evicts exactly one key. Memory frees
-        # at shrink time; the cron deletes the key afterwards.
-        def _surviving():
-            return [k for k in payloads if client.execute_command('EXISTS', k) == 1]
-        wait_for_true(lambda: len(_surviving()) == len(payloads) - shrinks,
-                      timeout=self.SHRINK_TIMEOUT_S)
-        surviving = _surviving()
-        info = info_largeobj(client)
-        assert info['largeobj_pending_reclaims'] == 0
-        assert info['largeobj_reclaims'] - reclaim_before == shrinks
+        after = info_largeobj(client)
+        shrinks = after['largeobj_scaling_shrinks'] - before['largeobj_scaling_shrinks']
+        assert after['largeobj_dram_live_segments'] == before['largeobj_dram_live_segments'] - shrinks
+        assert after['largeobj_reclaims'] - before['largeobj_reclaims'] == shrinks
+        surviving = [k for k in self.PAYLOADS if client.exists(k)]
+        assert len(surviving) == len(self.PAYLOADS) - shrinks
         for key in surviving:
-            assert client.execute_command('BLOB.GET', key) == payloads[key], f"{key} corrupted"
-        client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
+            assert client.execute_command('BLOB.GET', key) == self.PAYLOADS[key]
+
+    def test_reclaimed_key_reads_as_missing(self):
+        """Between the shrink and its key deletion, the victim key still exists
+        but every module command treats it as missing. A user DEL in that window
+        completes the reclaim."""
+        client = self.server.get_new_client()
+        # The shrink tick re-arms the cron 60s out, holding the window open.
+        client.config_set('largeobj.reclaim-poll-ms', 60000)
+        self._write_payloads(client)
+        client.set('core_seed', 'v')
+
+        apply_shrink_pressure(client)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_reclaims'] == 1,
+                      timeout=self.TIMEOUT_S)
+        client.config_set('maxmemory', 0)  # let COPY (denyoom) reach the module
+
+        victims = [k for k in self.PAYLOADS if client.execute_command('BLOB.GET', k) is None]
+        assert len(victims) == 1
+        victim = victims[0]
+        assert client.exists(victim) == 1
+        with pytest.raises(ResponseError, match='not found'):
+            client.execute_command('BLOB.INFO', victim)
+        with pytest.raises(ResponseError):
+            client.execute_command('COPY', victim, 'copy_dst')
+
+        reclaims = info_largeobj(client)['largeobj_reclaims']
+        client.delete(victim)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_reclaims'] == 0)
+        assert info_largeobj(client)['largeobj_reclaims'] == reclaims + 1
 
     def test_no_shrink_when_only_large_objects(self):
-        """With no non-LargeObject keys, shrink would only delete LargeObjects
-        with nothing to make room for, so it must not fire."""
+        """With only LargeObject keys there is nothing to make room for."""
         client = self.server.get_new_client()
-        payloads = {f'pure_{i}': bytes([i]) * (900 * 1024) for i in range(4)}
-        for key, payload in payloads.items():
-            assert client.execute_command('BLOB.SET', key, payload) == b'OK'
-        assert info_largeobj(client)['largeobj_num_objects'] == client.dbsize()
-        shrink_before = info_largeobj(client).get('largeobj_scaling_shrinks', 0)
+        self._write_payloads(client)
+        shrinks = info_largeobj(client)['largeobj_scaling_shrinks']
 
-        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
-        mem_info = client.execute_command('INFO', 'memory')
-        used = int(mem_info.get(b'used_memory') or mem_info.get('used_memory'))
-        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used * 0.85)))
+        apply_shrink_pressure(client)
         time.sleep(3)  # three cron ticks at scaling-poll-ms 1000
 
-        assert info_largeobj(client).get('largeobj_scaling_shrinks', 0) == shrink_before
-        for key, payload in payloads.items():
+        assert info_largeobj(client)['largeobj_scaling_shrinks'] == shrinks
+        for key, payload in self.PAYLOADS.items():
             assert client.execute_command('BLOB.GET', key) == payload
-        client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
-
-    def test_num_objects_tracks_keyspace(self):
-        """num_objects follows SET, overwrite, COPY and DEL."""
-        client = self.server.get_new_client()
-        count = lambda: info_largeobj(client)['largeobj_num_objects']
-        start = count()
-        client.execute_command('BLOB.SET', 'cnt_a', b'A' * 1024)
-        assert count() == start + 1
-        client.execute_command('BLOB.SET', 'cnt_a', b'B' * 1024)  # overwrite
-        wait_for_true(lambda: count() == start + 1)
-        client.execute_command('COPY', 'cnt_a', 'cnt_b')
-        assert count() == start + 2
-        client.set('cnt_core', 'v')
-        assert count() == start + 2
-        client.delete('cnt_a', 'cnt_b')
-        wait_for_true(lambda: count() == start)  # lo_free runs async
 
 
 # ─── Tiered Mode Scaling ──────────────────────────────────────────────────────
@@ -490,17 +490,6 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
             f"Run 'CONFIG SET maxmemory 0' to reset."
         )
 
-    def _apply_shrink_pressure(self, client):
-        """Set maxmemory below current used_memory so ratio > 0.80.
-
-        Setting maxmemory = used * 0.85 gives ratio ≈ 1.18 > 0.80.
-        noeviction means no keys are evicted — the module cron handles DRAM.
-        """
-        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
-        mem_info = client.execute_command('INFO', 'memory')
-        used = int(mem_info.get(b'used_memory') or mem_info.get('used_memory'))
-        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used * 0.85)))
-
     def test_shrink_preserves_nvme_data(self):
         """After the scaling cron shrinks the pool, keys remain readable from NVMe."""
         client = self.server.get_new_client()
@@ -516,7 +505,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         before = info_largeobj(client)
         shrink_before = before.get('largeobj_scaling_shrinks', 0)
 
-        self._apply_shrink_pressure(client)
+        apply_shrink_pressure(client)
 
         wait_for_true(
             lambda: info_largeobj(client).get('largeobj_scaling_shrinks', 0) > shrink_before,
@@ -549,7 +538,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         before = info_largeobj(client)
         shrink_before = before.get('largeobj_scaling_shrinks', 0)
 
-        self._apply_shrink_pressure(client)
+        apply_shrink_pressure(client)
 
         wait_for_true(
             lambda: info_largeobj(client).get('largeobj_scaling_shrinks', 0) > shrink_before,
@@ -645,10 +634,7 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         # Apply server memory pressure so the shrink cron releases a segment. In Tiered mode this
         # releases a live-data segment (data persists on NVMe), and because the fabric is up the
         # released segment carries an EFA registration that Segment::drop must tear down first.
-        client.execute_command('CONFIG', 'SET', 'maxmemory-policy', 'noeviction')
-        mem_now = client.execute_command('INFO', 'memory')
-        used = int(mem_now.get(b'used_memory') or mem_now.get('used_memory'))
-        client.execute_command('CONFIG', 'SET', 'maxmemory', str(int(used * 0.85)))
+        apply_shrink_pressure(client)
 
         # Shrink fires, then the drained segment is fully released (registration torn down + memory
         # freed). A broken teardown would fault here rather than completing cleanly.

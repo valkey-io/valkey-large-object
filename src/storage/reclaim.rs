@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use valkey_module::{raw, Context, KeysCursor};
 
@@ -57,10 +58,15 @@ impl ReclaimList {
     }
 }
 
-/// `RedisModule_Scan` calls per cron tick while reclaim-list keys remain.
-/// Each call visits one keyspace hash bucket (a few keys), so this bounds the
-/// main-thread time one tick spends scanning.
-const RECLAIM_SCAN_CALLS_PER_TICK: usize = 1000;
+/// Select db `db` on `ctx`. False past the last db.
+fn select_db(ctx: &Context, db: i32) -> bool {
+    unsafe { raw::RedisModule_SelectDb.unwrap()(ctx.get_raw(), db) == raw::REDISMODULE_OK as i32 }
+}
+
+/// Number of keys in the selected db.
+fn db_size(ctx: &Context) -> u64 {
+    unsafe { raw::RedisModule_DbSize.unwrap()(ctx.get_raw()) }
+}
 
 /// Where the reclaim scan resumes on the next tick.
 struct ReclaimScan {
@@ -73,10 +79,11 @@ thread_local! {
     static RECLAIM_SCAN: RefCell<ReclaimScan> = RefCell::new(ReclaimScan { db: 0, cursor: KeysCursor::new() });
 }
 
-/// Delete keys whose oids are on the reclaim list, one tick's scan budget
-/// at a time. Scans db by db, resuming across ticks, until the reclaim list is
-/// empty. An oid leaves the list when its key is deleted, here or by any other
-/// path (`lo_free` -> `remove_object`), so the scan cannot outlive its keys.
+/// Delete keys whose oids are on the reclaim list, spending at most
+/// `reclaim-scan-budget-us` of main-thread time per tick. Scans db by db,
+/// resuming across ticks, until the reclaim list is empty. An oid leaves the
+/// list when its key is deleted, here or by any other path (`lo_free` ->
+/// `remove_object`), so the scan cannot outlive its keys.
 ///
 /// Cross-slot deletion is safe here: a timer callback runs outside command
 /// execution (`server.current_client` is NULL), so key lookups hash each key's
@@ -85,38 +92,31 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
     if RECLAIM_LIST.is_empty() {
         return;
     }
-    let mut reclaim = RECLAIM_LIST.snapshot();
+    let deadline = Instant::now() + Duration::from_micros(crate::reclaim_scan_budget_us());
+    // Shrink, the only writer that adds oids, also runs on this thread, so the
+    // snapshot misses nothing. Oids other threads remove meanwhile just never match.
+    let reclaim = RECLAIM_LIST.snapshot();
     RECLAIM_SCAN.with_borrow_mut(|scan| {
-        for _ in 0..RECLAIM_SCAN_CALLS_PER_TICK {
-            if reclaim.is_empty() {
-                break;
-            }
-            // SelectDb fails past the last db: one full pass done. At most one
-            // pass per tick so a key moved behind the cursor can't spin us.
-            if unsafe { raw::RedisModule_SelectDb.unwrap()(ctx.get_raw(), scan.db) }
-                != raw::REDISMODULE_OK as i32
-            {
+        while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
+            // Past the last db: one full pass done. At most one pass per tick
+            // so a key moved behind the cursor can't spin us.
+            if !select_db(ctx, scan.db) {
                 scan.db = 0;
                 break;
             }
-            // The scan callback's key handle is read-only: collect, then delete.
-            let found = RefCell::new(Vec::new());
-            let more = scan.cursor.scan(ctx, &|_ctx, name, key| {
-                if let Some(Ok(Some(lo))) = key.map(|k| k.get_value::<LoValue>(&LO_TYPE)) {
-                    if reclaim.contains(&lo.object_id) {
-                        found
-                            .borrow_mut()
-                            .push((name.as_slice().to_vec(), lo.object_id));
-                    }
+            // VM_Scan allows deleting the current key from its callback.
+            let more = scan.cursor.scan(ctx, &|ctx, name, key| {
+                let Some(Ok(Some(lo))) = key.map(|k| k.get_value::<LoValue>(&LO_TYPE)) else {
+                    return;
+                };
+                let oid = lo.object_id;
+                if reclaim.contains(&oid) {
+                    let _ = ctx.open_key_writable(&name).unlink();
+                    // lo_free runs later on the BIO thread; clear now so the
+                    // scan stops once every listed key is gone.
+                    RECLAIM_LIST.remove(&oid);
                 }
             });
-            for (name, oid) in found.into_inner() {
-                unlink_key(ctx, &name);
-                // lo_free runs later on the BIO thread; clear now so the next
-                // tick doesn't hunt for an already-deleted key.
-                RECLAIM_LIST.remove(&oid);
-                reclaim.remove(&oid);
-            }
             if !more {
                 scan.cursor.restart();
                 scan.db += 1;
@@ -125,27 +125,17 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
     });
 }
 
-/// UNLINK `name` in the selected db.
-fn unlink_key(ctx: &Context, name: &[u8]) {
-    let key_name = ctx.create_string(name);
-    let key = ctx.open_key_writable(&key_name);
-    let _ = key.unlink();
-}
-
 /// Whether the keyspace holds any non-LargeObject keys: total keys across all
 /// dbs exceeds the LargeObject count. Dram shrink deletes LargeObject keys to
 /// free memory for other data types, so with none of those there is nothing
 /// to make room for. `num_objects` decrements when `lo_free` drops the value (async), so
 /// right after a delete it can read high and delay a shrink by one tick.
 pub fn has_non_lo_keys(ctx: &Context) -> bool {
-    let mut total_keys: u64 = 0;
+    let mut total_keys = 0;
     let mut db = 0;
-    // SelectDb fails past the last db.
-    while unsafe { raw::RedisModule_SelectDb.unwrap()(ctx.get_raw(), db) }
-        == raw::REDISMODULE_OK as i32
-    {
-        total_keys += unsafe { raw::RedisModule_DbSize.unwrap()(ctx.get_raw()) };
+    while select_db(ctx, db) {
+        total_keys += db_size(ctx);
         db += 1;
     }
-    total_keys > crate::info::LARGE_OBJECT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    total_keys > crate::info::LARGE_OBJECT_COUNT.load(Ordering::Relaxed)
 }
