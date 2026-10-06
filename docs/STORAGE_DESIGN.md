@@ -400,7 +400,7 @@ struct StreamingContext {
 - ALL N buffers for the entire object allocated upfront from DRAMPool segment
 - `state = Filling` during promotion (§7.3.4): batched ReadFixed fills buffers, `chunks_ready` advances per batch
 - `state = Ready`: all buffers filled, object servable
-- A GET that finds `Filling` does not wait: Tiered reads NVMe independently; the Dram EFA path is `todo!()` (§7.3.5)
+- A GET that finds `Filling` does not wait: Tiered reads NVMe independently (§7.3.5). Dram mode never has `Filling` objects (only Tiered promotion creates them); both Dram GET paths panic on one
 - Stored in: `DRAMPool.objects` (`ObjectMaps`)
 
 **StreamingContext (NVMePool — short-lived, partial window):**
@@ -790,7 +790,7 @@ Spawn tokio task with StreamingContext (X buffers from NVMePool):
 
 **Not implemented.** A Tiered GET that finds its object `Filling` reads NVMe
 independently (`cmd_get_tiered`, `TODO: coalesce`), so concurrent GETs during a
-promotion duplicate the NVMe read. The Dram EFA GET's `Filling` arm is `todo!()`.
+promotion duplicate the NVMe read. (Dram mode never has `Filling` objects.)
 
 Planned design:
 
@@ -1009,12 +1009,18 @@ with the fewest allocated bytes, drops every object on it, and releases it (§8.
 | Mode | Condition | Effect on the victim's objects |
 |---|---|---|
 | Tiered | ratio > watermark | Cached copies dropped; objects stay on NVMe, next GET reads NVMe. |
-| Dram | ratio > watermark **and** the keyspace holds a non-LargeObject key | The objects *are* the data. Their oids go on the reclaim list; the keys read as missing and the cron deletes them (§8.5). |
+| Dram | ratio > watermark **and** `maxmemory-policy` is not `noeviction` | The objects *are* the data. Their oids go on the reclaim list; the keys read as missing and the cron deletes them (§8.5). |
 
-The Dram non-LO-key gate (`reclaim::has_non_lo_keys`: total `DbSize` across dbs >
-`num_objects`) exists because Dram shrink frees memory for other data types: with only
-LargeObjects in the keyspace there is nothing to make room for, so the cron deletes
-nothing.
+**Why the policy decides Dram shrink** (`eviction_allowed`). Dram shrink
+deletes keys, so it runs only when the operator allowed eviction (the module context
+flag `EVICT`: `maxmemory` set and the policy is not `noeviction`); under `noeviction`
+writes fail with OOM instead. A replica that ignores maxmemory (the default) never has
+the flag, so it leaves eviction to its primary. Under any evicting policy shrink is required, not
+optional: core evicting an LO key frees almost no `used_memory` (fact 2), so without a
+segment release core's eviction loop would keep deleting keys without ever getting
+under `maxmemory`. Tiered shrink drops only cached copies, so it runs under every
+policy: it is what makes room for new keys, client query buffers (a TCP `BLOB.SET`
+buffers its whole payload) and output buffers, even in an LO-only keyspace.
 
 **Why proactive only.** Nothing "fails" to prompt a shrink: the trigger is external
 (the server approaching `maxmemory`), which the module only sees by polling. An alloc
@@ -1089,10 +1095,12 @@ why release leaves a hole rather than swap-removing the tail segment into the ga
 `ObjectContext` is a logic bug (the DRAM GET paths panic on it). Between step 3 and
 step 5 that is exactly the state of a reclaimed key, so every command that reaches the
 DRAMPool for an existing key checks `reclaim_in_progress()` first. The check and the
-shrink both run on the main thread, so a shrink cannot land between them. The EFA
-DRAM SET commits from a tokio worker; `commit_lo_value` refuses a commit whose object
-`get_object` no longer returns (removed by a shrink, or inserted onto a draining
-segment), so a key is never attached to an object that is not served.
+shrink both run on the main thread, so a shrink cannot land between them.
+
+The EFA DRAM SET commits from a tokio worker; `commit_lo_value` refuses a commit whose
+object `get_object` no longer returns (removed by a shrink, or inserted onto a draining
+segment), so a key is never attached to an object that is not served. How to handle
+those two races better is open (`DRAM_SHRINK_REVIEW.md`).
 
 ### 8.6 io_uring Registration (Tiered)
 
@@ -1388,8 +1396,8 @@ holder drops between ticks is released on the next tick.
 
 ## 10. Open Questions
 
-1. Dram shrink review questions (noeviction, keyspace notifications, the non-LO-key
-   gate, EFA commit race): `docs/DRAM_SHRINK_REVIEW.md`.
+1. Dram shrink review questions (keyspace notifications, oscillation, a single
+   reclaim-aware key-open helper): `docs/DRAM_SHRINK_REVIEW.md`.
 2. Scaling tuning: the shrink/expand watermarks and `scaling-poll-ms` cadence need
    benchmarks, so the cron keeps ahead of memory spikes without thrashing grow/shrink.
 3. Dram mode with server `maxmemory = 0`: the only bound is physical RAM and the OOM
@@ -1454,7 +1462,7 @@ bound is physical RAM, as in core Valkey.
 
 | Mode | At the ceiling |
 |---|---|
-| Dram | A `BLOB.SET` that needs a new segment is rejected (OOM). If the keyspace also holds non-LargeObject keys, the cron shrinks a segment and deletes its keys so core data types fit (§8.3). |
+| Dram | A `BLOB.SET` that needs a new segment is rejected (OOM). Under an evicting `maxmemory-policy` the cron shrinks a segment and deletes its keys; under `noeviction` writes keep failing (§8.3). |
 | Tiered | The cache stops growing; the cron shrinks segments (cached copies dropped, data stays on NVMe). |
 
 Segment **count** is always derived from demand, never a knob. Every segment is
@@ -1464,8 +1472,8 @@ exactly `segment-size`.
 
 - **Tiered mode:** DRAMPool is a cache, reclaimable under pressure without data loss.
   NVMe capacity is a hard SET bound today; module-driven NVMe eviction is planned (§8.1).
-- **Dram mode:** DRAMPool is the data. Under server memory pressure, with non-LO keys
-  present, the cron deletes the keys on the least-loaded segment (§8.5); core's
+- **Dram mode:** DRAMPool is the data. Under server memory pressure and an evicting
+  `maxmemory-policy`, the cron deletes the keys on the least-loaded segment (§8.5); core's
   `maxmemory-policy` evicts whole keys independently but cannot lower `used_memory`
   by itself (§8.1 fact 2). Module-driven per-object eviction is planned (§8.1).
 

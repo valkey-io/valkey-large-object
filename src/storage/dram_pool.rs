@@ -202,6 +202,9 @@ impl DRAMPool {
             .get(oid)
             .cloned()?;
 
+        // An object never spans segments: buffers[0] names the segment of all of them.
+        // A Filling object (promotion in progress) is returned too; callers check
+        // `is_ready()`.
         if self.pool.is_segment_draining(arc.buffers[0].segment_idx) {
             return None;
         }
@@ -448,14 +451,14 @@ impl DRAMPool {
         // Hold the reclaim list across the map scan. A concurrent `remove_object`
         // either removed the object first (not seen, not listed) or blocks
         // until we are done and then clears the oid we listed.
-        let dram = crate::operating_mode() == crate::OperatingMode::Dram;
         let mut reclaim = super::reclaim::RECLAIM_LIST.lock();
         let removed = self
             .objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
             .remove_by_segment_id(victim_idx);
-        if dram {
+        // Tiered: the objects live on in NVMe, so their keys stay valid.
+        if crate::operating_mode() == crate::OperatingMode::Dram {
             reclaim.extend(removed);
         }
         drop(reclaim);

@@ -56,11 +56,9 @@ pub fn scaling_cron(ctx: &Context) {
 
     // 4. Proactive shrink: yield memory back to core when server is under pressure.
     //
-    // Dram mode deletes keys (no NVMe copy to fall back on). Without it, core
-    // data types cannot be written once LargeObjects fill memory: core evicting
-    // an LO key only returns its buffer to the segment, so used_memory does not
-    // drop until a whole segment is released. Skipped when every key is a LargeObject:
-    // there is no other data type to make room for.
+    // Only a segment release lowers used_memory: core evicting an LO key just
+    // returns its buffer to the segment. Without shrink, an evicting policy would
+    // keep evicting keys without ever getting under maxmemory.
     //
     // Shrink is SERVER-scoped (crate::server_memory), not module-scoped: we give
     // DRAM back only under Valkey-wide pressure, so the module's own pool pressure
@@ -82,11 +80,11 @@ pub fn scaling_cron(ctx: &Context) {
         return;
     }
     let ratio = used as f64 / maxmemory as f64;
-    let dram_mode = crate::operating_mode() == crate::OperatingMode::Dram;
-    if ratio > shrink_watermark
-        && (!dram_mode || super::reclaim::has_non_lo_keys(ctx))
-        && pool.try_shrink()
-    {
+    // Tiered shrink only drops cached copies, so it always runs. Dram shrink
+    // deletes keys, so it follows `maxmemory-policy`: none under `noeviction`.
+    let may_shrink =
+        crate::operating_mode() == crate::OperatingMode::Tiered || crate::eviction_allowed(ctx);
+    if ratio > shrink_watermark && may_shrink && pool.try_shrink() {
         ctx.log_notice(&format!(
             "largeobj: scaling — memory pressure {:.1}% > {:.0}%, evicted one DRAM segment",
             ratio * 100.0,

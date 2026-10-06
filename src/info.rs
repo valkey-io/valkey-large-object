@@ -26,8 +26,6 @@ pub static SET_VALUE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Live `LoValue` instances: +1 in `LoValue::new`, −1 in its `Drop`. Equals the
 /// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
-/// Compared against the total key count to tell whether the keyspace holds any
-/// non-LargeObject keys.
 pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.

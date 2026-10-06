@@ -63,20 +63,15 @@ fn select_db(ctx: &Context, db: i32) -> bool {
     unsafe { raw::RedisModule_SelectDb.unwrap()(ctx.get_raw(), db) == raw::REDISMODULE_OK as i32 }
 }
 
-/// Number of keys in the selected db.
-fn db_size(ctx: &Context) -> u64 {
-    unsafe { raw::RedisModule_DbSize.unwrap()(ctx.get_raw()) }
-}
-
 /// Where the reclaim scan resumes on the next tick.
-struct ReclaimScan {
+struct ReclaimScanCursor {
     db: i32,
     cursor: KeysCursor,
 }
 
 thread_local! {
     // Scaling cron only, which always runs on the main event-loop thread.
-    static RECLAIM_SCAN: RefCell<ReclaimScan> = RefCell::new(ReclaimScan { db: 0, cursor: KeysCursor::new() });
+    static RECLAIM_SCAN_CURSOR: RefCell<ReclaimScanCursor> = RefCell::new(ReclaimScanCursor { db: 0, cursor: KeysCursor::new() });
 }
 
 /// Delete keys whose oids are on the reclaim list, spending at most
@@ -96,7 +91,7 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
     // Shrink, the only writer that adds oids, also runs on this thread, so the
     // snapshot misses nothing. Oids other threads remove meanwhile just never match.
     let reclaim = RECLAIM_LIST.snapshot();
-    RECLAIM_SCAN.with_borrow_mut(|scan| {
+    RECLAIM_SCAN_CURSOR.with_borrow_mut(|scan| {
         while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
             // Past the last db: one full pass done. At most one pass per tick
             // so a key moved behind the cursor can't spin us.
@@ -123,19 +118,4 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
             }
         }
     });
-}
-
-/// Whether the keyspace holds any non-LargeObject keys: total keys across all
-/// dbs exceeds the LargeObject count. Dram shrink deletes LargeObject keys to
-/// free memory for other data types, so with none of those there is nothing
-/// to make room for. `num_objects` decrements when `lo_free` drops the value (async), so
-/// right after a delete it can read high and delay a shrink by one tick.
-pub fn has_non_lo_keys(ctx: &Context) -> bool {
-    let mut total_keys = 0;
-    let mut db = 0;
-    while select_db(ctx, db) {
-        total_keys += db_size(ctx);
-        db += 1;
-    }
-    total_keys > crate::info::LARGE_OBJECT_COUNT.load(Ordering::Relaxed)
 }

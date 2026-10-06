@@ -37,7 +37,9 @@ use std::sync::Mutex;
 
 use dma_libfabric_protocol::encode_hex;
 use valkey_module::configuration::ConfigurationFlags;
-use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyResult, ValkeyString};
+use valkey_module::{
+    valkey_module, Context, ContextFlags, InfoContext, Status, ValkeyResult, ValkeyString,
+};
 use valkey_module_macros::shutdown_event_handler;
 
 use tokio::runtime::Runtime;
@@ -315,6 +317,14 @@ pub fn server_memory(ctx: &Context) -> (u64, u64) {
     let used = info.field_unsigned("used_memory").unwrap_or(0);
     let maxmemory = info.field_unsigned("maxmemory").unwrap_or(0);
     (used, maxmemory)
+}
+
+/// Whether the server may evict keys: `maxmemory` is set and `maxmemory-policy`
+/// is not `noeviction`. Not set on a replica that ignores maxmemory (the default),
+/// which leaves eviction to its primary. Dram shrink deletes keys, so it runs only
+/// when this holds.
+pub fn eviction_allowed(ctx: &Context) -> bool {
+    ctx.get_flags().contains(ContextFlags::EVICTED)
 }
 
 /// Whether allocating `extra_bytes` more would push server memory to/over the

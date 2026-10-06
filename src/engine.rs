@@ -263,7 +263,7 @@ fn cmd_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, Va
             }
         }
         Some(_) => {
-            panic!("DRAM-only GET: object in Filling state — SET is synchronous, this is a bug")
+            panic!("DRAM-only GET: object in Filling state — only Tiered promotion creates Filling objects")
         }
         None => panic!("DRAM-only GET: LoValue exists but ObjectContext missing — logic bug"),
     }
@@ -289,9 +289,8 @@ fn cmd_get_dram_efa(
                 dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, None,
             );
         }
-        Some(_obj_ctx) => {
-            // TODO: Replace with waiter registration on the watch channel (coalescing).
-            todo!("DRAM-only GET: object in Filling state. Needs Request Coalescing");
+        Some(_) => {
+            panic!("DRAM-only GET: object in Filling state — only Tiered promotion creates Filling objects")
         }
         None => panic!("DRAM-only GET: LoValue exists but ObjectContext missing — logic bug"),
     }

@@ -41,10 +41,11 @@ def wait_uring_registered_matches_live(client, timeout=10):
     wait_for_true(_match, timeout=timeout)
 
 
-def apply_shrink_pressure(client):
+def apply_shrink_pressure(client, policy='noeviction'):
     """Cap maxmemory at 85% of used_memory (ratio ~1.18, above the shrink
-    watermark). noeviction: core frees nothing, only the module shrink can."""
-    client.config_set('maxmemory-policy', 'noeviction')
+    watermark). With no TTL keys, volatile-lru evicts nothing in core, like
+    noeviction, but allows Dram shrink."""
+    client.config_set('maxmemory-policy', policy)
     client.config_set('maxmemory', int(client.info('memory')['used_memory'] * 0.85))
 
 
@@ -294,8 +295,9 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
 
 class TestDramShrink(ValkeyLargeObjTestCaseBase):
-    """Dram mode: under server memory pressure the scaling cron reclaims a segment
-    by deleting the keys whose objects live on it, so core data types fit again.
+    """Dram mode: under server memory pressure and an evicting maxmemory-policy,
+    the scaling cron reclaims a segment by deleting the keys whose objects live
+    on it, so used_memory drops and writes fit again.
     """
 
     TIMEOUT_S = 20
@@ -325,10 +327,9 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
     def test_shrink_deletes_victim_keys_and_frees_memory(self):
         client = self.server.get_new_client()
         self._write_payloads(client)
-        client.set('core_seed', 'v')  # Dram shrink runs only when a non-LargeObject key exists
         before = info_largeobj(client)
 
-        apply_shrink_pressure(client)
+        apply_shrink_pressure(client, 'volatile-lru')
         with pytest.raises(ResponseError):
             client.set('core_key', 'v')
         wait_for_true(lambda: info_largeobj(client)['largeobj_scaling_shrinks']
@@ -359,9 +360,8 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         # The shrink tick re-arms the cron 60s out, holding the window open.
         client.config_set('largeobj.reclaim-poll-ms', 60000)
         self._write_payloads(client)
-        client.set('core_seed', 'v')
 
-        apply_shrink_pressure(client)
+        apply_shrink_pressure(client, 'volatile-lru')
         wait_for_true(lambda: info_largeobj(client)['largeobj_pending_reclaims'] == 1,
                       timeout=self.TIMEOUT_S)
         client.config_set('maxmemory', 0)  # let COPY (denyoom) reach the module
@@ -380,8 +380,8 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: info_largeobj(client)['largeobj_pending_reclaims'] == 0)
         assert info_largeobj(client)['largeobj_reclaims'] == reclaims + 1
 
-    def test_no_shrink_when_only_large_objects(self):
-        """With only LargeObject keys there is nothing to make room for."""
+    def test_no_shrink_under_noeviction(self):
+        """Dram shrink deletes keys, so noeviction disables it."""
         client = self.server.get_new_client()
         self._write_payloads(client)
         shrinks = info_largeobj(client)['largeobj_scaling_shrinks']
