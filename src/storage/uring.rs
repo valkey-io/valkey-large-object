@@ -90,8 +90,6 @@ enum PendingOp {
         /// True if issued as ReadFixed — counts against `fixed_in_flight`, which
         /// gates the whole-table re-registration (see `poller_loop`).
         fixed: bool,
-        /// When the SQE was pushed, for INFO `nvme_read_usec_total`.
-        submitted_at: Instant,
     },
     Write {
         tx: oneshot::Sender<Result<(), StorageError>>,
@@ -99,8 +97,6 @@ enum PendingOp {
         expected_bytes: u64,
         /// True if issued as WriteFixed — counts against `fixed_in_flight`.
         fixed: bool,
-        /// When the SQE was pushed, for INFO `nvme_write_usec_total`.
-        submitted_at: Instant,
     },
 }
 
@@ -112,13 +108,14 @@ impl PendingOp {
         }
     }
 
-    /// Credit this op's SQE-push-to-CQE-reap time to INFO. Called for every
-    /// reaped CQE, failed or short ones included: they still occupied the device.
-    fn record_completion(&self) {
-        match self {
-            PendingOp::Read { submitted_at, .. } => crate::info::NVME_READS.record(*submitted_at),
-            PendingOp::Write { submitted_at, .. } => crate::info::NVME_WRITES.record(*submitted_at),
-        }
+    /// Credit this op's time since its SQE push to INFO. Called for every reaped
+    /// CQE, failed or short ones included: they still occupied the device.
+    fn record_completion(&self, pushed_at: Instant) {
+        let stats = match self {
+            PendingOp::Read { .. } => &crate::info::NVME_READS,
+            PendingOp::Write { .. } => &crate::info::NVME_WRITES,
+        };
+        stats.record(pushed_at);
     }
 
     /// Send an error to the waiting caller. Used when submit fails fatally.
@@ -278,7 +275,8 @@ impl UringEngine {
         shutdown: Arc<AtomicBool>,
         mut ring: io_uring::IoUring,
     ) {
-        let mut pending: HashMap<u64, PendingOp> = HashMap::new();
+        // token → (when its SQE was pushed, the op).
+        let mut pending: HashMap<u64, (Instant, PendingOp)> = HashMap::new();
         let mut next_token: u64 = 1;
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
@@ -387,7 +385,6 @@ impl UringEngine {
                                 tx,
                                 expected_bytes: op.len,
                                 fixed: issue_fixed,
-                                submitted_at: Instant::now(),
                             },
                         )
                     }
@@ -420,7 +417,6 @@ impl UringEngine {
                                 tx,
                                 expected_bytes: op.len,
                                 fixed: issue_fixed,
-                                submitted_at: Instant::now(),
                             },
                         )
                     }
@@ -434,7 +430,7 @@ impl UringEngine {
                         // SQ full even after flush — error the caller directly.
                         op.send_error(libc::EAGAIN);
                     } else {
-                        pending.insert(token, op);
+                        pending.insert(token, (Instant::now(), op));
                         if op_is_fixed {
                             fixed_in_flight += 1;
                         }
@@ -480,11 +476,11 @@ impl UringEngine {
                 completed.push((cqe.user_data(), cqe.result()));
             }
             for (token, result) in completed {
-                if let Some(op) = pending.remove(&token) {
+                if let Some((pushed_at, op)) = pending.remove(&token) {
                     if op.is_fixed() {
                         fixed_in_flight -= 1;
                     }
-                    op.record_completion();
+                    op.record_completion(pushed_at);
                     match op {
                         PendingOp::Read {
                             tx, expected_bytes, ..
@@ -524,7 +520,7 @@ impl UringEngine {
                     .copied()
                     .collect();
                 for token in batch_tokens {
-                    if let Some(op) = pending.remove(&token) {
+                    if let Some((_, op)) = pending.remove(&token) {
                         if op.is_fixed() {
                             fixed_in_flight -= 1;
                         }

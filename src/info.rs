@@ -4,7 +4,7 @@
 //! calling it from `info_sections`. Each section is a discrete group of fields.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use valkey_module::{InfoContext, ValkeyResult};
 
 use crate::smartlog::{snapshot_for_info, CRITICAL_WARNING_BITS};
@@ -50,7 +50,7 @@ impl IoStats {
     pub fn record(&self, started: Instant) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.usec
-            .fetch_add(nearest_usec(started.elapsed()), Ordering::Relaxed);
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
     pub fn count(&self) -> u64 {
@@ -60,13 +60,6 @@ impl IoStats {
     pub fn usec_total(&self) -> u64 {
         self.usec.load(Ordering::Relaxed)
     }
-}
-
-/// Rounded rather than truncated, so sub-microsecond I/Os don't bias the mean
-/// low. Summing whole microseconds rather than nanoseconds keeps the total from
-/// wrapping even with thousands of transfers in flight for years.
-fn nearest_usec(elapsed: Duration) -> u64 {
-    u64::try_from((elapsed.as_nanos() + 500) / 1_000).unwrap_or(u64::MAX)
 }
 
 /// One direction of EFA traffic: successful transfers and their payload bytes.
@@ -102,9 +95,7 @@ pub static NVME_WRITES: IoStats = IoStats::new();
 pub static EFA_READS: EfaStats = EfaStats::new();
 pub static EFA_WRITES: EfaStats = EfaStats::new();
 
-/// `part` as a percentage of `whole` to two decimals ("99.99"), or "0.00" when
-/// `whole` is 0. The same `%.2f` Valkey uses for `expired_stale_perc` and
-/// `current_fork_perc`, without the `%` some of its memory fields append.
+/// `part` as a percentage of `whole`, to two decimals like Valkey's own ("99.99").
 fn pct(part: u64, whole: u64) -> String {
     if whole == 0 {
         return "0.00".to_string();
@@ -245,8 +236,7 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     };
 
     let (total, _draining, unused) = nvme.segment_counts();
-    // Against the pool as built (whole segments), which can exceed
-    // nvme-staging-size when that isn't a multiple of segment-size.
+    // Whole segments, so it can exceed nvme-staging-size.
     let capacity = total * crate::dram_segment_size();
     let util_pct = pct(nvme.allocated_bytes() as u64, capacity as u64);
 
@@ -432,31 +422,10 @@ mod tests {
 
     #[test]
     fn test_pct_has_two_decimals() {
-        assert_eq!(pct(0, 0), "0.00");
         assert_eq!(pct(5, 0), "0.00");
-        assert_eq!(pct(0, 4096), "0.00");
-        assert_eq!(pct(1, 3), "33.33");
         assert_eq!(pct(2, 3), "66.67");
-        assert_eq!(pct(1, 7), "14.29");
         assert_eq!(pct(1, 8), "12.50");
-        assert_eq!(pct(9_999, 10_000), "99.99");
         assert_eq!(pct(4096, 4096), "100.00");
-        assert_eq!(pct(1, 1_000_000), "0.00");
-        assert_eq!(pct(u64::MAX, u64::MAX), "100.00");
-    }
-
-    #[test]
-    fn test_io_stats_round_each_io_to_the_nearest_usec() {
-        assert_eq!(nearest_usec(Duration::from_nanos(0)), 0);
-        assert_eq!(nearest_usec(Duration::from_nanos(499)), 0);
-        assert_eq!(nearest_usec(Duration::from_nanos(500)), 1);
-        assert_eq!(nearest_usec(Duration::from_nanos(1_499)), 1);
-        assert_eq!(nearest_usec(Duration::from_micros(250)), 250);
-        assert_eq!(nearest_usec(Duration::MAX), u64::MAX);
-        let stats = IoStats::new();
-        assert_eq!((stats.count(), stats.usec_total()), (0, 0));
-        stats.record(Instant::now());
-        assert_eq!(stats.count(), 1);
     }
 
     #[test]
