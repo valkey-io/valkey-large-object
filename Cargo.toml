@@ -1,10 +1,10 @@
 [package]
-name = "valkey-largeobj"
+name = "valkey-large-object"
 version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 description = "Valkey Large Object Module — NVMe + EFA storage for KV cache tensors"
-repository = "https://github.com/KarthikSubbarao/ValkeyLargeObj"
+repository = "https://github.com/KarthikSubbarao/valkey-large-object"
 
 [dependencies]
 valkey-module = { version = "0.1.14", features = ["min-valkey-compatibility-version-8-0"] }
@@ -17,6 +17,7 @@ crossbeam-channel = "0.5"
 dma-libfabric = { git = "https://github.com/momentohq/vdma.git", rev = "e2679fb03fb62daf4c04d15c2cf89772788857bf" }
 dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = "e2679fb03fb62daf4c04d15c2cf89772788857bf" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+indexmap = "2"
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 lazy_static = "1"
 nvme-telem = "0.3.3"
@@ -33,7 +34,7 @@ serial_test = "3"
 
 [lib]
 crate-type = ["cdylib"]
-name = "valkey_largeobj"
+name = "valkey_large_object"
 
 # The passive libfabric peer for integration tests.
 [[bin]]

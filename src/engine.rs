@@ -23,7 +23,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use valkey_module::{ValkeyError, ValkeyValue, VALKEY_OK};
+use valkey_module::{NotifyEvent, ValkeyError, ValkeyValue, VALKEY_OK};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
@@ -176,22 +176,30 @@ fn commit_lo_value(
     let ctx = thread_ctx.lock();
     let key_str = ctx.create_string(key_name.to_vec());
     let key = ctx.open_key_writable(&key_str);
-    if let Ok(Some(existing)) = key.get_value::<LoValue>(&LO_TYPE) {
-        if existing.object_id > object_id {
+    // One lookup drives both the version guard and the create/update event.
+    let event = match key.get_value::<LoValue>(&LO_TYPE) {
+        Ok(Some(existing)) if existing.object_id > object_id => {
             return Ok(CommitOutcome::StaleDiscarded);
         }
-    }
+        Ok(Some(_)) => EVENT_UPDATE,
+        _ => EVENT_CREATE,
+    };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key_str);
     Ok(CommitOutcome::ValueSet)
 }
+
+/// Keyspace event names published after a successful BLOB.SET.
+pub(crate) const EVENT_CREATE: &str = "largeobj.create";
+pub(crate) const EVENT_UPDATE: &str = "largeobj.update";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute LO.GET with mode + transport routing.
+/// Execute BLOB.GET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_get(
     ctx: &valkey_module::Context,
@@ -295,9 +303,12 @@ fn cmd_get_tiered(
     blocked_client: valkey_module::BlockedClient,
 ) {
     let dram_pool = storage::get_dram_pool();
+    let cache = dram_pool.tiered_cache();
     // ─── DRAMPool hit ────────────────────────────────────────────────────
+    let mut filling = false;
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
+            cache.stats.record_hit(&obj_ctx.stats);
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             cmd_get_from_dram(
                 dram_pool,
@@ -313,10 +324,19 @@ fn cmd_get_tiered(
         // Filling state: promotion in progress.
         // TODO: coalesce — register as waiter on this ObjectContext.
         // For now: fall through to NVMe read.
+        filling = true;
     }
+    // Everything below reads from NVMe, whether or not it also promotes.
+    cache.stats.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
-    // If pool has space and object is eligible, read directly into DRAMPool.
-    if let Some(obj_ctx) = dram_pool.try_promote_object(object_id, obj_len) {
+    // Admit via the admission filter, then allocate (reclaiming cold copies if full).
+    // Skip both if another GET is already promoting this OID (Filling).
+    let promoted = if !filling && cache.admission.admit(object_id, obj_len) {
+        dram_pool.try_promote_object(object_id, obj_len)
+    } else {
+        None
+    };
+    if let Some(obj_ctx) = promoted {
         let fd_pool = storage::get_fd_pool();
         let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
             Some(fd) => fd,
@@ -347,8 +367,10 @@ fn cmd_get_tiered(
         };
         let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
         crate::runtime_handle().spawn(async move {
-            let _keep_alive = (file, fd);
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+            // Declared after thread_ctx so it drops first: the fd clone is gone
+            // before the client unblocks, so its next GET sees the fd unpinned.
+            let _keep_alive = (file, fd);
             // Promotion: read the NVMe file INTO the DRAM buffers (pool=Dram), and the
             // progress hook marks the cached entry Ready.
             let progress = crate::stream::PromotionProgress {
@@ -372,9 +394,8 @@ fn cmd_get_tiered(
         return;
     }
     // ─── NVMePool fallback (promotion skipped) ───────────────────────────
-    // Reaches here when try_promote_object returns None: pool full, object
-    // exceeds max-promote-size, or another GET is already promoting this OID.
-    // Future: LRFU admission policy may also reject promotion here.
+    // Reaches here when admission rejected the object, try_promote_object returned None
+    // or another GET is already promoting this OID.
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
@@ -417,8 +438,9 @@ fn cmd_get_tiered(
         // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
         // open fd are held alive for the read's duration. No promotion → no cache,
         // source reads straight from the NVMe pool window.
-        let _keep_alive = (file, fd);
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        // Declared after thread_ctx so it drops first (see the promotion path).
+        let _keep_alive = (file, fd);
         cmd_get_tiered_run(
             get_info,
             &stream_ctx.buffers,
@@ -550,7 +572,7 @@ async fn cmd_get_tiered_run(
 // SET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute LO.SET with mode + transport routing.
+/// Execute BLOB.SET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_set(
     ctx: &valkey_module::Context,
@@ -644,11 +666,17 @@ fn cmd_set_dram_tcp(
         crc32c: crc,
         file: None,
     };
+    let event = if key.is_empty() {
+        EVENT_CREATE
+    } else {
+        EVENT_UPDATE
+    };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         dram_pool.remove_object(&object_id);
         info::SET_VALUE_FAILURES.fetch_add(1, Ordering::Relaxed);
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
+    ctx.notify_keyspace_event(NotifyEvent::MODULE, event, key_name);
     VALKEY_OK
 }
 

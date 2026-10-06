@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 
-# Build valkey-largeobj module and run tests.
+# Build valkey-large-object module and run tests.
 #
 # Usage:
 #   ./build.sh                # fmt + build + unit tests + integration tests
@@ -25,7 +25,7 @@ MODULE_EXT=".so"
 if [ "$(uname)" = "Darwin" ]; then
     MODULE_EXT=".dylib"
 fi
-export MODULE_PATH="$SCRIPT_DIR/target/release/libvalkey_largeobj$MODULE_EXT"
+export MODULE_PATH="$SCRIPT_DIR/target/release/libvalkey_large_object$MODULE_EXT"
 
 # ─── Clean ────────────────────────────────────────────────────────────────────
 

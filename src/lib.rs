@@ -1,4 +1,4 @@
-//! ValkeyLargeObj: Large Object Module + Transport Crate
+//! valkey-large-object: Large Object Module + Transport Crate
 //!
 //! Architecture (from interface doc):
 //!   Data Type (commands, LoValue, keyspace)
@@ -7,7 +7,7 @@
 //!       ↓ passes buffers to
 //!   Transport (EFA, fi_write/fi_read)
 //!
-//! Commands: LO.HELLO, LO.GET, LO.SET
+//! Commands: BLOB.HELLO, BLOB.GET, BLOB.SET
 //! Deletion: native Valkey DEL triggers module free callback.
 
 // ─── Initialization Order ────────────────────────────────────────────────────
@@ -16,7 +16,7 @@
 // all steps complete:
 //
 //   1. Fabric::start()         — one libfabric service per domain. On missing
-//                                fabric, the EFA path is unavailable and LO.HELLO
+//                                fabric, the EFA path is unavailable and BLOB.HELLO
 //                                gives an error.
 //   2. storage::init(mode, nvme_dir)
 //                              — validate config, allocate pool segments, create
@@ -29,7 +29,7 @@
 //                              — fi_mr_reg pool buffers with EFA domains.
 //   4. RUNTIME.set(rt)         — commit tokio runtime last (only used by commands).
 //
-// After step 4, commands (LO.GET, LO.SET, LO.HELLO) may execute safely.
+// After step 4, commands (BLOB.GET, BLOB.SET, BLOB.HELLO) may execute safely.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::sync::atomic::{AtomicBool, AtomicI64};
@@ -112,6 +112,20 @@ lazy_static::lazy_static! {
     /// Immutable after load — the poller either starts at init or not at all.
     static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(60);
 
+    /// LFU counter decay: minutes per one-point decrement. 0 disables decay.
+    static ref CFG_TIERED_DECAY_TIME: AtomicI64 = AtomicI64::new(1);
+
+    /// How many misses an object must accumulate in the admission filter before a GET
+    /// promotes it into DRAMPool. Default: 2.
+    static ref CFG_PROMOTE_MIN_HITS: AtomicI64 = AtomicI64::new(2);
+
+    /// Entries sampled per reclaim round; the lowest LFU score is reclaimed.
+    static ref CFG_RECLAIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(5);
+
+    /// Cap on read fds cached by the FdPool. When full, opening a new fd reclaims
+    /// the lowest LFU score among samples. 0 means unlimited.
+    static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(1024);
+
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
     /// ratio, a new segment is added ahead of time. Default: 0.80 (80%).
     static ref CFG_SCALING_EXPAND_WATERMARK: AtomicI64 = AtomicI64::new(80); // stored as percent
@@ -120,7 +134,7 @@ lazy_static::lazy_static! {
     /// the scaling cron evicts the least-used DRAM segment. Default: 0.90 (90%).
     static ref CFG_SCALING_SHRINK_WATERMARK: AtomicI64 = AtomicI64::new(90); // stored as percent
 
-    /// Bench mode: LO.GET TCP path replies with size integer instead of bulk value bytes.
+    /// Bench mode: BLOB.GET TCP path replies with size integer instead of bulk value bytes.
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
     static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
 
@@ -175,7 +189,7 @@ lazy_static::lazy_static! {
     /// Min buffers to start a streaming operation. Below this → reject. Default: 2.
     static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(2);
 
-    /// Maximum allowed object size for LO.SET. Rejects writes exceeding this limit.
+    /// Maximum allowed object size for BLOB.SET. Rejects writes exceeding this limit.
     /// Default: 512 MiB. Must fit in one segment in Dram mode (object_fits_segment
     /// check). Supports memory notation (e.g., "512mb").
     static ref CFG_MAX_OBJECT_SIZE: AtomicI64 = AtomicI64::new(512 * 1024 * 1024);
@@ -250,6 +264,22 @@ pub fn scaling_poll_ms() -> u64 {
 
 pub fn smartlog_poll_secs() -> u64 {
     CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn tiered_decay_time() -> u64 {
+    CFG_TIERED_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn promote_min_hits() -> u8 {
+    CFG_PROMOTE_MIN_HITS.load(std::sync::atomic::Ordering::Relaxed) as u8
+}
+
+pub fn reclaim_sample_size() -> usize {
+    CFG_RECLAIM_SAMPLE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn max_cached_fds() -> usize {
+    CFG_MAX_CACHED_FDS.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn scaling_expand_watermark() -> f64 {
@@ -647,10 +677,10 @@ valkey_module! {
     deinit: deinitialize,
     info: lo_info,
     commands: [
-        ["LO.HELLO", commands::lo_hello, "write", 0, 0, 0],
-        ["LO.GET", commands::lo_get, "readonly", 1, 1, 1],
-        ["LO.SET", commands::lo_set, "write deny-oom", 1, 1, 1],
-        ["LO.INFO", commands::lo_info, "readonly fast", 1, 1, 1],
+        ["BLOB.HELLO", commands::lo_hello, "write", 0, 0, 0],
+        ["BLOB.GET", commands::lo_get, "readonly", 1, 1, 1],
+        ["BLOB.SET", commands::lo_set, "write deny-oom", 1, 1, 1],
+        ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1],
     ],
     configurations: [
         i64: [
@@ -681,6 +711,14 @@ valkey_module! {
             ["max-object-size", &*CFG_MAX_OBJECT_SIZE, 536_870_912, 1, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, 90, 50, 95,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["tiered-decay-time", &*CFG_TIERED_DECAY_TIME, 1, 0, 65_535,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, 2, 1, 255,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["reclaim-sample-size", &*CFG_RECLAIM_SAMPLE_SIZE, 5, 1, 64,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["max-cached-fds", &*CFG_MAX_CACHED_FDS, 1024, 0, 1_048_576,
              ConfigurationFlags::DEFAULT, None, None],
             ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, 0, 0, 65_536,
              ConfigurationFlags::IMMUTABLE, None, None],

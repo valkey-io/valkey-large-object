@@ -26,7 +26,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     Subclasses can override get_module_args() to customize config.
 
     Env vars:
-        MODULE_PATH: path to libvalkey_largeobj.so
+        MODULE_PATH: path to libvalkey_large_object.so
         SERVER_VERSION: valkey-server version directory name
     """
 
@@ -75,6 +75,25 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     def _object_files(self):
         """Every file currently in nvme-dir (name-agnostic)."""
         return sorted(glob.glob(os.path.join(self.data_dir, "*")))
+
+    def subscribe_keyspace_events(self, client):
+        """Enable module keyspace events and return a pubsub on the keyevent channels."""
+        client.execute_command('CONFIG', 'SET', 'notify-keyspace-events', 'KEA')
+        pubsub = client.pubsub()
+        pubsub.psubscribe('__keyevent@*__:largeobj.*')
+        assert pubsub.get_message(timeout=1)['type'] == 'psubscribe'
+        return pubsub
+
+    def read_keyspace_events(self, pubsub, count):
+        """Read up to `count` events as (event, key) tuples."""
+        events = []
+        for _ in range(count):
+            msg = pubsub.get_message()
+            if msg is None:
+                break
+            event = msg['channel'].decode().split(':', 1)[1]
+            events.append((event, msg['data'].decode()))
+        return events
 
     def verify_error_response(self, client, cmd, expected_err_reply):
         try:

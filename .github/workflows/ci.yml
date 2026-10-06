@@ -109,7 +109,7 @@ jobs:
           pip3 install -r requirements.txt
 
       - name: Set module path
-        run: echo "MODULE_PATH=$(realpath target/release/libvalkey_largeobj.so)" >> $GITHUB_ENV
+        run: echo "MODULE_PATH=$(realpath target/release/libvalkey_large_object.so)" >> $GITHUB_ENV
 
       - name: Build test harness
         run: cargo build --release --features test-harness --bin fabric_target

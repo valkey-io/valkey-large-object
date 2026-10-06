@@ -10,6 +10,7 @@ use crc_fast::CrcAlgorithm;
 /// in the `FileHeader`/`LoValue`; the `checksum_combine` accumulator widens to
 /// `u64` internally, which is a crc-fast API detail, not this type.
 pub type Crc = u32;
+pub mod cache_policy;
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
@@ -131,7 +132,7 @@ pub const MAX_SEGMENTS: usize = 16_384;
 
 pub(super) static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
 pub(super) static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
-static FD_POOL: OnceLock<FdPool> = OnceLock::new();
+pub(super) static FD_POOL: OnceLock<FdPool> = OnceLock::new();
 
 pub fn get_dram_pool() -> &'static DRAMPool {
     DRAM_POOL.get().expect("DRAMPool not initialized")
@@ -189,7 +190,8 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         None
     };
     // DRAMPool: always needed (both modes).
-    let dram_pool = DRAMPool::new(dram_segment_count, dram_seg_size);
+    let cache = (mode == crate::OperatingMode::Tiered).then(cache_policy::TieredCache::default);
+    let dram_pool = DRAMPool::new(dram_segment_count, dram_seg_size, cache);
     // io_uring engines: only in Tiered mode. TWO independent engines — one for
     // the DRAM ring, one for the NVMe ring — each registering ONLY its own pool's
     // segments. Ring creation + buffer registration happen on this (main) thread

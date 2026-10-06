@@ -1,11 +1,11 @@
 //! Command Handlers — thin layer that parses args and dispatches to engine.
 //!
-//! LO.HELLO: EFA session establishment
-//! LO.GET key                                            (TCP): engine::execute_get
-//! LO.GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]   (EFA): engine::execute_get
-//! LO.SET key <data>                                     (TCP): engine::execute_set
-//! LO.SET key total_len rkey1 addr1 len1 [...]           (EFA): engine::execute_set
-//! LO.INFO key [LEN|CRC|TIER]: metadata from LoValue, no engine call
+//! BLOB.HELLO: EFA session establishment
+//! BLOB.GET key                                            (TCP): engine::execute_get
+//! BLOB.GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]   (EFA): engine::execute_get
+//! BLOB.SET key <data>                                     (TCP): engine::execute_set
+//! BLOB.SET key total_len rkey1 addr1 len1 [...]           (EFA): engine::execute_set
+//! BLOB.INFO key [LEN|CRC|TIER]: metadata from LoValue, no engine call
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use crate::transport::{self, session, Session};
 /// Upper bound on client memory addresses in one EFA command.
 const MAX_EFA_ADDRESSES: usize = 256;
 
-/// The EFA session the client previously established with LO.HELLO.
+/// The EFA session the client previously established with BLOB.HELLO.
 fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
     session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))
 }
@@ -72,7 +72,7 @@ fn parse_efa_addresses(
     Ok(addrs)
 }
 
-// ─── LO.HELLO ────────────────────────────────────────────────────────────────
+// ─── BLOB.HELLO ────────────────────────────────────────────────────────────────
 //
 // Establishes a fabric session with the client.
 // Client sends its fabric address as hex, opaque to us and in the provider's own format. The
@@ -120,15 +120,15 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     Ok(ValkeyValue::Array(reply))
 }
 
-// ─── LO.GET ──────────────────────────────────────────────────────────────────
+// ─── BLOB.GET ──────────────────────────────────────────────────────────────────
 //
 // Parse args → resolve key → determine transport → dispatch to engine.
 
 pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // Strict arity, decided before the key lookup so a malformed EFA call cannot be
     // answered as if it were a TCP GET (or as a missing key).
-    //   2 args: TCP — LO.GET key
-    //  ≥5 args: EFA — LO.GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
+    //   2 args: TCP — BLOB.GET key
+    //  ≥5 args: EFA — BLOB.GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
     let efa = match args.len() {
         2 => false,
         len if len >= 5 => true,
@@ -149,7 +149,7 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // Pin the file to protect it from asynchronous deletion in tiered mode.
     let file = lo_value.file.clone();
 
-    // EFA: LO.GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
+    // EFA: BLOB.GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
     // Address count is inferred from the triplet args.
     let transport = if efa {
         let addrs = parse_efa_addresses(&args, 2, obj_len)?;
@@ -166,14 +166,14 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 }
 
-// ─── LO.SET ──────────────────────────────────────────────────────────────────
+// ─── BLOB.SET ──────────────────────────────────────────────────────────────────
 //
 // Parse args → determine data source → dispatch to engine.
 
 pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // Strict arity.
-    //   3 args: TCP — LO.SET key <data>
-    //  ≥6 args: EFA — LO.SET key total_len rkey1 addr1 len1 [rkey2 addr2 len2 ...]
+    //   3 args: TCP — BLOB.SET key <data>
+    //  ≥6 args: EFA — BLOB.SET key total_len rkey1 addr1 len1 [rkey2 addr2 len2 ...]
     // 4 and 5 args are rejected: neither a valid TCP call (exactly 3) nor a valid EFA
     // call (needs total_len + at least one triplet).
     let efa = match args.len() {
@@ -184,7 +184,7 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     // Determine data source and obj_len based on transport.
     let (obj_len, data_source) = if efa {
-        // EFA: LO.SET key total_len rkey1 addr1 len1 [rkey2 addr2 len2 ...]
+        // EFA: BLOB.SET key total_len rkey1 addr1 len1 [rkey2 addr2 len2 ...]
         // total_len is required — server needs to know how many bytes to fi_read
         // from the client.
         let obj_len: u64 = args[2]
@@ -195,7 +195,7 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         let session = efa_session(ctx)?;
         (obj_len, DataSource::Efa { session, addrs })
     } else {
-        // TCP path: LO.SET key <data>
+        // TCP path: BLOB.SET key <data>
         // data.len() IS the authoritative length. No user-provided len needed.
         let data = args[2].as_slice().to_vec();
         let obj_len = data.len() as u64;
@@ -222,9 +222,9 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 }
 
-// ─── LO.INFO ─────────────────────────────────────────────────────────────────
+// ─── BLOB.INFO ─────────────────────────────────────────────────────────────────
 //
-// LO.INFO key [LEN | CRC | TIER]
+// BLOB.INFO key [LEN | CRC | TIER]
 //
 // Parse args → resolve key → return metadata field or all fields as array.
 
@@ -310,8 +310,8 @@ mod tests {
 
     #[test]
     fn start_idx_skips_leading_args() {
-        // Simulates LO.GET key rkey addr len — start_idx=2 skips "LO.GET" and "key".
-        let args = vs(&["LO.GET", "key", "7", "64", "4096"]);
+        // Simulates BLOB.GET key rkey addr len — start_idx=2 skips "BLOB.GET" and "key".
+        let args = vs(&["BLOB.GET", "key", "7", "64", "4096"]);
         assert_eq!(
             parse_efa_addresses(&args, 2, 4096).unwrap(),
             vec![(64, 4096, 7)]

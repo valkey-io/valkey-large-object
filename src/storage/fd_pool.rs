@@ -10,22 +10,34 @@
 //!   1. **Reuse** — avoid a fresh `open()` on every GET.
 //!   2. **Serialize the lazy first-open** — the write lock stops two concurrent first-GETs
 //!      on a cold object from both `open()`-ing and leaking an fd.
-//!   3. **Own the fd independently of `ObjectFile`** — a future evictor can drop the pool's
-//!      ref to reclaim a cold fd without disturbing in-flight readers that still hold one.
+//!   3. **Own the fd independently of `ObjectFile`** — reclaim drops the pool's ref to
+//!      reclaim a cold fd without disturbing in-flight readers that still hold one.
 //!
-//! `remove` drops the pool's ref; today only `ObjectFile::Drop` (on delete) calls it. There
-//! is no `Drop for FdPool` — it is a process-lifetime static, so any fds still cached at
-//! teardown are reclaimed by process exit. TODO: a cold-fd evictor will also call `remove`
-//! under fd pressure while the file still exists, after which the next GET reopens.
+//! Cap and reclaim (`docs/CACHE_POLICY_DESIGN.md` §4.8): with `max-cached-fds` set, a
+//! full pool reclaims the lowest-scoring fd. A reader still holding a reclaimed fd keeps
+//! it open until its read finishes.
+//!
+//! `remove` drops the pool's ref; `ObjectFile::Drop` (on delete) calls it. There is no
+//! `Drop for FdPool` — it is a process-lifetime static, so any fds still cached at
+//! teardown are reclaimed by process exit.
 
-use std::collections::HashMap;
 use std::os::unix::io::{FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use super::cache_policy::{now_minutes, reclaim_one, AccessStats, OIDIndexedMap};
 use crate::data_type::ObjectId;
 
+/// One cached fd plus its LFU score.
+struct FdEntry {
+    fd: Arc<OwnedFd>,
+    stats: AccessStats,
+}
+
 pub struct FdPool {
-    fds: RwLock<HashMap<ObjectId, Arc<OwnedFd>>>,
+    fds: RwLock<OIDIndexedMap<FdEntry>>,
+    /// Cached fds dropped to stay under `max-cached-fds`.
+    pub reclaims: AtomicU64,
 }
 
 impl Default for FdPool {
@@ -37,7 +49,8 @@ impl Default for FdPool {
 impl FdPool {
     pub fn new() -> Self {
         Self {
-            fds: RwLock::new(HashMap::new()),
+            fds: RwLock::new(OIDIndexedMap::new()),
+            reclaims: AtomicU64::new(0),
         }
     }
 
@@ -46,23 +59,51 @@ impl FdPool {
     /// used to prevent the underlying fd from being closed during inflight read requests.
     /// Returns `None` only on a genuine `open()` failure.
     pub fn get_or_open(&self, object_id: ObjectId, dir: &str) -> Option<Arc<OwnedFd>> {
-        // Fast path: shared read lock, clone the cached handle if present.
-        let cached = self
-            .fds
-            .read()
-            .expect("FdPool.fds lock unavailable")
-            .get(&object_id)
-            .cloned();
-        if let Some(fd) = cached {
-            return Some(fd);
+        self.get_or_open_with(object_id, dir, crate::max_cached_fds())
+    }
+
+    /// `get_or_open` with an explicit `max-cached-fds` cap (0 = unlimited), so
+    /// parallel unit tests do not share the global config.
+    pub(crate) fn get_or_open_with(
+        &self,
+        object_id: ObjectId,
+        dir: &str,
+        cap: usize,
+    ) -> Option<Arc<OwnedFd>> {
+        let now_min = now_minutes();
+        let decay_time = crate::tiered_decay_time();
+        let hit = |entry: &FdEntry| {
+            entry.stats.touch(now_min, decay_time);
+            Arc::clone(&entry.fd)
+        };
+        // Fast path: shared read lock, touch the score and clone the cached handle.
+        {
+            let fds = self.fds.read().expect("FdPool.fds lock unavailable");
+            if let Some(entry) = fds.get(&object_id) {
+                return Some(hit(entry));
+            }
         }
 
         // Slow path: serialize opens through the write lock.
         let mut fds = self.fds.write().expect("FdPool.fds lock unavailable");
 
         // Re-check under the lock: another caller may have opened it meanwhile.
-        if let Some(fd) = fds.get(&object_id).cloned() {
-            return Some(fd);
+        if let Some(entry) = fds.get(&object_id) {
+            return Some(hit(entry));
+        }
+
+        // Make room before opening, so the cap counts the new entry. Removing an
+        // entry only drops the map's ref: a reader still holding a clone keeps the
+        // fd open until its read finishes, then it closes.
+        if cap > 0 {
+            let samples = crate::reclaim_sample_size();
+            while fds.len() >= cap {
+                reclaim_one(&mut fds, samples, |e| {
+                    Some(e.stats.decayed_counter(now_min, decay_time))
+                })
+                .expect("a non-empty map always yields a victim");
+                self.reclaims.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         let path = object_id.file_path(dir);
@@ -77,7 +118,13 @@ impl FdPool {
             return None;
         }
         let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
-        fds.insert(object_id, Arc::clone(&fd));
+        fds.insert(
+            object_id,
+            FdEntry {
+                fd: Arc::clone(&fd),
+                stats: AccessStats::new(now_min),
+            },
+        );
         Some(fd)
     }
 
@@ -90,7 +137,7 @@ impl FdPool {
             .fds
             .write()
             .expect("FdPool.fds lock unavailable")
-            .remove(&object_id);
+            .swap_remove(&object_id);
         drop(removed);
     }
 
@@ -101,6 +148,15 @@ impl FdPool {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Whether `object_id`'s fd is cached right now. Test helper.
+    #[cfg(test)]
+    fn contains(&self, object_id: ObjectId) -> bool {
+        self.fds
+            .read()
+            .expect("FdPool.fds lock unavailable")
+            .contains_key(&object_id)
     }
 }
 
@@ -160,29 +216,63 @@ mod tests {
 
         let pool = FdPool::new();
         if let Some(reader) = pool.get_or_open(object_id, dir) {
-            let raw = reader.as_raw_fd();
+            let weak = Arc::downgrade(&reader);
             assert_eq!(pool.len(), 1);
 
             // Pool drops its ref; the reader clone is still alive, so fd stays open.
             pool.remove(object_id);
             assert_eq!(pool.len(), 0);
-            // SAFETY: fcntl on the fd; valid because the reader clone holds it open.
-            assert_ne!(
-                unsafe { libc::fcntl(raw, libc::F_GETFD) },
-                -1,
+            assert!(
+                weak.upgrade().is_some(),
                 "fd must stay open while a reader clone is alive"
             );
 
             // Last clone drops -> OwnedFd::drop closes the fd.
             drop(reader);
-            // SAFETY: fcntl on the now-closed fd returns -1 with EBADF, no crash.
-            assert_eq!(
-                unsafe { libc::fcntl(raw, libc::F_GETFD) },
-                -1,
+            assert!(
+                weak.upgrade().is_none(),
                 "fd must be closed once the last clone drops"
             );
         }
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ─── Cap and reclaim ───
+    // Victim choice and the cap count are covered end to end by
+    // TestLargeObjTieredFdCap. This case needs a reader holding an fd across a
+    // reclaim, which a client cannot line up, so it stays here.
+
+    #[test]
+    fn reclaimed_fd_stays_open_for_its_reader() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let oids = [ObjectId(0x7370), ObjectId(0x7371)];
+        for oid in &oids {
+            std::fs::write(oid.file_path(dir), b"x").unwrap();
+        }
+        let pool = FdPool::new();
+
+        if let Some(reader) = pool.get_or_open_with(oids[0], dir, 1) {
+            let weak = Arc::downgrade(&reader);
+
+            // Pool full: the next open reclaims the held fd and caches the new one.
+            pool.get_or_open_with(oids[1], dir, 1).unwrap();
+            assert_eq!(pool.len(), 1, "cap holds");
+            assert!(!pool.contains(oids[0]));
+            assert!(pool.contains(oids[1]));
+            assert_eq!(pool.reclaims.load(Ordering::Relaxed), 1);
+            assert!(
+                weak.upgrade().is_some(),
+                "reader keeps the reclaimed fd open"
+            );
+
+            drop(reader);
+            assert!(weak.upgrade().is_none(), "fd closes with its last reader");
+        }
+
+        for oid in &oids {
+            let _ = std::fs::remove_file(oid.file_path(dir));
+        }
     }
 }

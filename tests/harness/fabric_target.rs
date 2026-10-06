@@ -6,12 +6,12 @@
 //! # prints, once per region: advertisement: <address-hex> <rkey> <remote-addr> <len>
 //! cargo run --features test-harness --bin fabric_target -- 127.0.0.1
 //! # against a module started with fabric-provider Emulated:
-//! LO.HELLO <address-hex>
-//! LO.GET key 1 <rkey> <remote-addr> <len>    # writes the object into the target's buffer
+//! BLOB.HELLO <address-hex>
+//! BLOB.GET key 1 <rkey> <remote-addr> <len>    # writes the object into the target's buffer
 //! ```
 //!
 //! `--read` prefills the buffers and serves them for
-//! `LO.SET key <len> 1 <rkey> <remote-addr> <len>` instead. This holds the buffers open and lets
+//! `BLOB.SET key <len> 1 <rkey> <remote-addr> <len>` instead. This holds the buffers open and lets
 //! the initiator do the verifying.
 //!
 //! `--split=<size1>,<size2>[,...]` registers N separate allocations of the given sizes instead of
@@ -21,7 +21,7 @@
 //!
 //! `--efa` opens the `efa-direct` fabric instead of tcp loopback. There a target must hold the
 //! initiator's address before it can be RMA'd against, so it takes one as its only positional.
-//! `LO.HELLO` can't supply it, since HELLO needs the target's address first. The module logs each
+//! `BLOB.HELLO` can't supply it, since HELLO needs the target's address first. The module logs each
 //! service's address at load (`largeobj: fabric service N address <hex>`).
 
 use std::ffi::CString;
@@ -360,7 +360,7 @@ fn main() -> Result<(), String> {
     }
 
     // One line per region, in the order the object's bytes span them. The initiator carries these
-    // into LO.GET / LO.SET as its (rkey, addr, len) triples.
+    // into BLOB.GET / BLOB.SET as its (rkey, addr, len) triples.
     let address_hex = encode_hex(&address);
     for (remote_key, remote_address, length) in &advertisements {
         println!("advertisement: {address_hex} {remote_key} {remote_address} {length}");

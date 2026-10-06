@@ -34,9 +34,27 @@ pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
 fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     dram_pool_section(ctx)?;
     nvme_staging_section(ctx)?;
+    fd_pool_section(ctx)?;
     smartlog_section(ctx)?;
     error_metrics_section(ctx)?;
     Ok(())
+}
+
+/// Tiered only: absent in Dram mode, where no FdPool exists.
+fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    let Some(fds) = storage::FD_POOL.get() else {
+        return Ok(());
+    };
+    ctx.builder()
+        .add_section("fd")
+        .field("open_fds", fds.len() as i64)?
+        .field(
+            "fd_reclaims_total",
+            fds.reclaims.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
 }
 
 fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
@@ -50,7 +68,8 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let allocated = dram.allocated_bytes();
     let util_pct = (allocated * 100).checked_div(capacity).unwrap_or(0) as i64;
 
-    ctx.builder()
+    let mut section = ctx
+        .builder()
         .add_section("dram")
         .field("dram_live_segments", live as i64)?
         .field("draining_segments", draining as i64)?
@@ -60,6 +79,31 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("capacity_bytes", capacity as i64)?
         .field("utilization_pct", util_pct)?
         .field("cached_objects", dram.object_count() as i64)?
+        .field(
+            "reclaims_total",
+            dram.reclaims.load(Ordering::Relaxed) as i64,
+        )?;
+    // Cache counters exist only in Tiered mode.
+    if let Some(cache) = &dram.cache {
+        section = section
+            .field(
+                "cache_hits_total",
+                cache.stats.hits.load(Ordering::Relaxed) as i64,
+            )?
+            .field(
+                "cache_misses_total",
+                cache.stats.misses.load(Ordering::Relaxed) as i64,
+            )?
+            .field(
+                "promotions_total",
+                cache.stats.promotions.load(Ordering::Relaxed) as i64,
+            )?
+            .field(
+                "admission_rejects_total",
+                cache.admission.rejects.load(Ordering::Relaxed) as i64,
+            )?;
+    }
+    section
         .field(
             "scaling_expand_total",
             dram.expand_count.load(std::sync::atomic::Ordering::Relaxed) as i64,

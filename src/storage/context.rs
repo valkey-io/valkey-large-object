@@ -20,6 +20,8 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
+use super::cache_policy::{now_minutes, AccessStats};
+
 // ─── SegmentBuffer ───────────────────────────────────────────────────────────
 
 /// A buffer that is a sub-allocation within a registered segment.
@@ -89,6 +91,8 @@ pub struct ObjectContext {
     state: AtomicU8,
     /// Chunks completed during promotion (only meaningful when state == Filling).
     chunks_ready: AtomicU32,
+    /// LFU access score for the cache policy.
+    pub stats: AccessStats,
 }
 
 impl ObjectContext {
@@ -98,6 +102,7 @@ impl ObjectContext {
             buffers,
             state: AtomicU8::new(ObjectState::Ready as u8),
             chunks_ready: AtomicU32::new(0),
+            stats: AccessStats::new(now_minutes()),
         }
     }
 
@@ -107,6 +112,7 @@ impl ObjectContext {
             buffers,
             state: AtomicU8::new(ObjectState::Filling as u8),
             chunks_ready: AtomicU32::new(0),
+            stats: AccessStats::new(now_minutes()),
         }
     }
 

@@ -43,7 +43,7 @@ impl ObjectId {
 
 // ─── Tier ────────────────────────────────────────────────────────────────────
 
-/// Storage tier an object is currently served from. Reported by `LO.INFO`.
+/// Storage tier an object is currently served from. Reported by `BLOB.INFO`.
 pub enum Tier {
     /// Resident in DRAMPool (Dram mode always; Tiered mode when promoted).
     Dram,
@@ -52,7 +52,7 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// Lowercase token used in LO.INFO replies.
+    /// Lowercase token used in BLOB.INFO replies.
     pub fn as_str(self) -> &'static str {
         match self {
             Tier::Dram => "dram",
