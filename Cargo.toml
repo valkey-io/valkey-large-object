@@ -49,6 +49,7 @@ opt-level = 0
 debug = 2
 
 [features]
-default = []
+default = ["min-valkey-compatibility-version-8-0"]
 enable-system-alloc = ["valkey-module/enable-system-alloc", "valkey-module/test-shims"]
+min-valkey-compatibility-version-8-0 = []
 test-harness = []
