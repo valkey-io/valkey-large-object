@@ -62,7 +62,7 @@ impl IoStats {
     }
 }
 
-/// One direction of EFA traffic: successful transfers and their payload bytes.
+/// One direction of EFA traffic: transfers and the bytes they moved.
 #[derive(Default)]
 pub struct EfaStats {
     transfers: IoStats,
@@ -77,10 +77,10 @@ impl EfaStats {
         }
     }
 
-    /// Record one successful transfer of `len` bytes that started at `started`.
-    pub fn record(&self, started: Instant, len: u64) {
+    /// Record one transfer that started at `started` and moved `bytes`.
+    pub fn record(&self, started: Instant, bytes: u64) {
         self.transfers.record(started);
-        self.bytes.fetch_add(len, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 }
 
@@ -89,13 +89,13 @@ impl EfaStats {
 pub static NVME_READS: IoStats = IoStats::new();
 pub static NVME_WRITES: IoStats = IoStats::new();
 
-/// Successful EFA transfers, timed from submission to completion, one per client
+/// EFA transfers, timed from submission to completion, one per client
 /// address of a chunk. Reads pull client memory (the SET path); writes push into
 /// it (the GET path). The time includes any wait behind `fabric-max-in-flight`.
 pub static EFA_READS: EfaStats = EfaStats::new();
 pub static EFA_WRITES: EfaStats = EfaStats::new();
 
-/// `part` as a percentage of `whole`, to two decimals like Valkey's own ("99.99").
+/// `part` as a percentage of `whole`, to two decimals ("99.99").
 fn pct(part: u64, whole: u64) -> String {
     if whole == 0 {
         return "0.00".to_string();

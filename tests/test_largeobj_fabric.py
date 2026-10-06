@@ -303,6 +303,26 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         finally:
             process.kill()
 
+    def test_info_efa_counts_failed_transfers(self):
+        """A failed transfer counts in the transfer total and time, but adds no bytes."""
+        process, regions = self.start_target()
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.SET', 'key', PATTERN)
+            client.execute_command('BLOB.HELLO', regions[0].address)
+            # Just past the end of the target's registered region.
+            region = regions[0]
+            self.verify_error_response(
+                client, f'BLOB.GET key {region.rkey} {region.addr + region.len} {region.len}',
+                'EFA write')
+            efa = client.info('largeobj_efa')
+            assert efa['largeobj_efa_writes_total'] == 1
+            assert efa['largeobj_efa_write_usec_total'] > 0
+            assert efa['largeobj_efa_write_bytes_total'] == 0
+            assert client.info('largeobj_error_metrics')['largeobj_efa_write_errors'] == 1
+        finally:
+            process.kill()
+
 
 class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
     """Tiered mode with promotion off to run the NVMe paths."""

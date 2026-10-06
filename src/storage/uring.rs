@@ -108,8 +108,7 @@ impl PendingOp {
         }
     }
 
-    /// Credit this op's time since its SQE push to INFO. Called for every reaped
-    /// CQE, failed or short ones included: they still occupied the device.
+    /// Record this op's time since its SQE push in INFO, including failed and short I/Os.
     fn record_completion(&self, pushed_at: Instant) {
         let stats = match self {
             PendingOp::Read { .. } => &crate::info::NVME_READS,

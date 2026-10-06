@@ -771,9 +771,10 @@ pub(crate) async fn efa_transfer_addrs(
     }
     let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
     while let Some((idx, started, (outcome, _operand))) = indexed_futures.next().await {
+        // Failed transfers count too, with no bytes.
+        let moved = if outcome.is_ok() { sub_lens[idx] } else { 0 };
+        stats.record(started, moved as u64);
         let done = outcome.map_err(|_| ValkeyError::Str(err_str))?;
-        // Successful transfers only, so a failure can't skew bytes or latency.
-        stats.record(started, sub_lens[idx] as u64);
         results[idx] = match direction {
             // SET path: transport must provide a checksum for CRC combination.
             EfaDirection::Read => Some(
