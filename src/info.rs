@@ -47,8 +47,8 @@ fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .add_section("fd")
         .field("open_fds", fds.len() as i64)?
         .field(
-            "fd_demotions_total",
-            fds.demotions.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            "fd_reclaims_total",
+            fds.reclaims.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .build_section()?
         .build_info()

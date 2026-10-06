@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::cache_policy::{
-    now_minutes, sample_victim, OIDIndexedMap, TieredCache, RECLAIM_MAX_VICTIMS,
+    now_minutes, sample_victim, OIDIndexedMap, OIDIndexedSet, TieredCache, RECLAIM_MAX_VICTIMS,
 };
 use super::context::{ObjectContext, SegmentBuffer};
 use super::segment_pool::SegmentPool;
@@ -26,18 +26,18 @@ use crate::data_type::ObjectId;
 #[derive(Default)]
 struct ObjectMaps {
     all: OIDIndexedMap<Arc<ObjectContext>>,
-    /// `by_segment[s]`: OIDs whose first buffer is in segment `s`. Tiered
-    /// objects never span segments, so that is the only segment they use.
-    by_segment: Vec<OIDIndexedMap<()>>,
+    /// `by_segment[s]`: OIDs of the objects in segment `s`. An object never
+    /// spans segments, so its first buffer names its segment.
+    by_segment: Vec<OIDIndexedSet>,
 }
 
 impl ObjectMaps {
     fn insert(&mut self, oid: ObjectId, ctx: Arc<ObjectContext>) {
         let s = ctx.buffers[0].segment_idx as usize;
         if s >= self.by_segment.len() {
-            self.by_segment.resize_with(s + 1, OIDIndexedMap::new);
+            self.by_segment.resize_with(s + 1, OIDIndexedSet::new);
         }
-        self.by_segment[s].insert(oid, ());
+        self.by_segment[s].insert(oid);
         let old = self.all.insert(oid, ctx);
         debug_assert!(old.is_none(), "OIDs are never reused");
     }
@@ -48,15 +48,12 @@ impl ObjectMaps {
         Some(ctx)
     }
 
-    /// Remove every object in segment `seg` (shrink). The index is complete for
-    /// any segment shrink can pick: Tiered objects never span segments, and
-    /// Dram mode only shrinks empty segments, so a split Dram COPY never meets
-    /// this. Revisit if Dram shrink ever relocates live data.
-    fn remove_segment(&mut self, seg: usize) {
+    /// Remove every object in segment `seg` (shrink).
+    fn remove_by_segment_id(&mut self, seg: usize) {
         let Some(ids) = self.by_segment.get_mut(seg) else {
             return;
         };
-        for oid in std::mem::take(ids).into_keys() {
+        for oid in std::mem::take(ids) {
             self.all.swap_remove(&oid);
         }
     }
@@ -72,10 +69,10 @@ impl ObjectMaps {
     ) -> Option<(ObjectId, Arc<ObjectContext>)> {
         let ids = self.by_segment.get_mut(seg)?;
         let slot = sample_victim(ids.len(), samples, |s| {
-            let ctx = self.all.get(ids.get_index(s)?.0)?;
+            let ctx = self.all.get(ids.get_index(s)?)?;
             (Arc::strong_count(ctx) == 1).then(|| ctx.stats.decayed_counter(now_min, decay_time))
         })?;
-        let (oid, ()) = ids.swap_remove_index(slot)?;
+        let oid = ids.swap_remove_index(slot)?;
         Some((oid, self.all.swap_remove(&oid)?))
     }
 }
@@ -296,8 +293,14 @@ impl DRAMPool {
     /// `alloc_exact` would pick, then allocate `obj_len` there. That segment
     /// is the least loaded, so it needs the fewest victims. None if it cannot
     /// be made to fit.
+    ///
+    /// TODO: hold the SegmentPool state lock from `segment_shortfall` through
+    /// `alloc_exact_in` so a concurrent alloc cannot take the freed space. Needs
+    /// lock-taking variants of the segment APIs and of the free path that
+    /// `ObjectContext::drop` uses, and a fix for the lock order (shrink frees
+    /// buffers while holding `objects`, so today the order is objects -> state).
     fn make_room_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
-        let (seg, short) = self.pool.reclaim_target(obj_len)?;
+        let (seg, short) = self.pool.segment_shortfall(obj_len)?;
         // short == 0: the bytes fit but talc overhead blocked the alloc, so
         // free at least one victim.
         let victims = self.reclaim_in(seg, short.max(1), RECLAIM_MAX_VICTIMS)?;
@@ -316,7 +319,7 @@ impl DRAMPool {
         need: usize,
         max_victims: usize,
     ) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
-        let samples = crate::demote_sample_size();
+        let samples = crate::reclaim_sample_size();
         let now_min = now_minutes();
         let decay_time = crate::tiered_decay_time();
         let mut objects = self
@@ -447,7 +450,7 @@ impl DRAMPool {
         self.objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
-            .remove_segment(victim_idx);
+            .remove_by_segment_id(victim_idx);
 
         self.shrink_count.fetch_add(1, Ordering::Relaxed);
         true
@@ -489,7 +492,7 @@ mod tests {
         let m = p.objects.read().unwrap();
         for (oid, ctx) in &m.all {
             let s = ctx.buffers[0].segment_idx as usize;
-            assert!(m.by_segment[s].contains_key(oid), "{oid:?} not indexed");
+            assert!(m.by_segment[s].contains(oid), "{oid:?} not indexed");
         }
         let indexed: usize = m.by_segment.iter().map(|ids| ids.len()).sum();
         assert_eq!(indexed, m.all.len());
@@ -586,13 +589,13 @@ mod tests {
         // Shrink drains one segment's index and leaves the others alone.
         p.insert_object(ObjectId(4), ctx(0, 3));
         p.insert_object(ObjectId(5), ctx(0, 4));
-        p.objects.write().unwrap().remove_segment(0);
+        p.objects.write().unwrap().remove_by_segment_id(0);
         assert!(!p.contains_object(&ObjectId(4)));
         assert!(!p.contains_object(&ObjectId(5)));
         assert_eq!(p.object_count(), 2, "segment 1 objects survive");
         assert_index_consistent(&p);
         // A segment that never held anything is a no-op.
-        p.objects.write().unwrap().remove_segment(7);
+        p.objects.write().unwrap().remove_by_segment_id(7);
         assert_eq!(p.object_count(), 2);
     }
 }

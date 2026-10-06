@@ -1,12 +1,12 @@
 //! Cache policy primitives shared by DRAMPool and FdPool (see
 //! `docs/CACHE_POLICY_DESIGN.md`): `AccessStats` (Valkey-style LFU score),
-//! `OIDIndexedMap` (an `IndexMap` with sampled demotion), and the Tiered-only
+//! `OIDIndexedMap` (an `IndexMap` with sampled reclaim), and the Tiered-only
 //! `AdmissionFilter`, `CacheStats` and `TieredCache`. Only `AdmissionFilter`
 //! locks; the pools call the rest under their own locks.
 
 use std::collections::{HashMap, VecDeque};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -63,7 +63,7 @@ impl AccessStats {
     }
 
     /// Counter after applying decay for the minutes elapsed since the last
-    /// decay. This is what demotion ranks by. `decay_time == 0` disables decay.
+    /// decay. This is what reclaim ranks by. `decay_time == 0` disables decay.
     pub fn decayed_counter(&self, now_min: u16, decay_time: u64) -> u8 {
         let raw = self.0.load(Ordering::Relaxed);
         Self::decay(
@@ -239,9 +239,6 @@ pub(super) fn sample_victim<F>(len: usize, samples: usize, mut probe: F) -> Opti
 where
     F: FnMut(usize) -> Option<u8>,
 {
-    if len == 0 || samples == 0 {
-        return None;
-    }
     let mut best: Option<(usize, u8)> = None;
     let mut consider = |slot: usize| {
         if let Some(score) = probe(slot) {
@@ -266,9 +263,12 @@ where
 /// and `swap_remove` is O(1).
 pub type OIDIndexedMap<V> = IndexMap<ObjectId, V>;
 
+/// The set form of `OIDIndexedMap`: same dense storage and O(1) `swap_remove`.
+pub type OIDIndexedSet = IndexSet<ObjectId>;
+
 /// Remove and return the lowest-scoring entry among up to `samples` slots
 /// (see `sample_victim`). `score` returns `None` for a pinned entry.
-pub fn demote_one<V, F>(
+pub fn reclaim_one<V, F>(
     map: &mut OIDIndexedMap<V>,
     samples: usize,
     mut score: F,
@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn sample_victim_scans_small_maps_and_skips_pinned() {
         // len <= samples: every slot is probed exactly once, so the minimum
-        // demotable score is found exactly. Slot 1 (score 3) is pinned.
+        // reclaimable score is found exactly. Slot 1 (score 3) is pinned.
         let scores = [50u8, 3, 20, 7];
         let mut probed = [0u32; 4];
         let v = sample_victim(4, 4, |i| {
@@ -362,7 +362,7 @@ mod tests {
         });
         assert_eq!(v, Some(3));
         assert_eq!(probed, [1; 4]);
-        // Empty map, no draws, or everything pinned: no victim.
+        // Empty map or everything pinned: no victim.
         assert_eq!(sample_victim(0, 5, |_| Some(0)), None);
         assert_eq!(sample_victim(5, 0, |_| Some(0)), None);
         assert_eq!(sample_victim(4, 16, |_| None), None);
@@ -384,21 +384,21 @@ mod tests {
         assert_eq!(Some(&v), probed.iter().next());
     }
 
-    // ─── demote_one ───
+    // ─── reclaim_one ───
 
     #[test]
-    fn demote_one_removes_lowest_unpinned() {
+    fn reclaim_one_removes_lowest_unpinned() {
         let mut m: OIDIndexedMap<u8> = OIDIndexedMap::new();
         for (i, score) in [50u8, 3, 20, 7].into_iter().enumerate() {
             m.insert(ObjectId(i as u64), score);
         }
         // Score 3 is pinned, so 7 is the victim.
-        let v = demote_one(&mut m, 16, |&s| (s != 3).then_some(s));
+        let v = reclaim_one(&mut m, 16, |&s| (s != 3).then_some(s));
         assert_eq!(v, Some((ObjectId(3), 7)));
         assert_eq!(m.len(), 3);
         assert!(!m.contains_key(&ObjectId(3)));
         // Everything pinned: nothing removed.
-        assert_eq!(demote_one(&mut m, 16, |_| None), None);
+        assert_eq!(reclaim_one(&mut m, 16, |_| None), None);
         assert_eq!(m.len(), 3);
     }
 }

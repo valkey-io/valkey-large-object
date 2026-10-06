@@ -904,15 +904,15 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'dram'
 
 
-# ─── Inline demotion ────────────────────────────────────────────────────────
+# ─── Inline reclaim ────────────────────────────────────────────────────────
 
 
-class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
+class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
     """One 1 MiB segment, no room to grow (server maxmemory leaves less than a
     segment of headroom, see _block_expansion), so a promotion into a full pool
-    must demote. promote-min-hits 1 so every GET
+    must reclaim. promote-min-hits 1 so every GET
     promotes; decay off so scores are stable across a minute boundary. The
-    default demote-sample-size (5) exceeds the 3-entry map, so victim selection
+    default reclaim-sample-size (5) exceeds the 3-entry map, so victim selection
     scans every entry and is exact. 256 KiB objects: three fill 768 KiB; a
     fourth needs the remaining 256 KiB exactly, which any allocator overhead
     denies."""
@@ -944,8 +944,8 @@ class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
         client.config_set('maxmemory-policy', 'noeviction')
         client.config_set('maxmemory', int((used + 512 * 1024) / watermark))
 
-    def test_demotes_lowest_score_object(self):
-        """A fourth promotion into the full pool demotes exactly one cold object and
+    def test_reclaims_lowest_score_object(self):
+        """A fourth promotion into the full pool reclaims exactly one cold object and
         never the hot one."""
         client = self.server.get_new_client()
         self._block_expansion(client)
@@ -977,10 +977,10 @@ class TestLargeObjTieredDemotion(ValkeyLargeObjTestCaseBase):
         tiers = [client.execute_command('BLOB.INFO', k, 'TIER') for k in self.KEYS[1:]]
         assert tiers.count(b'nvme') == 1, tiers
 
-        # The demoted copy is still on NVMe and reads back intact.
-        demoted = self.KEYS[1:][tiers.index(b'nvme')]
-        idx = self.KEYS.index(demoted)
-        assert client.execute_command('BLOB.GET', demoted) == bytes([65 + idx]) * self.OBJ
+        # The reclaimed copy is still on NVMe and reads back intact.
+        reclaimed = self.KEYS[1:][tiers.index(b'nvme')]
+        idx = self.KEYS.index(reclaimed)
+        assert client.execute_command('BLOB.GET', reclaimed) == bytes([65 + idx]) * self.OBJ
 
 
 class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
@@ -989,7 +989,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
     expands once for the fourth. Segment 1 then gets the coldest objects, so a
     reclaim that looked across the whole pool would take one of those. The
     target is segment 0 (768 KiB vs 832 KiB) and its 3 entries are fewer than
-    the default demote-sample-size (5), so the victim choice there is exact.
+    the default reclaim-sample-size (5), so the victim choice there is exact.
     The expand watermark is raised so the scaling cron never adds a third
     segment (2 MiB, at most 78% full)."""
 
@@ -1028,7 +1028,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
 
         # No more growth. Segment 1 (D, 256 KiB) is the less loaded one, so E,
         # H and F all land there: 256 + 256 + 64 + 256 = 832 KiB.
-        TestLargeObjTieredDemotion._block_expansion(self, client)
+        TestLargeObjTieredReclaim._block_expansion(self, client)
         self._promote(client, 'E', b'E' * self.OBJ)
         self._promote(client, 'H', b'H' * self.SMALL)
         self._promote(client, 'F', b'F' * self.OBJ)
@@ -1057,9 +1057,9 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
 
 
 class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
-    """max-open-fds 2 with promotion effectively off (promote-min-hits 255), so
+    """max-cached-fds 2 with promotion effectively off (promote-min-hits 255), so
     every GET reads through the fd pool. Decay off so scores are stable across
-    a minute boundary. The default demote-sample-size (5) exceeds the 2-entry
+    a minute boundary. The default reclaim-sample-size (5) exceeds the 2-entry
     map, so victim selection scans both entries and is exact."""
 
     OBJ = 64 * 1024
@@ -1074,7 +1074,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             f" max-promote-size 983040"
             f" promote-min-hits 255"
             f" tiered-decay-time 0"
-            f" max-open-fds 2"
+            f" max-cached-fds 2"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
@@ -1084,7 +1084,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         return bytes([65 + i]) * self.OBJ
 
     def test_cap_respected_and_reads_succeed(self):
-        """Reading more objects than the cap keeps open_fds at the cap, demotes
+        """Reading more objects than the cap keeps open_fds at the cap, reclaims
         exactly the overflow, and every read still returns the right bytes."""
         client = self.server.get_new_client()
         for i, k in enumerate(self.KEYS):
@@ -1097,7 +1097,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
 
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_demotions_total'] == 3
+        assert info['largeobj_fd_reclaims_total'] == 3
         # Nothing was promoted, so these were all NVMe reads.
         dram = client.info('largeobj_dram')
         assert dram['largeobj_cached_objects'] == 0
@@ -1107,10 +1107,10 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('BLOB.GET', k) == self._payload(i)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        demotions = info['largeobj_fd_demotions_total']
+        reclaims = info['largeobj_fd_reclaims_total']
 
         # DEL drops the pool's fd through ObjectFile::Drop, so the next open
-        # takes the free slot instead of demoting. KEYS[4] was read last, so
+        # takes the free slot instead of reclaiming. KEYS[4] was read last, so
         # its fd is one of the two cached.
         client.execute_command('DEL', self.KEYS[4])
         wait_for_equal(
@@ -1118,12 +1118,12 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_demotions_total'] == demotions
+        assert info['largeobj_fd_reclaims_total'] == reclaims
 
-    def test_demotes_coldest_keeps_hot(self):
-        """A full pool demotes the lowest-scoring fd. KEYS[0] is read three
-        times and KEYS[1] once, so opening KEYS[2] must demote KEYS[1], and a
-        later read of KEYS[0] is a cache hit that demotes nothing."""
+    def test_reclaims_coldest_keeps_hot(self):
+        """A full pool reclaims the lowest-scoring fd. KEYS[0] is read three
+        times and KEYS[1] once, so opening KEYS[2] must reclaim KEYS[1], and a
+        later read of KEYS[0] is a cache hit that reclaims nothing."""
         client = self.server.get_new_client()
         for i, k in enumerate(self.KEYS[:3]):
             client.execute_command('BLOB.SET', k, self._payload(i))
@@ -1135,18 +1135,18 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.GET', self.KEYS[1]) == self._payload(1)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_demotions_total'] == 0
+        assert info['largeobj_fd_reclaims_total'] == 0
 
         assert client.execute_command('BLOB.GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_demotions_total'] == 1
+        assert info['largeobj_fd_reclaims_total'] == 1
 
-        # KEYS[0] survived, so reading it again needs no open and no demotion.
+        # KEYS[0] survived, so reading it again needs no open and no reclaim.
         assert client.execute_command('BLOB.GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_demotions_total'] == 1
+        assert info['largeobj_fd_reclaims_total'] == 1
 
     def test_lower_cap_at_runtime(self):
         """CONFIG SET to a smaller cap takes effect on the next open."""
@@ -1156,9 +1156,9 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('BLOB.GET', k) == self._payload(i)
         assert client.info('largeobj_fd')['largeobj_open_fds'] == 2
 
-        client.execute_command('CONFIG', 'SET', 'largeobj.max-open-fds', '1')
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '1')
         client.execute_command('BLOB.SET', self.KEYS[2], self._payload(2))
         assert client.execute_command('BLOB.GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 1
-        assert info['largeobj_fd_demotions_total'] == 2
+        assert info['largeobj_fd_reclaims_total'] == 2

@@ -10,11 +10,11 @@
 //!   1. **Reuse** — avoid a fresh `open()` on every GET.
 //!   2. **Serialize the lazy first-open** — the write lock stops two concurrent first-GETs
 //!      on a cold object from both `open()`-ing and leaking an fd.
-//!   3. **Own the fd independently of `ObjectFile`** — demotion drops the pool's ref to
+//!   3. **Own the fd independently of `ObjectFile`** — reclaim drops the pool's ref to
 //!      reclaim a cold fd without disturbing in-flight readers that still hold one.
 //!
-//! Cap and demotion (`docs/CACHE_POLICY_DESIGN.md` §4.8): with `max-open-fds` set, a
-//! full pool demotes the lowest-scoring fd. A reader still holding a demoted fd keeps
+//! Cap and reclaim (`docs/CACHE_POLICY_DESIGN.md` §4.8): with `max-cached-fds` set, a
+//! full pool reclaims the lowest-scoring fd. A reader still holding a reclaimed fd keeps
 //! it open until its read finishes.
 //!
 //! `remove` drops the pool's ref; `ObjectFile::Drop` (on delete) calls it. There is no
@@ -25,7 +25,7 @@ use std::os::unix::io::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use super::cache_policy::{demote_one, now_minutes, AccessStats, OIDIndexedMap};
+use super::cache_policy::{now_minutes, reclaim_one, AccessStats, OIDIndexedMap};
 use crate::data_type::ObjectId;
 
 /// One cached fd plus its LFU score.
@@ -36,8 +36,8 @@ struct FdEntry {
 
 pub struct FdPool {
     fds: RwLock<OIDIndexedMap<FdEntry>>,
-    /// Cached fds dropped to stay under `max-open-fds`.
-    pub demotions: AtomicU64,
+    /// Cached fds dropped to stay under `max-cached-fds`.
+    pub reclaims: AtomicU64,
 }
 
 impl Default for FdPool {
@@ -50,7 +50,7 @@ impl FdPool {
     pub fn new() -> Self {
         Self {
             fds: RwLock::new(OIDIndexedMap::new()),
-            demotions: AtomicU64::new(0),
+            reclaims: AtomicU64::new(0),
         }
     }
 
@@ -59,10 +59,10 @@ impl FdPool {
     /// used to prevent the underlying fd from being closed during inflight read requests.
     /// Returns `None` only on a genuine `open()` failure.
     pub fn get_or_open(&self, object_id: ObjectId, dir: &str) -> Option<Arc<OwnedFd>> {
-        self.get_or_open_with(object_id, dir, crate::max_open_fds())
+        self.get_or_open_with(object_id, dir, crate::max_cached_fds())
     }
 
-    /// `get_or_open` with an explicit `max-open-fds` cap (0 = unlimited), so
+    /// `get_or_open` with an explicit `max-cached-fds` cap (0 = unlimited), so
     /// parallel unit tests do not share the global config.
     pub(crate) fn get_or_open_with(
         &self,
@@ -96,13 +96,13 @@ impl FdPool {
         // entry only drops the map's ref: a reader still holding a clone keeps the
         // fd open until its read finishes, then it closes.
         if cap > 0 {
-            let samples = crate::demote_sample_size();
+            let samples = crate::reclaim_sample_size();
             while fds.len() >= cap {
-                demote_one(&mut fds, samples, |e| {
+                reclaim_one(&mut fds, samples, |e| {
                     Some(e.stats.decayed_counter(now_min, decay_time))
                 })
                 .expect("a non-empty map always yields a victim");
-                self.demotions.fetch_add(1, Ordering::Relaxed);
+                self.reclaims.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -238,13 +238,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ─── Cap and demotion ───
+    // ─── Cap and reclaim ───
     // Victim choice and the cap count are covered end to end by
     // TestLargeObjTieredFdCap. This case needs a reader holding an fd across a
-    // demotion, which a client cannot line up, so it stays here.
+    // reclaim, which a client cannot line up, so it stays here.
 
     #[test]
-    fn demoted_fd_stays_open_for_its_reader() {
+    fn reclaimed_fd_stays_open_for_its_reader() {
         let dir = std::env::temp_dir();
         let dir = dir.to_str().unwrap();
         let oids = [ObjectId(0x7370), ObjectId(0x7371)];
@@ -256,13 +256,16 @@ mod tests {
         if let Some(reader) = pool.get_or_open_with(oids[0], dir, 1) {
             let weak = Arc::downgrade(&reader);
 
-            // Pool full: the next open demotes the held fd and caches the new one.
+            // Pool full: the next open reclaims the held fd and caches the new one.
             pool.get_or_open_with(oids[1], dir, 1).unwrap();
             assert_eq!(pool.len(), 1, "cap holds");
             assert!(!pool.contains(oids[0]));
             assert!(pool.contains(oids[1]));
-            assert_eq!(pool.demotions.load(Ordering::Relaxed), 1);
-            assert!(weak.upgrade().is_some(), "reader keeps the demoted fd open");
+            assert_eq!(pool.reclaims.load(Ordering::Relaxed), 1);
+            assert!(
+                weak.upgrade().is_some(),
+                "reader keeps the reclaimed fd open"
+            );
 
             drop(reader);
             assert!(weak.upgrade().is_none(), "fd closes with its last reader");

@@ -21,12 +21,12 @@ The target workload is LLM KV-cache reuse (LMCache via Glide). Its access patter
 The cost model is also unusual for a cache:
 
 1. A miss costs one NVMe read either way. A promoted miss reads straight into DRAMPool buffers via `ReadFixed`; a non-promoted miss reads into a transient NVMePool buffer. Same I/O, zero extra copies. Admission is therefore free in I/O terms and only spends DRAM capacity.
-2. Demotion is a map remove. The buffers return to the owning segment's talc when the last `Arc<ObjectContext>` drops.
-3. The benefit of a DRAM hit scales with object size. Large objects are bandwidth bound on the drive, while DRAM feeds the EFA link at line rate. Benefit per byte is roughly constant, so a size-normalized score (GDSF style, frequency divided by size) adds complexity without changing the ranking. Size matters only operationally: promoting a large object may require several demotions.
+2. Reclaim is a map remove. The buffers return to the owning segment's talc when the last `Arc<ObjectContext>` drops.
+3. The benefit of a DRAM hit scales with object size. Large objects are bandwidth bound on the drive, while DRAM feeds the EFA link at line rate. Benefit per byte is roughly constant, so a size-normalized score (GDSF style, frequency divided by size) adds complexity without changing the ranking. Size matters only operationally: promoting a large object may require several reclaims.
 
 ## 3. Decision
 
-Use Valkey's approximated LFU (a logarithmic frequency counter with time-based decay) as the score, a second-touch admission filter in front of promotion, and bounded inline demotion on the promotion path.
+Use Valkey's approximated LFU (a logarithmic frequency counter with time-based decay) as the score, a second-touch admission filter in front of promotion, and bounded inline reclaim on the promotion path.
 
 Why this and not the alternatives:
 
@@ -37,7 +37,7 @@ Why this and not the alternatives:
 | LFU with time decay (Valkey style) | Chosen | Frequency wins the steady state, decay lets popularity move. Operators already understand `lfu-decay-time`. This is an LFRU in practice. |
 | W-TinyLFU / ARC | Rejected for now | Solves one-touch pollution through a sketch or ghost lists. Our object counts are small (DRAM divided by MB-scale objects) and the same protection comes from a small second-touch admission filter. Revisit only if measurements show the simple filter is insufficient. |
 | Size-normalized score (GDSF) | Rejected | Benefit per byte is constant, see section 2. |
-| Cron-only demotion | Rejected | Leaves the cache frozen between ticks; a full pool would reject promotions for up to `scaling-poll-ms`. Inline demotion is bounded and runs only on misses. |
+| Cron-only reclaim | Rejected | Leaves the cache frozen between ticks; a full pool would reject promotions for up to `scaling-poll-ms`. Inline reclaim is bounded and runs only on misses. |
 
 The policy applies to Tiered mode only. In Dram mode the DRAMPool is the data, so dropping an entry is data loss, not a cache decision.
 
@@ -49,8 +49,8 @@ Four runtime-mutable configs:
 |---|---|---|---|
 | `tiered-decay-time` | 1 | 0..=65535 | Minutes per one-point counter decay. 0 disables decay (pure LFU). Same semantics as core `lfu-decay-time`. |
 | `promote-min-hits` | 2 | 1..=255 | Misses an object must accumulate before a GET promotes it. 1 promotes on the first GET. |
-| `demote-sample-size` | 5 | 1..=64 | Entries sampled per demotion round. Same idea as core's `maxmemory-samples`. |
-| `max-open-fds` | 1024 | 0..=1048576 | Cap on cached read fds. 0 means unlimited. The default stays well under Valkey's fd limit (about `maxclients + 32`), which the module's fds share with client sockets. |
+| `reclaim-sample-size` | 5 | 1..=64 | Entries sampled per reclaim round. Same idea as core's `maxmemory-samples`. |
+| `max-cached-fds` | 1024 | 0..=1048576 | Cap on cached read fds. 0 means unlimited. The default stays well under Valkey's fd limit (about `maxclients + 32`), which the module's fds share with client sockets. |
 
 Three tuning values are constants in `src/storage/cache_policy.rs`, because no operator has a reason to change them:
 
@@ -74,7 +74,7 @@ bits 8..24   last_decr_min  minute (from now_minutes) of the last decay, wraps a
 Operations, all on `AccessStats` in `src/storage/cache_policy.rs`:
 
 1. `touch(now_min, decay_time)`: decay the counter for the elapsed minutes, then increment with probability `p = 1 / ((counter - INIT) * LFU_LOG_FACTOR + 1)`, then store with `now_min` stamped in. At `INIT` the probability is 1, so one touch always outranks an untouched entry. Two racing touches can lose one increment, as in Valkey.
-2. `decayed_counter(now_min, decay_time)`: the counter minus `elapsed / decay_time` periods, saturating at 0. Demotion ranks by this. It never writes back. `decay_time = 0` disables decay.
+2. `decayed_counter(now_min, decay_time)`: the counter minus `elapsed / decay_time` periods, saturating at 0. Reclaim ranks by this. It never writes back. `decay_time = 0` disables decay.
 3. `new(now_min)`: counter at `LFU_INIT_VAL`, stamped now. A fresh entry ranks below any entry that has been hit and above one that has fully decayed, as in Valkey.
 
 `now_minutes()` counts minutes since its first call, wrapping at 16 bits; elapsed time uses `wrapping_sub`, so the wrap is harmless unless an entry goes untouched for more than 45 days, when it looks recent again. Callers read it once per operation and pass it down.
@@ -122,8 +122,8 @@ buffers = alloc_exact_or_expand(obj_len)
 
 Every object lives in one segment (`alloc_exact`), so freeing bytes spread over several segments cannot help. `make_room_for` works on one segment:
 
-1. `SegmentPool::reclaim_target(obj_len)` returns the segment `alloc_exact` would pick (the least loaded live one) and how many bytes it is short, using the same per-chunk aligned sizes as the alloc. Short is 0 when the bytes fit but talc's per-chunk tags blocked the alloc; reclaim then frees at least one victim.
-2. `reclaim_in(seg, short, RECLAIM_MAX_VICTIMS)` takes the write lock on the object map. Until the victims' bytes cover `short`, it samples `demote-sample-size` OIDs from that segment's index (every one if there are that few), skips any entry whose `Arc::strong_count > 1`, and removes the lowest `decayed_counter`. It stops at the first fit, so it takes the fewest victims, never more.
+1. `SegmentPool::segment_shortfall(obj_len)` returns the segment `alloc_exact` would pick (the least loaded live one) and how many bytes it is short, using the same per-chunk aligned sizes as the alloc. Short is 0 when the bytes fit but talc's per-chunk tags blocked the alloc; reclaim then frees at least one victim.
+2. `reclaim_in(seg, short, RECLAIM_MAX_VICTIMS)` takes the write lock on the object map. Until the victims' bytes cover `short`, it samples `reclaim-sample-size` OIDs from that segment's index (every one if there are that few), skips any entry whose `Arc::strong_count > 1`, and removes the lowest `decayed_counter`. It stops at the first fit, so it takes the fewest victims, never more.
 3. If the segment runs out of unpinned entries or the cap is hit first, every victim goes back under the same lock and nothing is reclaimed. Readers wait on the lock, so none of them sees the entries missing.
 4. The lock is released, then the victims drop. Each had a strong count of 1 under the lock, and cloning needs the lock, so this is the last reference and `ObjectContext::Drop` returns the buffers to talc.
 5. `SegmentPool::alloc_exact_in(seg, obj_len)` allocates in that segment only.
@@ -138,19 +138,19 @@ Rules that fall out of the Arc model:
 
 There is no mode guard inside `make_room_for`. Its only caller is `try_promote_object`, which only the tiered GET handler reaches. The name states what it removes.
 
-Cost: picking the segment is one pass over the segment slots, as the allocator already does. Under the write lock, at most `demote-sample-size` times `RECLAIM_MAX_VICTIMS` index probes (each one hash lookup into the object map) and `RECLAIM_MAX_VICTIMS` removes (80 and 16 by default), independent of how many objects are cached. Usually far fewer, since the loop stops at the first fit.
+Cost: picking the segment is one pass over the segment slots, as the allocator already does. Under the write lock, at most `reclaim-sample-size` times `RECLAIM_MAX_VICTIMS` index probes (each one hash lookup into the object map) and `RECLAIM_MAX_VICTIMS` removes (80 and 16 by default), independent of how many objects are cached. Usually far fewer, since the loop stops at the first fit.
 
 Known limitation: `RECLAIM_MAX_VICTIMS` is also a size ceiling. An object that needs more than 16 victims from its target segment (a 64 MiB object into a segment of 64 KiB objects) is never promoted and stays on NVMe. Step 3 makes that a no-op instead of reclaiming on every miss. If object sizes turn out to vary widely, bound the loop by bytes examined instead of a victim count.
 
 ### 4.5 Data structure
 
-`HashMap` cannot be sampled at random, so both pools use `OIDIndexedMap<V>`, an alias for `indexmap::IndexMap<ObjectId, V>`. It keeps entries in a dense `Vec` with a hash table of positions, so sampling a slot is a plain index with no hashing. Insert pushes to the end and `swap_remove` is O(1). `cache_policy::demote_one(map, samples, score)` probes up to `samples` slots, removes the lowest-scoring entry the `score` closure accepts, and returns it; the fd pool demotes through it.
+`HashMap` cannot be sampled at random, so both pools use `OIDIndexedMap<V>`, an alias for `indexmap::IndexMap<ObjectId, V>`. It keeps entries in a dense `Vec` with a hash table of positions, so sampling a slot is a plain index with no hashing. Insert pushes to the end and `swap_remove` is O(1). `cache_policy::reclaim_one(map, samples, score)` probes up to `samples` slots, removes the lowest-scoring entry the `score` closure accepts, and returns it; the fd pool reclaims through it.
 
-DRAMPool keeps two maps under one lock, changed together only through `ObjectMaps::insert` and `remove`: `all` (OID to `Arc<ObjectContext>`) and `by_segment[s]` (an `OIDIndexedMap<()>` of the OIDs whose first buffer is in segment `s`). The index holds `()`, not a second `Arc`, so `strong_count` still means "only the map holds it". Reclaim samples `by_segment[seg]` with the same `sample_victim` and looks each probe up in `all`. Both updates are O(1). Tiered objects never span segments, so the first buffer names the only segment; a Dram-mode COPY can split an object (a known bug in `ObjectContext::try_clone`), but Dram mode only shrinks empty segments, so `try_shrink` can still drain `by_segment[seg]` directly in O(objects in that segment). If Dram shrink ever relocates live data, fix `try_clone` first.
+DRAMPool keeps two maps under one lock, changed together only through `ObjectMaps::insert` and `remove`: `all` (OID to `Arc<ObjectContext>`) and `by_segment[s]` (an `OIDIndexedMap<()>` of the OIDs of the objects in segment `s`). The index holds `()`, not a second `Arc`, so `strong_count` still means "only the map holds it". Reclaim samples `by_segment[seg]` with the same `sample_victim` and looks each probe up in `all`. Both updates are O(1). An object never spans segments, so its first buffer names its segment, and `try_shrink` drains `by_segment[seg]` directly in O(objects in that segment).
 
 ### 4.6 Interaction with existing mechanisms
 
-1. Segment shrink (`try_shrink`) is unchanged and remains the server-memory-pressure path; inline demotion is the pool-full path. Both change the map under the same write lock, so they never interleave.
+1. Segment shrink (`try_shrink`) is unchanged and remains the server-memory-pressure path; inline reclaim is the pool-full path. Both change the map under the same write lock, so they never interleave.
 2. Request coalescing on `Filling` entries is still not implemented. Reads during a promotion count as misses and do not touch the score, so a newly promoted object starts at `LFU_INIT_VAL`.
 3. The free callback (`lo_free`) still calls `remove_object`, so anything that deletes a key also drops its cached copy.
 
@@ -178,14 +178,14 @@ fds: RwLock<OIDIndexedMap<FdEntry>>
 ```
 
 1. The `get_or_open` fast path touches `stats` under the read lock and hands out a clone. The re-check under the write lock (two concurrent first GETs on a cold object) does the same.
-2. Slow path, under the write lock: if `max-open-fds` is nonzero and `len >= cap`, remove the lowest-scoring sampled fd until there is room for the new one under the cap (normally one; more after the cap is lowered at runtime, since it is enforced on the next open). Unlike the DRAM pool, an fd held by an in-flight read is not skipped: demotion only drops the map's `Arc`, the reader's clone keeps the fd open until the read completes, and it closes then. Open fds can briefly exceed the cap by the number of such readers. Victims are chosen before `open()`, so if the open fails they are still demoted and counted, costing one reopen each.
+2. Slow path, under the write lock: if `max-cached-fds` is nonzero and `len >= cap`, remove the lowest-scoring sampled fd until there is room for the new one under the cap (normally one; more after the cap is lowered at runtime, since it is enforced on the next open). Unlike the DRAM pool, an fd held by an in-flight read is not skipped: reclaim only drops the map's `Arc`, the reader's clone keeps the fd open until the read completes, and it closes then. Open fds can briefly exceed the cap by the number of such readers. Victims are chosen before `open()`, so if the open fails they are still reclaimed and counted, costing one reopen each.
 3. The DRAM pool keeps the held-entry skip because reclaim there must free bytes for an allocation that happens right after; a held entry frees nothing until its reader finishes. The fd cap has no such follow-up, so the skip buys nothing.
-4. The next GET on a demoted fd reopens it, which costs one `open()` syscall, so a wrong fd demotion is far cheaper than a wrong DRAM demotion.
+4. The next GET on a reclaimed fd reopens it, which costs one `open()` syscall, so a wrong fd reclaim is far cheaper than a wrong DRAM reclaim.
 5. No admission filter for fds: a miss costs a syscall, not DRAM, so first-touch admission is fine.
 
-`get_or_open_with` takes the cap as an argument so unit tests can set it without racing on the global config; the other settings are read live. `RECLAIM_MAX_VICTIMS` does not apply, since the fd loop demotes exactly the overflow.
+`get_or_open_with` takes the cap as an argument so unit tests can set it without racing on the global config; the other settings are read live. `RECLAIM_MAX_VICTIMS` does not apply, since the fd loop reclaims exactly the overflow.
 
-INFO section `largeobj_fd` (Tiered only): `open_fds`, `fd_demotions_total`.
+INFO section `largeobj_fd` (Tiered only): `open_fds`, `fd_reclaims_total`.
 
 
 ## 5. Open questions

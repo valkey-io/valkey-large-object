@@ -132,10 +132,10 @@ impl SegmentPool {
         self.alloc_object_in_one_segment(&Self::chunk_sizes(size), Some(seg_idx))
     }
 
-    /// The segment `alloc_exact(size)` would pick if it had room (least-loaded
-    /// live one), and how many bytes it is short. Short is 0 if the bytes fit
-    /// and only talc overhead blocked the alloc.
-    pub(super) fn reclaim_target(&self, size: usize) -> Option<(usize, usize)> {
+    /// `(seg_idx, bytes_short)`: the segment `alloc_exact(size)` would pick
+    /// (least-loaded live one) and how many bytes it lacks for `size`. 0 means
+    /// the bytes fit and only talc overhead could block the alloc.
+    pub(super) fn segment_shortfall(&self, size: usize) -> Option<(usize, usize)> {
         let total: usize = Self::chunk_sizes(size).iter().sum();
         let (i, cur) = self.find_shrink_victim()?;
         Some((i, (cur + total).saturating_sub(self.segment_size)))
@@ -176,8 +176,9 @@ impl SegmentPool {
         );
         let total: usize = sizes.iter().sum();
         let st = self.state.lock().expect("state lock unavailable");
-        // Segments are uniform, so if the least-loaded one can't fit, none can
-        // (same picker as alloc_one). `target` pins the segment instead.
+        // Single O(N) pass: least-loaded eligible segment, checked against the
+        // object's TOTAL size. Segments are uniform, so if it can't fit, none
+        // can. `target` pins the segment instead.
         let seg_idx = match target {
             Some(i) => i,
             None => Self::least_loaded(&st)?.0,
@@ -524,8 +525,9 @@ impl SegmentPool {
         Self::least_loaded(&st)
     }
 
-    /// Least-loaded non-draining segment as `(slot_idx, allocated_bytes)`. The
-    /// allocator's pick, the shrink victim, and the reclaim target are all this.
+    /// Least-loaded non-draining segment as `(slot_idx, allocated_bytes)`.
+    /// Single O(N) pass; the caller holds the state lock so slots stay stable.
+    /// The allocator's pick, the shrink victim, and `segment_shortfall` use it.
     fn least_loaded(st: &SegmentState) -> Option<(usize, usize)> {
         st.slots
             .iter()
@@ -784,16 +786,16 @@ mod tests {
     // ── alloc_exact ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_reclaim_target_is_least_loaded_with_shortfall() {
+    fn test_segment_shortfall_picks_least_loaded() {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
         let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
         let a = pool.alloc_exact(4096 * 4).unwrap(); // seg 0: 16 KiB
         let b = pool.alloc_exact(4096 * 2).unwrap(); // seg 1: 8 KiB (least loaded)
         assert_eq!((a[0].segment_idx, b[0].segment_idx), (0, 1));
         // 60 KiB into seg 1 (8 KiB used of 64 KiB) is 4 KiB short.
-        assert_eq!(pool.reclaim_target(4096 * 15), Some((1, 4096)));
+        assert_eq!(pool.segment_shortfall(4096 * 15), Some((1, 4096)));
         // Fits by bytes: nothing short.
-        assert_eq!(pool.reclaim_target(4096), Some((1, 0)));
+        assert_eq!(pool.segment_shortfall(4096), Some((1, 0)));
         pool.free_n(&a);
         pool.free_n(&b);
     }
