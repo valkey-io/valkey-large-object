@@ -415,6 +415,103 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
             assert 'nvme-maxmemory' in str(e).lower(), f"Unexpected error: {e}"
 
+    # ─── Coalescing tests ────────────────────────────────────────────
+
+    def test_concurrent_gets_pipeline(self):
+        """Use a pipeline to fire N GETs for the same key in a single round-trip.
+        All should return correct data."""
+        client = self.server.get_new_client()
+        payload = os.urandom(16384)
+        client.execute_command('BLOB.SET', 'pipe_key', payload)
+        pipe = client.pipeline(transaction=False)
+        num_gets = 10
+        for _ in range(num_gets):
+            pipe.execute_command('BLOB.GET', 'pipe_key')
+        results = pipe.execute()
+        for i, r in enumerate(results):
+            assert r == payload, f"Pipeline GET {i} data mismatch"
+
+    def test_coalescing_deterministic(self):
+        """Deterministic coalescing: pause the promotion leader so concurrent
+        GETs are guaranteed to register as waiters on the Filling ObjectContext.
+        Asserts the coalesced_waiters metric incremented and all readers get
+        correct data.
+
+        Timeline:
+            Leader GET:  insert Filling → [PAUSE 2s] → NVMe read → mark Ready
+            Waiter GETs: arrive during pause → subscribe → wait → serve from DRAM
+        """
+        client = self.server.get_new_client()
+        payload = os.urandom(32768)
+        client.execute_command('BLOB.SET', 'det_coal_key', payload)
+        # Enable test hook: pause promotion for 2s before NVMe reads.
+        client.execute_command(
+            'CONFIG', 'SET', 'largeobj.test-pause-during-promotion-ms', '2000'
+        )
+        waiters_before = int(
+            client.info('largeobj').get('largeobj_coalesced_reads', 0)
+        )
+        num_readers = 4
+        results = [None] * num_readers
+        errors = [None] * num_readers
+        def reader(idx):
+            try:
+                c = self.server.get_new_client()
+                results[idx] = c.execute_command('BLOB.GET', 'det_coal_key')
+            except Exception as e:
+                errors[idx] = e
+        # Fire all readers — the first becomes the leader, the rest arrive
+        # during the 2s pause and deterministically become waiters.
+        threads = []
+        for i in range(num_readers):
+            t = threading.Thread(target=reader, args=(i,))
+            threads.append(t)
+        for t in threads:
+            t.start()
+        # Wait for all to return (leader unblocks after 2s pause + read).
+        for t in threads:
+            t.join(timeout=10)
+        # Disable the hook.
+        client.execute_command(
+            'CONFIG', 'SET', 'largeobj.test-pause-during-promotion-ms', '0'
+        )
+        for i in range(num_readers):
+            assert errors[i] is None, f"Reader {i} got error: {errors[i]}"
+            assert results[i] == payload, (
+                f"Reader {i} data mismatch: got "
+                f"{len(results[i]) if results[i] else 'None'} bytes"
+            )
+        # Exactly num_readers - 1 should have coalesced (one is the leader).
+        waiters_after = int(
+            client.info('largeobj').get('largeobj_coalesced_reads', 0)
+        )
+        assert waiters_after - waiters_before == num_readers - 1, (
+            f"Expected {num_readers - 1} coalesced reads, "
+            f"got {waiters_after - waiters_before} "
+            f"(before={waiters_before} after={waiters_after})"
+        )
+
+    def test_delete_during_promotion(self):
+        """SET a multi-chunk object, then issue GET (starts promotion) + DEL
+        concurrently via pipeline. Verify no crash. GET may return data or error
+        depending on timing. Subsequent GET returns nil."""
+        client = self.server.get_new_client()
+        payload = os.urandom(32768)
+        client.execute_command('BLOB.SET', 'delprom_key', payload)
+        pipe = client.pipeline(transaction=False)
+        pipe.execute_command('BLOB.GET', 'delprom_key')
+        pipe.execute_command('DEL', 'delprom_key')
+        results = pipe.execute()
+        # GET result: either the payload (promotion completed before DEL) or an
+        # error (DEL removed the fd). Both are valid — no crash is the assertion.
+        get_result = results[0]
+        if isinstance(get_result, bytes):
+            assert get_result == payload
+        # DEL result: 1 (key existed) or 0 (already gone).
+        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        # After both complete, key should be gone.
+        assert client.execute_command('BLOB.GET', 'delprom_key') is None
+
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
     """Tiered mode with max-promote-size=0 (no promotion, all reads from NVMe)."""

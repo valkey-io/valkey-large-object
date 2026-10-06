@@ -177,6 +177,12 @@ lazy_static::lazy_static! {
     /// and deterministically exercise the delete-during-SET race.
     static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);
 
+    /// Test-only: pause the promotion leader for this many milliseconds after
+    /// inserting the Filling ObjectContext but before starting NVMe reads.
+    /// 0 = disabled. Allows integration tests to deterministically exercise
+    /// coalesced-waiter registration during promotion.
+    static ref CFG_TEST_PAUSE_DURING_PROMOTION_MS: AtomicI64 = AtomicI64::new(0);
+
     // ─── Streaming Configs ───────────────────────────────────────────────
 
     /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
@@ -373,6 +379,10 @@ pub fn min_buffers_per_op() -> usize {
 
 pub fn test_pause_before_finalize_set_ms() -> u64 {
     CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_pause_during_promotion_ms() -> u64 {
+    CFG_TEST_PAUSE_DURING_PROMOTION_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn fabric_provider() -> FabricProvider {
@@ -701,6 +711,8 @@ valkey_module! {
             ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, 2, 1, 64,
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
+            ["test-pause-during-promotion-ms", &*CFG_TEST_PAUSE_DURING_PROMOTION_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],

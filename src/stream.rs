@@ -603,6 +603,8 @@ async fn drive_window(
         // A source error is fatal to the whole op (bad disk read / lost client read).
         if let Some(e) = source_err {
             if let Some(p) = progress {
+                p.obj_ctx
+                    .set_promotion_failure(storage::PromotionFailureReason::ReadError);
                 p.dram_pool.remove_object(&p.object_id); // evict half-filled DRAM entry
             }
             return Err(e);
@@ -619,7 +621,7 @@ async fn drive_window(
 
         if let Some(p) = progress {
             p.obj_ctx.advance_chunks_ready(batch_count as u32);
-            // TODO: obj_ctx.notify_progress() for coalesced waiters.
+            p.obj_ctx.notify_progress();
         }
         chunks_done += batch_count as u32;
     }

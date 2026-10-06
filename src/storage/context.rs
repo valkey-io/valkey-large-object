@@ -19,6 +19,7 @@
 //! value on completion. Neither ObjectContext nor StreamingContext needs CRC state.
 
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use tokio::sync::watch;
 
 use super::cache_policy::{now_minutes, AccessStats};
 
@@ -71,6 +72,16 @@ pub enum ObjectState {
     Filling = 1,
 }
 
+/// Reason the promotion leader failed. Stored as AtomicU8 on ObjectContext.
+/// Waiters check this after the watch channel sender is dropped to determine
+/// the failure mode and reply with the correct error.
+/// CRC mismatch is not represented — it panics the server immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionFailureReason {
+    None = 0,
+    ReadError = 1,
+}
+
 // ─── ObjectContext ───────────────────────────────────────────────────────────
 
 /// Long-lived runtime state for a cached object in DRAMPool.
@@ -91,6 +102,13 @@ pub struct ObjectContext {
     state: AtomicU8,
     /// Chunks completed during promotion (only meaningful when state == Filling).
     chunks_ready: AtomicU32,
+    /// Leader sends updated chunks_ready after each batch. Waiters subscribe via
+    /// Receiver. None when state is Ready (sender dropped in mark_ready).
+    /// Wrapped in std::sync::Mutex so mark_ready/set_promotion_failure can drop through &self.
+    progress_tx: std::sync::Mutex<Option<watch::Sender<u32>>>,
+    /// Set by leader on promotion failure before dropping progress_tx.
+    /// Waiters check this on RecvError to distinguish failure mode.
+    promotion_failure: AtomicU8,
     /// LFU access score for the cache policy.
     pub stats: AccessStats,
 }
@@ -102,16 +120,22 @@ impl ObjectContext {
             buffers,
             state: AtomicU8::new(ObjectState::Ready as u8),
             chunks_ready: AtomicU32::new(0),
+            progress_tx: std::sync::Mutex::new(None),
+            promotion_failure: AtomicU8::new(PromotionFailureReason::None as u8),
             stats: AccessStats::new(now_minutes()),
         }
     }
 
     /// Create a new ObjectContext in Filling state (Tiered promotion path).
+    /// Creates a watch channel so coalesced waiters can subscribe to progress.
     pub fn new_filling(buffers: Vec<SegmentBuffer>) -> Self {
+        let (tx, _rx) = watch::channel(0u32);
         Self {
             buffers,
             state: AtomicU8::new(ObjectState::Filling as u8),
             chunks_ready: AtomicU32::new(0),
+            progress_tx: std::sync::Mutex::new(Some(tx)),
+            promotion_failure: AtomicU8::new(PromotionFailureReason::None as u8),
             stats: AccessStats::new(now_minutes()),
         }
     }
@@ -123,8 +147,10 @@ impl ObjectContext {
         self.state.load(Ordering::Acquire) == ObjectState::Ready as u8
     }
 
-    /// Transition from Filling to Ready. Called by the tokio task
-    /// after NVMe ReadFixed completes successfully.
+    /// Transition from Filling to Ready. Called by the promotion tokio task
+    /// after all NVMe ReadFixed batches complete successfully. Drops the watch
+    /// sender — waiters' changed().await returns RecvError, then they check
+    /// is_ready() or promotion_failure() to determine the outcome.
     /// Uses Release ordering: all preceding writes (the NVMe read data
     /// in the buffer) are visible to any thread that later sees is_ready() == true.
     pub fn mark_ready(&self) {
@@ -134,6 +160,8 @@ impl ObjectContext {
         );
         self.state
             .store(ObjectState::Ready as u8, Ordering::Release);
+        // Drop sender → wakes all waiters with RecvError.
+        *self.progress_tx.lock().unwrap() = None;
     }
 
     /// Get the number of chunks ready (contiguous from offset 0).
@@ -152,6 +180,69 @@ impl ObjectContext {
             "advance_chunks_ready called on Ready ObjectContext"
         );
         self.chunks_ready.fetch_add(count, Ordering::Release);
+    }
+
+    /// Subscribe to progress updates. Returns None if object is already Ready
+    /// (sender was dropped in mark_ready). Waiters call changed().await on the
+    /// returned Receiver to wait for chunks_ready to advance.
+    pub fn subscribe(&self) -> Option<watch::Receiver<u32>> {
+        self.progress_tx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|tx| tx.subscribe())
+    }
+
+    /// Notify waiters of progress. Called by the leader after advance_chunks_ready.
+    /// Sends the current chunks_ready value on the watch channel.
+    pub fn notify_progress(&self) {
+        if let Some(tx) = self.progress_tx.lock().unwrap().as_ref() {
+            let _ = tx.send(self.chunks_ready.load(Ordering::Acquire));
+        }
+    }
+
+    /// Set promotion failure reason and drop the watch sender. Called by the leader
+    /// on NVMe read error. Dropping the sender wakes all waiters with RecvError —
+    /// they then check promotion_failure() to determine the failure mode.
+    pub fn set_promotion_failure(&self, reason: PromotionFailureReason) {
+        self.promotion_failure
+            .store(reason as u8, Ordering::Release);
+        *self.progress_tx.lock().unwrap() = None;
+    }
+
+    /// Get the promotion failure reason. Returns PromotionFailureReason::None if no failure.
+    pub fn promotion_failure(&self) -> PromotionFailureReason {
+        match self.promotion_failure.load(Ordering::Acquire) {
+            1 => PromotionFailureReason::ReadError,
+            _ => PromotionFailureReason::None,
+        }
+    }
+
+    /// Wait for the promotion to complete. Returns Ok(()) when the object
+    /// transitions to Ready, or Err(reason) on promotion failure.
+    /// Called by coalesced waiters; the caller handles reply dispatch.
+    pub async fn await_promotion(
+        &self,
+        mut rx: watch::Receiver<u32>,
+    ) -> Result<(), PromotionFailureReason> {
+        loop {
+            match rx.changed().await {
+                Ok(()) => {
+                    // Last notify_progress() can race ahead of mark_ready()'s
+                    // sender drop, so we may see Ok with is_ready() already true.
+                    if self.is_ready() {
+                        return Ok(());
+                    }
+                }
+                Err(_) => {
+                    // Sender dropped — leader finished or failed.
+                    if self.is_ready() {
+                        return Ok(());
+                    }
+                    return Err(self.promotion_failure());
+                }
+            }
+        }
     }
 }
 
@@ -244,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_object_context_filling() {
+    fn test_object_context_filling_with_coalescing() {
         let bufs = vec![
             SegmentBuffer {
                 segment_idx: 0,
@@ -265,9 +356,90 @@ mod tests {
         let ctx = ObjectContext::new_filling(bufs);
         assert!(!ctx.is_ready());
         assert_eq!(ctx.chunks_ready(), 0);
+        assert_eq!(ctx.promotion_failure(), PromotionFailureReason::None);
+        // Subscription should succeed on Filling object.
+        assert!(ctx.subscribe().is_some());
         ctx.advance_chunks_ready(2);
         assert_eq!(ctx.chunks_ready(), 2);
         ctx.advance_chunks_ready(1);
         assert_eq!(ctx.chunks_ready(), 3);
+        // mark_ready drops the sender.
+        ctx.mark_ready();
+        assert!(ctx.is_ready());
+        assert!(ctx.subscribe().is_none());
+    }
+
+    #[test]
+    fn test_object_context_failure_signaling() {
+        let bufs = vec![SegmentBuffer {
+            segment_idx: 0,
+            offset: 0,
+            len: 4096,
+        }];
+        let ctx = ObjectContext::new_filling(bufs);
+        assert_eq!(ctx.promotion_failure(), PromotionFailureReason::None);
+        ctx.set_promotion_failure(PromotionFailureReason::ReadError);
+        assert_eq!(ctx.promotion_failure(), PromotionFailureReason::ReadError);
+    }
+
+    #[test]
+    fn test_object_context_ready_no_subscription() {
+        let bufs = vec![SegmentBuffer {
+            segment_idx: 0,
+            offset: 0,
+            len: 1024,
+        }];
+        let ctx = ObjectContext::new_ready(bufs);
+        assert!(ctx.is_ready());
+        assert!(ctx.subscribe().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_failure_propagates_to_waiter() {
+        let bufs = vec![
+            SegmentBuffer {
+                segment_idx: 0,
+                offset: 0,
+                len: 4096,
+            },
+            SegmentBuffer {
+                segment_idx: 0,
+                offset: 4096,
+                len: 4096,
+            },
+        ];
+        let ctx = std::sync::Arc::new(ObjectContext::new_filling(bufs));
+        let rx = ctx
+            .subscribe()
+            .expect("subscribe should succeed on Filling");
+        let waiter_ctx = ctx.clone();
+        let waiter = tokio::spawn(async move { waiter_ctx.await_promotion(rx).await });
+        // Leader: advance one batch, notify, then fail.
+        ctx.advance_chunks_ready(1);
+        ctx.notify_progress();
+        tokio::task::yield_now().await;
+        ctx.set_promotion_failure(PromotionFailureReason::ReadError);
+        let result = waiter.await.unwrap();
+        assert_eq!(result, Err(PromotionFailureReason::ReadError));
+    }
+
+    #[tokio::test]
+    async fn test_success_propagates_to_waiter() {
+        let bufs = vec![SegmentBuffer {
+            segment_idx: 0,
+            offset: 0,
+            len: 4096,
+        }];
+        let ctx = std::sync::Arc::new(ObjectContext::new_filling(bufs));
+        let rx = ctx
+            .subscribe()
+            .expect("subscribe should succeed on Filling");
+        let waiter_ctx = ctx.clone();
+        let waiter = tokio::spawn(async move { waiter_ctx.await_promotion(rx).await });
+        ctx.advance_chunks_ready(1);
+        ctx.notify_progress();
+        ctx.mark_ready();
+        let result = waiter.await.unwrap();
+        assert_eq!(result, Ok(()));
     }
 }

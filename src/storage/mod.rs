@@ -23,7 +23,7 @@ pub mod segment_pool;
 pub mod uring;
 
 // Re-exports for convenience.
-pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
+pub use context::{ObjectContext, PromotionFailureReason, SegmentBuffer, StreamingContext};
 pub use object_file::ObjectFile;
 
 // Re-exports from nvme.rs
