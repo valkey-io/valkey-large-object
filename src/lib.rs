@@ -177,10 +177,16 @@ lazy_static::lazy_static! {
     /// and deterministically exercise the delete-during-SET race.
     static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);
 
-    /// Test-only: override `EFA_OP_TIMEOUT` to this many milliseconds.
-    /// 0 = use the production default (10 s). Allows integration tests to
-    /// force an EFA timeout and exercise the drain path.
-    static ref CFG_TEST_EFA_OP_TIMEOUT_MS: AtomicI64 = AtomicI64::new(0);
+    /// Per-EFA-operation timeout in milliseconds. Default: 10000 (10 s).
+    /// If the NIC doesn't complete within this, the client gets an error and
+    /// remaining transfers are drained in the background.
+    static ref CFG_EFA_OP_TIMEOUT_MS: AtomicI64 = AtomicI64::new(10_000);
+
+    /// Test-only: sleep this many milliseconds before the EFA polling loop.
+    /// 0 = disabled (production default). When combined with a short
+    /// `test-efa-op-timeout-ms`, the deadline expires during the sleep so
+    /// all submitted transfers are still in-flight when the timeout fires.
+    static ref CFG_TEST_EFA_POLL_DELAY_MS: AtomicI64 = AtomicI64::new(0);
 
     // ─── Streaming Configs ───────────────────────────────────────────────
 
@@ -380,8 +386,12 @@ pub fn test_pause_before_finalize_set_ms() -> u64 {
     CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn test_efa_op_timeout_ms() -> u64 {
-    CFG_TEST_EFA_OP_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn efa_op_timeout_ms() -> u64 {
+    CFG_EFA_OP_TIMEOUT_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_efa_poll_delay_ms() -> u64 {
+    CFG_TEST_EFA_POLL_DELAY_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn fabric_provider() -> FabricProvider {
@@ -711,7 +721,9 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN, None, None],
-            ["test-efa-op-timeout-ms", &*CFG_TEST_EFA_OP_TIMEOUT_MS, 0, 0, 60_000,
+            ["efa-op-timeout-ms", &*CFG_EFA_OP_TIMEOUT_MS, 10_000, 1, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
+            ["test-efa-poll-delay-ms", &*CFG_TEST_EFA_POLL_DELAY_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],

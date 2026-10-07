@@ -4,8 +4,8 @@ import crc32c
 import os
 import pytest
 import subprocess
-import time
 from valkey import ResponseError
+from valkeytestframework.util.waiters import wait_for_equal
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
 
@@ -264,9 +264,11 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             process.kill()
 
     def test_efa_timeout_drains_and_reports_metrics(self):
-        """Force EFA timeout on both GET and SET, verify error replies and
-        exact metric increments. Uses a 1ms deadline so the tcp-loopback
-        transfer cannot complete in time, triggering the drain path."""
+        """Force EFA timeout with futures still in-flight, verify error replies,
+        exact metric increments, and the RDMA-in-flight warning on GET.
+        Uses efa-op-timeout-ms=1 + test-efa-poll-delay-ms=100 so the
+        1ms deadline expires during the 100ms pre-poll sleep, guaranteeing
+        all submitted transfers are still pending when the timeout fires."""
         cases = [
             # (label, target_flags, setup, efa_command_args)
             ('GET', (), lambda c: c.execute_command('BLOB.SET', 'key', PATTERN),
@@ -284,18 +286,24 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 timeout_before = before.get('largeobj_efa_timeout_errors', 0)
                 drain_before = before.get('largeobj_efa_drain_count', 0)
                 client.execute_command(
-                    'CONFIG', 'SET', 'largeobj.test-efa-op-timeout-ms', '1')
-                with pytest.raises(ResponseError, match='EFA operation timed out'):
+                    'CONFIG', 'SET', 'largeobj.efa-op-timeout-ms', '1')
+                client.execute_command(
+                    'CONFIG', 'SET', 'largeobj.test-efa-poll-delay-ms', '100')
+                with pytest.raises(ResponseError, match='EFA operation timed out') as exc_info:
                     client.execute_command(*cmd_args(regions))
-                time.sleep(0.5)
+                if label == 'GET':
+                    assert 'RDMA writes may still be in flight' in str(exc_info.value), \
+                        "GET timeout should warn about in-flight RDMA writes"
+                wait_for_equal(
+                    lambda: info_largeobj(client)['largeobj_efa_drain_count'] - drain_before, 1)
                 after = info_largeobj(client)
                 assert after['largeobj_efa_timeout_errors'] - timeout_before == 1, \
                     f"{label}: expected 1 timeout error, got delta {after['largeobj_efa_timeout_errors'] - timeout_before}"
-                assert after['largeobj_efa_drain_count'] - drain_before == 1, \
-                    f"{label}: expected 1 drained future, got delta {after['largeobj_efa_drain_count'] - drain_before}"
             finally:
                 client.execute_command(
-                    'CONFIG', 'SET', 'largeobj.test-efa-op-timeout-ms', '0')
+                    'CONFIG', 'SET', 'largeobj.efa-op-timeout-ms', '10000')
+                client.execute_command(
+                    'CONFIG', 'SET', 'largeobj.test-efa-poll-delay-ms', '0')
                 process.kill()
 
 

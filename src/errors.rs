@@ -57,6 +57,12 @@ define_errors! {
     ERR_MAX_BUF_GE_MIN_BUF => "ERR max-buffers-per-op must be >= min-buffers-per-op",
 }
 
+/// Suffix appended to EFA error replies on the GET path when RDMA writes are
+/// still in flight after the error. Not a standalone error, so it lives outside
+/// the `define_errors!` macro.
+pub const WARN_RDMA_IN_FLIGHT: &str =
+    "; RDMA writes may still be in flight — do not reuse registered memory regions until the session is closed";
+
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]

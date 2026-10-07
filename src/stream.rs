@@ -163,7 +163,7 @@ impl Source<'_> {
                 );
                 match rx.await {
                     Ok(Ok(_)) => Ok(None),
-                    _ => Err(StreamError::NvmeRead),
+                    _ => Err(StreamError::new(StreamErrorKind::NvmeRead)),
                 }
             }
             Source::DramResident { .. } => Ok(None), // resident
@@ -180,13 +180,7 @@ impl Source<'_> {
                     EfaDirection::Read,
                     drain_handles,
                 )
-                .await
-                .map_err(|e| match e {
-                    ValkeyError::Str(s) if s == crate::errors::ERR_EFA_TIMEOUT => {
-                        StreamError::EfaTimeout
-                    }
-                    _ => StreamError::EfaRead,
-                })?;
+                .await?;
                 Ok(Some(crc))
             }
             Source::TcpInline { data, .. } => {
@@ -290,12 +284,6 @@ impl Target<'_> {
                 efa_transfer_addrs(session, buf_ptr, addrs, EfaDirection::Write, drain_handles)
                     .await
                     .map(|_| ())
-                    .map_err(|e| match e {
-                        ValkeyError::Str(s) if s == crate::errors::ERR_EFA_TIMEOUT => {
-                            StreamError::EfaTimeout
-                        }
-                        _ => StreamError::EfaWrite,
-                    })
             }
             Target::NvmeWrite { buffers, pool } => {
                 let buf = &buffers[chunk.buffer_idx];
@@ -313,7 +301,7 @@ impl Target<'_> {
                 );
                 match rx.await {
                     Ok(Ok(())) => Ok(()),
-                    _ => Err(StreamError::NvmeWrite),
+                    _ => Err(StreamError::new(StreamErrorKind::NvmeWrite)),
                 }
             }
             Target::DramResident => Ok(()),
@@ -393,24 +381,39 @@ impl Pool {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Which stage failed — the caller maps this to its reply string + metric.
+/// `message` overrides the default error string when present (e.g. to carry
+/// the RDMA in-flight warning from `efa_transfer_addrs`).
+pub struct StreamError {
+    pub kind: StreamErrorKind,
+    pub message: Option<String>,
+}
 #[derive(Clone, Copy)]
-pub enum StreamError {
+pub enum StreamErrorKind {
     NvmeRead,
     NvmeWrite,
     EfaRead,
     EfaWrite,
     EfaTimeout,
 }
+impl StreamError {
+    fn new(kind: StreamErrorKind) -> Self {
+        Self {
+            kind,
+            message: None,
+        }
+    }
+}
 
 /// Map a `StreamError` to its metric + reply string and send the error.
 /// One place, so every path that drives `run_get` / `run_set` reports failures
-/// identically.
+/// identically. If the error carries a custom `message`, that is used as the
+/// client-facing reply instead of the default string.
 pub(crate) fn reply_stream_err(
     thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     e: StreamError,
 ) {
-    use StreamError::*;
-    let (metric, err): (&std::sync::atomic::AtomicU64, &str) = match e {
+    use StreamErrorKind::*;
+    let (metric, default_err): (&std::sync::atomic::AtomicU64, &str) = match e.kind {
         NvmeRead => (&crate::info::NVME_READ_ERRORS, crate::errors::ERR_NVME_READ),
         NvmeWrite => (
             &crate::info::NVME_WRITE_ERRORS,
@@ -423,7 +426,11 @@ pub(crate) fn reply_stream_err(
             crate::errors::ERR_EFA_TIMEOUT,
         ),
     };
-    crate::engine::reply_err(thread_ctx, metric, ValkeyError::Str(err));
+    let reply = match e.message {
+        Some(msg) => ValkeyError::String(msg),
+        None => ValkeyError::Str(default_err),
+    };
+    crate::engine::reply_err(thread_ctx, metric, reply);
 }
 
 /// DRAM-promotion side effects run around the batch loop (GET only). When present,
@@ -663,10 +670,8 @@ async fn drive_window(
         // A target (client-transfer) error: without a progress hook (streaming GET
         // or any SET) abort now; a DRAM promotion latches it and keeps filling for
         // coalesced waiters, surfacing the error to the caller after the loop.
-        if let Some(e) = target_err {
-            if progress.is_none() {
-                return Err(e);
-            }
+        if target_err.is_some() && progress.is_none() {
+            return Err(target_err.take().unwrap());
         }
 
         if let Some(p) = progress {
@@ -777,7 +782,7 @@ pub async fn run_set(
         .await
         .is_err()
         {
-            return Err(StreamError::NvmeWrite);
+            return Err(StreamError::new(StreamErrorKind::NvmeWrite));
         }
     }
     Ok(crc)
@@ -799,14 +804,20 @@ pub enum EfaDirection {
 /// complete within this, we return an error. The caller is responsible for
 /// draining remaining in-flight DMA transfers (via `drain_handles`) and keeping
 /// the underlying buffers alive until that drain completes.
-/// Overridable at runtime via the hidden `test-efa-op-timeout-ms` config (0 = default).
 fn efa_op_timeout() -> std::time::Duration {
-    let test_ms = crate::test_efa_op_timeout_ms();
-    if test_ms > 0 {
-        std::time::Duration::from_millis(test_ms)
-    } else {
-        std::time::Duration::from_secs(10)
+    std::time::Duration::from_millis(crate::efa_op_timeout_ms())
+}
+
+/// Test hook: sleep before the EFA polling loop so the deadline expires with
+/// futures still in-flight. Returns `true` if the deadline expired during the
+/// sleep, `false` otherwise. No-op when the config is 0 (default).
+async fn maybe_test_poll_delay(deadline: tokio::time::Instant) -> bool {
+    let delay_ms = crate::test_efa_poll_delay_ms();
+    if delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        return tokio::time::Instant::now() >= deadline;
     }
+    false
 }
 
 /// Collector for background EFA drain tasks. On timeout or transport error,
@@ -834,15 +845,15 @@ pub(crate) async fn efa_transfer_addrs(
     addrs: &[ClientEFAAddress],
     direction: EfaDirection,
     drain_handles: &DrainHandles,
-) -> Result<u32, ValkeyError> {
-    let err_str = match direction {
-        EfaDirection::Write => crate::errors::ERR_EFA_WRITE,
-        EfaDirection::Read => crate::errors::ERR_EFA_READ,
+) -> Result<u32, StreamError> {
+    let (err_str, err_kind) = match direction {
+        EfaDirection::Write => (crate::errors::ERR_EFA_WRITE, StreamErrorKind::EfaWrite),
+        EfaDirection::Read => (crate::errors::ERR_EFA_READ, StreamErrorKind::EfaRead),
     };
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
     let mut sub_lens: Vec<usize> = Vec::with_capacity(addrs.len());
-    let mut err: Option<ValkeyError> = None;
+    let mut err: Option<(StreamErrorKind, &str)> = None;
     for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
         let transfer = match direction {
             EfaDirection::Write => {
@@ -858,12 +869,15 @@ pub(crate) async fn efa_transfer_addrs(
             }
             // Break so already-submitted transfers get drained.
             Err(_) => {
-                err = Some(ValkeyError::Str(err_str));
+                err = Some((err_kind, err_str));
                 break;
             }
         }
     }
     let deadline = tokio::time::Instant::now() + efa_op_timeout();
+    if maybe_test_poll_delay(deadline).await {
+        err = Some((StreamErrorKind::EfaTimeout, crate::errors::ERR_EFA_TIMEOUT));
+    }
     let mut results: Vec<Option<Crc>> = vec![None; addrs.len()];
     if err.is_none() {
         loop {
@@ -871,7 +885,7 @@ pub(crate) async fn efa_transfer_addrs(
                 biased;
                 item = indexed_futures.next() => item,
                 _ = tokio::time::sleep_until(deadline) => {
-                    err = Some(ValkeyError::Str(crate::errors::ERR_EFA_TIMEOUT));
+                    err = Some((StreamErrorKind::EfaTimeout, crate::errors::ERR_EFA_TIMEOUT));
                     break;
                 }
             };
@@ -888,16 +902,17 @@ pub(crate) async fn efa_transfer_addrs(
                     };
                 }
                 Err(_) => {
-                    err = Some(ValkeyError::Str(err_str));
+                    err = Some((err_kind, err_str));
                     break;
                 }
             }
         }
     }
-    if let Some(e) = err {
+    if let Some((kind, base_err)) = err {
         // Spawn a background task to drain remaining in-flight DMA transfers.
         // The engine keeps the underlying buffers alive until these handles resolve.
-        if !indexed_futures.is_empty() {
+        let has_in_flight = !indexed_futures.is_empty();
+        if has_in_flight {
             let handle = tokio::spawn(async move {
                 while indexed_futures.next().await.is_some() {
                     crate::info::EFA_DRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -905,7 +920,14 @@ pub(crate) async fn efa_transfer_addrs(
             });
             drain_handles.lock().unwrap().push(handle);
         }
-        return Err(e);
+        // GET (Write) path with in-flight RDMA writes: warn the client that
+        // its registered memory regions may still be written to.
+        let message = if has_in_flight && direction == EfaDirection::Write {
+            Some(format!("{base_err}{}", crate::errors::WARN_RDMA_IN_FLIGHT))
+        } else {
+            None
+        };
+        return Err(StreamError { kind, message });
     }
     // GET (Write) path: callers ignore the returned CRC — skip combination.
     if matches!(direction, EfaDirection::Write) {

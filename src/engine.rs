@@ -792,6 +792,7 @@ fn cmd_set_dram_efa(
                 {
                     Ok(crc) => crc,
                     Err(e) => {
+                        // SET path: no RDMA writes into client memory, no warning needed.
                         crate::stream::reply_stream_err(&thread_ctx, e);
                         spawn_buffer_guard(drain_handles, obj_ctx);
                         return;
@@ -1001,6 +1002,7 @@ async fn cmd_set_tiered_run(
     let crc = match result {
         Ok(crc) => crc,
         Err(e) => {
+            // SET path: no RDMA writes into client memory, no warning needed.
             crate::stream::reply_stream_err(&thread_ctx, e);
             // Keep NVMe buffers alive until any background EFA drains complete.
             spawn_buffer_guard(drain_handles, stream_ctx);
