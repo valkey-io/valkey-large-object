@@ -701,7 +701,7 @@ pub async fn run_get(
         ) && matches!(target, Target::TcpReply { .. } | Target::EfaWrite { .. }),
         "run_get called with a non-GET source/target pairing"
     );
-    if let Some(fh) = job.verify_file_header.as_ref() {
+    let window_result = if let Some(fh) = job.verify_file_header.as_ref() {
         // Parallel path: dedicated header buffer (separate from the data window),
         // so the header read and data reads can land on the ring together.
         let header_fut = async {
@@ -724,14 +724,16 @@ pub async fn run_get(
             // Free the dedicated header buffer now that validation is done.
             pool.free_buf(&fh.dedicated_buffer);
         };
-        let ((), window_result) = futures::join!(
+        let ((), result) = futures::join!(
             header_fut,
             drive_window(job, chunk_iter, source, target, progress)
         );
-        let (_chunk_iter, target_err) = window_result?;
-        return Ok(target_err);
-    }
-    let (_chunk_iter, target_err) = drive_window(job, chunk_iter, source, target, progress).await?;
+        result
+    } else {
+        // DRAM path: no on-disk header to verify, just run the data transfer.
+        drive_window(job, chunk_iter, source, target, progress).await
+    };
+    let (_chunk_iter, target_err) = window_result?;
     Ok(target_err)
 }
 
