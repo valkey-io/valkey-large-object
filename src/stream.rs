@@ -807,7 +807,6 @@ async fn timed_drain_efa(
             biased;
             item = futures.next() => item,
             _ = tokio::time::sleep_until(deadline) => {
-                crate::info::EFA_TIMEOUT_ERRORS.fetch_add(1, Ordering::Relaxed);
                 if first_err.is_none() {
                     first_err = Some(ValkeyError::Str(crate::errors::ERR_EFA_TIMEOUT));
                 }
@@ -1003,7 +1002,6 @@ mod tests {
     #[tokio::test(start_paused = true)]
     #[serial_test::serial(efa_metrics)]
     async fn test_timed_drain_timeout() {
-        crate::info::EFA_TIMEOUT_ERRORS.store(0, Ordering::Relaxed);
         crate::info::EFA_DRAIN_COUNT.store(0, Ordering::Relaxed);
         let futs: FuturesUnordered<EfaFut> = FuturesUnordered::new();
         // One completes immediately, one sleeps past the 10s deadline.
@@ -1020,8 +1018,7 @@ mod tests {
         assert_eq!(results[0], Some(42));
         // Index 1 timed out — no result recorded in phase 1.
         assert_eq!(results[1], None);
-        // Metrics: exactly one timeout, one future drained in phase 2.
-        assert_eq!(crate::info::EFA_TIMEOUT_ERRORS.load(Ordering::Relaxed), 1);
+        // One future drained in phase 2.
         assert_eq!(crate::info::EFA_DRAIN_COUNT.load(Ordering::Relaxed), 1);
     }
 }
