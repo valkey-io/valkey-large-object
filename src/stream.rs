@@ -182,11 +182,11 @@ impl Source<'_> {
                 )
                 .await
                 .map_err(|e| match e {
-                            ValkeyError::Str(s) if s == crate::errors::ERR_EFA_TIMEOUT => {
-                                StreamError::EfaTimeout
-                            }
-                            _ => StreamError::EfaRead,
-                        })?;
+                    ValkeyError::Str(s) if s == crate::errors::ERR_EFA_TIMEOUT => {
+                        StreamError::EfaTimeout
+                    }
+                    _ => StreamError::EfaRead,
+                })?;
                 Ok(Some(crc))
             }
             Source::TcpInline { data, .. } => {
@@ -880,10 +880,9 @@ pub(crate) async fn efa_transfer_addrs(
         match outcome {
             Ok(done) => {
                 results[idx] = match direction {
-                    EfaDirection::Read => Some(
-                        done.checksum
-                            .expect("EFA Read completion missing checksum — transport must provide CRC"),
-                    ),
+                    EfaDirection::Read => Some(done.checksum.expect(
+                        "EFA Read completion missing checksum — transport must provide CRC",
+                    )),
                     EfaDirection::Write => Some(0),
                 };
             }

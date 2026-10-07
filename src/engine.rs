@@ -771,7 +771,12 @@ fn cmd_set_dram_efa(
                     ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(addrs));
                 // Dram EFA SET: EFA-read every chunk into the DRAM buffers via the
                 // ONE streaming driver (source=EFA client, target=DRAM resident).
-                let job = crate::stream::StreamJob::for_dram(obj_len, chunk_size, 0, obj_ctx.buffers.len());
+                let job = crate::stream::StreamJob::for_dram(
+                    obj_len,
+                    chunk_size,
+                    0,
+                    obj_ctx.buffers.len(),
+                );
                 let drain_handles = Arc::new(crate::stream::DrainHandles::new(Vec::new()));
                 let source = crate::stream::Source::EfaRead {
                     session,

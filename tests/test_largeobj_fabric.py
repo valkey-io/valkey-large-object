@@ -2,6 +2,7 @@ import binascii
 import collections
 import crc32c
 import os
+import pytest
 import subprocess
 import time
 from valkey import ResponseError
@@ -284,9 +285,8 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 drain_before = before.get('largeobj_efa_drain_count', 0)
                 client.execute_command(
                     'CONFIG', 'SET', 'largeobj.test-efa-op-timeout-ms', '1')
-                with self.assertRaises(ResponseError) as cm:
+                with pytest.raises(ResponseError, match='EFA operation timed out'):
                     client.execute_command(*cmd_args(regions))
-                assert 'EFA operation timed out' in str(cm.exception)
                 time.sleep(0.5)
                 after = info_largeobj(client)
                 assert after['largeobj_efa_timeout_errors'] - timeout_before == 1, \
