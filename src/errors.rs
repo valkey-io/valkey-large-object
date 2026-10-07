@@ -39,11 +39,11 @@ define_errors! {
     ERR_NVME_WRITE => "ERR NVMe write",
     ERR_EFA_WRITE => "ERR EFA write",
     ERR_EFA_READ => "ERR EFA read",
+    ERR_EFA_TIMEOUT => "ERR EFA operation timed out",
     ERR_SESSION_CREATE => "ERR session create",
 
     // Streaming Errors
     ERR_INSUFFICIENT_NVME_BUFFERS => "ERR NVMe staging buffer pool exhausted",
-    ERR_EFA_TIMEOUT => "ERR EFA operation timed out",
     ERR_NVME_CAPACITY_EXCEEDED => "ERR NVMe disk capacity exceeded",
     ERR_SET_VALUE => "ERR failed to set key",
 
