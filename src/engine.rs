@@ -168,20 +168,11 @@ enum CommitOutcome {
 /// own cleanup/metric/reply on each outcome. On `StaleDiscarded`/`Err` the moved-in
 /// `LoValue` drops here; for NVMe that drops its `ObjectFile` → unlink + budget release.
 fn commit_lo_value(
-    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    ctx: &valkey_module::ContextGuard,
     key_name: &[u8],
     object_id: ObjectId,
     lo_value: LoValue,
 ) -> Result<CommitOutcome, ValkeyError> {
-    let ctx = thread_ctx.lock();
-    // Dram mode: a shrink between insert and this commit removed the object
-    // (or it landed on a draining segment). Never attach a key to an object
-    // that isn't served: Dram GET relies on LoValue => ObjectContext.
-    if crate::operating_mode() == OperatingMode::Dram
-        && storage::get_dram_pool().get_object(&object_id).is_none()
-    {
-        return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
-    }
     let key_str = ctx.create_string(key_name.to_vec());
     let key = ctx.open_key_writable(&key_str);
     // One lookup drives both the version guard and the create/update event.
@@ -736,13 +727,21 @@ fn cmd_set_dram_efa(
                         return;
                     }
                 };
-                // Insert ObjectContext BEFORE set_value so the key is never visible
-                // without its ObjectContext. On discard, remove the entry —
-                // ObjectContext::Drop returns buffers to DRAMPool automatically.
-                let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
-                dram_pool.insert_object(object_id, obj_ctx);
                 let lo_value = LoValue::new(object_id, obj_len, crc, None);
-                match commit_lo_value(&thread_ctx, &key_name, object_id, lo_value) {
+                // Insert and commit under one server-lock hold, so no shrink lands between.
+                let outcome = {
+                    let ctx = thread_ctx.lock();
+                    if dram_pool.is_segment_draining(buffers[0].segment_idx) {
+                        // A shrink took the segment during the transfer.
+                        dram_pool.free_n(&buffers);
+                        Err(ValkeyError::Str(errors::ERR_SET_VALUE))
+                    } else {
+                        let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
+                        dram_pool.insert_object(object_id, obj_ctx);
+                        commit_lo_value(&ctx, &key_name, object_id, lo_value)
+                    }
+                };
+                match outcome {
                     Ok(CommitOutcome::ValueSet) => {
                         thread_ctx.reply(VALKEY_OK);
                     }
@@ -957,7 +956,8 @@ async fn cmd_set_tiered_run(
         object_id, disk_len
     );
     let lo_value = LoValue::new(object_id, obj_len, crc, Some(object_file));
-    match commit_lo_value(&thread_ctx, &key_name, object_id, lo_value) {
+    let outcome = commit_lo_value(&thread_ctx.lock(), &key_name, object_id, lo_value);
+    match outcome {
         Ok(CommitOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);
         }

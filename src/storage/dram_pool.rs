@@ -211,6 +211,10 @@ impl DRAMPool {
         Some(arc)
     }
 
+    pub fn is_segment_draining(&self, seg_idx: u16) -> bool {
+        self.pool.is_segment_draining(seg_idx)
+    }
+
     /// Insert an ObjectContext (promotion path).
     pub fn insert_object(&self, oid: ObjectId, ctx: Arc<ObjectContext>) {
         self.objects
