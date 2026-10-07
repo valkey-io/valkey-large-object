@@ -76,7 +76,6 @@ use crate::data_type::ObjectId;
 use crate::storage::{
     self, uring, ChunkIterator, ChunkRef, ClientEFAAddress, Crc, ObjectContext, SegmentBuffer,
 };
-use crate::transport::operand::PoolOperand;
 use crate::transport::Session;
 
 // `Crc` (a CRC32C checksum value) is defined in `storage` and imported below —
@@ -108,6 +107,7 @@ pub enum Source<'a> {
         buffers: &'a [SegmentBuffer],
         pool: Pool,
         session: Arc<Session>,
+        drain_handles: Arc<DrainHandles>,
     },
     /// memcpy inline command bytes into the buffer (SET); resolves immediately.
     TcpInline {
@@ -167,12 +167,21 @@ impl Source<'_> {
                 }
             }
             Source::DramResident { .. } => Ok(None), // resident
-            Source::EfaRead { session, .. } => {
+            Source::EfaRead {
+                session,
+                drain_handles,
+                ..
+            } => {
                 let addrs = chunk.addrs.as_ref().expect("EFA chunk missing addrs");
-                let crc =
-                    efa_transfer_addrs(session, pool.ptr(buf) as usize, addrs, EfaDirection::Read)
-                        .await
-                        .map_err(|e| match e {
+                let crc = efa_transfer_addrs(
+                    session,
+                    pool.ptr(buf) as usize,
+                    addrs,
+                    EfaDirection::Read,
+                    drain_handles,
+                )
+                .await
+                .map_err(|e| match e {
                             ValkeyError::Str(s) if s == crate::errors::ERR_EFA_TIMEOUT => {
                                 StreamError::EfaTimeout
                             }
@@ -211,7 +220,10 @@ pub enum Target<'a> {
         bench: bool,
     },
     /// fi_write each ready chunk to the client (GET EFA).
-    EfaWrite { session: Arc<Session> },
+    EfaWrite {
+        session: Arc<Session>,
+        drain_handles: Arc<DrainHandles>,
+    },
     /// io_uring WriteFixed each ready chunk to the NVMe file (SET tiered).
     NvmeWrite {
         buffers: &'a [SegmentBuffer],
@@ -270,9 +282,12 @@ impl Target<'_> {
                 }
                 Ok(())
             }
-            Target::EfaWrite { session } => {
+            Target::EfaWrite {
+                session,
+                drain_handles,
+            } => {
                 let addrs = chunk.addrs.as_ref().expect("EFA chunk missing addrs");
-                efa_transfer_addrs(session, buf_ptr, addrs, EfaDirection::Write)
+                efa_transfer_addrs(session, buf_ptr, addrs, EfaDirection::Write, drain_handles)
                     .await
                     .map(|_| ())
                     .map_err(|e| match e {
@@ -779,92 +794,50 @@ pub enum EfaDirection {
 }
 
 /// Per-EFA-operation timeout for the client-facing result. If the NIC doesn't
-/// complete within this, we return an error but keep the Transfer alive for
-/// the drain phase (the DMA is still in flight and cannot be cancelled).
-const EFA_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-type EfaResults = Vec<Option<u32>>;
-
-/// Two-phase EFA drain.
-/// Phase 1: race futures against `EFA_OP_TIMEOUT` — on timeout, latch error.
-/// Phase 2: await every remaining Transfer with no time limit so hardware DMA
-/// finishes before buffers are freed.
-/// Returns (per-index results, first error if any).
-async fn timed_drain_efa(
-    mut futures: FuturesUnordered<
-        impl std::future::Future<Output = (usize, (dma_libfabric::Outcome, PoolOperand))>,
-    >,
-    count: usize,
-    direction: EfaDirection,
-    err_str: &'static str,
-) -> (EfaResults, Option<ValkeyError>) {
-    let mut results: EfaResults = vec![None; count];
-    let mut first_err: Option<ValkeyError> = None;
-    let deadline = tokio::time::Instant::now() + EFA_OP_TIMEOUT;
-    // Phase 1: timed — decide the client-facing result.
-    loop {
-        let next = tokio::select! {
-            biased;
-            item = futures.next() => item,
-            _ = tokio::time::sleep_until(deadline) => {
-                if first_err.is_none() {
-                    first_err = Some(ValkeyError::Str(crate::errors::ERR_EFA_TIMEOUT));
-                }
-                break;
-            }
-        };
-        let Some((idx, (outcome, _operand))) = next else {
-            break;
-        };
-        match outcome {
-            Ok(done) => {
-                results[idx] = Some(match direction {
-                    // SET path: transport must provide a checksum for CRC combination.
-                    EfaDirection::Read => {
-                        done.checksum.expect("EFA Read completion missing checksum")
-                    }
-                    // GET path: checksum not needed (already stored in FileHeader).
-                    EfaDirection::Write => 0,
-                });
-            }
-            Err(_) => {
-                first_err = Some(ValkeyError::Str(err_str));
-                break;
-            }
-        }
+/// complete within this, we return an error. The caller is responsible for
+/// draining remaining in-flight DMA transfers (via `drain_handles`) and keeping
+/// the underlying buffers alive until that drain completes.
+/// Overridable at runtime via the hidden `test-efa-op-timeout-ms` config (0 = default).
+fn efa_op_timeout() -> std::time::Duration {
+    let test_ms = crate::test_efa_op_timeout_ms();
+    if test_ms > 0 {
+        std::time::Duration::from_millis(test_ms)
+    } else {
+        std::time::Duration::from_secs(10)
     }
-    // Phase 2: untimed — wait for real DMA completion so buffers outlive the NIC writes.
-    while futures.next().await.is_some() {
-        crate::info::EFA_DRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
-    (results, first_err)
 }
+
+/// Collector for background EFA drain tasks. On timeout or transport error,
+/// `efa_transfer_addrs` spawns a task that awaits the remaining `Transfer`
+/// futures (so hardware DMA finishes) and pushes its `JoinHandle` here. The
+/// engine checks this after `run_set`/`run_get` returns with an error and
+/// keeps the buffer handles alive until every drain completes.
+pub type DrainHandles = std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>;
 
 /// EFA transfer for ONE chunk. Called once per chunk — from `Source::produce`
 /// (Read, the SET path) and `Target::consume` (Write, the GET path). `addrs` is
 /// that single chunk's client-side scatter list: a chunk may map to several client
 /// memory regions, one `(remote_addr, len, rkey)` sub-transfer each.
 ///
-/// Submits all sub-transfers, then runs `timed_drain_efa` (phase 1: timed
-/// completion for the client-facing result; phase 2: untimed drain so we never
-/// free buffers before hardware DMA finishes). Returns the chunk's combined transport
-/// CRC32C (Read/SET) or 0 (Write/GET, checksum unneeded). This is the INTRA-chunk
-/// combination (across one chunk's addresses); the caller's `combine_checksums`
-/// later does the INTER-chunk combination (across all chunks) into the
-/// whole-object CRC.
+/// Fires this chunk's sub-transfers in parallel via `FuturesUnordered`, racing
+/// them against `EFA_OP_TIMEOUT`. On timeout or transport error, remaining futures
+/// are drained in a background task (pushed to `drain_handles`). Returns the
+/// chunk's combined transport CRC32C (Read/SET) or 0 (Write/GET, checksum
+/// unneeded). This is the INTRA-chunk combination (across one chunk's addresses);
+/// the caller's `combine_checksums` later does the INTER-chunk combination
+/// (across all chunks) into the whole-object CRC.
 pub(crate) async fn efa_transfer_addrs(
     session: &Arc<Session>,
     buf_ptr: usize,
     addrs: &[ClientEFAAddress],
     direction: EfaDirection,
+    drain_handles: &DrainHandles,
 ) -> Result<u32, ValkeyError> {
-    // TODO: Track specific EFA error types (e.g. timeout, connection reset) before
-    // collapsing to the generic ERR_EFA_READ/ERR_EFA_WRITE reply string.
     let err_str = match direction {
         EfaDirection::Write => crate::errors::ERR_EFA_WRITE,
         EfaDirection::Read => crate::errors::ERR_EFA_READ,
     };
-    let indexed_futures = FuturesUnordered::new();
+    let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
     let mut sub_lens: Vec<usize> = Vec::with_capacity(addrs.len());
     for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
@@ -879,9 +852,48 @@ pub(crate) async fn efa_transfer_addrs(
         indexed_futures.push(async move { (i, transfer.await) });
         buf_offset += len;
     }
-    let (results, first_err) =
-        timed_drain_efa(indexed_futures, addrs.len(), direction, err_str).await;
-    if let Some(e) = first_err {
+    let deadline = tokio::time::Instant::now() + efa_op_timeout();
+    let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
+    let mut err: Option<ValkeyError> = None;
+    loop {
+        let next = tokio::select! {
+            biased;
+            item = indexed_futures.next() => item,
+            _ = tokio::time::sleep_until(deadline) => {
+                err = Some(ValkeyError::Str(crate::errors::ERR_EFA_TIMEOUT));
+                break;
+            }
+        };
+        let Some((idx, (outcome, _operand))) = next else {
+            break; // all futures resolved
+        };
+        match outcome {
+            Ok(done) => {
+                results[idx] = match direction {
+                    EfaDirection::Read => Some(
+                        done.checksum
+                            .expect("EFA Read completion missing checksum — transport must provide CRC"),
+                    ),
+                    EfaDirection::Write => Some(0),
+                };
+            }
+            Err(_) => {
+                err = Some(ValkeyError::Str(err_str));
+                break;
+            }
+        }
+    }
+    if let Some(e) = err {
+        // Spawn a background task to drain remaining in-flight DMA transfers.
+        // The engine keeps the underlying buffers alive until these handles resolve.
+        if !indexed_futures.is_empty() {
+            let handle = tokio::spawn(async move {
+                while indexed_futures.next().await.is_some() {
+                    crate::info::EFA_DRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            drain_handles.lock().unwrap().push(handle);
+        }
         return Err(e);
     }
     // GET (Write) path: callers ignore the returned CRC — skip combination.
@@ -900,125 +912,4 @@ pub(crate) async fn efa_transfer_addrs(
         );
     }
     Ok(combined as u32)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use dma_libfabric::{Outcome, TransferDone};
-    use dma_libfabric_protocol::DmaError;
-    use futures::stream::FuturesUnordered;
-    use std::pin::Pin;
-
-    type EfaFut =
-        Pin<Box<dyn std::future::Future<Output = (usize, (Outcome, PoolOperand))> + Send>>;
-
-    /// Build a PoolOperand safe for tests (null pointer, zero length — never dereferenced).
-    fn dummy_operand() -> PoolOperand {
-        PoolOperand::new(std::ptr::null_mut(), 0)
-    }
-
-    fn ok_read_outcome(checksum: u32) -> Outcome {
-        Ok(TransferDone {
-            bytes: 0,
-            checksum: Some(checksum),
-        })
-    }
-
-    fn ok_write_outcome() -> Outcome {
-        Ok(TransferDone {
-            bytes: 0,
-            checksum: None,
-        })
-    }
-
-    fn err_outcome() -> Outcome {
-        Err(DmaError::Transfer("test transport failure".into()))
-    }
-
-    fn instant(idx: usize, outcome: Outcome) -> EfaFut {
-        Box::pin(async move { (idx, (outcome, dummy_operand())) })
-    }
-
-    fn delayed(idx: usize, outcome: Outcome, secs: u64) -> EfaFut {
-        Box::pin(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-            (idx, (outcome, dummy_operand()))
-        })
-    }
-
-    // ─── timed_drain_efa: all complete within deadline ───────────────────
-
-    #[tokio::test(start_paused = true)]
-    async fn test_timed_drain_all_succeed_read() {
-        let futs: FuturesUnordered<EfaFut> = FuturesUnordered::new();
-        futs.push(instant(0, ok_read_outcome(100)));
-        futs.push(instant(1, ok_read_outcome(200)));
-        let (results, err) =
-            timed_drain_efa(futs, 2, EfaDirection::Read, crate::errors::ERR_EFA_READ).await;
-        assert!(err.is_none());
-        assert_eq!(results[0], Some(100));
-        assert_eq!(results[1], Some(200));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn test_timed_drain_all_succeed_write() {
-        let futs: FuturesUnordered<EfaFut> = FuturesUnordered::new();
-        futs.push(instant(0, ok_write_outcome()));
-        let (results, err) =
-            timed_drain_efa(futs, 1, EfaDirection::Write, crate::errors::ERR_EFA_WRITE).await;
-        assert!(err.is_none());
-        assert_eq!(results[0], Some(0));
-    }
-
-    // ─── timed_drain_efa: transport error ────────────────────────────────
-    // Serialized: these tests reset and assert global metric counters.
-
-    #[tokio::test(start_paused = true)]
-    #[serial_test::serial(efa_metrics)]
-    async fn test_timed_drain_transport_error_breaks_immediately() {
-        crate::info::EFA_DRAIN_COUNT.store(0, Ordering::Relaxed);
-        let futs: FuturesUnordered<EfaFut> = FuturesUnordered::new();
-        futs.push(instant(0, ok_read_outcome(100)));
-        futs.push(instant(1, err_outcome()));
-        // Third future still in-flight — should be drained in phase 2.
-        futs.push(delayed(2, ok_read_outcome(300), 1));
-        let (results, err) =
-            timed_drain_efa(futs, 3, EfaDirection::Read, crate::errors::ERR_EFA_READ).await;
-        assert!(err.is_some());
-        assert_eq!(
-            err.unwrap().to_string(),
-            crate::errors::ERR_EFA_READ.to_string()
-        );
-        // Index 0 may or may not have been polled before the error depending on
-        // FuturesUnordered ordering; index 1 was the error — no result.
-        assert_eq!(results[1], None);
-        // Phase 2 drained at least the delayed future.
-        assert!(crate::info::EFA_DRAIN_COUNT.load(Ordering::Relaxed) >= 1);
-    }
-
-    // ─── timed_drain_efa: timeout ────────────────────────────────────────
-
-    #[tokio::test(start_paused = true)]
-    #[serial_test::serial(efa_metrics)]
-    async fn test_timed_drain_timeout() {
-        crate::info::EFA_DRAIN_COUNT.store(0, Ordering::Relaxed);
-        let futs: FuturesUnordered<EfaFut> = FuturesUnordered::new();
-        // One completes immediately, one sleeps past the 10s deadline.
-        futs.push(instant(0, ok_read_outcome(42)));
-        futs.push(delayed(1, ok_read_outcome(99), 30));
-        let (results, err) =
-            timed_drain_efa(futs, 2, EfaDirection::Read, crate::errors::ERR_EFA_READ).await;
-        assert!(err.is_some());
-        assert_eq!(
-            err.unwrap().to_string(),
-            crate::errors::ERR_EFA_TIMEOUT.to_string()
-        );
-        // Index 0 completed within the deadline.
-        assert_eq!(results[0], Some(42));
-        // Index 1 timed out — no result recorded in phase 1.
-        assert_eq!(results[1], None);
-        // One future drained in phase 2.
-        assert_eq!(crate::info::EFA_DRAIN_COUNT.load(Ordering::Relaxed), 1);
-    }
 }

@@ -112,6 +112,26 @@ pub(crate) fn reply_err(
     thread_ctx.reply(Err(err));
 }
 
+/// Keep `_buffers` alive until all in-flight EFA drain tasks complete.
+/// Called on EFA error paths so the client is unblocked immediately while
+/// hardware DMA finishes safely. If no drains are pending this is a no-op
+/// and the buffers drop synchronously.
+fn spawn_buffer_guard(
+    drain_handles: Arc<crate::stream::DrainHandles>,
+    _buffers: impl Send + 'static,
+) {
+    let handles: Vec<_> = drain_handles.lock().unwrap().drain(..).collect();
+    if handles.is_empty() {
+        return;
+    }
+    crate::runtime_handle().spawn(async move {
+        for h in handles {
+            let _ = h.await;
+        }
+        drop(_buffers);
+    });
+}
+
 /// Test hook: pause between NVMe write completion and the commit (`commit_lo_value`) to allow
 /// integration tests to inject a DEL and deterministically exercise the
 /// delete-during-SET race. Controlled by `test-pause-before-finalize-set-ms`
@@ -378,7 +398,7 @@ fn cmd_get_tiered(
                 dram_pool,
                 object_id,
             };
-            cmd_get_tiered_run(
+            let drain_handles = cmd_get_tiered_run(
                 get_info,
                 &obj_ctx.buffers,
                 crate::stream::Pool::Dram(dram_pool),
@@ -390,6 +410,10 @@ fn cmd_get_tiered(
                 target,
             )
             .await;
+            // Keep DRAM buffers alive until any background EFA drains complete.
+            if let Some(dh) = drain_handles {
+                spawn_buffer_guard(dh, obj_ctx.clone());
+            }
         });
         return;
     }
@@ -441,7 +465,7 @@ fn cmd_get_tiered(
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         // Declared after thread_ctx so it drops first (see the promotion path).
         let _keep_alive = (file, fd);
-        cmd_get_tiered_run(
+        let drain_handles = cmd_get_tiered_run(
             get_info,
             &stream_ctx.buffers,
             crate::stream::Pool::Nvme(nvme_pool),
@@ -453,6 +477,10 @@ fn cmd_get_tiered(
             target,
         )
         .await;
+        // Keep NVMe buffers alive until any background EFA drains complete.
+        if let Some(dh) = drain_handles {
+            spawn_buffer_guard(dh, stream_ctx);
+        }
     });
 }
 
@@ -504,7 +532,7 @@ async fn cmd_get_tiered_run(
     chunk_iter: ChunkIterator,
     thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     target: GetTarget,
-) {
+) -> Option<Arc<crate::stream::DrainHandles>> {
     let GetObjectInfo {
         object_id,
         obj_len,
@@ -525,7 +553,7 @@ async fn cmd_get_tiered_run(
                 }
             };
             reply_err(thread_ctx, metric, ValkeyError::Str(err));
-            return;
+            return None;
         }
     };
     let job = crate::stream::StreamJob::for_nvme_get(
@@ -543,6 +571,10 @@ async fn cmd_get_tiered_run(
         pool: source_pool,
     };
     // Build the target, run the driver, reply — TCP: collected bytes; EFA: [obj_len, crc32c].
+    let drain_handles = match &target {
+        GetTarget::Efa(_) => Some(Arc::new(crate::stream::DrainHandles::new(Vec::new()))),
+        GetTarget::Tcp => None,
+    };
     let outcome = match &target {
         GetTarget::Tcp => {
             let tgt = crate::stream::Target::tcp_reply(obj_len, crate::bench_mode());
@@ -553,6 +585,7 @@ async fn cmd_get_tiered_run(
         GetTarget::Efa(session) => {
             let tgt = crate::stream::Target::EfaWrite {
                 session: session.clone(),
+                drain_handles: drain_handles.clone().unwrap(),
             };
             crate::stream::run_get(&job, chunk_iter, &source, &tgt, progress)
                 .await
@@ -566,6 +599,7 @@ async fn cmd_get_tiered_run(
         }
         Err(e) => crate::stream::reply_stream_err(thread_ctx, e),
     }
+    drain_handles
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -728,15 +762,18 @@ fn cmd_set_dram_efa(
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 let dram_pool = storage::get_dram_pool();
+                let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
                 let chunk_iter =
-                    ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(addrs));
+                    ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(addrs));
                 // Dram EFA SET: EFA-read every chunk into the DRAM buffers via the
                 // ONE streaming driver (source=EFA client, target=DRAM resident).
-                let job = crate::stream::StreamJob::for_dram(obj_len, chunk_size, 0, buffers.len());
+                let job = crate::stream::StreamJob::for_dram(obj_len, chunk_size, 0, obj_ctx.buffers.len());
+                let drain_handles = Arc::new(crate::stream::DrainHandles::new(Vec::new()));
                 let source = crate::stream::Source::EfaRead {
                     session,
-                    buffers: &buffers,
+                    buffers: &obj_ctx.buffers,
                     pool: crate::stream::Pool::Dram(dram_pool),
+                    drain_handles: drain_handles.clone(),
                 };
                 let target = crate::stream::Target::DramResident;
                 let crc = match crate::stream::run_set(&job, chunk_iter, &source, &target, |ci| {
@@ -747,14 +784,13 @@ fn cmd_set_dram_efa(
                     Ok(crc) => crc,
                     Err(e) => {
                         crate::stream::reply_stream_err(&thread_ctx, e);
-                        dram_pool.free_n(&buffers);
+                        spawn_buffer_guard(drain_handles, obj_ctx);
                         return;
                     }
                 };
                 // Insert ObjectContext BEFORE set_value so the key is never visible
                 // without its ObjectContext. On discard, remove the entry —
                 // ObjectContext::Drop returns buffers to DRAMPool automatically.
-                let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
                 dram_pool.insert_object(object_id, obj_ctx);
                 let lo_value = LoValue {
                     object_id,
@@ -927,6 +963,7 @@ async fn cmd_set_tiered_run(
         pool: nvme_pool,
     };
     // The one per-transport branch: build the source + choose the object-CRC rule.
+    let drain_handles = Arc::new(crate::stream::DrainHandles::new(Vec::new()));
     let result = match &variant {
         SetSource::Tcp(data) => {
             let source = crate::stream::Source::TcpInline {
@@ -944,6 +981,7 @@ async fn cmd_set_tiered_run(
                 session: session.clone(),
                 buffers: &stream_ctx.buffers,
                 pool: crate::stream::Pool::Nvme(nvme_pool),
+                drain_handles: drain_handles.clone(),
             };
             crate::stream::run_set(&job, chunk_iter, &source, &target, |ci| {
                 ci.combine_checksums()
@@ -955,6 +993,8 @@ async fn cmd_set_tiered_run(
         Ok(crc) => crc,
         Err(e) => {
             crate::stream::reply_stream_err(&thread_ctx, e);
+            // Keep NVMe buffers alive until any background EFA drains complete.
+            spawn_buffer_guard(drain_handles, stream_ctx);
             return;
         }
     };
@@ -1048,14 +1088,22 @@ fn cmd_get_from_dram(
                     buffers: &obj_ctx.buffers,
                     pool: crate::stream::Pool::Dram(dram_pool),
                 };
-                let target = crate::stream::Target::EfaWrite { session };
+                let drain_handles = Arc::new(crate::stream::DrainHandles::new(Vec::new()));
+                let target = crate::stream::Target::EfaWrite {
+                    session,
+                    drain_handles: drain_handles.clone(),
+                };
                 match crate::stream::run_get(&job, chunk_iter, &source, &target, None).await {
                     // [obj_len, crc32c] on clean success; a Dram GET has no progress
                     // hook, so a target error already surfaced as Err below.
                     Ok(_) => {
                         thread_ctx.reply(Ok(efa_get_reply(obj_len, crc32c)));
                     }
-                    Err(e) => crate::stream::reply_stream_err(&thread_ctx, e),
+                    Err(e) => {
+                        crate::stream::reply_stream_err(&thread_ctx, e);
+                        // Keep DRAM buffers alive until any background EFA drains complete.
+                        spawn_buffer_guard(drain_handles, obj_ctx.clone());
+                    }
                 }
             });
         }

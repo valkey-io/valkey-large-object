@@ -3,8 +3,9 @@ import collections
 import crc32c
 import os
 import subprocess
+import time
 from valkey import ResponseError
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
 
 # A tcp-provider fabric address: FI_SOCKADDR_IN for 127.0.0.1:1. The server only records it until
@@ -260,6 +261,42 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 'client address space smaller than object length')
         finally:
             process.kill()
+
+    def test_efa_timeout_drains_and_reports_metrics(self):
+        """Force EFA timeout on both GET and SET, verify error replies and
+        exact metric increments. Uses a 1ms deadline so the tcp-loopback
+        transfer cannot complete in time, triggering the drain path."""
+        cases = [
+            # (label, target_flags, setup, efa_command_args)
+            ('GET', (), lambda c: c.execute_command('BLOB.SET', 'key', PATTERN),
+             lambda r: ['BLOB.GET', 'key', *address_args(r)]),
+            ('SET', ('--read',), lambda c: None,
+             lambda r: ['BLOB.SET', 'key', TARGET_LEN, *address_args(r)]),
+        ]
+        for label, target_flags, setup, cmd_args in cases:
+            process, regions = self.start_target(*target_flags)
+            try:
+                client = self.server.get_new_client()
+                setup(client)
+                client.execute_command('BLOB.HELLO', regions[0].address)
+                before = info_largeobj(client)
+                timeout_before = before.get('largeobj_efa_timeout_errors', 0)
+                drain_before = before.get('largeobj_efa_drain_count', 0)
+                client.execute_command(
+                    'CONFIG', 'SET', 'largeobj.test-efa-op-timeout-ms', '1')
+                with self.assertRaises(ResponseError) as cm:
+                    client.execute_command(*cmd_args(regions))
+                assert 'EFA operation timed out' in str(cm.exception)
+                time.sleep(0.5)
+                after = info_largeobj(client)
+                assert after['largeobj_efa_timeout_errors'] - timeout_before == 1, \
+                    f"{label}: expected 1 timeout error, got delta {after['largeobj_efa_timeout_errors'] - timeout_before}"
+                assert after['largeobj_efa_drain_count'] - drain_before == 1, \
+                    f"{label}: expected 1 drained future, got delta {after['largeobj_efa_drain_count'] - drain_before}"
+            finally:
+                client.execute_command(
+                    'CONFIG', 'SET', 'largeobj.test-efa-op-timeout-ms', '0')
+                process.kill()
 
 
 class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
