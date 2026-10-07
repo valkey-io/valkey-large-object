@@ -21,23 +21,18 @@ from valkey import ResponseError
 from valkeytestframework.util.waiters import wait_for_true
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
-# What tests/harness/fabric_target writes (--read mode) or expects (write mode).
-# Must match fabric_target's generate_pattern(): cycling 0x00..0xFF.
-EFA_TARGET_LEN = 4096
-EFA_PATTERN = bytes(i % 256 for i in range(EFA_TARGET_LEN))
-
-# 900KB objects in 1MB segments: exactly one object per segment.
-OBJ_SIZE = 900 * 1024
+# 900KB in a 1MB segment: one object of this size fills a segment by itself.
+SEGMENT_FILLING_SIZE = 900 * 1024
 
 
-def wait_uring_registered_matches_live(client, timeout=10):
-    """Tiered: each pool's io_uring ring registers its own live segments
-    (dram_uring==dram_live, nvme_uring==nvme_live). wait_for because the
+def wait_uring_registered_matches_segments(client, timeout=10):
+    """Tiered: each pool's io_uring ring registers all its segments
+    (dram_uring==dram_segments, nvme_uring==nvme_segments). wait_for because the
     re-register on expand/shrink is fire-and-forget on the poller."""
     def _match():
         i = info_largeobj(client)
-        return (i['largeobj_dram_uring_registered_segments'] == i['largeobj_dram_live_segments']
-                and i['largeobj_nvme_uring_registered_segments'] == i['largeobj_nvme_live_segments'])
+        return (i['largeobj_dram_uring_registered_segments'] == i['largeobj_dram_segments']
+                and i['largeobj_nvme_uring_registered_segments'] == i['largeobj_nvme_segments'])
     wait_for_true(_match, timeout=timeout)
 
 
@@ -58,14 +53,14 @@ def apply_full_shrink_pressure(client, policy='noeviction'):
 def shrink_completed(client):
     """No segment draining and every reclaimed key deleted."""
     info = info_largeobj(client)
-    return info['largeobj_draining_segments'] == 0 and info['largeobj_pending_reclaims'] == 0
+    return info['largeobj_dram_draining_segments'] == 0 and info['largeobj_pending_reclaims'] == 0
 
 
 def promote(client, keys):
     """Tiered (promote-min-hits 1): one GET per key caches it in DRAM."""
     for key in keys:
         client.execute_command('BLOB.GET', key)
-    wait_for_true(lambda: info_largeobj(client)['largeobj_cached_objects'] == len(keys))
+    wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == len(keys))
 
 
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
@@ -110,25 +105,25 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         before = info_largeobj(client)
 
-        assert client.execute_command('BLOB.SET', 'key_a', b'A' * OBJ_SIZE) == b'OK'
-        assert client.execute_command('BLOB.SET', 'key_b', b'B' * OBJ_SIZE) == b'OK'
+        assert client.execute_command('BLOB.SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE) == b'OK'
+        assert client.execute_command('BLOB.SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE) == b'OK'
 
         after = info_largeobj(client)
-        assert after['largeobj_scaling_expands'] == before['largeobj_scaling_expands'] + 1
-        assert after['largeobj_dram_live_segments'] == 2
+        assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands'] + 1
+        assert after['largeobj_dram_segments'] == 2
         # Dram mode has no io_uring ring, so nothing is ever io_uring-registered.
         assert after['largeobj_dram_uring_registered_segments'] == 0
 
     def test_expand_data_integrity(self):
         """Objects spread over expanded segments all read back correctly."""
         client = self.server.get_new_client()
-        before = info_largeobj(client)['largeobj_scaling_expands']
+        before = info_largeobj(client)['largeobj_dram_scaling_expands']
         payloads = {f'key_{i}': bytes([i]) * (800 * 1024) for i in range(4)}
 
         for key, payload in payloads.items():
             client.execute_command('BLOB.SET', key, payload)
 
-        assert info_largeobj(client)['largeobj_scaling_expands'] == before + 3
+        assert info_largeobj(client)['largeobj_dram_scaling_expands'] == before + 3
         for key, payload in payloads.items():
             assert client.execute_command('BLOB.GET', key) == payload
 
@@ -140,8 +135,11 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         so the next 4KB object -- the EFA SET -- fits neither.
         """
         client = self.server.get_new_client()
-        expands = lambda: info_largeobj(client)['largeobj_scaling_expands']
-        small = b'F' * EFA_TARGET_LEN
+        expands = lambda: info_largeobj(client)['largeobj_dram_scaling_expands']
+        efa_len = 4096
+        # fabric_target --read serves 0x00..0xFF repeating (its generate_pattern()).
+        efa_payload = bytes(i % 256 for i in range(efa_len))
+        small = b'F' * efa_len
         start = expands()
 
         sets = 0
@@ -153,18 +151,18 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         for i in range(per_segment - 1):
             client.execute_command('BLOB.SET', f'filler_{sets + i}', small)
         assert expands() == start + 1
-        assert info_largeobj(client)['largeobj_dram_live_segments'] == 2
+        assert info_largeobj(client)['largeobj_dram_segments'] == 2
 
         process, address, rkey, remote_addr, length = self.start_target('--read')
         try:
             client.execute_command('BLOB.HELLO', address)
-            result = client.execute_command('BLOB.SET', 'efa_key', EFA_TARGET_LEN, rkey, remote_addr, length)
+            result = client.execute_command('BLOB.SET', 'efa_key', efa_len, rkey, remote_addr, length)
             assert result == b'OK', f"EFA SET failed: {result}"
-            assert client.execute_command('BLOB.GET', 'efa_key') == EFA_PATTERN
+            assert client.execute_command('BLOB.GET', 'efa_key') == efa_payload
         finally:
             process.kill()
         assert expands() == start + 2
-        assert info_largeobj(client)['largeobj_dram_live_segments'] == 3
+        assert info_largeobj(client)['largeobj_dram_segments'] == 3
 
 
 class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
@@ -199,15 +197,25 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
         any expand is the cron's.
         """
         client = self.server.get_new_client()
-        expand_before = info_largeobj(client)['largeobj_scaling_expands']
+        expand_before = info_largeobj(client)['largeobj_dram_scaling_expands']
 
         assert client.execute_command('BLOB.SET', 'probe', b'P' * (600 * 1024)) == b'OK'
-        assert info_largeobj(client)['largeobj_scaling_expands'] == expand_before
+        assert info_largeobj(client)['largeobj_dram_scaling_expands'] == expand_before
 
         wait_for_true(
-            lambda: info_largeobj(client)['largeobj_scaling_expands'] > expand_before,
+            lambda: info_largeobj(client)['largeobj_dram_scaling_expands'] > expand_before,
             timeout=self.EXPAND_TIMEOUT_S,
         )
+
+        # The next 600KB object doesn't fit the first segment, so it must land in
+        # the cron's new one. Raising the watermark to 95 (~59% used after it)
+        # stops cron expands, so any expand from here would be the SET's own.
+        client.config_set('largeobj.scaling-expand-watermark', 95)
+        expanded = info_largeobj(client)['largeobj_dram_scaling_expands']
+        second = b'S' * (600 * 1024)
+        assert client.execute_command('BLOB.SET', 'second', second) == b'OK'
+        assert info_largeobj(client)['largeobj_dram_scaling_expands'] == expanded
+        assert client.execute_command('BLOB.GET', 'second') == second
 
 
 class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
@@ -233,18 +241,21 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         not grow. The object is small enough that core's own OOM check passes."""
         client = self.server.get_new_client()
         client.config_set('maxmemory-policy', 'noeviction')
-        client.execute_command('BLOB.SET', 'key_a', b'A' * OBJ_SIZE)
+        client.execute_command('BLOB.SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
 
         used = int(client.info('memory')['used_memory'])
+        # 600KB under maxmemory: core's OOM check lets a 200KB SET through, but
+        # the module can't add a 1MB segment.
         client.config_set('maxmemory', used + 600 * 1024)
         before = info_largeobj(client)
 
-        # 200KB does not fit the ~124KB left in the segment.
+        # 200KB does not fit the ~124KB left in the segment, so it needs a new
+        # segment, and the module rejects it.
         with pytest.raises(ResponseError, match='pool exhausted'):
             client.execute_command('BLOB.SET', 'key_b', b'B' * (200 * 1024))
         after = info_largeobj(client)
-        assert after['largeobj_dram_live_segments'] == before['largeobj_dram_live_segments']
-        assert after['largeobj_scaling_expands'] == before['largeobj_scaling_expands']
+        assert after['largeobj_dram_segments'] == before['largeobj_dram_segments']
+        assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands']
 
 
 class TestDramShrink(ValkeyLargeObjTestCaseBase):
@@ -255,7 +266,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
 
     TIMEOUT_S = 20
     # One object per segment, so each shrink reclaims exactly one key.
-    PAYLOADS = {f'dshrink_{i}': bytes([i]) * OBJ_SIZE for i in range(4)}
+    PAYLOADS = {f'dshrink_{i}': bytes([i]) * SEGMENT_FILLING_SIZE for i in range(4)}
 
     def get_module_args(self, data_dir, direct_io):
         # Expand watermark 95 (above one object's ~88% of a segment): no proactive
@@ -284,8 +295,8 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         apply_shrink_pressure(client, 'volatile-lru')
         with pytest.raises(ResponseError):
             client.set('core_key', 'v')
-        wait_for_true(lambda: info_largeobj(client)['largeobj_scaling_shrinks']
-                      > before['largeobj_scaling_shrinks'], timeout=self.TIMEOUT_S)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_scaling_shrinks']
+                      > before['largeobj_dram_scaling_shrinks'], timeout=self.TIMEOUT_S)
         # SET raises OOM until the shrink has freed enough memory.
         wait_for_true(lambda: client.set('core_key', 'v'), ignore_exception=ResponseError,
                       timeout=self.TIMEOUT_S)
@@ -296,8 +307,8 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: shrink_completed(client), timeout=self.TIMEOUT_S)
 
         after = info_largeobj(client)
-        shrinks = after['largeobj_scaling_shrinks'] - before['largeobj_scaling_shrinks']
-        assert after['largeobj_dram_live_segments'] == before['largeobj_dram_live_segments'] - shrinks
+        shrinks = after['largeobj_dram_scaling_shrinks'] - before['largeobj_dram_scaling_shrinks']
+        assert after['largeobj_dram_segments'] == before['largeobj_dram_segments'] - shrinks
         assert after['largeobj_reclaims'] - before['largeobj_reclaims'] == shrinks
         surviving = [k for k in self.PAYLOADS if client.exists(k)]
         assert len(surviving) == len(self.PAYLOADS) - shrinks
@@ -336,12 +347,12 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         """Dram shrink deletes keys, so noeviction disables it."""
         client = self.server.get_new_client()
         self._write_payloads(client)
-        shrinks = info_largeobj(client)['largeobj_scaling_shrinks']
+        shrinks = info_largeobj(client)['largeobj_dram_scaling_shrinks']
 
         apply_shrink_pressure(client)
         time.sleep(3)  # three cron ticks at scaling-poll-ms 1000
 
-        assert info_largeobj(client)['largeobj_scaling_shrinks'] == shrinks
+        assert info_largeobj(client)['largeobj_dram_scaling_shrinks'] == shrinks
         for key, payload in self.PAYLOADS.items():
             assert client.execute_command('BLOB.GET', key) == payload
 
@@ -349,12 +360,12 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         """maxmemory 0 gives no pressure signal, so no shrink under any policy."""
         client = self.server.get_new_client()
         self._write_payloads(client)
-        shrinks = info_largeobj(client)['largeobj_scaling_shrinks']
+        shrinks = info_largeobj(client)['largeobj_dram_scaling_shrinks']
 
         client.config_set('maxmemory-policy', 'volatile-lru')
         time.sleep(3)  # three cron ticks at scaling-poll-ms 1000
 
-        assert info_largeobj(client)['largeobj_scaling_shrinks'] == shrinks
+        assert info_largeobj(client)['largeobj_dram_scaling_shrinks'] == shrinks
         for key, payload in self.PAYLOADS.items():
             assert client.execute_command('BLOB.GET', key) == payload
 
@@ -365,24 +376,24 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         before = info_largeobj(client)
         self._write_payloads(client)
         expanded = info_largeobj(client)
-        assert expanded['largeobj_scaling_expands'] == before['largeobj_scaling_expands'] + 3
-        assert expanded['largeobj_dram_live_segments'] == 4
+        assert expanded['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands'] + 3
+        assert expanded['largeobj_dram_segments'] == 4
 
         apply_full_shrink_pressure(client, 'volatile-lru')
-        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_live_segments'] == 0
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 0
                       and shrink_completed(client), timeout=self.TIMEOUT_S)
         shrunk = info_largeobj(client)
-        assert shrunk['largeobj_scaling_shrinks'] == expanded['largeobj_scaling_shrinks'] + 4
+        assert shrunk['largeobj_dram_scaling_shrinks'] == expanded['largeobj_dram_scaling_shrinks'] + 4
         assert shrunk['largeobj_reclaims'] == expanded['largeobj_reclaims'] + 4
         assert shrunk['largeobj_num_objects'] == 0
         assert client.dbsize() == 0
 
         client.config_set('maxmemory', 0)
-        assert client.execute_command('BLOB.SET', 'after', b'Z' * OBJ_SIZE) == b'OK'
+        assert client.execute_command('BLOB.SET', 'after', b'Z' * SEGMENT_FILLING_SIZE) == b'OK'
         regrown = info_largeobj(client)
-        assert regrown['largeobj_scaling_expands'] == shrunk['largeobj_scaling_expands'] + 1
-        assert regrown['largeobj_dram_live_segments'] == 1
-        assert client.execute_command('BLOB.GET', 'after') == b'Z' * OBJ_SIZE
+        assert regrown['largeobj_dram_scaling_expands'] == shrunk['largeobj_dram_scaling_expands'] + 1
+        assert regrown['largeobj_dram_segments'] == 1
+        assert client.execute_command('BLOB.GET', 'after') == b'Z' * SEGMENT_FILLING_SIZE
 
 
 # ─── Tiered Mode Scaling ──────────────────────────────────────────────────────
@@ -411,19 +422,19 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
     def test_tiered_expand_on_promotion(self):
         """Promoting an object that fits no segment expands the pool."""
         client = self.server.get_new_client()
-        client.execute_command('BLOB.SET', 'key_a', b'A' * OBJ_SIZE)
-        client.execute_command('BLOB.SET', 'key_b', b'B' * OBJ_SIZE)
+        client.execute_command('BLOB.SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE)
         before = info_largeobj(client)
 
         promote(client, ['key_a', 'key_b'])
 
         after = info_largeobj(client)
-        assert after['largeobj_scaling_expands'] == before['largeobj_scaling_expands'] + 1
-        assert after['largeobj_dram_live_segments'] == 2
-        assert client.execute_command('BLOB.GET', 'key_a') == b'A' * OBJ_SIZE
-        assert client.execute_command('BLOB.GET', 'key_b') == b'B' * OBJ_SIZE
+        assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands'] + 1
+        assert after['largeobj_dram_segments'] == 2
+        assert client.execute_command('BLOB.GET', 'key_a') == b'A' * SEGMENT_FILLING_SIZE
+        assert client.execute_command('BLOB.GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE
         # The expanded DRAM segment joins its ring's io_uring table (per-pool).
-        wait_uring_registered_matches_live(client)
+        wait_uring_registered_matches_segments(client)
 
 
 class TestTieredShrink(ValkeyLargeObjTestCaseBase):
@@ -432,7 +443,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
     deletes no keys, so it runs under noeviction too."""
 
     TIMEOUT_S = 20
-    PAYLOADS = {f'tshrink_{i}': bytes([i]) * OBJ_SIZE for i in range(4)}
+    PAYLOADS = {f'tshrink_{i}': bytes([i]) * SEGMENT_FILLING_SIZE for i in range(4)}
 
     def get_module_args(self, data_dir, direct_io):
         # Expand watermark 95: one segment per cached object and no empty
@@ -452,35 +463,35 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         self._write_and_promote(client)
         before = info_largeobj(client)
-        assert before['largeobj_dram_live_segments'] == 4
+        assert before['largeobj_dram_segments'] == 4
 
         apply_shrink_pressure(client, 'noeviction')
-        wait_for_true(lambda: info_largeobj(client)['largeobj_scaling_shrinks']
-                      > before['largeobj_scaling_shrinks'], timeout=self.TIMEOUT_S)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_scaling_shrinks']
+                      > before['largeobj_dram_scaling_shrinks'], timeout=self.TIMEOUT_S)
         client.config_set('maxmemory', 0)
         wait_for_true(lambda: shrink_completed(client), timeout=self.TIMEOUT_S)
 
         after = info_largeobj(client)
-        shrinks = after['largeobj_scaling_shrinks'] - before['largeobj_scaling_shrinks']
-        assert after['largeobj_dram_live_segments'] == 4 - shrinks
-        assert after['largeobj_cached_objects'] == 4 - shrinks
+        shrinks = after['largeobj_dram_scaling_shrinks'] - before['largeobj_dram_scaling_shrinks']
+        assert after['largeobj_dram_segments'] == 4 - shrinks
+        assert after['largeobj_dram_objects'] == 4 - shrinks
         assert after['largeobj_reclaims'] == before['largeobj_reclaims']  # no key deleted
         assert client.dbsize() == 4
         self._assert_reads_from_nvme(client)
         # The released segment left its ring's io_uring table too.
-        wait_uring_registered_matches_live(client, timeout=self.TIMEOUT_S)
+        wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
 
     def test_no_shrink_without_maxmemory(self):
         """maxmemory 0 gives no pressure signal, so cached copies stay."""
         client = self.server.get_new_client()
         self._write_and_promote(client)
-        shrinks = info_largeobj(client)['largeobj_scaling_shrinks']
+        before = info_largeobj(client)
 
         time.sleep(3)  # three cron ticks at scaling-poll-ms 1000
 
         after = info_largeobj(client)
-        assert after['largeobj_scaling_shrinks'] == shrinks
-        assert after['largeobj_cached_objects'] == 4
+        assert after['largeobj_dram_scaling_shrinks'] == before['largeobj_dram_scaling_shrinks']
+        assert after['largeobj_dram_objects'] == before['largeobj_dram_objects']
 
     def test_expand_shrink_to_zero_expand(self):
         """Promotion expands the pool, shrink drops every cached copy down to
@@ -489,28 +500,28 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         before = info_largeobj(client)
         self._write_and_promote(client)
         expanded = info_largeobj(client)
-        assert expanded['largeobj_scaling_expands'] == before['largeobj_scaling_expands'] + 3
-        assert expanded['largeobj_dram_live_segments'] == 4
+        assert expanded['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands'] + 3
+        assert expanded['largeobj_dram_segments'] == 4
 
         apply_full_shrink_pressure(client, 'noeviction')
-        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_live_segments'] == 0
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 0
                       and shrink_completed(client), timeout=self.TIMEOUT_S)
         shrunk = info_largeobj(client)
-        assert shrunk['largeobj_scaling_shrinks'] == expanded['largeobj_scaling_shrinks'] + 4
-        assert shrunk['largeobj_cached_objects'] == 0
+        assert shrunk['largeobj_dram_scaling_shrinks'] == expanded['largeobj_dram_scaling_shrinks'] + 4
+        assert shrunk['largeobj_dram_objects'] == 0
         # Still under pressure, so no segment can be added: reads come from NVMe.
         self._assert_reads_from_nvme(client)
-        assert info_largeobj(client)['largeobj_dram_live_segments'] == 0
-        wait_uring_registered_matches_live(client, timeout=self.TIMEOUT_S)
+        assert info_largeobj(client)['largeobj_dram_segments'] == 0
+        wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
 
         client.config_set('maxmemory', 0)
         promote(client, ['tshrink_0'])
         regrown = info_largeobj(client)
-        assert regrown['largeobj_scaling_expands'] == shrunk['largeobj_scaling_expands'] + 1
-        assert regrown['largeobj_dram_live_segments'] == 1
+        assert regrown['largeobj_dram_scaling_expands'] == shrunk['largeobj_dram_scaling_expands'] + 1
+        assert regrown['largeobj_dram_segments'] == 1
         assert client.execute_command('BLOB.INFO', 'tshrink_0', 'TIER') == b'dram'
         assert client.execute_command('BLOB.GET', 'tshrink_0') == self.PAYLOADS['tshrink_0']
-        wait_uring_registered_matches_live(client, timeout=self.TIMEOUT_S)
+        wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
 
 
 class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
@@ -527,28 +538,28 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
 
     def test_shrink_releases_efa_registered_expanded_segment(self):
         client = self.server.get_new_client()
-        expand_before = info_largeobj(client)['largeobj_scaling_expands']
+        expand_before = info_largeobj(client)['largeobj_dram_scaling_expands']
 
         # Promoting the second ~full-segment object forces a reactive expand, and with the
         # fabric up try_expand EFA-registers that new segment (the path under test).
-        client.execute_command('BLOB.SET', 'key_a', b'A' * OBJ_SIZE)
-        client.execute_command('BLOB.SET', 'key_b', b'B' * OBJ_SIZE)
+        client.execute_command('BLOB.SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE)
         promote(client, ['key_a', 'key_b'])
 
         expanded = info_largeobj(client)
-        assert expanded['largeobj_scaling_expands'] > expand_before
-        dram_live = expanded['largeobj_dram_live_segments']
+        assert expanded['largeobj_dram_scaling_expands'] > expand_before
+        dram_segments = expanded['largeobj_dram_segments']
         registered = expanded['largeobj_efa_registered_segments']
-        assert dram_live > 1
+        assert dram_segments > 1
         # EFA registration spans BOTH pools: every live segment (DRAM + NVMe staging) is registered.
-        assert registered == dram_live + expanded['largeobj_nvme_live_segments']
-        wait_uring_registered_matches_live(client, timeout=self.TIMEOUT_S)
+        assert registered == dram_segments + expanded['largeobj_nvme_segments']
+        wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
 
         # In Tiered mode shrink releases a live-data segment (data persists on NVMe), and with
         # the fabric up the released segment carries an EFA registration Segment::drop tears down.
         apply_shrink_pressure(client)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_scaling_shrinks']
-                      > expanded['largeobj_scaling_shrinks'], timeout=self.TIMEOUT_S)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_scaling_shrinks']
+                      > expanded['largeobj_dram_scaling_shrinks'], timeout=self.TIMEOUT_S)
         client.config_set('maxmemory', 0)
         wait_for_true(lambda: shrink_completed(client), timeout=self.TIMEOUT_S)
 
@@ -556,7 +567,7 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         after = info_largeobj(client)
         assert after['largeobj_efa_registered_segments'] < registered
         assert after['largeobj_efa_registered_segments'] == (
-            after['largeobj_dram_live_segments'] + after['largeobj_nvme_live_segments'])
-        wait_uring_registered_matches_live(client, timeout=self.TIMEOUT_S)
-        assert client.execute_command('BLOB.GET', 'key_a') == b'A' * OBJ_SIZE
-        assert client.execute_command('BLOB.GET', 'key_b') == b'B' * OBJ_SIZE
+            after['largeobj_dram_segments'] + after['largeobj_nvme_segments'])
+        wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
+        assert client.execute_command('BLOB.GET', 'key_a') == b'A' * SEGMENT_FILLING_SIZE
+        assert client.execute_command('BLOB.GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE

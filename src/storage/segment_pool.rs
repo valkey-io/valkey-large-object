@@ -734,25 +734,24 @@ impl SegmentPool {
         (allocated as f64) / (capacity as f64)
     }
 
-    /// Counts of (live, draining, unused) segments.
+    /// Counts of (total, draining, unused) segments; total includes draining.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         let st = self.state.lock().expect("state lock unavailable");
-        let mut live = 0usize;
+        let mut total = 0usize;
         let mut draining = 0usize;
         let mut unused = 0usize;
         for s in st.slots.iter() {
             match s {
                 None => unused += 1,
                 Some(seg) => {
+                    total += 1;
                     if seg.draining.load(std::sync::atomic::Ordering::Relaxed) {
                         draining += 1;
-                    } else {
-                        live += 1;
                     }
                 }
             }
         }
-        (live, draining, unused)
+        (total, draining, unused)
     }
 
     /// Call `f` with each live segment's base pointer and size.

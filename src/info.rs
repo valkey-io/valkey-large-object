@@ -89,23 +89,23 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .get()
         .expect("DRAM_POOL not initialized — lo_info called before module init");
 
-    let (live, draining, unused) = dram.segment_counts();
+    let (total, draining, unused) = dram.segment_counts();
     let seg_size = crate::dram_segment_size();
-    let capacity = live * seg_size;
+    let capacity = (total - draining) * seg_size;
     let allocated = dram.allocated_bytes();
     let util_pct = (allocated * 100).checked_div(capacity).unwrap_or(0) as i64;
 
     let mut section = ctx
         .builder()
         .add_section("dram")
-        .field("dram_live_segments", live as i64)?
-        .field("draining_segments", draining as i64)?
+        .field("dram_segments", total as i64)?
+        .field("dram_draining_segments", draining as i64)?
         .field("dram_unused_segments", unused as i64)?
-        .field("allocated_bytes", allocated as i64)?
+        .field("dram_allocated_bytes", allocated as i64)?
         .field("dram_fragment_count", dram.fragment_count() as i64)?
-        .field("capacity_bytes", capacity as i64)?
-        .field("utilization_pct", util_pct)?
-        .field("cached_objects", dram.object_count() as i64)?;
+        .field("dram_capacity_bytes", capacity as i64)?
+        .field("dram_utilization_pct", util_pct)?
+        .field("dram_objects", dram.object_count() as i64)?;
     // Cache counters exist only in Tiered mode.
     if let Some(cache) = &dram.cache {
         section = section
@@ -118,25 +118,25 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
                 cache.stats.misses.load(Ordering::Relaxed) as i64,
             )?
             .field(
-                "promotions",
+                "cache_promotions",
                 cache.stats.promotions.load(Ordering::Relaxed) as i64,
             )?
             .field(
-                "admission_rejects",
+                "cache_admission_rejects",
                 cache.admission.rejects.load(Ordering::Relaxed) as i64,
             )?
             .field(
-                "demotions",
+                "cache_demotions",
                 cache.stats.demotions.load(Ordering::Relaxed) as i64,
             )?;
     }
     section
         .field(
-            "scaling_expands",
+            "dram_scaling_expands",
             dram.expand_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
-            "scaling_shrinks",
+            "dram_scaling_shrinks",
             dram.shrink_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field("dram_segment_size_bytes", seg_size as i64)?
@@ -158,14 +158,14 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         return Ok(());
     };
 
-    let (live, _draining, unused) = nvme.segment_counts();
+    let (total, _draining, unused) = nvme.segment_counts();
 
     ctx.builder()
         .add_section("nvme_staging")
-        .field("nvme_live_segments", live as i64)?
+        .field("nvme_segments", total as i64)?
         .field("nvme_unused_segments", unused as i64)?
         .field("nvme_fragment_count", nvme.fragment_count() as i64)?
-        .field("staging_size_bytes", crate::nvme_staging_size() as i64)?
+        .field("nvme_staging_size_bytes", crate::nvme_staging_size() as i64)?
         .field("nvme_segment_size_bytes", crate::dram_segment_size() as i64)?
         .field(
             "nvme_uring_registered_segments",
