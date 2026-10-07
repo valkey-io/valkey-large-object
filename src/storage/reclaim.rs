@@ -112,6 +112,8 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
                 let oid = lo.object_id;
                 if RECLAIM_LIST.contains(&oid) {
                     let _ = ctx.open_key_writable(&name).unlink();
+                    // Same keyspace event core fires for its own evictions.
+                    ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
                     // lo_free runs later on the BIO thread; clear now so the
                     // scan stops once every listed key is gone.
                     RECLAIM_LIST.remove(&oid);

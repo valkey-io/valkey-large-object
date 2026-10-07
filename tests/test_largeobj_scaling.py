@@ -291,6 +291,9 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         self._write_payloads(client)
         before = info_largeobj(client)
+        client.config_set('notify-keyspace-events', 'Ee')
+        events = client.pubsub()
+        events.subscribe('__keyevent@0__:evicted')
 
         apply_shrink_pressure(client, 'volatile-lru')
         with pytest.raises(ResponseError):
@@ -314,6 +317,12 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         assert len(surviving) == len(self.PAYLOADS) - shrinks
         for key in surviving:
             assert client.execute_command('BLOB.GET', key) == self.PAYLOADS[key]
+        # Each reclaimed key fires the same 'evicted' event as a core eviction.
+        evicted = []
+        while (msg := events.get_message(timeout=1)) is not None:
+            if msg['type'] == 'message':
+                evicted.append(msg['data'].decode())
+        assert sorted(evicted) == sorted(set(self.PAYLOADS) - set(surviving))
 
     def test_reclaimed_key_reads_as_missing(self):
         """Between the shrink and its key deletion, the victim key still exists
