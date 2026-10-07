@@ -884,7 +884,7 @@ pub(crate) async fn efa_transfer_addrs(
                         EfaDirection::Read => Some(done.checksum.expect(
                             "EFA Read completion missing checksum — transport must provide CRC",
                         )),
-                        EfaDirection::Write => Some(0),
+                        EfaDirection::Write => None,
                     };
                 }
                 Err(_) => {
