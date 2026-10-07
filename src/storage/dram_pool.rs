@@ -451,17 +451,19 @@ impl DRAMPool {
         // Hold the reclaim list across the map scan. A concurrent `remove_object`
         // either removed the object first (not seen, not listed) or blocks
         // until we are done and then clears the oid we listed.
-        let mut reclaim = super::reclaim::RECLAIM_LIST.lock();
-        let removed = self
-            .objects
-            .write()
-            .expect("DRAMPool.objects lock unavailable")
-            .remove_by_segment_id(victim_idx);
-        // Tiered: the objects live on in NVMe, so their keys stay valid.
-        if crate::operating_mode() == crate::OperatingMode::Dram {
-            reclaim.extend(removed);
-        }
-        drop(reclaim);
+        super::reclaim::RECLAIM_LIST.add_with(|| {
+            let removed = self
+                .objects
+                .write()
+                .expect("DRAMPool.objects lock unavailable")
+                .remove_by_segment_id(victim_idx);
+            // Tiered: the objects live on in NVMe, so their keys stay valid.
+            if crate::operating_mode() == crate::OperatingMode::Dram {
+                removed
+            } else {
+                Default::default()
+            }
+        });
 
         self.shrink_count.fetch_add(1, Ordering::Relaxed);
         true

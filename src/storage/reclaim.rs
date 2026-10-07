@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -22,35 +22,43 @@ pub static RECLAIM_LIST: LazyLock<ReclaimList> = LazyLock::new(ReclaimList::defa
 #[derive(Default)]
 pub struct ReclaimList {
     oids: Mutex<HashSet<ObjectId>>,
+    /// `oids.len()`, written under the lock: readers skip it when empty.
+    len: AtomicUsize,
 }
 
 impl ReclaimList {
-    /// Hold the list across another lock (shrink lists oids while it holds
-    /// `DRAMPool.objects`).
-    pub fn lock(&self) -> MutexGuard<'_, HashSet<ObjectId>> {
+    /// Private so every change goes through `add_with` / `remove`, which update `len`.
+    fn lock(&self) -> MutexGuard<'_, HashSet<ObjectId>> {
         self.oids.lock().expect("RECLAIM_LIST lock unavailable")
     }
 
+    /// Adds the oids returned by `f` to the reclaim set, which stays locked while
+    /// `f` runs. Call with the server lock held (main thread, or
+    /// `ThreadSafeContext::lock()`).
+    pub fn add_with<I: IntoIterator<Item = ObjectId>>(&self, f: impl FnOnce() -> I) {
+        let mut oids = self.lock();
+        oids.extend(f());
+        self.len.store(oids.len(), Ordering::Release);
+    }
+
     pub fn contains(&self, oid: &ObjectId) -> bool {
-        self.lock().contains(oid)
+        !self.is_empty() && self.lock().contains(oid)
     }
 
     pub fn len(&self) -> usize {
-        self.lock().len()
+        self.len.load(Ordering::Acquire)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.len() == 0
     }
 
-    /// Copy of the listed oids, so the caller can scan without holding the lock.
-    pub fn snapshot(&self) -> HashSet<ObjectId> {
-        self.lock().clone()
-    }
-
-    /// Take `oid` off the list, counting the completed reclaim on the DRAMPool.
+    /// Take `oid` off the list, counting the reclaim. Always locks: `remove_object`
+    /// must wait for a shrink that is listing this oid.
     pub fn remove(&self, oid: &ObjectId) {
-        if self.lock().remove(oid) {
+        let mut oids = self.lock();
+        if oids.remove(oid) {
+            self.len.store(oids.len(), Ordering::Release);
             super::get_dram_pool()
                 .reclaims
                 .fetch_add(1, Ordering::Relaxed);
@@ -88,9 +96,6 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
         return;
     }
     let deadline = Instant::now() + Duration::from_micros(crate::reclaim_scan_budget_us());
-    // Shrink, the only writer that adds oids, also runs on this thread, so the
-    // snapshot misses nothing. Oids other threads remove meanwhile just never match.
-    let reclaim = RECLAIM_LIST.snapshot();
     RECLAIM_SCAN_CURSOR.with_borrow_mut(|scan| {
         while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
             // Past the last db: one full pass done. At most one pass per tick
@@ -105,7 +110,7 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
                     return;
                 };
                 let oid = lo.object_id;
-                if reclaim.contains(&oid) {
+                if RECLAIM_LIST.contains(&oid) {
                     let _ = ctx.open_key_writable(&name).unlink();
                     // lo_free runs later on the BIO thread; clear now so the
                     // scan stops once every listed key is gone.
