@@ -862,7 +862,7 @@ pub(crate) async fn efa_transfer_addrs(
         }
     }
     let deadline = tokio::time::Instant::now() + efa_op_timeout();
-    let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
+    let mut results: Vec<Option<Crc>> = vec![None; addrs.len()];
     loop {
         let next = tokio::select! {
             biased;
