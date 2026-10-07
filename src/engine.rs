@@ -552,6 +552,10 @@ async fn cmd_get_tiered_run(
                     (&info::DRAM_POOL_EXHAUSTED, errors::ERR_DRAM_POOL_EXHAUSTED)
                 }
             };
+            // Promotion path: remove the Filling entry from the DRAM pool.
+            if let crate::stream::Pool::Dram(p) = source_pool {
+                p.remove_object(&object_id);
+            }
             reply_err(thread_ctx, metric, ValkeyError::Str(err));
             return None;
         }
