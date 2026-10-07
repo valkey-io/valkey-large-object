@@ -180,7 +180,7 @@ fn commit_lo_value(
     if crate::operating_mode() == OperatingMode::Dram
         && storage::get_dram_pool().get_object(&object_id).is_none()
     {
-        return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
+        return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
     let key_str = ctx.create_string(key_name.to_vec());
     let key = ctx.open_key_writable(&key_str);
