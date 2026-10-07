@@ -17,7 +17,7 @@ import subprocess
 import time
 
 import pytest
-from valkey import ResponseError
+from valkey import OutOfMemoryError, ResponseError
 from valkeytestframework.util.waiters import wait_for_true
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
@@ -288,21 +288,30 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('BLOB.SET', key, payload) == b'OK'
 
     def test_shrink_deletes_victim_keys_and_frees_memory(self):
+        """Under maxmemory pressure with an evicting policy, a shrink releases a
+        segment and deletes its keys, which frees enough memory for core writes
+        to succeed again. Every deleted key fires an 'evicted' keyspace event,
+        and every surviving key still reads back correctly."""
         client = self.server.get_new_client()
         self._write_payloads(client)
         before = info_largeobj(client)
+        # Subscribe before the shrink so no 'evicted' event is missed.
         client.config_set('notify-keyspace-events', 'Ee')
         events = client.pubsub()
         events.subscribe('__keyevent@0__:evicted')
+        assert events.get_message(timeout=1)['type'] == 'subscribe'
 
         apply_shrink_pressure(client, 'volatile-lru')
-        with pytest.raises(ResponseError):
+        # Over maxmemory: core rejects the write before any shrink has run.
+        with pytest.raises(OutOfMemoryError):
             client.set('core_key', 'v')
         wait_for_true(lambda: info_largeobj(client)['largeobj_dram_scaling_shrinks']
                       > before['largeobj_dram_scaling_shrinks'], timeout=self.TIMEOUT_S)
-        # SET raises OOM until the shrink has freed enough memory.
-        wait_for_true(lambda: client.set('core_key', 'v'), ignore_exception=ResponseError,
-                      timeout=self.TIMEOUT_S)
+        # Retry SET on a standard (core) Valkey string key until it returns OK:
+        # it raises OOM until the shrink has freed enough memory. The client
+        # maps an OK reply to True.
+        wait_for_true(lambda: client.set('core_key', 'v') is True,
+                      ignore_exception=OutOfMemoryError, timeout=self.TIMEOUT_S)
 
         # Lift the pressure so no further shrink starts, then wait for the last
         # one to finish: segment released and its keys deleted.
@@ -310,19 +319,24 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: shrink_completed(client), timeout=self.TIMEOUT_S)
 
         after = info_largeobj(client)
-        shrinks = after['largeobj_dram_scaling_shrinks'] - before['largeobj_dram_scaling_shrinks']
-        assert after['largeobj_dram_segments'] == before['largeobj_dram_segments'] - shrinks
-        assert after['largeobj_reclaims'] - before['largeobj_reclaims'] == shrinks
-        surviving = [k for k in self.PAYLOADS if client.exists(k)]
-        assert len(surviving) == len(self.PAYLOADS) - shrinks
-        for key in surviving:
+        # Every shrink releases exactly one segment.
+        num_shrinks = after['largeobj_dram_scaling_shrinks'] - before['largeobj_dram_scaling_shrinks']
+        assert num_shrinks > 0
+        assert after['largeobj_dram_segments'] == before['largeobj_dram_segments'] - num_shrinks
+        # Every key the shrinks deleted is counted as one reclaim.
+        surviving_keys = [k for k in self.PAYLOADS if client.exists(k)]
+        deleted_keys = set(self.PAYLOADS) - set(surviving_keys)
+        assert deleted_keys
+        assert after['largeobj_reclaims'] == before['largeobj_reclaims'] + len(deleted_keys)
+        # Keys whose segments were not released read back unchanged.
+        for key in surviving_keys:
             assert client.execute_command('BLOB.GET', key) == self.PAYLOADS[key]
-        # Each reclaimed key fires the same 'evicted' event as a core eviction.
-        evicted = []
+        # Each deleted key fires the same 'evicted' event as a core eviction.
+        evicted_keys = []
         while (msg := events.get_message(timeout=1)) is not None:
             if msg['type'] == 'message':
-                evicted.append(msg['data'].decode())
-        assert sorted(evicted) == sorted(set(self.PAYLOADS) - set(surviving))
+                evicted_keys.append(msg['data'].decode())
+        assert sorted(evicted_keys) == sorted(deleted_keys)
 
     def test_reclaimed_key_reads_as_missing(self):
         """Between the shrink and its key deletion, the victim key still exists
@@ -344,7 +358,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         assert client.exists(victim) == 1
         with pytest.raises(ResponseError, match='not found'):
             client.execute_command('BLOB.INFO', victim)
-        with pytest.raises(ResponseError):
+        with pytest.raises(ResponseError, match='module key failed to copy'):
             client.execute_command('COPY', victim, 'copy_dst')
 
         reclaims = info_largeobj(client)['largeobj_reclaims']

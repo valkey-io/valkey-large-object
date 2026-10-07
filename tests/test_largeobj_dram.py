@@ -106,8 +106,8 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         try:
             client.execute_command('BLOB.SET', 'toobig', b'D' * (4 * 1024 * 1024))
             assert False, "Expected max-object-size rejection"
-        except ResponseError:
-            pass
+        except ResponseError as e:
+            assert 'max object size' in str(e).lower(), f"Unexpected error: {e}"
         assert self.read_keyspace_events(pubsub, 1) == []
 
     # ─── COPY callback tests ─────────────────────────────────────────────
@@ -302,8 +302,9 @@ class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):
         try:
             client.execute_command('COPY', 'bigkey', 'bigcopy')
             assert False, "Expected COPY to fail — expansion would cross maxmemory"
-        except ResponseError:
-            pass  # Expected — cannot fit a second object without crossing the watermark
+        except ResponseError as e:
+            # Cannot fit a second object without crossing maxmemory.
+            assert 'module key failed to copy' in str(e).lower(), f"Unexpected error: {e}"
         finally:
             client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
         # Source intact.
