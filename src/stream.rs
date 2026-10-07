@@ -865,30 +865,32 @@ pub(crate) async fn efa_transfer_addrs(
     }
     let deadline = tokio::time::Instant::now() + efa_op_timeout();
     let mut results: Vec<Option<Crc>> = vec![None; addrs.len()];
-    loop {
-        let next = tokio::select! {
-            biased;
-            item = indexed_futures.next() => item,
-            _ = tokio::time::sleep_until(deadline) => {
-                err = Some(ValkeyError::Str(crate::errors::ERR_EFA_TIMEOUT));
-                break;
-            }
-        };
-        let Some((idx, (outcome, _operand))) = next else {
-            break; // all futures resolved
-        };
-        match outcome {
-            Ok(done) => {
-                results[idx] = match direction {
-                    EfaDirection::Read => Some(done.checksum.expect(
-                        "EFA Read completion missing checksum — transport must provide CRC",
-                    )),
-                    EfaDirection::Write => Some(0),
-                };
-            }
-            Err(_) => {
-                err = Some(ValkeyError::Str(err_str));
-                break;
+    if err.is_none() {
+        loop {
+            let next = tokio::select! {
+                biased;
+                item = indexed_futures.next() => item,
+                _ = tokio::time::sleep_until(deadline) => {
+                    err = Some(ValkeyError::Str(crate::errors::ERR_EFA_TIMEOUT));
+                    break;
+                }
+            };
+            let Some((idx, (outcome, _operand))) = next else {
+                break; // all futures resolved
+            };
+            match outcome {
+                Ok(done) => {
+                    results[idx] = match direction {
+                        EfaDirection::Read => Some(done.checksum.expect(
+                            "EFA Read completion missing checksum — transport must provide CRC",
+                        )),
+                        EfaDirection::Write => Some(0),
+                    };
+                }
+                Err(_) => {
+                    err = Some(ValkeyError::Str(err_str));
+                    break;
+                }
             }
         }
     }
