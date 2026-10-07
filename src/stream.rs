@@ -840,21 +840,29 @@ pub(crate) async fn efa_transfer_addrs(
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
     let mut sub_lens: Vec<usize> = Vec::with_capacity(addrs.len());
+    let mut err: Option<ValkeyError> = None;
     for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
         let transfer = match direction {
             EfaDirection::Write => {
                 session.write((buf_ptr + buf_offset) as *mut u8, len, rkey, addr)
             }
             EfaDirection::Read => session.read((buf_ptr + buf_offset) as *mut u8, len, rkey, addr),
+        };
+        match transfer {
+            Ok(t) => {
+                sub_lens.push(len);
+                indexed_futures.push(async move { (i, t.await) });
+                buf_offset += len;
+            }
+            // Break so already-submitted transfers get drained.
+            Err(_) => {
+                err = Some(ValkeyError::Str(err_str));
+                break;
+            }
         }
-        .map_err(|_| ValkeyError::Str(err_str))?;
-        sub_lens.push(len);
-        indexed_futures.push(async move { (i, transfer.await) });
-        buf_offset += len;
     }
     let deadline = tokio::time::Instant::now() + efa_op_timeout();
     let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
-    let mut err: Option<ValkeyError> = None;
     loop {
         let next = tokio::select! {
             biased;
