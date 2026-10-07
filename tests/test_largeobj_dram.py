@@ -195,16 +195,17 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
 
     def test_num_objects(self):
         """INFO num_objects counts LargeObject keys through SET, overwrite, COPY
-        and DEL, and ignores core keys. Frees run async, so decrements are awaited."""
+        and DEL, and ignores keys of standard (core) Valkey data types such as
+        strings. Frees run async, so decrements are awaited."""
         client = self.server.get_new_client()
-        count = lambda: info_largeobj(client)['largeobj_num_objects']
-        client.execute_command('BLOB.SET', 'cnt_a', b'A' * 1024)
-        client.execute_command('BLOB.SET', 'cnt_a', b'B' * 1024)
-        client.execute_command('COPY', 'cnt_a', 'cnt_b')
-        client.set('cnt_core', 'v')
-        wait_for_true(lambda: count() == 2)
-        client.delete('cnt_a', 'cnt_b')
-        wait_for_true(lambda: count() == 0)
+        num_objects = lambda: info_largeobj(client)['largeobj_num_objects']
+        client.execute_command('BLOB.SET', 'blob', b'A' * 1024)
+        client.execute_command('BLOB.SET', 'blob', b'B' * 1024)
+        client.execute_command('COPY', 'blob', 'blob_copy')
+        client.set('string_key', 'v')
+        wait_for_true(lambda: num_objects() == 2)
+        client.delete('blob', 'blob_copy')
+        wait_for_true(lambda: num_objects() == 0)
 
     # ─── BLOB.INFO tests ───────────────────────────────────────────────────
 

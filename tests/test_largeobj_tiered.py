@@ -3,7 +3,7 @@ import glob
 import time
 import threading
 from valkey import ResponseError
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 
 
@@ -414,6 +414,20 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         except ResponseError as e:
             assert 'max-object-size' in str(e).lower(), f"Unexpected error: {e}"
             assert 'nvme-maxmemory' in str(e).lower(), f"Unexpected error: {e}"
+
+    def test_num_objects(self):
+        """INFO num_objects counts LargeObject keys through SET, overwrite, COPY
+        and DEL, and ignores keys of standard (core) Valkey data types such as
+        strings. Frees run async, so decrements are awaited."""
+        client = self.server.get_new_client()
+        num_objects = lambda: info_largeobj(client)['largeobj_num_objects']
+        client.execute_command('BLOB.SET', 'blob', b'A' * 1024)
+        client.execute_command('BLOB.SET', 'blob', b'B' * 1024)
+        client.execute_command('COPY', 'blob', 'blob_copy')
+        client.set('string_key', 'v')
+        wait_for_true(lambda: num_objects() == 2)
+        client.delete('blob', 'blob_copy')
+        wait_for_true(lambda: num_objects() == 0)
 
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
