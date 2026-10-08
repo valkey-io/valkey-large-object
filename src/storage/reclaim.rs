@@ -54,12 +54,26 @@ impl ReclaimList {
     }
 
     /// Take `oid` off the list. Always locks: `remove_object` must wait for a
-    /// shrink that is listing this oid.
-    pub fn remove(&self, oid: &ObjectId) {
+    /// shrink that is listing this oid. Returns whether it was listed.
+    pub fn remove(&self, oid: &ObjectId) -> bool {
         let mut oids = self.lock();
-        if oids.remove(oid) {
+        let listed = oids.remove(oid);
+        if listed {
             self.len.store(oids.len(), Ordering::Release);
         }
+        listed
+    }
+
+    /// List `oid` unless it is listed already or `refuse`, which runs with the list locked, says
+    /// no. Returns whether it was listed. Call with the server lock held, as for `add_with`.
+    pub fn add_unless(&self, oid: ObjectId, refuse: impl FnOnce() -> bool) -> bool {
+        let mut oids = self.lock();
+        if oids.contains(&oid) || refuse() {
+            return false;
+        }
+        oids.insert(oid);
+        self.len.store(oids.len(), Ordering::Release);
+        true
     }
 }
 
@@ -112,8 +126,11 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
                     .reclaims
                     .fetch_add(1, Ordering::Relaxed);
                 // lo_free runs later on the BIO thread; clear now so the scan
-                // stops once every listed key is gone.
-                RECLAIM_LIST.remove(&oid);
+                // stops once every listed key is gone. Tiered leaves it to `lo_free`, which must
+                // find the entry to know eviction owns the file's unlink.
+                if crate::operating_mode() == crate::OperatingMode::Dram {
+                    RECLAIM_LIST.remove(&oid);
+                }
             }
             if !more {
                 scan.cursor.restart();

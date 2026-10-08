@@ -25,7 +25,7 @@ pub mod uring;
 
 // Re-exports for convenience.
 pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
-pub use object_file::ObjectFile;
+pub use object_file::{DiskReservation, Evicted, ObjectFile, KEYLESS_FILES};
 
 // Re-exports from nvme.rs
 pub use nvme::{
@@ -90,13 +90,6 @@ pub(crate) fn chunk_user_data_len(
     } else {
         chunk_size
     }
-}
-
-// ─── TryClone Trait ──────────────────────────────────────────────────────────
-
-/// Fallible deep-copy. Like Clone but returns None on failure modes when not possible.
-pub trait TryClone: Sized {
-    fn try_clone(&self) -> Option<Self>;
 }
 
 // ─── Error Types ─────────────────────────────────────────────────────────────

@@ -101,6 +101,9 @@ impl LoValue {
     /// - Tiered mode: only if the object has been promoted into DRAMPool.
     pub fn memory_usage(&self) -> usize {
         let base = std::mem::size_of::<LoValue>();
+        if self.reclaim_in_progress() {
+            return base;
+        }
         let dram_usage = base + self.len as usize;
         match crate::operating_mode() {
             crate::OperatingMode::Dram => dram_usage,
@@ -143,44 +146,48 @@ impl LoValue {
         0
     }
 
-    /// Deep-copy for the COPY command callback.
-    /// Dram mode: clone ObjectContext via try_clone. Tiered mode: copy NVMe file.
-    /// Returns None on capacity exhaustion (pool full or nvme-maxmemory exceeded).
-    pub fn create_copy(&self) -> Option<LoValue> {
+    /// Deep-copy for the COPY command callback, evicting other keys for room if the budget is
+    /// full (never the source).
+    /// Dram mode: copy the ObjectContext's buffers. Tiered mode: copy the NVMe file.
+    /// Returns None on capacity exhaustion or when the source has been evicted.
+    pub fn create_copy(&self, ctx: &valkey_module::Context) -> Option<LoValue> {
         if self.reclaim_in_progress() {
             return None;
         }
         match crate::operating_mode() {
-            crate::OperatingMode::Dram => self.create_copy_dram(),
-            crate::OperatingMode::Tiered => self.create_copy_tiered(),
+            crate::OperatingMode::Dram => self.create_copy_dram(ctx),
+            crate::OperatingMode::Tiered => self.create_copy_tiered(ctx),
         }
     }
 
-    /// Dram mode: deep-copy ObjectContext via try_clone, insert with new OID.
-    fn create_copy_dram(&self) -> Option<LoValue> {
-        use crate::storage::TryClone;
+    /// Dram mode: deep-copy ObjectContext into fresh buffers, insert with new OID.
+    fn create_copy_dram(&self, ctx: &valkey_module::Context) -> Option<LoValue> {
         let dram_pool = crate::storage::get_dram_pool();
         let src_ctx = dram_pool
             .get_object(&self.object_id)
             .expect("Dram COPY: LoValue exists but ObjectContext missing");
-        // Returns None if object is Filling (incomplete) or pool is full.
-        let new_ctx = src_ctx.try_clone()?;
+        let buffers = crate::engine::alloc_dram_or_make_room(ctx, dram_pool, self.len)?;
         let new_oid = ObjectId::next();
-        dram_pool.insert_object(new_oid, std::sync::Arc::new(new_ctx));
+        dram_pool.insert_object(new_oid, Arc::new(src_ctx.copy_into(buffers)));
         Some(LoValue::new(new_oid, self.len, self.crc32c, None))
     }
 
     /// Tiered mode: copy NVMe file with a fresh OID.
     /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
-    /// Returns None if nvme-maxmemory would be exceeded or the copy fails.
-    fn create_copy_tiered(&self) -> Option<LoValue> {
-        let file = self.file.as_ref()?.copy(self.len, self.crc32c)?;
-        Some(LoValue::new(
-            file.object_id(),
-            self.len,
-            self.crc32c,
-            Some(Arc::new(file)),
-        ))
+    fn create_copy_tiered(&self, ctx: &valkey_module::Context) -> Option<LoValue> {
+        let src_file = Arc::clone(self.file.as_ref()?);
+        let new_oid = ObjectId::next();
+        let reservation = crate::engine::reserve_nvme_or_make_room(
+            ctx,
+            new_oid,
+            src_file.disk_len(),
+            Some(self.object_id),
+        )?;
+        let file = Arc::new(src_file.copy(reservation, self.len, self.crc32c)?);
+        // Core installs the returned value before the event loop runs anything else, so the copy
+        // may be a victim from here.
+        crate::storage::KEYLESS_FILES.lock().remove(&new_oid);
+        Some(LoValue::new(new_oid, self.len, self.crc32c, Some(file)))
     }
 }
 
@@ -201,8 +208,20 @@ impl Drop for LoValue {
 /// the arena once the last reader drops it.
 unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     let lo = Box::from_raw(value as *mut LoValue);
-    // Drop the DRAM cache entry.
-    crate::storage::get_dram_pool().remove_object(&lo.object_id);
+    let pool = crate::storage::get_dram_pool();
+    if let Some(file) = &lo.file {
+        // The key is gone but its file lives on until it is unlinked, so it is keyless from here
+        // (a claim checks that under the list lock). If a claim got in first, eviction owns the
+        // unlink and the credit.
+        crate::storage::KEYLESS_FILES.lock().insert(lo.object_id);
+        if crate::storage::reclaim::RECLAIM_LIST.remove(&lo.object_id) {
+            file.leave_to_eviction();
+        }
+        pool.remove_cached_copy(&lo.object_id);
+    } else {
+        // Dram: drops the object and its reclaim-list entry.
+        pool.remove_object(&lo.object_id);
+    }
     // `lo` (and its Option<Arc<ObjectFile>>) drops here; teardown fires on last ref.
 }
 
@@ -233,7 +252,7 @@ unsafe extern "C" fn lo_copy(
     value: *const std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
     let src = &*(value as *const LoValue);
-    match src.create_copy() {
+    match crate::with_callback_ctx(|ctx| src.create_copy(ctx)) {
         Some(new_val) => Box::into_raw(Box::new(new_val)) as *mut std::ffi::c_void,
         None => std::ptr::null_mut(),
     }

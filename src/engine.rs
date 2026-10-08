@@ -47,8 +47,8 @@ use crate::OperatingMode;
 //     is needed.)
 //   - The promotion read, whose target buffer lives in the Filling `ObjectContext`
 //     already inserted in the map — the task moves that Arc in for the read.
-//   NOT needed on SET: the buffer is private until `set_value` + `insert_object`
-//   commit it, so no concurrent free can reach it.
+//   A Dram SET holds its object from `insert_object` until the key commits, so eviction passes
+//   it over; before that the buffer is private.
 //
 // Must pin `Arc<ObjectFile>` (the object's on-disk existence; its Drop unlinks). The
 // open fd is a separate `Arc<OwnedFd>` from `ensure_open`, held for the read's duration:
@@ -127,6 +127,18 @@ async fn test_pause_before_finalize() {
     }
 }
 
+/// Test hook: pause a Tiered SET before it unlinks its victims' files (`test-pause-before-evict-unlink-ms`).
+async fn test_pause_before_evict_unlink() {
+    let pause_ms = crate::test_pause_before_evict_unlink_ms();
+    if pause_ms > 0 {
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        })
+        .await
+        .ok();
+    }
+}
+
 /// Collect all DRAMPool buffers into a contiguous Vec for TCP reply.
 fn collect_dram_bytes(
     dram_pool: &storage::DRAMPool,
@@ -177,14 +189,20 @@ fn commit_lo_value(
     let key = ctx.open_key_writable(&key_str);
     // One lookup drives both the version guard and the create/update event.
     let event = match key.get_value::<LoValue>(&LO_TYPE) {
-        Ok(Some(existing)) if existing.object_id > object_id => {
+        // An evicted value is a miss, not a newer write to defer to.
+        Ok(Some(existing)) if existing.object_id > object_id && !existing.reclaim_in_progress() => {
             return Ok(CommitOutcome::StaleDiscarded);
         }
         Ok(Some(_)) => EVENT_UPDATE,
         _ => EVENT_CREATE,
     };
+    let tiered = lo_value.file.is_some();
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
+    }
+    // The key exists now: the file is a live object, which eviction may take.
+    if tiered {
+        storage::KEYLESS_FILES.lock().remove(&object_id);
     }
     ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key_str);
     Ok(CommitOutcome::ValueSet)
@@ -234,12 +252,21 @@ pub fn execute_get(
 
 // ─── DRAM-only TCP GET ────────────────────────────────────────────
 
+/// Count a Dram-mode read, which eviction ranks its victims by.
+fn touch_dram(obj_ctx: &ObjectContext) {
+    obj_ctx.stats.touch(
+        storage::cache_policy::now_minutes(),
+        crate::tiered_decay_time(),
+    );
+}
+
 /// Sync DRAM-only TCP GET: serve object data directly from DRAMPool.
 /// Multi-buffer: collect_dram_bytes iterates all buffers, copying up to obj_len total.
 fn cmd_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
+            touch_dram(&obj_ctx);
             if crate::bench_mode() {
                 Ok(ValkeyValue::Integer(obj_len as i64))
             } else {
@@ -275,6 +302,7 @@ fn cmd_get_dram_efa(
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
+            touch_dram(&obj_ctx);
             // Serve from DRAMPool.
             cmd_get_from_dram(
                 dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, None,
@@ -339,9 +367,8 @@ fn cmd_get_tiered(
         let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
             Some(fd) => fd,
             None => {
-                // remove_object drops the map's Arc; obj_ctx drops at end of scope
-                // → ObjectContext::Drop frees the buffer automatically.
-                dram_pool.remove_object(&object_id);
+                // Not `remove_object`: if eviction took the object meanwhile, it must stay listed.
+                dram_pool.remove_cached_copy(&object_id);
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 reply_err(
@@ -587,6 +614,7 @@ pub fn execute_set(
                 }
                 OperatingMode::Tiered => {
                     cmd_set_tiered(
+                        ctx,
                         key_name_bytes,
                         obj_len,
                         data_source,
@@ -602,6 +630,18 @@ pub fn execute_set(
 
 // ─── DRAM-only TCP SET ───────────────────────────────────────────────────────
 
+/// Allocate `len` bytes in the DRAM arena, on the main thread: free capacity first, then one
+/// segment of growth if the `maxmemory` watermark allows, then eviction if the server allows it.
+pub(crate) fn alloc_dram_or_make_room(
+    ctx: &valkey_module::Context,
+    dram_pool: &storage::DRAMPool,
+    len: u64,
+) -> Option<Vec<storage::context::SegmentBuffer>> {
+    dram_pool
+        .alloc_exact_or_expand(ctx, len)
+        .or_else(|| crate::eviction::alloc_by_evicting(ctx, len as usize))
+}
+
 /// Sync DRAM-only TCP SET: chunked alloc + chunked memcpy + create LoValue.
 fn cmd_set_dram_tcp(
     ctx: &valkey_module::Context,
@@ -612,7 +652,7 @@ fn cmd_set_dram_tcp(
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    let buffers = match dram_pool.alloc_exact_or_expand(ctx, obj_len) {
+    let buffers = match alloc_dram_or_make_room(ctx, dram_pool, obj_len) {
         Some(bufs) => bufs,
         None => {
             info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
@@ -683,8 +723,7 @@ fn cmd_set_dram_efa(
     // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
-    // DRAMPool::alloc_exact_or_expand: all-or-nothing with reactive expansion.
-    let buffers = match dram_pool.alloc_exact_or_expand(ctx, obj_len) {
+    let buffers = match alloc_dram_or_make_room(ctx, dram_pool, obj_len) {
         Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -763,8 +802,34 @@ fn cmd_set_dram_efa(
 
 // ─── Tiered SET ──────────────────────────────────────────────────────────────
 
+/// Reserve `disk_len` of the `nvme-maxmemory` budget, evicting resident objects if it is full and
+/// the server allows it, but never `keep`. `None` means the budget cannot serve this object. Main
+/// thread only. The new bytes are charged here, against the victims' as pending; the victims' files
+/// are unlinked, and credited, off this thread (with the SET's write, or in the background).
+pub(crate) fn reserve_nvme_or_make_room(
+    ctx: &valkey_module::Context,
+    object_id: ObjectId,
+    disk_len: u64,
+    keep: Option<ObjectId>,
+) -> Option<storage::DiskReservation> {
+    let evicted = if nvme::try_reserve_nvme_disk_usage(disk_len) {
+        storage::Evicted::default()
+    } else {
+        let evicted = crate::eviction::make_disk_room(ctx, disk_len, keep)?;
+        // A concurrent reservation may have taken the room: the victims still go.
+        if !nvme::try_reserve_nvme_disk_usage(disk_len) {
+            return None;
+        }
+        evicted
+    };
+    Some(storage::DiskReservation::charged(
+        object_id, disk_len, evicted,
+    ))
+}
+
 /// Tiered SET: streaming batch write to NVMe via NVMePool buffer window.
 fn cmd_set_tiered(
+    ctx: &valkey_module::Context,
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -789,9 +854,26 @@ fn cmd_set_tiered(
     let stream_ctx = storage::StreamingContext::new(buffers);
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
+    // Settled here, on the main thread, so the write task cannot fail for capacity.
+    let disk_len = storage::object_disk_len(&mut ChunkIterator::new(
+        obj_len,
+        chunk_size,
+        batch_width,
+        None,
+    ));
+    let Some(reservation) = reserve_nvme_or_make_room(ctx, object_id, disk_len, None) else {
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        reply_err(
+            &thread_ctx,
+            &info::NVME_CAPACITY_EXCEEDED,
+            ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED),
+        );
+        return;
+    };
     match data_source {
         DataSource::Tcp(data) => {
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
+            // add evicted list to to reclaimed list here (instead of at victim selection time)
             crate::runtime_handle().spawn(async move {
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -806,6 +888,7 @@ fn cmd_set_tiered(
                     chunk_iter,
                     thread_ctx,
                     SetSource::Tcp(data),
+                    reservation,
                 )
                 .await;
             });
@@ -826,6 +909,7 @@ fn cmd_set_tiered(
                     chunk_iter,
                     thread_ctx,
                     SetSource::Efa(session),
+                    reservation,
                 )
                 .await;
             });
@@ -843,8 +927,8 @@ enum SetSource {
     Efa(Arc<Session>),
 }
 
-/// Envelope shared by both Tiered NVMe-write SET paths (TCP + EFA). Reserve disk →
-/// open write fd → ObjectFile (owns cleanup) → run(source → NvmeTarget) → finalize.
+/// Envelope shared by both Tiered NVMe-write SET paths (TCP + EFA). Reservation (made on the
+/// main thread) → open write fd → ObjectFile (owns cleanup) → run(source → NvmeTarget) → finalize.
 /// `variant` is the ONLY per-transport difference (source construction + CRC rule);
 /// it is matched once here. On any error the fd + ObjectFile drop on return,
 /// unlinking the file and releasing the disk budget.
@@ -854,32 +938,29 @@ async fn cmd_set_tiered_run(
     chunk_iter: ChunkIterator,
     thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     variant: SetSource,
+    mut reservation: storage::DiskReservation,
 ) {
     let SetObjectInfo {
         object_id,
         obj_len,
         key_name,
     } = set_info;
+    // The victims' files go before the write, off the async workers: an unlink can stall on the
+    // filesystem journal.
+    let evicted = reservation.take_evicted();
+    if !evicted.is_empty() {
+        test_pause_before_evict_unlink().await;
+        let _ = tokio::task::spawn_blocking(move || evicted.unlink()).await;
+    }
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
-    let mut chunk_iter = chunk_iter;
-    let disk_len = storage::object_disk_len(&mut chunk_iter);
-    if !nvme::try_reserve_nvme_disk_usage(disk_len) {
-        reply_err(
-            &thread_ctx,
-            &info::NVME_CAPACITY_EXCEEDED,
-            ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED),
-        );
-        return;
-    }
     // FdPool not used on SET: this write fd is short-lived and never cached.
     // FdPool caches read fds lazily on first GET via ensure_open.
     let file_path = object_id.file_path(&crate::nvme_dir());
     let fd = match storage::open_nvme_file_for_write(&file_path) {
         Ok(fd) => fd,
         Err(_e) => {
-            nvme::decrease_nvme_disk_usage(disk_len);
             reply_err(
                 &thread_ctx,
                 &info::NVME_WRITE_ERRORS,
@@ -889,7 +970,7 @@ async fn cmd_set_tiered_run(
         }
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
-    let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
+    let object_file = Arc::new(reservation.into_object_file());
     let job = crate::stream::StreamJob::for_nvme_set(
         fd.as_raw_fd(),
         obj_len,

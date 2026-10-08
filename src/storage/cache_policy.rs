@@ -1,4 +1,4 @@
-//! Cache policy primitives shared by DRAMPool and FdPool (see
+//! Cache policy primitives shared by DRAMPool, FdPool and eviction (see
 //! `docs/CACHE_POLICY_DESIGN.md`): `AccessStats` (Valkey-style LFU score),
 //! `OIDIndexedMap` (an `IndexMap` with sampled reclaim), and the Tiered-only
 //! `AdmissionFilter`, `CacheStats` and `TieredCache`. Only `AdmissionFilter`
@@ -46,7 +46,8 @@ const COUNTER_MASK: u32 = 0xFF;
 const MINUTES_SHIFT: u32 = 8;
 const MINUTES_MASK: u32 = 0xFFFF;
 
-/// Packed LFU state: bits 0..8 counter, bits 8..24 last-decay minute.
+/// Packed LFU state: bits 0..8 counter, bits 8..24 last-decay minute, which is also the minute
+/// of the last touch.
 #[derive(Debug)]
 pub struct AccessStats(AtomicU32);
 
@@ -238,11 +239,12 @@ pub struct TieredCache {
 /// Lowest-scoring unpinned slot among up to `samples` slots in `0..len`;
 /// `probe` returns `None` for a pinned slot. Maps with `len <= samples` are
 /// scanned fully (exact); larger ones get `samples` random draws, as in Valkey.
-pub(super) fn sample_victim<F>(len: usize, samples: usize, mut probe: F) -> Option<usize>
+pub(super) fn sample_victim<S, F>(len: usize, samples: usize, mut probe: F) -> Option<usize>
 where
-    F: FnMut(usize) -> Option<u8>,
+    S: Ord + Copy,
+    F: FnMut(usize) -> Option<S>,
 {
-    let mut best: Option<(usize, u8)> = None;
+    let mut best: Option<(usize, S)> = None;
     let mut consider = |slot: usize| {
         if let Some(score) = probe(slot) {
             if best.is_none_or(|(_, s)| score < s) {
@@ -368,8 +370,8 @@ mod tests {
         // Empty map or everything pinned: no victim.
         assert_eq!(sample_victim(0, 5, |_| Some(0)), None);
         assert_eq!(sample_victim(5, 0, |_| Some(0)), None);
-        assert_eq!(sample_victim(4, 16, |_| None), None);
-        assert_eq!(sample_victim(100, 5, |_| None), None);
+        assert_eq!(sample_victim(4, 16, |_| None::<u8>), None);
+        assert_eq!(sample_victim(100, 5, |_| None::<u8>), None);
     }
 
     #[test]

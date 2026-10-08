@@ -42,23 +42,6 @@ pub struct SegmentBuffer {
     pub len: u32,
 }
 
-impl super::TryClone for SegmentBuffer {
-    fn try_clone(&self) -> Option<Self> {
-        let pool = crate::storage::get_dram_pool();
-        let dummy = valkey_module::Context::dummy();
-        let new_buf = pool
-            .alloc_exact_or_expand(&dummy, self.len as u64)?
-            .remove(0);
-        let src_ptr = pool.buffer_ptr(self);
-        let dst_ptr = pool.buffer_ptr(&new_buf);
-        // SAFETY: src and dst are non-overlapping regions within pool segment(s).
-        unsafe {
-            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, self.len as usize);
-        }
-        Some(new_buf)
-    }
-}
-
 // ─── Object State ────────────────────────────────────────────────────────────
 
 /// Atomic state for ObjectContext. `#[repr(u8)]` for use with AtomicU8.
@@ -166,20 +149,25 @@ impl Drop for ObjectContext {
     }
 }
 
-impl super::TryClone for ObjectContext {
-    /// Deep-copies all buffers into new DRAMPool allocations.
-    /// Returns Some(new Ready ObjectContext) on success.
-    /// Returns None if object is Filling (incomplete) or pool is full.
-    fn try_clone(&self) -> Option<Self> {
-        // Cannot copy an object that is still being promoted (buffers incomplete).
-        if !self.is_ready() {
-            return None;
+impl ObjectContext {
+    /// Deep-copies this Ready object's bytes into `dst`, which must be allocated for the same
+    /// object length so the buffers line up one-to-one.
+    pub fn copy_into(&self, dst: Vec<SegmentBuffer>) -> Self {
+        debug_assert!(self.is_ready());
+        debug_assert_eq!(self.buffers.len(), dst.len());
+        let pool = crate::storage::get_dram_pool();
+        for (src, dst) in self.buffers.iter().zip(&dst) {
+            debug_assert_eq!(src.len, dst.len);
+            // SAFETY: distinct pool allocations never overlap, and each is `len` bytes long.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    pool.buffer_ptr(src),
+                    pool.buffer_ptr(dst),
+                    src.len as usize,
+                );
+            }
         }
-        let mut new_buffers = Vec::with_capacity(self.buffers.len());
-        for buf in &self.buffers {
-            new_buffers.push(buf.try_clone()?);
-        }
-        Some(Self::new_ready(new_buffers))
+        Self::new_ready(dst)
     }
 }
 

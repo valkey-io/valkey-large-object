@@ -11,6 +11,10 @@
 //! removes its objects so the segment releases once in-flight readers drop.
 //! Tiered: GETs fall back to NVMe. Dram: the objects' oids go on the reclaim
 //! list; their keys read as missing until the cron deletes them.
+//!
+//! A promotion into a full arena demotes cold cached copies (`reclaim_in`). In Dram mode the pool
+//! is the data, so a full arena destroys objects instead (`evict_in`), listing their oids like a
+//! shrink does (see `crate::eviction`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -21,6 +25,12 @@ use super::cache_policy::{
 use super::context::{ObjectContext, SegmentBuffer};
 use super::segment_pool::SegmentPool;
 use crate::data_type::ObjectId;
+
+/// Redraws of an all-pinned sample before `evict_in` calls a segment short (a pin is transient).
+const EVICT_PATIENCE: usize = 8;
+
+/// Objects taken out of the pool, to be dropped once the lock is released.
+pub type Victims = Vec<(ObjectId, Arc<ObjectContext>)>;
 
 /// Cached objects plus a per-segment index of the same OIDs, so reclaim can
 /// sample one segment. Both change together, only through `insert`/`remove`.
@@ -61,22 +71,31 @@ impl ObjectMaps {
         ids
     }
 
-    /// Remove and return the lowest-scoring unpinned object among up to
-    /// `samples` drawn from segment `seg`.
+    /// Remove and return the lowest-ranked unpinned object among up to
+    /// `samples` drawn from segment `seg`. Adds the pinned ones it passed over to `pinned`.
     fn take_victim(
         &mut self,
         seg: usize,
         samples: usize,
         now_min: u16,
         decay_time: u64,
+        pinned: &mut u64,
     ) -> Option<(ObjectId, Arc<ObjectContext>)> {
         let ids = self.by_segment.get_mut(seg)?;
         let slot = sample_victim(ids.len(), samples, |s| {
             let ctx = self.all.get(ids.get_index(s)?)?;
-            (Arc::strong_count(ctx) == 1).then(|| ctx.stats.decayed_counter(now_min, decay_time))
+            if Arc::strong_count(ctx) != 1 {
+                *pinned += 1;
+                return None;
+            }
+            Some(ctx.stats.decayed_counter(now_min, decay_time))
         })?;
         let oid = ids.swap_remove_index(slot)?;
         Some((oid, self.all.swap_remove(&oid)?))
+    }
+
+    fn segment_is_empty(&self, seg: usize) -> bool {
+        self.by_segment.get(seg).is_none_or(|ids| ids.is_empty())
     }
 }
 
@@ -128,9 +147,9 @@ impl DRAMPool {
     /// If even a fresh segment can't (talc overhead on an object right at the
     /// boundary), no same-size segment can — so we return None rather than loop.
     ///
-    /// Callers on the main thread pass their command `&Context`; callers on
-    /// tokio workers or data-type callbacks pass `&Context::dummy()` (null ctx
-    /// is accepted by RM_GetServerInfo for the memory watermark check).
+    /// Callers on the main thread pass their command `&Context`; `try_promote_object`
+    /// passes `&Context::dummy()` (null ctx is accepted by RM_GetServerInfo for the
+    /// memory watermark check).
     pub fn alloc_exact_or_expand(
         &self,
         ctx: &valkey_module::Context,
@@ -237,6 +256,16 @@ impl DRAMPool {
         removed
     }
 
+    /// Drop `oid`'s cached copy while its key lives on (eviction took the file, or a promotion
+    /// failed). Unlike `remove_object` it leaves the reclaim list alone: a listed key still reads
+    /// as a miss.
+    pub fn remove_cached_copy(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
+        self.objects
+            .write()
+            .expect("DRAMPool.objects lock unavailable")
+            .remove(oid)
+    }
+
     /// Check if object exists (coalesce check — is promotion in progress?).
     pub fn contains_object(&self, oid: &ObjectId) -> bool {
         self.objects
@@ -327,12 +356,57 @@ impl DRAMPool {
     /// bytes cover `need`, at most `max_victims`. All or nothing: if they fall
     /// short, every victim goes back and this returns None. The victims are
     /// returned so they drop after the write lock is released.
-    fn reclaim_in(
+    fn reclaim_in(&self, seg: usize, need: usize, max_victims: usize) -> Option<Victims> {
+        let (victims, _) = self.take_victims(seg, need, max_victims, false);
+        let victims = victims?;
+        self.tiered_cache()
+            .stats
+            .demotions
+            .fetch_add(victims.len() as u64, Ordering::Relaxed);
+        Some(victims)
+    }
+
+    /// `reclaim_in` for Dram mode, where a victim is destroyed rather than demoted, so it is listed
+    /// on the reclaim list. The second value is how many pinned objects the draws passed over,
+    /// whether or not the eviction succeeded.
+    pub fn evict_in(&self, seg: usize, need: usize, max_victims: usize) -> (Option<Victims>, u64) {
+        self.take_victims(seg, need, max_victims, true)
+    }
+
+    /// `destroy`: list the victims' oids on the reclaim list before another thread can see them
+    /// gone, as `try_shrink` does (a concurrent `remove_object` either finds the object or clears
+    /// its entry), and redraw an all-pinned sample `EVICT_PATIENCE` times before calling the
+    /// segment short.
+    fn take_victims(
         &self,
         seg: usize,
         need: usize,
         max_victims: usize,
-    ) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
+        destroy: bool,
+    ) -> (Option<Victims>, u64) {
+        if !destroy {
+            return self.draw_victims(seg, need, max_victims, 1);
+        }
+        let mut drawn = (None, 0);
+        super::reclaim::RECLAIM_LIST.add_with(|| {
+            drawn = self.draw_victims(seg, need, max_victims, EVICT_PATIENCE);
+            drawn
+                .0
+                .iter()
+                .flatten()
+                .map(|(oid, _)| *oid)
+                .collect::<Vec<_>>()
+        });
+        drawn
+    }
+
+    fn draw_victims(
+        &self,
+        seg: usize,
+        need: usize,
+        max_victims: usize,
+        patience: usize,
+    ) -> (Option<Victims>, u64) {
         let samples = crate::reclaim_sample_size();
         let now_min = now_minutes();
         let decay_time = crate::tiered_decay_time();
@@ -342,10 +416,19 @@ impl DRAMPool {
             .expect("DRAMPool.objects lock unavailable");
         let mut victims = Vec::new();
         let mut freed = 0usize;
+        let mut pinned = 0u64;
+        let mut redraws = 0;
         while freed < need && victims.len() < max_victims {
-            let Some((oid, ctx)) = objects.take_victim(seg, samples, now_min, decay_time) else {
+            let Some((oid, ctx)) =
+                objects.take_victim(seg, samples, now_min, decay_time, &mut pinned)
+            else {
+                redraws += 1;
+                if redraws < patience && !objects.segment_is_empty(seg) {
+                    continue;
+                }
                 break;
             };
+            redraws = 0;
             freed += ctx.buffers.iter().map(|b| b.len as usize).sum::<usize>();
             victims.push((oid, ctx));
         }
@@ -353,13 +436,20 @@ impl DRAMPool {
             for (oid, ctx) in victims {
                 objects.insert(oid, ctx);
             }
-            return None;
+            return (None, pinned);
         }
-        self.tiered_cache()
-            .stats
-            .demotions
-            .fetch_add(victims.len() as u64, Ordering::Relaxed);
-        Some(victims)
+        (Some(victims), pinned)
+    }
+
+    /// Dram mode: the segment `alloc_exact` would pick for `obj_len` and how many bytes it lacks
+    /// (see `SegmentPool::segment_shortfall`), so eviction frees where the object will land.
+    pub fn alloc_target(&self, obj_len: usize) -> Option<(usize, usize)> {
+        self.pool.segment_shortfall(obj_len)
+    }
+
+    /// `alloc_exact` in segment `seg` only. Never expands.
+    pub fn alloc_exact_in(&self, seg: usize, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
+        self.pool.alloc_exact_in(seg, obj_len)
     }
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
@@ -481,8 +571,13 @@ impl DRAMPool {
 mod tests {
     use super::*;
     use crate::storage::cache_policy::LFU_INIT_VAL;
+    use crate::storage::reclaim::RECLAIM_LIST;
 
     const BUF: u32 = 4096;
+
+    /// Ids for the tests that evict, which list their victims on the process-wide reclaim list
+    /// (`remove_object` of a listed id reaches for the unset global pool): no other test uses them.
+    const EV: u64 = 0xe71c_5000;
 
     fn pool() -> DRAMPool {
         DRAMPool::new(2, 1 << 20, Some(TieredCache::default()))
@@ -496,6 +591,15 @@ mod tests {
             offset: slot as u64 * BUF as u64,
             len: BUF,
         }]))
+    }
+
+    /// `evict_in`, checking that its victims are listed and taking them off the list again.
+    fn evict(p: &DRAMPool, seg: usize, need: usize, max_victims: usize) -> (Option<Victims>, u64) {
+        let out = p.evict_in(seg, need, max_victims);
+        for (oid, _) in out.0.iter().flatten() {
+            assert!(RECLAIM_LIST.remove(oid), "{oid:?} was not listed");
+        }
+        out
     }
 
     fn oids(victims: &[(ObjectId, Arc<ObjectContext>)]) -> Vec<u64> {
@@ -534,6 +638,10 @@ mod tests {
 
         let victims = p.reclaim_in(0, BUF as usize, 16).unwrap();
         assert_eq!(oids(&victims), vec![2], "cold object is the victim");
+        assert!(
+            !RECLAIM_LIST.contains(&ObjectId(2)),
+            "a demotion keeps its key"
+        );
         assert!(p.contains_object(&ObjectId(1)), "hot object must survive");
         assert!(
             p.contains_object(&ObjectId(3)),
@@ -552,6 +660,43 @@ mod tests {
         assert!(p.reclaim_in(0, BUF as usize, 16).is_none());
         assert_eq!(p.object_count(), 3);
         assert_index_consistent(&p);
+    }
+
+    #[test]
+    fn evict_in_counts_what_it_skipped_and_redraws_before_giving_up() {
+        let p = pool();
+        let held: Vec<_> = (0..3u16).map(|slot| ctx(0, slot)).collect();
+        for (i, obj) in held.iter().enumerate() {
+            p.insert_object(ObjectId(EV + 10 + i as u64), Arc::clone(obj));
+        }
+        // Few enough to scan whole, so each of the redraws sees all three held.
+        let (victims, pinned) = evict(&p, 0, BUF as usize, 16);
+        assert!(victims.is_none());
+        assert_eq!(pinned, 3 * EVICT_PATIENCE as u64);
+        assert_eq!(p.object_count(), 3);
+        assert_index_consistent(&p);
+
+        // Reclaim gives up on the first empty-handed draw.
+        assert!(p.reclaim_in(0, BUF as usize, 16).is_none());
+
+        drop(held);
+        let (victims, pinned) = evict(&p, 0, BUF as usize, 16);
+        assert_eq!(victims.unwrap().len(), 1);
+        assert_eq!(pinned, 0);
+    }
+
+    #[test]
+    fn evict_in_destroys_and_lists_nothing_when_the_segment_cannot_cover_the_need() {
+        let p = pool();
+        p.insert_object(ObjectId(EV + 1), ctx(0, 0));
+        p.insert_object(ObjectId(EV + 2), ctx(0, 1));
+        let (victims, _) = evict(&p, 0, 3 * BUF as usize, 16);
+        assert!(victims.is_none());
+        assert_eq!(p.object_count(), 2);
+        assert!(!RECLAIM_LIST.contains(&ObjectId(EV + 1)));
+        assert_index_consistent(&p);
+        // An empty segment has nothing to give however long it waits.
+        assert!(evict(&p, 1, 1, 16).0.is_none());
     }
 
     #[test]

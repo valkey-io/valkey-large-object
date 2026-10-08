@@ -32,7 +32,7 @@
 // After step 4, commands (BLOB.GET, BLOB.SET, BLOB.HELLO) may execute safely.
 // ─────────────────────────────────────────────────────────────────────────────
 
-use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr};
 use std::sync::Mutex;
 
 use dma_libfabric_protocol::encode_hex;
@@ -48,6 +48,7 @@ pub mod commands;
 pub mod data_type;
 pub mod engine;
 pub mod errors;
+pub mod eviction;
 pub mod info;
 pub mod smartlog;
 pub mod storage;
@@ -93,7 +94,10 @@ lazy_static::lazy_static! {
     /// Default: 1 GiB. Immutable after load.
     static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(1024 * 1024 * 1024);
 
-    /// Max disk usage in nvme-dir. Default: 0 (unlimited).
+    /// Max disk usage in nvme-dir. Default: 0 (unlimited). At the cap a write evicts only if the
+    /// server's `maxmemory` is set with an evicting policy; otherwise it is refused. Lowering the
+    /// cap under the usage makes the writes that follow shed the overage, a bounded number of objects at a
+    /// time, and they are refused until it is gone.
     static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
@@ -119,14 +123,16 @@ lazy_static::lazy_static! {
     /// Immutable after load — the poller either starts at init or not at all.
     static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(60);
 
-    /// LFU counter decay: minutes per one-point decrement. 0 disables decay.
+    /// LFU counter decay: minutes per one-point decrement. 0 disables decay. Applies wherever the
+    /// module ranks by hits: the DRAM cache's reclaim and Dram-mode eviction.
     static ref CFG_TIERED_DECAY_TIME: AtomicI64 = AtomicI64::new(1);
 
     /// How many misses an object must accumulate in the admission filter before a GET
     /// promotes it into DRAMPool. Default: 2.
     static ref CFG_PROMOTE_MIN_HITS: AtomicI64 = AtomicI64::new(2);
 
-    /// Entries sampled per reclaim round; the lowest LFU score is reclaimed.
+    /// Entries sampled per victim, by the DRAM cache's reclaim and by eviction; the lowest-ranked
+    /// is taken, as in core's `maxmemory-samples`.
     static ref CFG_RECLAIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(5);
 
     /// Cap on read fds cached by the FdPool. When full, opening a new fd reclaims
@@ -184,6 +190,14 @@ lazy_static::lazy_static! {
     /// and deterministically exercise the delete-during-SET race.
     static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);
 
+    /// Test-only: pause a Tiered SET for this many milliseconds before it unlinks the files it
+    /// evicted, to open the window in which their keys can be deleted. 0 = disabled.
+    static ref CFG_TEST_PAUSE_BEFORE_EVICT_UNLINK_MS: AtomicI64 = AtomicI64::new(0);
+
+    /// Test-only: 1 makes every unlink of an object file fail, leaving the file in place, to
+    /// exercise the failure paths. 0 = disabled.
+    static ref CFG_TEST_FAIL_UNLINK: AtomicI64 = AtomicI64::new(0);
+
     // ─── Streaming Configs ───────────────────────────────────────────────
 
     /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
@@ -225,6 +239,18 @@ pub fn is_main_thread() -> bool {
         .get()
         // SAFETY: pthread_self/pthread_equal take no pointers and always succeed.
         .is_some_and(|&main| unsafe { libc::pthread_equal(libc::pthread_self(), main) != 0 })
+}
+
+/// A detached context for data-type callbacks, which are handed none.
+static CALLBACK_CTX: AtomicPtr<valkey_module::raw::RedisModuleCtx> =
+    AtomicPtr::new(std::ptr::null_mut());
+
+/// Run `f` with the callback context. Main thread only, inside a callback: the event loop already
+/// holds the lock the context nominally needs.
+pub fn with_callback_ctx<T>(f: impl FnOnce(&Context) -> T) -> T {
+    let ptr = CALLBACK_CTX.load(std::sync::atomic::Ordering::Relaxed);
+    debug_assert!(is_main_thread() && !ptr.is_null());
+    f(&Context::new(ptr))
 }
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
@@ -396,6 +422,14 @@ pub fn min_buffers_per_op() -> usize {
 
 pub fn test_pause_before_finalize_set_ms() -> u64 {
     CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_pause_before_evict_unlink_ms() -> u64 {
+    CFG_TEST_PAUSE_BEFORE_EVICT_UNLINK_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_fail_unlink() -> bool {
+    CFG_TEST_FAIL_UNLINK.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
 pub fn fabric_provider() -> FabricProvider {
@@ -573,6 +607,11 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Record the main event-loop thread. SAFETY: pthread_self takes no arguments
     // and always succeeds; we store the opaque handle for later pthread_equal.
     let _ = MAIN_THREAD.set(unsafe { libc::pthread_self() });
+    // SAFETY: `ctx` is the live load-time context.
+    CALLBACK_CTX.store(
+        unsafe { valkey_module::raw::RedisModule_GetDetachedThreadSafeContext.unwrap()(ctx.ctx) },
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
@@ -724,6 +763,10 @@ valkey_module! {
             ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, 2, 1, 64,
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
+            ["test-pause-before-evict-unlink-ms", &*CFG_TEST_PAUSE_BEFORE_EVICT_UNLINK_MS, 0, 0, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
+            ["test-fail-unlink", &*CFG_TEST_FAIL_UNLINK, 0, 0, 1,
              ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
