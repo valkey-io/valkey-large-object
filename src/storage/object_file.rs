@@ -25,10 +25,8 @@
 //! last ref, except on the main event-loop thread, where blocking would stall the
 //! server, so it is handed to the tokio worker pool (see `crate::is_main_thread`).
 //!
-//! `disk_len` is the handle's charge against `nvme-maxmemory`, credited back by whoever unlinks the
-//! file: this `Drop`, or eviction, which unlinks by id without a handle (`Evicted`, off the main
-//! thread). If the key is freed while eviction has the file claimed (`leave_to_eviction`), this
-//! `Drop` leaves the file alone.
+//! If the key is freed while eviction has the file claimed (`leave_to_eviction`), this `Drop`
+//! leaves the file, and the credit for its `disk_len`, to eviction.
 //!
 //! `ObjectFile` is Tiered-mode-only (DRAM-only mode has no NVMe file). It has no
 //! serialized form; on load a handle is reconstructed for the existing file and its
@@ -117,9 +115,8 @@ impl ObjectFile {
     /// payload past the header byte-for-byte. `fsync`s before returning so the file is
     /// durable before it is exposed to O_DIRECT reads via io_uring.
     ///
-    /// The returned handle's `Drop` releases the reserved bytes. Returns `None` if any I/O
-    /// fails (COPY then fails the command rather than aborting the node), leaving no partial
-    /// file behind.
+    /// Returns `None` if any I/O fails (COPY then fails the command rather than aborting the
+    /// node), leaving no partial file behind.
     pub fn copy(&self, reservation: DiskReservation, len: u64, crc32c: Crc) -> Option<ObjectFile> {
         let new_oid = reservation.object_id();
         let dir = crate::nvme_dir();
@@ -294,8 +291,8 @@ impl Drop for DiskReservation {
 
 /// Victim files eviction has listed whose unlink is still owed. Until it is done their bytes stay
 /// in the ledger, counted as pending (`nvme::add_pending_free`) so reservations may use them.
-/// The main thread must not make the syscall (it can stall on the filesystem journal), so whoever
-/// holds this unlinks off it: the SET's write task, or `Drop` in the background.
+/// The victims' unlink is coupled to the write's tokio task (or to `Drop` in the background), never
+/// the main thread, where it can stall on the filesystem journal.
 #[derive(Default)]
 pub struct Evicted(Vec<(ObjectId, u64, InflightGuard)>);
 
@@ -340,12 +337,13 @@ fn unlink_victims(files: Vec<(ObjectId, u64, InflightGuard)>) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 super::warn_failed_unlink("eviction", &path, &e);
-                // Still listed: its key lives, the object serves again, and its handle credits the
-                // file when the key goes. Not listed: the key was freed meanwhile and left the
-                // unlink to us, so nobody will ever remove the file, and it stays pinned.
                 if super::reclaim::RECLAIM_LIST.remove(&id) {
+                    // Rollback: the key is alive. Unlisting makes the object serve again, and its
+                    // own handle credits the file when the key goes.
                     drop(pin);
                 } else {
+                    // No rollback: the key was freed meanwhile and left the unlink to us, so
+                    // nothing else will ever remove the file. It stays pinned and is counted.
                     crate::eviction::DISK_LEAKED_FILES_TOTAL.fetch_add(1, Ordering::Relaxed);
                     valkey_module::logging::log_warning(format!(
                         "largeobj: leaked {path}: its key is gone and eviction could not unlink it"

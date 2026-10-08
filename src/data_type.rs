@@ -256,7 +256,7 @@ unsafe extern "C" fn lo_copy(
     value: *const std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
     let src = &*(value as *const LoValue);
-    match crate::with_callback_ctx(|ctx| src.create_copy(ctx)) {
+    match src.create_copy(&valkey_module::Context::dummy()) {
         Some(new_val) => Box::into_raw(Box::new(new_val)) as *mut std::ffi::c_void,
         None => std::ptr::null_mut(),
     }
