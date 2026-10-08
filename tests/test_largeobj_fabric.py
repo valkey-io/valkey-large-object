@@ -2,9 +2,10 @@ import binascii
 import collections
 import crc32c
 import os
+import pytest
 import subprocess
 from valkey import ResponseError
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
 
 # A tcp-provider fabric address: FI_SOCKADDR_IN for 127.0.0.1:1. The server only records it until
@@ -259,6 +260,27 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 client, f'BLOB.SET key {TARGET_LEN} {first}',
                 'client address space smaller than object length')
         finally:
+            process.kill()
+
+    def test_efa_drain_on_partial_failure(self):
+        """When an EFA submit fails partway through, already-posted transfers are drained
+        inline before the error is returned, and efa_drain_count increments."""
+        process, regions = self.start_target(split=[2048, 2048])
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.SET', 'key', PATTERN)
+            client.execute_command('BLOB.HELLO', regions[0].address)
+            before = info_largeobj(client).get('largeobj_efa_drain_count', 0)
+            client.execute_command(
+                'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'yes')
+            with pytest.raises(ResponseError):
+                client.execute_command('BLOB.GET', 'key', *address_args(regions))
+            after = info_largeobj(client)
+            assert after['largeobj_efa_drain_count'] - before == 1, \
+                f"expected exactly 1 drained transfer, got {after['largeobj_efa_drain_count'] - before}"
+        finally:
+            client.execute_command(
+                'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'no')
             process.kill()
 
 
