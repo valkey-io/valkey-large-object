@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use valkey_module::{raw, Context, KeysCursor};
+use valkey_module::{raw, Context, KeysCursor, ValkeyString};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 
@@ -53,15 +53,12 @@ impl ReclaimList {
         self.len() == 0
     }
 
-    /// Take `oid` off the list, counting the reclaim. Always locks: `remove_object`
-    /// must wait for a shrink that is listing this oid.
+    /// Take `oid` off the list. Always locks: `remove_object` must wait for a
+    /// shrink that is listing this oid.
     pub fn remove(&self, oid: &ObjectId) {
         let mut oids = self.lock();
         if oids.remove(oid) {
             self.len.store(oids.len(), Ordering::Release);
-            super::get_dram_pool()
-                .reclaims
-                .fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -86,7 +83,9 @@ thread_local! {
 /// `reclaim-scan-budget-us` of main-thread time per tick. Scans db by db,
 /// resuming across ticks, until the reclaim list is empty. An oid leaves the
 /// list when its key is deleted, here or by any other path (`lo_free` ->
-/// `remove_object`), so the scan cannot outlive its keys.
+/// `remove_object`), so the scan cannot outlive its keys. Only a delete made
+/// here counts as a reclaim; a normal delete (user DEL, overwrite, expiry ->
+/// `lo_free`) just takes the oid off the list.
 ///
 /// Cross-slot deletion is safe here: a timer callback runs outside command
 /// execution (`server.current_client` is NULL), so key lookups hash each key's
@@ -104,22 +103,14 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
                 scan.db = 0;
                 break;
             }
-            // Collect inside the scan callback, delete after it returns: core
-            // reads the scanned value after the callback (moduleCloseKey), so
-            // unlinking there hands BIO an object core still dereferences.
-            let victims = RefCell::new(Vec::new());
-            let more = scan.cursor.scan(ctx, &|_ctx, name, key| {
-                let Some(Ok(Some(lo))) = key.map(|k| k.get_value::<LoValue>(&LO_TYPE)) else {
-                    return;
-                };
-                if RECLAIM_LIST.contains(&lo.object_id) {
-                    victims.borrow_mut().push((name, lo.object_id));
-                }
-            });
-            for (name, oid) in victims.into_inner() {
+            let (listed_keys, more) = listed_keys_in_next_bucket(ctx, &scan.cursor);
+            for (name, oid) in listed_keys {
                 let _ = ctx.open_key_writable(&name).unlink();
-                // Same keyspace event core fires for its own evictions.
+                // Same keyspace event and count core makes for its own evictions.
                 ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
+                super::get_dram_pool()
+                    .reclaims
+                    .fetch_add(1, Ordering::Relaxed);
                 // lo_free runs later on the BIO thread; clear now so the scan
                 // stops once every listed key is gone.
                 RECLAIM_LIST.remove(&oid);
@@ -130,4 +121,27 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
             }
         }
     });
+}
+
+/// Scan the next hashtable bucket of the selected db. Returns the bucket's keys
+/// whose oids are on the reclaim list, and whether the db has more buckets.
+///
+/// Only collects, never deletes: core reads each scanned value after the scan
+/// callback returns (`moduleCloseKey`), so unlinking a key inside the callback
+/// hands BIO an object core still dereferences.
+fn listed_keys_in_next_bucket(
+    ctx: &Context,
+    cursor: &KeysCursor,
+) -> (Vec<(ValkeyString, ObjectId)>, bool) {
+    let listed = RefCell::new(Vec::new());
+    // scan() calls this once per key in the bucket.
+    let more = cursor.scan(ctx, &|_ctx, name, key| {
+        let Some(Ok(Some(lo))) = key.map(|k| k.get_value::<LoValue>(&LO_TYPE)) else {
+            return;
+        };
+        if RECLAIM_LIST.contains(&lo.object_id) {
+            listed.borrow_mut().push((name, lo.object_id));
+        }
+    });
+    (listed.into_inner(), more)
 }

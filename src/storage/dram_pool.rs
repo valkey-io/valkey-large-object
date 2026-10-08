@@ -90,8 +90,9 @@ pub struct DRAMPool {
     pub expand_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
     pub shrink_count: AtomicU64,
-    /// Completed reclaims: objects whose memory a background job freed and
-    /// whose key is now gone (Dram shrink today; other reclaims later).
+    /// Keys the module deleted because their objects were already freed
+    /// (Dram shrink today). Like core's `evicted_keys`: a key deleted by
+    /// anything else (user DEL, overwrite, expiry) is not counted.
     pub reclaims: AtomicU64,
     /// Admission filter and cache stats. `Some` in Tiered mode, `None` in Dram
     /// mode where the DRAMPool is the data, not a cache.

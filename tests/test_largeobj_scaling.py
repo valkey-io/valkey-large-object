@@ -341,7 +341,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
     def test_reclaimed_key_reads_as_missing(self):
         """Between the shrink and its key deletion, the victim key still exists
         but every module command treats it as missing. A user DEL in that window
-        completes the reclaim."""
+        takes it off the reclaim list but is not counted as a reclaim."""
         client = self.server.get_new_client()
         # The shrink tick re-arms the cron 60s out, holding the window open.
         client.config_set('largeobj.reclaim-poll-ms', 60000)
@@ -364,7 +364,8 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         reclaims = info_largeobj(client)['largeobj_reclaims']
         client.delete(victim)
         wait_for_true(lambda: info_largeobj(client)['largeobj_pending_reclaims'] == 0)
-        assert info_largeobj(client)['largeobj_reclaims'] == reclaims + 1
+        # The user deleted it, not the module, so it isn't counted.
+        assert info_largeobj(client)['largeobj_reclaims'] == reclaims
 
     def test_no_shrink_under_noeviction(self):
         """Dram shrink deletes keys, so noeviction disables it."""
