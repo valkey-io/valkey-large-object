@@ -61,7 +61,7 @@ define_errors! {
 /// still in flight after the error. Not a standalone error, so it lives outside
 /// the `define_errors!` macro.
 pub const WARN_RDMA_IN_FLIGHT: &str =
-    "; RDMA writes may still be in flight — do not reuse registered memory regions until the session is closed";
+    "; RDMA writes may still be in flight. Do not reuse registered memory regions until the session is closed.";
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
 
