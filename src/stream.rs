@@ -755,7 +755,6 @@ pub(crate) async fn efa_transfer_addrs(
     };
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
-    let mut sub_lens: Vec<usize> = Vec::with_capacity(addrs.len());
     let mut err: Option<&str> = None;
     let fail_partial = crate::test_efa_fail_partial();
     for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
@@ -774,7 +773,6 @@ pub(crate) async fn efa_transfer_addrs(
         };
         match transfer {
             Ok(t) => {
-                sub_lens.push(len);
                 indexed_futures.push(async move { (i, t.await) });
                 buf_offset += len;
             }
@@ -827,7 +825,7 @@ pub(crate) async fn efa_transfer_addrs(
             crc_fast::CrcAlgorithm::Crc32Iscsi,
             combined,
             results[i].expect("EFA transfer result missing") as u64,
-            sub_lens[i] as u64,
+            addrs[i].1 as u64,
         );
     }
     Ok(combined as u32)
