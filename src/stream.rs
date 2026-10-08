@@ -760,7 +760,8 @@ pub(crate) async fn efa_transfer_addrs(
     for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
         // Hidden test hook: after the first successful post, inject a failure
         // so the await loop exercises the inline drain path. Only takes effect
-        // when addrs has more than one entry.
+        // when addrs has more than one entry, meaning a chunk spans more
+        // than one client address.
         if fail_partial && i > 0 {
             err = Some(err_str);
             break;
