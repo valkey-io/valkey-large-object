@@ -28,7 +28,7 @@ use valkey_module::Context;
 use crate::data_type::ObjectId;
 use crate::storage::context::{ObjectContext, SegmentBuffer};
 use crate::storage::reclaim::RECLAIM_LIST;
-use crate::storage::{DRAMPool, Evicted, InflightGuard, INFLIGHT};
+use crate::storage::{lock_inflight, DRAMPool, Evicted, InflightGuard};
 
 // ─── Counters and shared helpers ────────────────────────────────────────────────────────────
 
@@ -41,7 +41,7 @@ pub static RECLAIMED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// SETs that still failed after eviction ran: objects destroyed for nothing.
 pub static EVICTION_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Candidates passed over because something still held them, counted per look: a pinned `Arc` in
-/// Dram mode, a file with a request in flight (`INFLIGHT`) in Tiered mode.
+/// Dram mode, a file with a request in flight (`InflightGuard`) in Tiered mode.
 pub static PINNED_SKIPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Tiered counterparts. Reclaimed is each victim's whole `disk_len`.
 pub static DISK_EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -263,7 +263,7 @@ impl Selection {
         let fresh = ids.len();
         // A file a request is using, or a victim claimed earlier and not yet unlinked, is pinned.
         {
-            let pins = INFLIGHT.lock();
+            let pins = lock_inflight();
             let before = ids.len();
             ids.retain(|id| !pins.contains_key(id));
             PINNED_SKIPS_TOTAL.fetch_add((before - ids.len()) as u64, Ordering::Relaxed);
@@ -590,7 +590,7 @@ mod tests {
 
         let victim = claim(id).expect("unpinned");
         assert!(RECLAIM_LIST.contains(&id));
-        assert!(INFLIGHT.lock().contains_key(&id), "a victim stays pinned");
+        assert!(lock_inflight().contains_key(&id), "a victim stays pinned");
         assert!(claim(id).is_none(), "already listed");
         drop(victim);
         RECLAIM_LIST.remove(&id);

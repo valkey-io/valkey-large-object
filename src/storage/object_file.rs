@@ -25,21 +25,66 @@
 //! last ref, except on the main event-loop thread, where blocking would stall the
 //! server, so it is handed to the tokio worker pool (see `crate::is_main_thread`).
 //!
-//! If the key is freed while eviction has the file claimed (`leave_to_eviction`), this `Drop`
-//! leaves the file, and the credit for its `disk_len`, to eviction.
-//!
 //! `ObjectFile` is Tiered-mode-only (DRAM-only mode has no NVMe file). It has no
 //! serialized form; on load a handle is reconstructed for the existing file and its
 //! fd opens lazily on the first GET.
 
+use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use super::fd_pool::FdPool;
-use super::inflight::InflightGuard;
 use super::Crc;
 use crate::data_type::ObjectId;
+
+// ─── Pins ──────────────────────────────────────────────────────────────────────
+
+/// Object id -> number of pins on it. Eviction picks victims from the NVMe directory, so it sees
+/// files, not keys, and must not take one with a live request or no live key behind it. Lock
+/// order: `RECLAIM_LIST`, then this map.
+static INFLIGHT: LazyLock<Mutex<HashMap<ObjectId, u32>>> = LazyLock::new(Mutex::default);
+
+pub fn lock_inflight() -> MutexGuard<'static, HashMap<ObjectId, u32>> {
+    INFLIGHT.lock().expect("INFLIGHT lock unavailable")
+}
+
+/// One pin on an object id, released on drop; `std::mem::forget` it to pin the id for good. A
+/// command pins every id it touches as soon as it knows it, and holds the pin until it is done:
+/// SET and COPY pin the new id from the mint until the key commits, and the overwritten or
+/// copied-from id until the command ends; GET pins until the reply; `lo_free` pins a freed key's
+/// file until it is unlinked; an eviction claim pins its victim until it is unlinked.
+#[derive(Debug)]
+pub struct InflightGuard(ObjectId);
+
+impl InflightGuard {
+    pub fn new(oid: ObjectId) -> Self {
+        *lock_inflight().entry(oid).or_default() += 1;
+        Self(oid)
+    }
+
+    /// Pin `oid` unless something has it pinned already.
+    pub fn new_if_unpinned(oid: ObjectId) -> Option<Self> {
+        let mut pins = lock_inflight();
+        if pins.contains_key(&oid) {
+            return None;
+        }
+        pins.insert(oid, 1);
+        Some(Self(oid))
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let mut pins = lock_inflight();
+        if let Some(count) = pins.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&self.0);
+            }
+        }
+    }
+}
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
 
@@ -56,7 +101,7 @@ pub struct ObjectFile {
     /// Eviction had claimed this file when its key was freed (set by `lo_free`): eviction owns the
     /// unlink and the credit, so this handle's `Drop` must do neither.
     owned_by_eviction: AtomicBool,
-    /// Held while no live key stands behind the file (see `storage::inflight`); dropped by the
+    /// Held while no live key stands behind the file (see `InflightGuard`); dropped by the
     /// teardown, after the unlink.
     pin: Mutex<Option<InflightGuard>>,
 }
@@ -88,8 +133,7 @@ impl ObjectFile {
         *self.pin.lock().expect("ObjectFile pin lock unavailable") = Some(pin);
     }
 
-    /// Leave this file's unlink and credit to eviction. Called when the key is freed while eviction
-    /// has the file claimed.
+    /// The key was freed while eviction has the file claimed.
     pub fn leave_to_eviction(&self) {
         self.owned_by_eviction.store(true, Ordering::Relaxed);
     }
@@ -379,5 +423,28 @@ impl std::ops::Deref for PinnedFile {
 
     fn deref(&self) -> &ObjectFile {
         &self.file
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_id_stays_pinned_until_its_last_guard_drops() {
+        let id = ObjectId(0x91a_0001);
+        assert!(!lock_inflight().contains_key(&id));
+        let first = InflightGuard::new(id);
+        let second = InflightGuard::new(id);
+        assert!(InflightGuard::new_if_unpinned(id).is_none());
+        drop(first);
+        assert!(lock_inflight().contains_key(&id));
+        drop(second);
+        assert!(!lock_inflight().contains_key(&id));
+
+        let claim = InflightGuard::new_if_unpinned(id).expect("unpinned");
+        assert_eq!(lock_inflight().get(&id), Some(&1));
+        drop(claim);
+        assert!(!lock_inflight().contains_key(&id));
     }
 }

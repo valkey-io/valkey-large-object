@@ -14,7 +14,6 @@ pub mod cache_policy;
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
-pub mod inflight;
 pub mod nvme;
 pub mod nvme_pool;
 pub mod object_file;
@@ -26,8 +25,9 @@ pub mod uring;
 
 // Re-exports for convenience.
 pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
-pub use inflight::{InflightGuard, INFLIGHT};
-pub use object_file::{DiskReservation, Evicted, ObjectFile, PinnedFile};
+pub use object_file::{
+    lock_inflight, DiskReservation, Evicted, InflightGuard, ObjectFile, PinnedFile,
+};
 
 // Re-exports from nvme.rs
 pub use nvme::{
