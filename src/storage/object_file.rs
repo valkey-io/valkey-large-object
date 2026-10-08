@@ -56,9 +56,8 @@ pub struct ObjectFile {
     /// Eviction had claimed this file when its key was freed (set by `lo_free`): eviction owns the
     /// unlink and the credit, so this handle's `Drop` must do neither.
     owned_by_eviction: AtomicBool,
-    /// Keeps eviction off this file while no live key stands behind it: from the SET or COPY that
-    /// makes it until its key commits (`release_pin`), and from `lo_free` until the unlink
-    /// (`hold_pin`). Dropped by the teardown, after the unlink.
+    /// Held while no live key stands behind the file (see `storage::inflight`); dropped by the
+    /// teardown, after the unlink.
     pin: Mutex<Option<InflightGuard>>,
 }
 

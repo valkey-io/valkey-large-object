@@ -98,6 +98,28 @@ def wait_unlinked(client):
     wait_for_true(lambda: info_largeobj(client)['largeobj_disk_pending_free_bytes'] == 0, timeout=10)
 
 
+def hook(client, name, value):
+    """Set a test-only pause or failure hook, which opens a window in the production path."""
+    client.execute_command('CONFIG', 'SET', f'largeobj.test-{name}', value)
+
+
+@contextmanager
+def paused_set(server, client, key, payload):
+    """A SET paused after writing its file and before its key commits. The pause is lifted at once,
+    so other commands run meanwhile; the SET commits when the block ends. Yields its outcome."""
+    hook(client, 'pause-before-finalize-set-ms', 3000)
+    outcome = {}
+    thread = threading.Thread(target=lambda: outcome.update(
+        reply=server.get_new_client().execute_command('BLOB.SET', key, payload)))
+    thread.start()
+    time.sleep(0.5)  # the file is written and the task is paused
+    hook(client, 'pause-before-finalize-set-ms', 0)
+    try:
+        yield outcome
+    finally:
+        thread.join(timeout=15)
+
+
 def set_objects(client, prefix, count, size):
     """SET `count` objects of `size` bytes, each filled with its own byte; return them by key."""
     payloads = {f'{prefix}{i}': bytes([i % 251 + 1]) * size for i in range(count)}
@@ -915,6 +937,17 @@ class TieredCap:
     def fill_cap(self, client):
         return set_objects(client, 'fill_', self.OBJECTS_PER_CAP, self.OBJ)
 
+    def wait_settled(self, client, live, timeout=10):
+        """Every victim unlinked and every pin released: the ledger and the directory hold exactly
+        `live` objects."""
+        def settled():
+            info = info_largeobj(client)
+            return (info['largeobj_disk_pending_free_bytes'] == 0
+                    and info['largeobj_disk_pinned_objects'] == 0
+                    and info['largeobj_disk_used_bytes'] == live * self.DISK_PER_OBJ
+                    and len(self._dat_files()) == live)
+        wait_for_true(settled, timeout=timeout)
+
 
 class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
 
@@ -1020,12 +1053,7 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
             assert info['largeobj_disk_used_bytes'] == (live + 1) * self.DISK_PER_OBJ, \
                 "the freed key's file is still there, and still charged"
 
-        def settled():
-            info = info_largeobj(client)
-            return (info['largeobj_disk_pinned_objects'] == 0
-                    and info['largeobj_disk_used_bytes'] == live * self.DISK_PER_OBJ
-                    and len(self._dat_files()) == live)
-        wait_for_true(settled, timeout=30)
+        self.wait_settled(client, live, timeout=30)
 
     def test_a_write_that_fails_after_evicting_returns_every_byte(self):
         """An EFA SET to a dead peer evicts, charges, starts writing and fails: the victim stays
@@ -1040,13 +1068,7 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         survivors = len(payloads) - 1
         assert info_largeobj(client)['largeobj_disk_evictions'] == 1
         assert client.execute_command('EXISTS', 'efa_key') == 0
-
-        def settled():
-            info = info_largeobj(client)
-            return (info['largeobj_disk_used_bytes'] == survivors * self.DISK_PER_OBJ
-                    and info['largeobj_disk_pinned_objects'] == 0
-                    and len(self._dat_files()) == survivors)
-        wait_for_true(settled, timeout=10)
+        self.wait_settled(client, survivors)
 
     def test_a_write_that_cannot_create_its_file_returns_every_byte(self):
         """`nvme-dir` vanishes under a SET that has already charged its file: the charge comes back.
@@ -1073,22 +1095,20 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         assert info['largeobj_disk_used_bytes'] == self.OBJECTS_PER_CAP * self.DISK_PER_OBJ
         assert info['largeobj_disk_pinned_objects'] == 0
 
-    def test_deleting_a_victim_does_not_free_its_bytes_for_another_write(self):
-        """A victim's bytes belong to the write that evicted it. If its key is deleted before its
-        file is unlinked, the teardown must leave the file alone, or another write is admitted into
-        room the first one is counting on."""
+    def test_a_victim_whose_key_was_deleted_stays_the_evicting_writes_to_unlink(self):
+        """A victim's bytes belong to the write that evicted it, even once its key is deleted: the
+        teardown leaves the file alone, and no other write may admit itself into that room or claim
+        the file again, or both would unlink and credit it."""
         client = self.server.get_new_client()
         set_policy(client)
         payloads = self.fill_cap(client)
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-evict-unlink-ms', '2000')
-
+        hook(client, 'pause-before-evict-unlink-ms', 2000)
         results = {}
 
         def write(name):
-            c = self.server.get_new_client()
-            results[name] = c.execute_command('BLOB.SET', name, b'W' * self.OBJ)
+            results[name] = self.server.get_new_client().execute_command('BLOB.SET', name, b'W' * self.OBJ)
 
-        first = threading.Thread(target=write, args=('first',))
+        first = threading.Thread(target=write, args=('w0',))
         first.start()
         wait_for_true(lambda: pending_reclaims(client) == 1, timeout=10)
         victim = next(key for key in payloads if key not in surviving(client, payloads))
@@ -1099,19 +1119,18 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         assert info['largeobj_disk_used_bytes'] == (self.OBJECTS_PER_CAP + 1) * self.DISK_PER_OBJ
         assert info['largeobj_disk_pending_free_bytes'] == self.DISK_PER_OBJ
 
-        second = threading.Thread(target=write, args=('second',))
-        second.start()
-        for t in (first, second):
+        # Enough writes to claim every file in the directory, the deleted victim's included if it
+        # could be: all of them arrive well within the pause, before any new file exists.
+        others = [threading.Thread(target=write, args=(f'w{i}',)) for i in range(1, self.OBJECTS_PER_CAP)]
+        for t in others:
+            t.start()
+        for t in [first, *others]:
             t.join(timeout=30)
-        assert results == {'first': b'OK', 'second': b'OK'}
+        assert results == {f'w{i}': b'OK' for i in range(self.OBJECTS_PER_CAP)}
 
         wait_unlinked(client)
-        info = info_largeobj(client)
-        assert info['largeobj_disk_evictions'] == 2, "the second write evicted for itself"
-        assert info['largeobj_disk_used_bytes'] == self.OBJECTS_PER_CAP * self.DISK_PER_OBJ
-        wait_for_true(lambda: len(self._dat_files()) == self.OBJECTS_PER_CAP, timeout=10)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_pinned_objects'] == 0, timeout=10)
-
+        assert info_largeobj(client)['largeobj_disk_evictions'] == self.OBJECTS_PER_CAP
+        self.wait_settled(client, self.OBJECTS_PER_CAP)
     def test_a_key_being_read_is_not_evicted(self):
         """A GET pins its object until it ends, so eviction passes it over and it survives; once the
         transfer ends it is a victim again."""
@@ -1120,79 +1139,44 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         payloads = self.fill_cap(client)
         assert_pin_skipped_then_released(self.server, client, 'fill_0', payloads['fill_0'])
 
-    def test_an_object_being_overwritten_is_not_evicted(self):
-        """A SET pins the object it overwrites, as well as its own new file, until it ends: while
-        it is paused before its commit, writes that need room pass over both."""
+    @pytest.mark.parametrize('overwrite', [False, True])
+    def test_a_set_in_flight_is_not_evicted(self, overwrite):
+        """A SET's file exists before its key does, and a SET pins the object it overwrites too.
+        While it is paused before its commit, writes that need room must offer and pass over both,
+        or the SET loses its file mid-flight."""
         client = self.server.get_new_client()
         set_policy(client)
         payloads = self.fill_cap(client)
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '3000')
-        thread = threading.Thread(target=lambda: self.server.get_new_client().execute_command(
-            'BLOB.SET', 'fill_0', b'S' * self.OBJ))
-        thread.start()
-        time.sleep(0.5)  # the new file is written, the task is paused, the old object is still there
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0')
+        key = 'fill_0' if overwrite else 'slow'
+        with paused_set(self.server, client, key, b'S' * self.OBJ) as outcome:
+            before = info_largeobj(client)['largeobj_pinned_skips']
+            for i in range(3):
+                assert client.execute_command('BLOB.SET', f'other_{i}', b'O' * self.OBJ) == b'OK'
+            skips = info_largeobj(client)['largeobj_pinned_skips'] - before
+            assert skips >= (2 if overwrite else 1), "eviction never met the file"
+            if overwrite:
+                assert client.execute_command('BLOB.GET', key) == payloads[key]
 
-        before = info_largeobj(client)['largeobj_pinned_skips']
-        assert client.execute_command('BLOB.SET', 'other', b'O' * self.OBJ) == b'OK'
-        assert info_largeobj(client)['largeobj_pinned_skips'] - before >= 2, "the old object and the new file"
-        assert client.execute_command('BLOB.GET', 'fill_0') == payloads['fill_0']
-        thread.join(timeout=15)
-        assert client.execute_command('BLOB.GET', 'fill_0') == b'S' * self.OBJ
-        wait_unlinked(client)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_pinned_objects'] == 0, timeout=10)
-
-    def test_a_write_in_flight_is_never_a_victim(self):
-        """A SET's file exists before its key does. Eviction must offer it and pass it over, or the
-        write loses its file mid-flight."""
-        client = self.server.get_new_client()
-        set_policy(client)
-        self.fill_cap(client)
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '3000')
-        outcome = {}
-        thread = threading.Thread(target=lambda: outcome.update(
-            reply=self.server.get_new_client().execute_command('BLOB.SET', 'slow', b'S' * self.OBJ)))
-        thread.start()
-        time.sleep(0.5)  # the file is written and the task is paused, before its key exists
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0')
-
-        before = info_largeobj(client)['largeobj_pinned_skips']
-        for i in range(3):
-            assert client.execute_command('BLOB.SET', f'other_{i}', b'O' * self.OBJ) == b'OK'
-        assert info_largeobj(client)['largeobj_pinned_skips'] > before, "eviction never met the file"
-
-        thread.join(timeout=15)
         assert outcome['reply'] == b'OK'
-        assert client.execute_command('BLOB.GET', 'slow') == b'S' * self.OBJ
-        wait_unlinked(client)
-        assert info_largeobj(client)['largeobj_disk_pinned_objects'] == 0
-
+        assert client.execute_command('BLOB.GET', key) == b'S' * self.OBJ
+        live = len(surviving(client, {**payloads, **{f'other_{i}': None for i in range(3)}, key: None}))
+        self.wait_settled(client, live)
     def test_a_write_discarded_as_stale_leaves_nothing_behind(self):
         """A SET slow to commit finds a newer object under its key and is dropped: its file is
         unlinked, its bytes come back and nothing stays listed."""
         client = self.server.get_new_client()
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '3000')
-        thread = threading.Thread(
-            target=lambda: self.server.get_new_client().execute_command('BLOB.SET', 'key', b'L' * self.OBJ))
-        thread.start()
-        time.sleep(0.5)  # written, paused holding the older object id
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0')
-        assert client.execute_command('BLOB.SET', 'key', b'N' * self.OBJ) == b'OK'
-        thread.join(timeout=15)
+        with paused_set(self.server, client, 'key', b'L' * self.OBJ):  # holds the older object id
+            assert client.execute_command('BLOB.SET', 'key', b'N' * self.OBJ) == b'OK'
 
         assert client.execute_command('BLOB.GET', 'key') == b'N' * self.OBJ
-        wait_for_true(lambda: len(self._dat_files()) == 1, timeout=10)
-        info = info_largeobj(client)
-        assert info['largeobj_disk_used_bytes'] == self.DISK_PER_OBJ
-        assert info['largeobj_disk_pinned_objects'] == 0
-
+        self.wait_settled(client, 1)
     def test_a_failed_unlink_leaves_a_live_victim_serving_and_its_key_credits_it_later(self):
         """Eviction cannot unlink a victim whose key is alive: the object serves again, its bytes
         stay charged, and deleting its key later unlinks the file and credits them."""
         client = self.server.get_new_client()
         set_policy(client)
         payloads = self.fill_cap(client)
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-fail-unlink', '1')
+        hook(client, 'fail-unlink', 1)
         assert client.execute_command('BLOB.SET', 'newcomer', b'N' * self.OBJ) == b'OK'
         wait_unlinked(client)
 
@@ -1203,7 +1187,7 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         assert surviving(client, payloads) == payloads
         assert len(self._dat_files()) == self.OBJECTS_PER_CAP + 1
 
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-fail-unlink', '0')
+        hook(client, 'fail-unlink', 0)
         assert client.execute_command('DEL', 'fill_0') == 1
         wait_for_true(lambda: len(self._dat_files()) == self.OBJECTS_PER_CAP, timeout=10)
         wait_for_true(lambda: info_largeobj(client)['largeobj_disk_used_bytes']
@@ -1216,8 +1200,8 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         set_policy(client)
         payloads = self.fill_cap(client)
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-evict-unlink-ms', '2000')
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-fail-unlink', '1')
+        hook(client, 'pause-before-evict-unlink-ms', 2000)
+        hook(client, 'fail-unlink', 1)
         outcome = {}
         thread = threading.Thread(target=lambda: outcome.update(
             reply=self.server.get_new_client().execute_command('BLOB.SET', 'newcomer', b'N' * self.OBJ)))
@@ -1242,11 +1226,11 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         set_policy(client)
         self.fill_cap(client)
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-fail-unlink', '1')
+        hook(client, 'fail-unlink', 1)
         assert client.execute_command('DEL', 'fill_0') == 1
         wait_for_true(lambda: info_largeobj(client)['largeobj_disk_used_bytes']
                       == (self.OBJECTS_PER_CAP - 1) * self.DISK_PER_OBJ, timeout=10)
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-fail-unlink', '0')
+        hook(client, 'fail-unlink', 0)
         assert info_largeobj(client)['largeobj_disk_pinned_objects'] == 1
         assert len(self._dat_files()) == self.OBJECTS_PER_CAP
 
@@ -1256,60 +1240,20 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         assert skips() > before, "eviction never met the stray file"
         assert info_largeobj(client)['largeobj_disk_pinned_objects'] == 1, "it was never claimed"
 
-    def test_a_victim_whose_key_was_deleted_is_not_claimed_again(self):
-        """Once its key is deleted, a victim's file is nobody's key's, but it is still the evicting
-        write's to unlink. A later write must not claim it again: both would unlink and credit it."""
-        client = self.server.get_new_client()
-        set_policy(client)
-        payloads = self.fill_cap(client)
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-evict-unlink-ms', '2000')
-        results = {}
-
-        def write(name):
-            results[name] = self.server.get_new_client().execute_command('BLOB.SET', name, b'W' * self.OBJ)
-
-        first = threading.Thread(target=write, args=('w0',))
-        first.start()
-        wait_for_true(lambda: pending_reclaims(client) == 1, timeout=10)
-        victim = next(key for key in payloads if key not in surviving(client, payloads))
-        assert client.execute_command('DEL', victim) == 1
-
-        # Enough writes to claim every file in the directory, the deleted victim's included if it
-        # could be: all of them arrive well within the pause, before any new file exists.
-        others = [threading.Thread(target=write, args=(f'w{i}',)) for i in range(1, self.OBJECTS_PER_CAP)]
-        for t in others:
-            t.start()
-        for t in [first, *others]:
-            t.join(timeout=30)
-        assert results == {f'w{i}': b'OK' for i in range(self.OBJECTS_PER_CAP)}
-
-        wait_unlinked(client)
-        info = info_largeobj(client)
-        assert info['largeobj_disk_evictions'] == self.OBJECTS_PER_CAP
-        assert info['largeobj_disk_used_bytes'] == self.OBJECTS_PER_CAP * self.DISK_PER_OBJ
-        wait_for_true(lambda: len(self._dat_files()) == self.OBJECTS_PER_CAP, timeout=10)
-        assert info['largeobj_disk_pinned_objects'] == 0
-
     def test_a_freed_key_stays_pinned_until_its_file_is_unlinked(self):
         """With no reader holding it, a freed key's file is still the teardown's to unlink. While the
         teardown waits, writes that need room must pass over it, or both would credit it."""
         client = self.server.get_new_client()
         set_policy(client)
         payloads = self.fill_cap(client)
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-teardown-unlink-ms', '3000')
+        hook(client, 'pause-before-teardown-unlink-ms', 3000)
         assert client.execute_command('DEL', 'fill_0') == 1
         wait_for_true(lambda: info_largeobj(client)['largeobj_disk_pinned_objects'] == 1, timeout=10)
 
         before = info_largeobj(client)['largeobj_pinned_skips']
         assert client.execute_command('BLOB.SET', 'other', b'O' * self.OBJ) == b'OK'
         assert info_largeobj(client)['largeobj_pinned_skips'] > before, "eviction never met the file"
-        wait_unlinked(client)
-
-        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_pinned_objects'] == 0, timeout=15)
-        info = info_largeobj(client)
-        survivors = len(surviving(client, {**payloads, 'other': None}))
-        assert info['largeobj_disk_used_bytes'] == survivors * self.DISK_PER_OBJ
-        wait_for_true(lambda: len(self._dat_files()) == survivors, timeout=10)
+        self.wait_settled(client, len(surviving(client, {**payloads, 'other': None})), timeout=15)
 
     def test_overlapping_writes_each_evict_only_for_themselves(self):
         """A victim stays in the ledger until its file is unlinked, so a write that arrives meanwhile
@@ -1331,10 +1275,8 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
             t.join(timeout=60)
 
         wait_unlinked(client)
-        info = info_largeobj(client)
-        assert info['largeobj_disk_evictions'] == threads * writes, "one victim per write"
-        assert info['largeobj_disk_used_bytes'] == self.OBJECTS_PER_CAP * self.DISK_PER_OBJ
-        wait_for_true(lambda: len(self._dat_files()) == self.OBJECTS_PER_CAP, timeout=10)
+        assert info_largeobj(client)['largeobj_disk_evictions'] == threads * writes, "one victim per write"
+        self.wait_settled(client, self.OBJECTS_PER_CAP)
 
     @pytest.mark.parametrize('policy', ['allkeys-lru', 'volatile-ttl'])
     def test_any_policy_but_noeviction_evicts_one_random_victim(self, policy):
@@ -1414,7 +1356,7 @@ class TestTieredEvictionReclaim(TieredCap, ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         set_policy(client)
         self.fill_cap(client)
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-evict-unlink-ms', '4000')
+        hook(client, 'pause-before-evict-unlink-ms', 4000)
         thread = threading.Thread(
             target=lambda: self.server.get_new_client().execute_command('BLOB.SET', 'newcomer', b'N' * self.OBJ))
         thread.start()
@@ -1543,7 +1485,7 @@ class TestClusterTieredEviction(TieredNode, ValkeyLargeObjTestCaseBase):
             target=lambda: outcome.update(reply=slow.execute_command('BLOB.SET', key, late)))
         thread.start()
         time.sleep(0.5)  # the write is done and the task is paused, holding the older object id
-        client.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0')
+        hook(client, 'pause-before-finalize-set-ms', 0)
         assert client.execute_command('BLOB.SET', key, b'N' * self.OBJ) == b'OK'
 
         gone = lambda: client.execute_command('BLOB.GET', key) is None

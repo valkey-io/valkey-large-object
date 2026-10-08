@@ -318,10 +318,9 @@ fn select(
     picked
 }
 
-/// List `id` as reclaimed, which makes its file a victim, and pin it until its unlink, unless it is
-/// listed already or pinned: a request is using it, or it has no live key and is on its way out.
-/// Under the list lock, so the teardown of a key freed after this point finds the entry, and
-/// leaves the file's unlink to us.
+/// List `id` as reclaimed and pin it until its unlink, unless it is listed or pinned already.
+/// Under the list lock, so the teardown of a key freed after this finds the entry and leaves the
+/// unlink to us.
 fn claim(id: ObjectId) -> Option<InflightGuard> {
     let mut pin = None;
     RECLAIM_LIST.add_unless(id, || {

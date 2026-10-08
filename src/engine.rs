@@ -84,9 +84,8 @@ struct GetObjectInfo {
 
 /// What a Tiered SET pins against eviction until it ends.
 struct SetPins {
-    /// The new object's id, from the mint; it passes to the new file's handle.
+    /// From the mint; passes to the new file's handle.
     new: storage::InflightGuard,
-    /// The object the SET overwrites, if there is one.
     overwritten: Option<storage::InflightGuard>,
 }
 
@@ -95,7 +94,6 @@ struct SetObjectInfo {
     object_id: ObjectId,
     obj_len: u64,
     key_name: Vec<u8>,
-    /// Tiered: the object this SET overwrites, pinned until the command ends.
     overwritten: Option<storage::InflightGuard>,
 }
 
