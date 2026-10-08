@@ -207,7 +207,10 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         Covers equal and unequal splits, and a boundary that falls mid-chunk: 1024 is not
         a multiple of chunk-size 4096, so the first chunk must be scattered across both
         addresses. The target reports 'payload verified' only once EVERY address has filled,
-        so a transfer that wrote the head and dropped the tail fails here."""
+        so a transfer that wrote the head and dropped the tail fails here.
+        Also exercises the inline EFA drain path: after a successful transfer, inject a
+        partial failure and verify that already-posted transfers are drained before the
+        error is returned, then confirm a subsequent transfer still succeeds."""
         payload = PATTERN
         for sizes in ([2048, 2048], [1024, 3072]):
             process, regions = self.start_target(split=sizes)
@@ -233,6 +236,32 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 'BLOB.SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
             assert client.execute_command('BLOB.GET', 'copy') == payload
         finally:
+            process.kill()
+        # Partial failure with drain: inject an error after the first EFA post so the
+        # await loop drains the already-submitted transfer before returning the error.
+        process, regions = self.start_target(split=[2048, 2048])
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.SET', 'key', payload)
+            client.execute_command('BLOB.HELLO', regions[0].address)
+            before = info_largeobj(client).get('largeobj_efa_drain_count', 0)
+            client.execute_command(
+                'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'yes')
+            with pytest.raises(ResponseError, match="EFA write"):
+                client.execute_command('BLOB.GET', 'key', *address_args(regions))
+            after = info_largeobj(client)
+            assert after['largeobj_efa_drain_count'] - before == 1, \
+                f"expected exactly 1 drained transfer, got {after['largeobj_efa_drain_count'] - before}"
+            # Recovery: disable the hook and confirm the next transfer succeeds.
+            client.execute_command(
+                'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'no')
+            reply = client.execute_command('BLOB.GET', 'key', *address_args(regions))
+            assert reply == [TARGET_LEN, crc32c.crc32c(payload)]
+            output = process.communicate(timeout=30)[0]
+            assert 'payload verified' in output, output
+        finally:
+            client.execute_command(
+                'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'no')
             process.kill()
 
     def test_address_coverage_is_validated(self):
@@ -260,27 +289,6 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 client, f'BLOB.SET key {TARGET_LEN} {first}',
                 'client address space smaller than object length')
         finally:
-            process.kill()
-
-    def test_efa_drain_on_partial_failure(self):
-        """When an EFA submit fails partway through, already-posted transfers are drained
-        inline before the error is returned, and efa_drain_count increments."""
-        process, regions = self.start_target(split=[2048, 2048])
-        try:
-            client = self.server.get_new_client()
-            client.execute_command('BLOB.SET', 'key', PATTERN)
-            client.execute_command('BLOB.HELLO', regions[0].address)
-            before = info_largeobj(client).get('largeobj_efa_drain_count', 0)
-            client.execute_command(
-                'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'yes')
-            with pytest.raises(ResponseError, match="EFA write"):
-                client.execute_command('BLOB.GET', 'key', *address_args(regions))
-            after = info_largeobj(client)
-            assert after['largeobj_efa_drain_count'] - before == 1, \
-                f"expected exactly 1 drained transfer, got {after['largeobj_efa_drain_count'] - before}"
-        finally:
-            client.execute_command(
-                'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'no')
             process.kill()
 
 
