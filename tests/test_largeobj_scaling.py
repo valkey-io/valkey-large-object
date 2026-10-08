@@ -128,11 +128,11 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.SET', 'src', src) == b'OK'
         assert client.execute_command('COPY', 'src', 'dst') == 1
         assert client.execute_command('BLOB.GET', 'dst') == src
-        assert info_largeobj(client)['largeobj_dram_live_segments'] == 2
+        assert info_largeobj(client)['largeobj_dram_segments'] == 2
         client.execute_command('DEL', 'src')
-        wait_for_true(lambda: info_largeobj(client)['largeobj_cached_objects'] == 1)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == 1)
         assert client.execute_command('BLOB.SET', 'big', b'B' * (900 * 1024)) == b'OK'
-        assert info_largeobj(client)['largeobj_dram_live_segments'] == 2, \
+        assert info_largeobj(client)['largeobj_dram_segments'] == 2, \
             "copy was split across segments, so a 900KB SET needed a third"
 
     def test_expand_data_integrity(self):
