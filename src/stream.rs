@@ -755,7 +755,7 @@ pub(crate) async fn efa_transfer_addrs(
     };
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
-    let mut err: Option<&str> = None;
+    let mut failed = false;
     let fail_partial = crate::test_efa_fail_partial();
     for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
         // Hidden test hook: after the first successful post, inject a failure
@@ -763,7 +763,7 @@ pub(crate) async fn efa_transfer_addrs(
         // when addrs has more than one entry, meaning a chunk spans more
         // than one client address.
         if fail_partial && i > 0 {
-            err = Some(err_str);
+            failed = true;
             break;
         }
         let transfer = match direction {
@@ -780,7 +780,7 @@ pub(crate) async fn efa_transfer_addrs(
             // Posted RMAs can't be aborted, so break and let the await loop
             // drain already-submitted transfers before returning the error.
             Err(_) => {
-                err = Some(err_str);
+                failed = true;
                 break;
             }
         }
@@ -788,14 +788,14 @@ pub(crate) async fn efa_transfer_addrs(
     let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
     while let Some((idx, (outcome, _operand))) = indexed_futures.next().await {
         // Already failing — remaining futures are in-flight RMAs being drained.
-        if err.is_some() {
+        if failed {
             crate::info::EFA_DRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         let done = match outcome {
             Ok(d) => d,
             Err(_) => {
-                err.get_or_insert(err_str);
+                failed = true;
                 continue;
             }
         };
@@ -811,8 +811,8 @@ pub(crate) async fn efa_transfer_addrs(
     }
     // All in-flight RMAs have completed. If any failed, return the error now
     // that no DMA is outstanding and buffers are safe to release.
-    if let Some(e) = err {
-        return Err(ValkeyError::Str(e));
+    if failed {
+        return Err(ValkeyError::Str(err_str));
     }
     // GET (Write) path: callers ignore the returned CRC — skip combination.
     if matches!(direction, EfaDirection::Write) {
