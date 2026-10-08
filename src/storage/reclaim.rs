@@ -104,21 +104,26 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
                 scan.db = 0;
                 break;
             }
-            // VM_Scan allows deleting the current key from its callback.
-            let more = scan.cursor.scan(ctx, &|ctx, name, key| {
+            // Collect inside the scan callback, delete after it returns: core
+            // reads the scanned value after the callback (moduleCloseKey), so
+            // unlinking there hands BIO an object core still dereferences.
+            let victims = RefCell::new(Vec::new());
+            let more = scan.cursor.scan(ctx, &|_ctx, name, key| {
                 let Some(Ok(Some(lo))) = key.map(|k| k.get_value::<LoValue>(&LO_TYPE)) else {
                     return;
                 };
-                let oid = lo.object_id;
-                if RECLAIM_LIST.contains(&oid) {
-                    let _ = ctx.open_key_writable(&name).unlink();
-                    // Same keyspace event core fires for its own evictions.
-                    ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
-                    // lo_free runs later on the BIO thread; clear now so the
-                    // scan stops once every listed key is gone.
-                    RECLAIM_LIST.remove(&oid);
+                if RECLAIM_LIST.contains(&lo.object_id) {
+                    victims.borrow_mut().push((name, lo.object_id));
                 }
             });
+            for (name, oid) in victims.into_inner() {
+                let _ = ctx.open_key_writable(&name).unlink();
+                // Same keyspace event core fires for its own evictions.
+                ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
+                // lo_free runs later on the BIO thread; clear now so the scan
+                // stops once every listed key is gone.
+                RECLAIM_LIST.remove(&oid);
+            }
             if !more {
                 scan.cursor.restart();
                 scan.db += 1;
