@@ -111,8 +111,8 @@ impl PendingOp {
     /// Record this op's time since its SQE push in INFO, including failed and short I/Os.
     fn record_completion(&self, pushed_at: Instant) {
         let stats = match self {
-            PendingOp::Read { .. } => &crate::info::NVME_READS,
-            PendingOp::Write { .. } => &crate::info::NVME_WRITES,
+            PendingOp::Read { .. } => &crate::info::DISK_READS,
+            PendingOp::Write { .. } => &crate::info::DISK_WRITES,
         };
         stats.record(pushed_at);
     }

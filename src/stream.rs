@@ -750,8 +750,8 @@ pub(crate) async fn efa_transfer_addrs(
     // TODO: Track specific EFA error types (e.g. timeout, connection reset) before
     // collapsing to the generic ERR_EFA_READ/ERR_EFA_WRITE reply string.
     let (err_str, stats) = match direction {
-        EfaDirection::Write => (crate::errors::ERR_EFA_WRITE, &crate::info::EFA_WRITES),
-        EfaDirection::Read => (crate::errors::ERR_EFA_READ, &crate::info::EFA_READS),
+        EfaDirection::Write => (crate::errors::ERR_EFA_WRITE, &crate::info::RDMA_WRITES),
+        EfaDirection::Read => (crate::errors::ERR_EFA_READ, &crate::info::RDMA_READS),
     };
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;

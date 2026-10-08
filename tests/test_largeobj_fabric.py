@@ -272,35 +272,35 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client = self.server.get_new_client()
 
             def efa():
-                return client.info('largeobj_efa')
+                return client.info('largeobj_rdma')
 
             client.execute_command('BLOB.SET', 'key', PATTERN)
             assert client.execute_command('BLOB.GET', 'key') == PATTERN
             assert set(efa().values()) == {0}
 
             client.execute_command('BLOB.HELLO', regions[0].address)
-            assert efa()['largeobj_efa_sessions'] == 1
+            assert efa()['largeobj_rdma_sessions'] == 1
             assert client.execute_command('BLOB.GET', 'key', *address_args(regions)) == [
                 TARGET_LEN, crc32c.crc32c(PATTERN)]
             get = efa()
-            assert get['largeobj_efa_write_bytes_total'] == TARGET_LEN
-            assert get['largeobj_efa_writes_total'] == len(sizes)
-            assert get['largeobj_efa_write_usec_total'] > 0
-            assert get['largeobj_efa_read_bytes_total'] == 0
-            assert get['largeobj_efa_reads_total'] == 0
+            assert get['largeobj_rdma_write_bytes'] == TARGET_LEN
+            assert get['largeobj_rdma_writes'] == len(sizes)
+            assert get['largeobj_rdma_write_usec'] > 0
+            assert get['largeobj_rdma_read_bytes'] == 0
+            assert get['largeobj_rdma_reads'] == 0
 
             assert client.execute_command(
                 'BLOB.SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
             both = efa()
-            assert both['largeobj_efa_read_bytes_total'] == TARGET_LEN
-            assert both['largeobj_efa_reads_total'] == len(sizes)
-            assert both['largeobj_efa_read_usec_total'] > 0
-            assert both['largeobj_efa_write_bytes_total'] == TARGET_LEN
-            assert client.info('largeobj_requests')['largeobj_inflight_requests'] == 0
+            assert both['largeobj_rdma_read_bytes'] == TARGET_LEN
+            assert both['largeobj_rdma_reads'] == len(sizes)
+            assert both['largeobj_rdma_read_usec'] > 0
+            assert both['largeobj_rdma_write_bytes'] == TARGET_LEN
+            assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
 
             client.close()
             observer = self.server.get_new_client()
-            wait_for_equal(lambda: observer.info('largeobj_efa')['largeobj_efa_sessions'], 0)
+            wait_for_equal(lambda: observer.info('largeobj_rdma')['largeobj_rdma_sessions'], 0)
         finally:
             process.kill()
 
@@ -316,12 +316,12 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             self.verify_error_response(
                 client, f'BLOB.GET key {region.rkey} {region.addr + region.len} {region.len}',
                 'EFA write')
-            efa = client.info('largeobj_efa')
-            assert efa['largeobj_efa_writes_total'] == 1
-            assert efa['largeobj_efa_write_usec_total'] > 0
-            assert efa['largeobj_efa_write_bytes_total'] == 0
+            efa = client.info('largeobj_rdma')
+            assert efa['largeobj_rdma_writes'] == 1
+            assert efa['largeobj_rdma_write_usec'] > 0
+            assert efa['largeobj_rdma_write_bytes'] == 0
             assert client.info('largeobj_error_metrics')['largeobj_efa_write_errors'] == 1
-            assert client.info('largeobj_requests')['largeobj_inflight_requests'] == 0
+            assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
         finally:
             process.kill()
 
@@ -338,10 +338,10 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 f'BLOB.GET key {good.rkey} {good.addr} {good.len}'
                 f' {bad.rkey} {bad.addr + bad.len} {bad.len}',
                 'EFA write')
-            efa = client.info('largeobj_efa')
-            assert efa['largeobj_efa_writes_total'] == 2
+            efa = client.info('largeobj_rdma')
+            assert efa['largeobj_rdma_writes'] == 2
             # The good transfer may fail too once the bad one does.
-            assert efa['largeobj_efa_write_bytes_total'] in (0, good.len)
+            assert efa['largeobj_rdma_write_bytes'] in (0, good.len)
             assert client.info('largeobj_error_metrics')['largeobj_efa_write_errors'] == 1
         finally:
             process.kill()

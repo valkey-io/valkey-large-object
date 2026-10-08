@@ -108,7 +108,7 @@ pub fn inflight_requests() -> u64 {
     INFLIGHT_REQUESTS.load(Ordering::Relaxed)
 }
 
-/// An async BLOB.GET or BLOB.SET. Its client stays blocked until this drops.
+/// An async GET or SET, over TCP or RDMA. Its client stays blocked until this drops.
 pub(crate) struct BlockedRequest(valkey_module::ThreadSafeContext<valkey_module::BlockedClient>);
 
 impl BlockedRequest {

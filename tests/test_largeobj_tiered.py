@@ -114,47 +114,21 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         payload = b'P' * 12288  # 3 chunks
         client.execute_command('BLOB.SET', 'key', payload)
         written = info_largeobj(client)
-        assert written['largeobj_nvme_writes_total'] >= 3
-        assert written['largeobj_nvme_write_usec_total'] > 0
-        assert written['largeobj_nvme_reads_total'] == 0
+        assert written['largeobj_disk_writes'] >= 3
+        assert written['largeobj_disk_write_usec'] > 0
+        assert written['largeobj_disk_reads'] == 0
 
         assert client.execute_command('BLOB.GET', 'key') == payload
         miss = info_largeobj(client)
         assert (miss['largeobj_cache_hits'], miss['largeobj_cache_misses']) == (0, 1)
-        assert miss['largeobj_nvme_reads_total'] >= 3
-        assert miss['largeobj_nvme_read_usec_total'] > 0
+        assert miss['largeobj_disk_reads'] >= 3
+        assert miss['largeobj_disk_read_usec'] > 0
 
         assert client.execute_command('BLOB.GET', 'key') == payload
         hit = info_largeobj(client)
         assert (hit['largeobj_cache_hits'], hit['largeobj_cache_misses']) == (1, 1)
-        assert hit['largeobj_nvme_reads_total'] == miss['largeobj_nvme_reads_total']
-        assert hit['largeobj_nvme_writes_total'] == written['largeobj_nvme_writes_total']
-
-    def test_info_live_objects_follow_the_keyspace(self):
-        """live_objects counts keys holding a Blob: SET and COPY add one, an overwrite
-        doesn't, and DEL and FLUSHALL take theirs back once the value is freed."""
-        client = self.server.get_new_client()
-
-        def live():
-            return client.info('largeobj_nvme')['largeobj_live_objects']
-
-        assert live() == 0
-        client.execute_command('BLOB.SET', 'a', b'A' * 4096)
-        client.execute_command('BLOB.SET', 'b', b'B' * 4096)
-        assert live() == 2
-        client.execute_command('BLOB.SET', 'a', b'C' * 8192)
-        wait_for_equal(live, 2)
-        client.execute_command('COPY', 'a', 'c')
-        assert live() == 3
-        client.execute_command('DEL', 'b')
-        wait_for_equal(live, 2)
-        assert client.execute_command('DBSIZE') == 2
-        nvme = client.info('largeobj_nvme')
-        assert nvme['largeobj_nvme_disk_used_bytes'] > 0
-        # nvme-maxmemory 0 is unlimited: there is no budget to be a percentage of.
-        assert nvme['largeobj_nvme_disk_utilization_pct'] == 0
-        client.execute_command('FLUSHALL')
-        wait_for_equal(live, 0)
+        assert hit['largeobj_disk_reads'] == miss['largeobj_disk_reads']
+        assert hit['largeobj_disk_writes'] == written['largeobj_disk_writes']
 
     def test_info_set_in_flight(self):
         """A Tiered SET holds its staging window and counts in inflight_requests until it
@@ -166,10 +140,10 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         def staging():
             # A failed SET would otherwise only show up as a wait timeout.
             assert set_error[0] is None, f"SET raised: {set_error[0]}"
-            return client.info('largeobj_nvme_staging')['largeobj_staging_utilization_pct']
+            return client.info('largeobj_nvme_staging')['largeobj_nvme_staging_utilization_pct']
 
         def inflight():
-            return client.info('largeobj_requests')['largeobj_inflight_requests']
+            return client.info('largeobj_core_metrics')['largeobj_inflight_requests']
 
         def background_set():
             try:
@@ -564,7 +538,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
         info = info_largeobj(client)
         assert (info['largeobj_cache_hits'], info['largeobj_cache_misses']) == (0, 3)
         assert info['largeobj_dram_objects'] == 0
-        assert info['largeobj_live_objects'] == 1
+        assert info['largeobj_num_objects'] == 1
 
     def test_reject_invalid_buffer_configs(self):
         """CONFIG SET rejects min-buffers-per-op > max-buffers-per-op and
@@ -618,7 +592,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
 class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
     """Shared helpers for the NVMe disk-usage accounting tests.
 
-    INFO reports the usage counter as `largeobj_nvme_disk_used_bytes`. These tests
+    INFO reports the usage counter as `largeobj_disk_used_bytes`. These tests
     also exercise its other externally-visible effect: the reserve-if-capacity gate
     (`try_reserve_nvme_disk_usage`) on the Tiered SET path.
     A SET that would push tracked usage past `nvme-maxmemory` is rejected with
@@ -749,21 +723,21 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
         disk_len = self.FILE_HEADER_SIZE + self._align_up(self.OBJ)
 
         def used():
-            return client.info('largeobj_nvme')['largeobj_nvme_disk_used_bytes']
+            return client.info('largeobj_disk')['largeobj_disk_used_bytes']
 
         for i in range(7):
             self._set_ok(client, f"k{i}", b"X" * self.OBJ)
-        nvme = client.info('largeobj_nvme')
-        assert nvme['largeobj_nvme_disk_used_bytes'] == 7 * disk_len
+        nvme = client.info('largeobj_disk')
+        assert nvme['largeobj_disk_used_bytes'] == 7 * disk_len
         # Two decimals: 1863680 / 2097152 = 88.867...%.
-        assert nvme['largeobj_nvme_disk_utilization_pct'] == 88.87
+        assert nvme['largeobj_disk_utilization_pct'] == 88.87
         client.execute_command("DEL", "k0")
         self._wait_free_settled(client)
         wait_for_equal(used, 6 * disk_len)
         client.execute_command("FLUSHALL")
         self._wait_free_settled(client)
         wait_for_equal(used, 0)
-        assert client.info('largeobj_nvme')['largeobj_nvme_disk_utilization_pct'] == 0
+        assert client.info('largeobj_disk')['largeobj_disk_utilization_pct'] == 0
 
     def test_overwrite_does_not_leak_capacity(self):
         client = self.server.get_new_client()

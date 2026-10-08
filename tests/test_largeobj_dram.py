@@ -210,19 +210,19 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     # ─── INFO largeobj tests ───────────────────────────────────────────────
 
     def test_info_sections_by_mode(self):
-        """The NVMe sections are Tiered-only. The EFA and requests sections are always
-        present, zeroed while nothing has moved over EFA. A TCP request in Dram mode replies
-        inline, so it is never in flight."""
+        """The NVMe sections are Tiered-only. The EFA section is always present, zeroed
+        while nothing has moved over EFA. A TCP request in Dram mode replies inline, so it
+        is never in flight."""
         client = self.server.get_new_client()
         client.execute_command('BLOB.SET', 'key', b'A' * 4096)
         assert client.execute_command('BLOB.GET', 'key') == b'A' * 4096
-        assert client.info('largeobj_nvme') == {}
+        assert client.info('largeobj_disk') == {}
         assert client.info('largeobj_nvme_staging') == {}
-        efa = client.info('largeobj_efa')
-        for field in ('sessions', 'read_bytes_total', 'write_bytes_total',
-                      'reads_total', 'read_usec_total', 'writes_total', 'write_usec_total'):
-            assert efa[f'largeobj_efa_{field}'] == 0, field
-        assert client.info('largeobj_requests') == {'largeobj_inflight_requests': 0}
+        efa = client.info('largeobj_rdma')
+        for field in ('sessions', 'read_bytes', 'write_bytes',
+                      'reads', 'read_usec', 'writes', 'write_usec'):
+            assert efa[f'largeobj_rdma_{field}'] == 0, field
+        assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
 
     # ─── BLOB.INFO tests ───────────────────────────────────────────────────
 

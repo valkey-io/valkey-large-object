@@ -112,7 +112,7 @@ pub fn lookup(client_id: u64) -> Option<Arc<Session>> {
     sessions().get(&client_id).cloned()
 }
 
-/// Live sessions: connections that ran BLOB.HELLO and haven't disconnected.
+/// Live sessions: connections that opened an RDMA session and haven't disconnected.
 pub fn count() -> usize {
     sessions().len()
 }

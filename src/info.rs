@@ -31,7 +31,7 @@ pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ─── I/O Metrics ─────────────────────────────────────────────────────────────
 
-/// Count and total duration of one kind of I/O. `usec_total / count` is the mean.
+/// Count and total duration of one kind of I/O. `usec / count` is the mean.
 #[derive(Default)]
 pub struct IoStats {
     count: AtomicU64,
@@ -57,19 +57,19 @@ impl IoStats {
         self.count.load(Ordering::Relaxed)
     }
 
-    pub fn usec_total(&self) -> u64 {
+    pub fn usec(&self) -> u64 {
         self.usec.load(Ordering::Relaxed)
     }
 }
 
-/// One direction of EFA traffic: transfers and the bytes they moved.
+/// One direction of RDMA traffic: transfers and the bytes they moved.
 #[derive(Default)]
-pub struct EfaStats {
+pub struct RdmaStats {
     transfers: IoStats,
     bytes: AtomicU64,
 }
 
-impl EfaStats {
+impl RdmaStats {
     pub const fn new() -> Self {
         Self {
             transfers: IoStats::new(),
@@ -84,16 +84,16 @@ impl EfaStats {
     }
 }
 
-/// io_uring reads and writes of NVMe object files on either ring, timed from
+/// io_uring reads and writes of object files on disk, on either ring, timed from
 /// SQE push to CQE reap. Every reaped CQE counts, including failed and short I/Os.
-pub static NVME_READS: IoStats = IoStats::new();
-pub static NVME_WRITES: IoStats = IoStats::new();
+pub static DISK_READS: IoStats = IoStats::new();
+pub static DISK_WRITES: IoStats = IoStats::new();
 
-/// EFA transfers, timed from submission to completion, one per client
+/// RDMA transfers, timed from submission to completion, one per client
 /// address of a chunk. Reads pull client memory (the SET path); writes push into
 /// it (the GET path). The time includes any wait behind `fabric-max-in-flight`.
-pub static EFA_READS: EfaStats = EfaStats::new();
-pub static EFA_WRITES: EfaStats = EfaStats::new();
+pub static RDMA_READS: RdmaStats = RdmaStats::new();
+pub static RDMA_WRITES: RdmaStats = RdmaStats::new();
 
 /// `part` as a percentage of `whole`, to two decimals ("99.99").
 fn pct(part: u64, whole: u64) -> String {
@@ -114,11 +114,10 @@ fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     core_metrics_section(ctx)?;
     dram_pool_section(ctx)?;
     nvme_staging_section(ctx)?;
-    nvme_section(ctx)?;
+    disk_section(ctx)?;
     fd_pool_section(ctx)?;
     smartlog_section(ctx)?;
-    efa_section(ctx)?;
-    requests_section(ctx)?;
+    rdma_section(ctx)?;
     error_metrics_section(ctx)?;
     Ok(())
 }
@@ -139,6 +138,10 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "reclaims",
             storage::get_dram_pool().reclaims.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "inflight_requests",
+            crate::engine::inflight_requests() as i64,
         )?
         .build_section()?
         .build_info()?;
@@ -247,7 +250,7 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("nvme_unused_segments", unused as i64)?
         .field("nvme_fragment_count", nvme.fragment_count() as i64)?
         .field("nvme_staging_size_bytes", crate::nvme_staging_size() as i64)?
-        .field("staging_utilization_pct", util_pct)?
+        .field("nvme_staging_utilization_pct", util_pct)?
         .field("nvme_segment_size_bytes", crate::dram_segment_size() as i64)?
         .field(
             "nvme_uring_registered_segments",
@@ -258,9 +261,8 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .map(|_| ())
 }
 
-/// NVMe object files, Tiered mode only: disk budget, object count and io_uring
-/// I/O timing.
-fn nvme_section(ctx: &InfoContext) -> ValkeyResult<()> {
+/// Object files on disk, Tiered mode only: disk budget and io_uring I/O timing.
+fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
     if operating_mode() != OperatingMode::Tiered {
         return Ok(());
     }
@@ -269,14 +271,13 @@ fn nvme_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let util_pct = pct(used, crate::nvme_maxmemory());
 
     ctx.builder()
-        .add_section("nvme")
-        .field("nvme_disk_used_bytes", used)?
-        .field("nvme_disk_utilization_pct", util_pct)?
-        .field("live_objects", crate::data_type::live_objects())?
-        .field("nvme_reads_total", NVME_READS.count())?
-        .field("nvme_read_usec_total", NVME_READS.usec_total())?
-        .field("nvme_writes_total", NVME_WRITES.count())?
-        .field("nvme_write_usec_total", NVME_WRITES.usec_total())?
+        .add_section("disk")
+        .field("disk_used_bytes", used)?
+        .field("disk_utilization_pct", util_pct)?
+        .field("disk_reads", DISK_READS.count())?
+        .field("disk_read_usec", DISK_READS.usec())?
+        .field("disk_writes", DISK_WRITES.count())?
+        .field("disk_write_usec", DISK_WRITES.usec())?
         .build_section()?
         .build_info()
         .map(|_| ())
@@ -348,34 +349,21 @@ fn smartlog_section(ctx: &InfoContext) -> ValkeyResult<()> {
     warnings.build_section()?.build_info().map(|_| ())
 }
 
-/// EFA sessions and traffic, in both modes. Emitted as zeros where no fabric
+/// RDMA sessions and traffic, in both modes. Emitted as zeros where no fabric
 /// is available, so consumers can depend on a fixed key set.
-fn efa_section(ctx: &InfoContext) -> ValkeyResult<()> {
+fn rdma_section(ctx: &InfoContext) -> ValkeyResult<()> {
     ctx.builder()
-        .add_section("efa")
-        .field("efa_sessions", crate::transport::session::count() as u64)?
+        .add_section("rdma")
+        .field("rdma_sessions", crate::transport::session::count() as u64)?
+        .field("rdma_read_bytes", RDMA_READS.bytes.load(Ordering::Relaxed))?
         .field(
-            "efa_read_bytes_total",
-            EFA_READS.bytes.load(Ordering::Relaxed),
+            "rdma_write_bytes",
+            RDMA_WRITES.bytes.load(Ordering::Relaxed),
         )?
-        .field(
-            "efa_write_bytes_total",
-            EFA_WRITES.bytes.load(Ordering::Relaxed),
-        )?
-        .field("efa_reads_total", EFA_READS.transfers.count())?
-        .field("efa_read_usec_total", EFA_READS.transfers.usec_total())?
-        .field("efa_writes_total", EFA_WRITES.transfers.count())?
-        .field("efa_write_usec_total", EFA_WRITES.transfers.usec_total())?
-        .build_section()?
-        .build_info()
-        .map(|_| ())
-}
-
-/// Async BLOB.GET and BLOB.SET requests, in both modes.
-fn requests_section(ctx: &InfoContext) -> ValkeyResult<()> {
-    ctx.builder()
-        .add_section("requests")
-        .field("inflight_requests", crate::engine::inflight_requests())?
+        .field("rdma_reads", RDMA_READS.transfers.count())?
+        .field("rdma_read_usec", RDMA_READS.transfers.usec())?
+        .field("rdma_writes", RDMA_WRITES.transfers.count())?
+        .field("rdma_write_usec", RDMA_WRITES.transfers.usec())?
         .build_section()?
         .build_info()
         .map(|_| ())
@@ -440,11 +428,11 @@ mod tests {
     }
 
     #[test]
-    fn test_efa_stats_record_count_and_bytes() {
-        let efa = EfaStats::new();
-        efa.record(Instant::now(), 4096);
-        efa.record(Instant::now(), 1024);
-        assert_eq!(efa.transfers.count(), 2);
-        assert_eq!(efa.bytes.load(Ordering::Relaxed), 5120);
+    fn test_rdma_stats_record_count_and_bytes() {
+        let rdma = RdmaStats::new();
+        rdma.record(Instant::now(), 4096);
+        rdma.record(Instant::now(), 1024);
+        assert_eq!(rdma.transfers.count(), 2);
+        assert_eq!(rdma.bytes.load(Ordering::Relaxed), 5120);
     }
 }

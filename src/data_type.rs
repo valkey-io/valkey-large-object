@@ -41,15 +41,6 @@ impl ObjectId {
     }
 }
 
-// ─── Live Objects ────────────────────────────────────────────────────────────
-
-/// INFO `live_objects`: `LoValue::new` counts a value in, its `Drop` counts it out.
-static LIVE_OBJECTS: AtomicU64 = AtomicU64::new(0);
-
-pub fn live_objects() -> u64 {
-    LIVE_OBJECTS.load(Ordering::Relaxed)
-}
-
 // ─── Tier ────────────────────────────────────────────────────────────────────
 
 /// Storage tier an object is currently served from. Reported by `BLOB.INFO`.
@@ -95,7 +86,6 @@ impl LoValue {
     /// Not `Clone`: a clone would be a second counted instance of one object.
     pub fn new(object_id: ObjectId, len: u64, crc32c: Crc, file: Option<Arc<ObjectFile>>) -> Self {
         crate::info::LARGE_OBJECT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        LIVE_OBJECTS.fetch_add(1, Ordering::Relaxed);
         Self {
             object_id,
             len,
@@ -197,7 +187,6 @@ impl LoValue {
 impl Drop for LoValue {
     fn drop(&mut self) {
         crate::info::LARGE_OBJECT_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        LIVE_OBJECTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
