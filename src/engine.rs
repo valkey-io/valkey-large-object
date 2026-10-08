@@ -168,12 +168,11 @@ enum CommitOutcome {
 /// own cleanup/metric/reply on each outcome. On `StaleDiscarded`/`Err` the moved-in
 /// `LoValue` drops here; for NVMe that drops its `ObjectFile` → unlink + budget release.
 fn commit_lo_value(
-    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    ctx: &valkey_module::ContextGuard,
     key_name: &[u8],
     object_id: ObjectId,
     lo_value: LoValue,
 ) -> Result<CommitOutcome, ValkeyError> {
-    let ctx = thread_ctx.lock();
     let key_str = ctx.create_string(key_name.to_vec());
     let key = ctx.open_key_writable(&key_str);
     // One lookup drives both the version guard and the create/update event.
@@ -255,7 +254,7 @@ fn cmd_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, Va
             }
         }
         Some(_) => {
-            panic!("DRAM-only GET: object in Filling state — SET is synchronous, this is a bug")
+            panic!("DRAM-only GET: object in Filling state — only Tiered promotion creates Filling objects")
         }
         None => panic!("DRAM-only GET: LoValue exists but ObjectContext missing — logic bug"),
     }
@@ -281,9 +280,8 @@ fn cmd_get_dram_efa(
                 dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, None,
             );
         }
-        Some(_obj_ctx) => {
-            // TODO: Replace with waiter registration on the watch channel (coalescing).
-            todo!("DRAM-only GET: object in Filling state. Needs Request Coalescing");
+        Some(_) => {
+            panic!("DRAM-only GET: object in Filling state — only Tiered promotion creates Filling objects")
         }
         None => panic!("DRAM-only GET: LoValue exists but ObjectContext missing — logic bug"),
     }
@@ -643,12 +641,7 @@ fn cmd_set_dram_tcp(
     let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
     dram_pool.insert_object(object_id, obj_ctx);
     let key = ctx.open_key_writable(key_name);
-    let lo_value = LoValue {
-        object_id,
-        len: obj_len,
-        crc32c: crc,
-        file: None,
-    };
+    let lo_value = LoValue::new(object_id, obj_len, crc, None);
     let event = if key.is_empty() {
         EVENT_CREATE
     } else {
@@ -734,18 +727,21 @@ fn cmd_set_dram_efa(
                         return;
                     }
                 };
-                // Insert ObjectContext BEFORE set_value so the key is never visible
-                // without its ObjectContext. On discard, remove the entry —
-                // ObjectContext::Drop returns buffers to DRAMPool automatically.
-                let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
-                dram_pool.insert_object(object_id, obj_ctx);
-                let lo_value = LoValue {
-                    object_id,
-                    len: obj_len,
-                    crc32c: crc,
-                    file: None,
+                let lo_value = LoValue::new(object_id, obj_len, crc, None);
+                // Insert and commit under one server-lock hold, so no shrink lands between.
+                let outcome = {
+                    let ctx = thread_ctx.lock();
+                    if dram_pool.is_segment_draining(buffers[0].segment_idx) {
+                        // A shrink took the segment during the transfer.
+                        dram_pool.free_n(&buffers);
+                        Err(ValkeyError::Str(errors::ERR_SET_VALUE))
+                    } else {
+                        let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
+                        dram_pool.insert_object(object_id, obj_ctx);
+                        commit_lo_value(&ctx, &key_name, object_id, lo_value)
+                    }
                 };
-                match commit_lo_value(&thread_ctx, &key_name, object_id, lo_value) {
+                match outcome {
                     Ok(CommitOutcome::ValueSet) => {
                         thread_ctx.reply(VALKEY_OK);
                     }
@@ -959,13 +955,9 @@ async fn cmd_set_tiered_run(
          reserved {} B — write path and accounting have diverged",
         object_id, disk_len
     );
-    let lo_value = LoValue {
-        object_id,
-        len: obj_len,
-        crc32c: crc,
-        file: Some(object_file),
-    };
-    match commit_lo_value(&thread_ctx, &key_name, object_id, lo_value) {
+    let lo_value = LoValue::new(object_id, obj_len, crc, Some(object_file));
+    let outcome = commit_lo_value(&thread_ctx.lock(), &key_name, object_id, lo_value);
+    match outcome {
         Ok(CommitOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);
         }

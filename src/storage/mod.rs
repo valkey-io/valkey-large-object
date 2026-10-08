@@ -17,6 +17,7 @@ pub mod fd_pool;
 pub mod nvme;
 pub mod nvme_pool;
 pub mod object_file;
+pub mod reclaim;
 pub mod scaling;
 pub mod segment;
 pub mod segment_pool;

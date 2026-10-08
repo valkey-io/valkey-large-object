@@ -1,6 +1,7 @@
 import os
 from valkey import ResponseError
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkeytestframework.util.waiters import wait_for_true
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
 
 class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
@@ -105,8 +106,8 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         try:
             client.execute_command('BLOB.SET', 'toobig', b'D' * (4 * 1024 * 1024))
             assert False, "Expected max-object-size rejection"
-        except ResponseError:
-            pass
+        except ResponseError as e:
+            assert 'max object size' in str(e).lower(), f"Unexpected error: {e}"
         assert self.read_keyspace_events(pubsub, 1) == []
 
     # ─── COPY callback tests ─────────────────────────────────────────────
@@ -191,6 +192,20 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         """Dram mode never starts the SMART log poller"""
         client = self.server.get_new_client()
         assert 'largeobj_snapshot_age_seconds' not in client.info('largeobj_smartlog_usage')
+
+    def test_num_objects(self):
+        """INFO num_objects counts LargeObject keys through SET, overwrite, COPY
+        and DEL, and ignores keys of standard (core) Valkey data types such as
+        strings. Frees run async, so decrements are awaited."""
+        client = self.server.get_new_client()
+        num_objects = lambda: info_largeobj(client)['largeobj_num_objects']
+        client.execute_command('BLOB.SET', 'blob', b'A' * 1024)
+        client.execute_command('BLOB.SET', 'blob', b'B' * 1024)
+        client.execute_command('COPY', 'blob', 'blob_copy')
+        client.set('string_key', 'v')
+        wait_for_true(lambda: num_objects() == 2)
+        client.delete('blob', 'blob_copy')
+        wait_for_true(lambda: num_objects() == 0)
 
     # ─── BLOB.INFO tests ───────────────────────────────────────────────────
 
@@ -287,8 +302,9 @@ class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):
         try:
             client.execute_command('COPY', 'bigkey', 'bigcopy')
             assert False, "Expected COPY to fail — expansion would cross maxmemory"
-        except ResponseError:
-            pass  # Expected — cannot fit a second object without crossing the watermark
+        except ResponseError as e:
+            # Cannot fit a second object without crossing maxmemory.
+            assert 'module key failed to copy' in str(e).lower(), f"Unexpected error: {e}"
         finally:
             client.execute_command('CONFIG', 'SET', 'maxmemory', '0')
         # Source intact.

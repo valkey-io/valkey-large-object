@@ -159,14 +159,14 @@ DRAMPool keeps two maps under one lock, changed together only through `ObjectMap
 Fields in the `largeobj_dram` INFO section (`add_section("dram")`; the module name is added as a prefix):
 
 ```
-cache_hits_total            tiered GET served from a Ready cached entry
-cache_misses_total          tiered GET that read from NVMe (absent, Filling, rejected, or no space)
-promotions_total            try_promote_object succeeded
-admission_rejects_total     miss served transiently because the filter's miss count was below promote-min-hits
-reclaims_total              cached copies removed by make_room_for (DRAMPool, both modes)
+cache_hits          tiered GET served from a Ready cached entry
+cache_misses        tiered GET that read from NVMe (absent, Filling, rejected, or no space)
+promotions          try_promote_object succeeded
+admission_rejects   miss served transiently because the filter's miss count was below promote-min-hits
+demotions           cached copies demoted by make_room_for (key and NVMe copy kept)
 ```
 
-`cache_hits_total + cache_misses_total` is the number of tiered GETs. `cache_misses_total - promotions_total - admission_rejects_total` counts misses that were neither promoted nor rejected: objects above `max-promote-size`, a pool with no room even after reclaim, or a concurrent promotion of the same object. `reclaims_total` counts cached copies only, never keys.
+`cache_hits + cache_misses` is the number of tiered GETs. `cache_misses - promotions - admission_rejects` counts misses that were neither promoted nor rejected: objects above `max-promote-size`, a pool with no room even after reclaim, or a concurrent promotion of the same object. `demotions` counts cached copies only, never keys. All of these fields are emitted in Tiered mode only.
 
 ### 4.8 FD pool
 
@@ -185,7 +185,7 @@ fds: RwLock<OIDIndexedMap<FdEntry>>
 
 `get_or_open_with` takes the cap as an argument so unit tests can set it without racing on the global config; the other settings are read live. `RECLAIM_MAX_VICTIMS` does not apply, since the fd loop reclaims exactly the overflow.
 
-INFO section `largeobj_fd` (Tiered only): `open_fds`, `fd_reclaims_total`.
+INFO section `largeobj_fd` (Tiered only): `open_fds`, `fd_reclaims`.
 
 
 ## 5. Open questions

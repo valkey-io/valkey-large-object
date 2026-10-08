@@ -6,10 +6,11 @@
 //! by the scaling cron when utilization exceeds the expand watermark.
 //! Adds one `segment-size` segment via `try_expand()`.
 //!
-//! Shrink (Tiered-mode only): triggered proactively by the scaling cron when
-//! `used_memory` approaches `maxmemory`. Picks the least-used segment, marks
-//! it draining, and removes its cached objects from the HashMap so GET handlers
-//! fall back to NVMe. The segment releases on the next cron tick when refcount hits 0.
+//! Shrink: triggered proactively by the scaling cron when `used_memory`
+//! approaches `maxmemory`. Picks the least-used segment, marks it draining, and
+//! removes its objects so the segment releases once in-flight readers drop.
+//! Tiered: GETs fall back to NVMe. Dram: the objects' oids go on the reclaim
+//! list; their keys read as missing until the cron deletes them.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -48,14 +49,16 @@ impl ObjectMaps {
         Some(ctx)
     }
 
-    /// Remove every object in segment `seg` (shrink).
-    fn remove_by_segment_id(&mut self, seg: usize) {
+    /// Remove every object in segment `seg` (shrink) and return their OIDs.
+    fn remove_by_segment_id(&mut self, seg: usize) -> OIDIndexedSet {
         let Some(ids) = self.by_segment.get_mut(seg) else {
-            return;
+            return OIDIndexedSet::new();
         };
-        for oid in std::mem::take(ids) {
-            self.all.swap_remove(&oid);
+        let ids = std::mem::take(ids);
+        for oid in &ids {
+            self.all.swap_remove(oid);
         }
+        ids
     }
 
     /// Remove and return the lowest-scoring unpinned object among up to
@@ -87,7 +90,9 @@ pub struct DRAMPool {
     pub expand_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
     pub shrink_count: AtomicU64,
-    /// Cached objects removed by `make_room_for` to free space.
+    /// Keys the module deleted because their objects were already freed
+    /// (Dram shrink today). Like core's `evicted_keys`: a key deleted by
+    /// anything else (user DEL, overwrite, expiry) is not counted.
     pub reclaims: AtomicU64,
     /// Admission filter and cache stats. `Some` in Tiered mode, `None` in Dram
     /// mode where the DRAMPool is the data, not a cache.
@@ -188,7 +193,7 @@ impl DRAMPool {
     /// Lookup a cached object.
     ///
     /// Returns None if the object is not cached, or if its segment is draining
-    /// (caller should fall back to NVMe to prevent new Arc refs on a draining segment).
+    /// (no new Arc refs on a draining segment, so the drain can finish).
     pub fn get_object(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
         let arc = self
             .objects
@@ -198,13 +203,17 @@ impl DRAMPool {
             .get(oid)
             .cloned()?;
 
-        // If any buffer of this object lives in a draining segment, refuse the
-        // Arc — forces the caller to NVMe and lets the refcount drain to zero.
-        let is_draining = self.pool.is_any_buffer_draining(&arc.buffers);
-        if is_draining {
+        // An object never spans segments: buffers[0] names the segment of all of them.
+        // A Filling object (promotion in progress) is returned too; callers check
+        // `is_ready()`.
+        if self.pool.is_segment_draining(arc.buffers[0].segment_idx) {
             return None;
         }
         Some(arc)
+    }
+
+    pub fn is_segment_draining(&self, seg_idx: u16) -> bool {
+        self.pool.is_segment_draining(seg_idx)
     }
 
     /// Insert an ObjectContext (promotion path).
@@ -215,12 +224,17 @@ impl DRAMPool {
             .insert(oid, ctx);
     }
 
-    /// Remove an ObjectContext (free callback / eviction).
+    /// Remove an ObjectContext (free callback / eviction). Also clears `oid`
+    /// from the reclaim list: its key is gone. Map first, then list: a shrink
+    /// that runs in between no longer sees the object, so cannot list it.
     pub fn remove_object(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
-        self.objects
+        let removed = self
+            .objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
-            .remove(oid)
+            .remove(oid);
+        super::reclaim::RECLAIM_LIST.remove(oid);
+        removed
     }
 
     /// Check if object exists (coalesce check — is promotion in progress?).
@@ -341,7 +355,9 @@ impl DRAMPool {
             }
             return None;
         }
-        self.reclaims
+        self.tiered_cache()
+            .stats
+            .demotions
             .fetch_add(victims.len() as u64, Ordering::Relaxed);
         Some(victims)
     }
@@ -423,34 +439,36 @@ impl DRAMPool {
     ///
     /// Victim selection: the non-draining segment with the fewest allocated bytes.
     /// Uses the per-segment `allocated_bytes` counter — O(live segments), no HashMap scan.
-    /// This minimises NVMe fallback work after eviction — clients re-read the least data.
     ///
-    /// **Tiered mode:** always safe — data persists on NVMe; GETs fall back.
-    /// **Dram mode:** only allowed when the victim segment has zero allocated bytes.
-    ///   If it has live data, shrink is skipped — there is no NVMe fallback.
+    /// Removing the objects drops the map's Arcs, so the segment releases as soon
+    /// as in-flight readers drop theirs.
+    /// - **Tiered:** data persists on NVMe; GETs fall back.
+    /// - **Dram:** the oids go on the reclaim list. Their keys read as missing
+    ///   until the scaling cron deletes them.
     ///
     /// Returns true if a victim was selected, false if nothing to shrink.
     pub fn try_shrink(&self) -> bool {
-        let (victim_idx, victim_bytes) = match self.pool.find_shrink_victim() {
-            Some(v) => v,
-            None => return false,
-        };
-
-        if crate::operating_mode() == crate::OperatingMode::Dram && victim_bytes > 0 {
-            // Can't evict — data would be lost with no NVMe fallback.
-            // No unmark needed: segment was never marked draining.
+        let Some((victim_idx, _)) = self.pool.find_shrink_victim() else {
             return false;
-        }
-
-        // Commit: mark draining only now that we know eviction is safe.
+        };
         self.pool.mark_segment_draining(victim_idx);
 
-        // Remove cached objects on the victim segment from the HashMap.
-        // Tiered: data persists on NVMe. Dram: verified empty above.
-        self.objects
-            .write()
-            .expect("DRAMPool.objects lock unavailable")
-            .remove_by_segment_id(victim_idx);
+        // Hold the reclaim list across the map scan. A concurrent `remove_object`
+        // either removed the object first (not seen, not listed) or blocks
+        // until we are done and then clears the oid we listed.
+        super::reclaim::RECLAIM_LIST.add_with(|| {
+            let removed = self
+                .objects
+                .write()
+                .expect("DRAMPool.objects lock unavailable")
+                .remove_by_segment_id(victim_idx);
+            // Tiered: the objects live on in NVMe, so their keys stay valid.
+            if crate::operating_mode() == crate::OperatingMode::Dram {
+                removed
+            } else {
+                Default::default()
+            }
+        });
 
         self.shrink_count.fetch_add(1, Ordering::Relaxed);
         true
@@ -525,7 +543,7 @@ mod tests {
             p.contains_object(&ObjectId(10)),
             "other segment is untouched"
         );
-        assert_eq!(p.reclaims.load(Ordering::Relaxed), 1);
+        assert_eq!(p.tiered_cache().stats.demotions.load(Ordering::Relaxed), 1);
         drop(victims);
         assert_index_consistent(&p);
 
@@ -545,7 +563,7 @@ mod tests {
         let victims = p.reclaim_in(0, 2 * BUF as usize, 16).unwrap();
         assert_eq!(victims.len(), 2, "no over-reclaim past the first fit");
         assert_eq!(p.object_count(), 2);
-        assert_eq!(p.reclaims.load(Ordering::Relaxed), 2);
+        assert_eq!(p.tiered_cache().stats.demotions.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -560,7 +578,7 @@ mod tests {
         // The victim cap stops short of 3 BUF.
         assert!(p.reclaim_in(0, 3 * BUF as usize, 2).is_none());
         assert_eq!(p.object_count(), 8);
-        assert_eq!(p.reclaims.load(Ordering::Relaxed), 0);
+        assert_eq!(p.tiered_cache().stats.demotions.load(Ordering::Relaxed), 0);
         assert_index_consistent(&p);
 
         // Exactly what segment 0 holds goes through, and only segment 0 pays.

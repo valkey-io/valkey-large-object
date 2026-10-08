@@ -206,6 +206,9 @@ pub struct CacheStats {
     pub misses: AtomicU64,
     /// Successful `try_promote_object` calls.
     pub promotions: AtomicU64,
+    /// Cached copies demoted (dropped from DRAM, NVMe copy kept) by
+    /// `make_room_for` to free space.
+    pub demotions: AtomicU64,
 }
 
 impl CacheStats {

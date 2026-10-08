@@ -138,8 +138,8 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // Lookup LoValue in keyspace.
     let key = ctx.open_key(&args[1]);
     let lo_value: &LoValue = match key.get_value::<LoValue>(&LO_TYPE)? {
-        Some(v) => v,
-        None => return Ok(ValkeyValue::Null),
+        Some(v) if !v.reclaim_in_progress() => v,
+        _ => return Ok(ValkeyValue::Null),
     };
 
     let object_id = lo_value.object_id;
@@ -235,8 +235,8 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let key = ctx.open_key(&args[1]);
     let value = match key.get_value::<LoValue>(&LO_TYPE)? {
-        Some(v) => v,
-        None => return Err(ValkeyError::Str(errors::ERR_NOT_FOUND)),
+        Some(v) if !v.reclaim_in_progress() => v,
+        _ => return Err(ValkeyError::Str(errors::ERR_NOT_FOUND)),
     };
 
     let len = ValkeyValue::Integer(value.len as i64);

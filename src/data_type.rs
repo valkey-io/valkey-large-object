@@ -67,7 +67,7 @@ impl Tier {
 /// Accessed via ValkeyModule_OpenKey → ModuleTypeGetValue on the main thread.
 /// This is NOT in the storage layer. Command handlers read this to get file info
 /// before calling storage.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LoValue {
     pub object_id: ObjectId, // monotonic per-node OID (used as filename)
     pub len: u64,            // object size in bytes
@@ -82,6 +82,18 @@ pub struct LoValue {
 // ─── LoValue Helper Methods ──────────────────────────────────────────────────
 
 impl LoValue {
+    /// Every LoValue is counted in INFO `num_objects` from creation until drop.
+    /// Not `Clone`: a clone would be a second counted instance of one object.
+    pub fn new(object_id: ObjectId, len: u64, crc32c: Crc, file: Option<Arc<ObjectFile>>) -> Self {
+        crate::info::LARGE_OBJECT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            object_id,
+            len,
+            crc32c,
+            file,
+        }
+    }
+
     /// Reports DRAM memory usage in bytes for `MEMORY USAGE <key>`.
     /// Always includes the LoValue struct overhead. Includes the object payload
     /// only when it is actually resident in DRAM:
@@ -100,6 +112,12 @@ impl LoValue {
                 }
             }
         }
+    }
+
+    /// On the reclaim list: memory already freed, the key reads as missing
+    /// until the scaling cron deletes it. Check before touching the DRAMPool.
+    pub fn reclaim_in_progress(&self) -> bool {
+        crate::storage::reclaim::RECLAIM_LIST.contains(&self.object_id)
     }
 
     /// Where a GET issued right now would be served from:
@@ -129,6 +147,9 @@ impl LoValue {
     /// Dram mode: clone ObjectContext via try_clone. Tiered mode: copy NVMe file.
     /// Returns None on capacity exhaustion (pool full or nvme-maxmemory exceeded).
     pub fn create_copy(&self) -> Option<LoValue> {
+        if self.reclaim_in_progress() {
+            return None;
+        }
         match crate::operating_mode() {
             crate::OperatingMode::Dram => self.create_copy_dram(),
             crate::OperatingMode::Tiered => self.create_copy_tiered(),
@@ -145,12 +166,7 @@ impl LoValue {
         let new_ctx = src_ctx.try_clone(self.len)?;
         let new_oid = ObjectId::next();
         dram_pool.insert_object(new_oid, std::sync::Arc::new(new_ctx));
-        Some(LoValue {
-            object_id: new_oid,
-            len: self.len,
-            crc32c: self.crc32c,
-            file: None,
-        })
+        Some(LoValue::new(new_oid, self.len, self.crc32c, None))
     }
 
     /// Tiered mode: copy NVMe file with a fresh OID.
@@ -158,12 +174,18 @@ impl LoValue {
     /// Returns None if nvme-maxmemory would be exceeded or the copy fails.
     fn create_copy_tiered(&self) -> Option<LoValue> {
         let file = self.file.as_ref()?.copy(self.len, self.crc32c)?;
-        Some(LoValue {
-            object_id: file.object_id(),
-            len: self.len,
-            crc32c: self.crc32c,
-            file: Some(Arc::new(file)),
-        })
+        Some(LoValue::new(
+            file.object_id(),
+            self.len,
+            self.crc32c,
+            Some(Arc::new(file)),
+        ))
+    }
+}
+
+impl Drop for LoValue {
+    fn drop(&mut self) {
+        crate::info::LARGE_OBJECT_COUNT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -287,28 +309,13 @@ mod tests {
     #[test]
     fn test_free_effort_always_zero() {
         // free_effort always returns 0 (async free) regardless of object size.
-        let small = LoValue {
-            object_id: ObjectId(1),
-            len: 512,
-            crc32c: 0,
-            file: None,
-        };
+        let small = LoValue::new(ObjectId(1), 512, 0, None);
         assert_eq!(small.free_effort(), 0);
 
-        let large = LoValue {
-            object_id: ObjectId(2),
-            len: 100 * 1024 * 1024,
-            crc32c: 0,
-            file: None,
-        };
+        let large = LoValue::new(ObjectId(2), 100 * 1024 * 1024, 0, None);
         assert_eq!(large.free_effort(), 0);
 
-        let zero = LoValue {
-            object_id: ObjectId(3),
-            len: 0,
-            crc32c: 0,
-            file: None,
-        };
+        let zero = LoValue::new(ObjectId(3), 0, 0, None);
         assert_eq!(zero.free_effort(), 0);
     }
 }

@@ -37,7 +37,9 @@ use std::sync::Mutex;
 
 use dma_libfabric_protocol::encode_hex;
 use valkey_module::configuration::ConfigurationFlags;
-use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyResult, ValkeyString};
+use valkey_module::{
+    valkey_module, Context, ContextFlags, InfoContext, Status, ValkeyResult, ValkeyString,
+};
 use valkey_module_macros::shutdown_event_handler;
 
 use tokio::runtime::Runtime;
@@ -80,7 +82,7 @@ lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     static ref CFG_NVME_DIR: Mutex<String> = Mutex::new(String::new());
 
-    /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 64MB.
+    /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 1GiB.
     /// Used in Tiered mode for read/write staging. Split into uniform
     /// `segment-size` segments: count = ceil(nvme-staging-size / segment-size)
     /// (ceiling so actual staging is never less than requested). Immutable after load.
@@ -106,6 +108,11 @@ lazy_static::lazy_static! {
     /// Scaling cron poll interval in milliseconds. Controls how often the scaling
     /// timer fires to check utilization and memory pressure. Default: 5000ms.
     static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(5000);
+
+    /// Main-thread time, in microseconds, one scaling-cron tick may spend
+    /// scanning for and deleting reclaim-list keys. Default: 1000us.
+    static ref CFG_RECLAIM_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(1000);
+    static ref CFG_RECLAIM_POLL_MS: AtomicI64 = AtomicI64::new(100);
 
     /// NVMe SMART poll interval in seconds (Tiered mode). 0 disables polling
     /// entirely: no background reads, and the INFO section never appears.
@@ -262,6 +269,14 @@ pub fn scaling_poll_ms() -> u64 {
     CFG_SCALING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
+pub fn reclaim_scan_budget_us() -> u64 {
+    CFG_RECLAIM_SCAN_BUDGET_US.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn reclaim_poll_ms() -> u64 {
+    CFG_RECLAIM_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
 pub fn smartlog_poll_secs() -> u64 {
     CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
@@ -302,6 +317,14 @@ pub fn server_memory(ctx: &Context) -> (u64, u64) {
     let used = info.field_unsigned("used_memory").unwrap_or(0);
     let maxmemory = info.field_unsigned("maxmemory").unwrap_or(0);
     (used, maxmemory)
+}
+
+/// Whether the server may evict keys: `maxmemory` is set and `maxmemory-policy`
+/// is not `noeviction`. Not set on a replica that ignores maxmemory (the default),
+/// which leaves eviction to its primary. Dram shrink deletes keys, so it runs only
+/// when this holds.
+pub fn eviction_allowed(ctx: &Context) -> bool {
+    ctx.get_flags().contains(ContextFlags::EVICTED)
 }
 
 /// Whether allocating `extra_bytes` more would push server memory to/over the
@@ -706,6 +729,10 @@ valkey_module! {
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["reclaim-scan-budget-us", &*CFG_RECLAIM_SCAN_BUDGET_US, 1_000, 100, 100_000,
+             ConfigurationFlags::DEFAULT, None, None],
+            ["reclaim-poll-ms", &*CFG_RECLAIM_POLL_MS, 100, 10, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
             ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, 60, 0, 86_400,
              ConfigurationFlags::IMMUTABLE, None, None],
