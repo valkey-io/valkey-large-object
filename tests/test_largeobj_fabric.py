@@ -273,7 +273,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             before = info_largeobj(client).get('largeobj_efa_drain_count', 0)
             client.execute_command(
                 'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'yes')
-            with pytest.raises(ResponseError):
+            with pytest.raises(ResponseError, match="EFA write"):
                 client.execute_command('BLOB.GET', 'key', *address_args(regions))
             after = info_largeobj(client)
             assert after['largeobj_efa_drain_count'] - before == 1, \
