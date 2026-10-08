@@ -122,22 +122,9 @@ pub(crate) fn reply_err(
 
 /// Test hook: pause between NVMe write completion and the commit (`commit_lo_value`) to allow
 /// integration tests to inject a DEL and deterministically exercise the
-/// delete-during-SET race. Controlled by `test-pause-before-finalize-set-ms`
-/// config. 0 = disabled (production default).
-async fn test_pause_before_finalize() {
-    let pause_ms = crate::test_pause_before_finalize_set_ms();
-    if pause_ms > 0 {
-        tokio::task::spawn_blocking(move || {
-            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
-        })
-        .await
-        .ok();
-    }
-}
-
-/// Test hook: pause a Tiered SET before it unlinks its victims' files (`test-pause-before-evict-unlink-ms`).
-async fn test_pause_before_evict_unlink() {
-    let pause_ms = crate::test_pause_before_evict_unlink_ms();
+/// delete-during-SET race (`test-pause-before-finalize-set-ms`), or before a SET unlinks its
+/// victims (`test-pause-before-evict-unlink-ms`). 0 = disabled (production default).
+async fn test_pause(pause_ms: u64) {
     if pause_ms > 0 {
         tokio::task::spawn_blocking(move || {
             std::thread::sleep(std::time::Duration::from_millis(pause_ms));
@@ -977,7 +964,7 @@ async fn cmd_set_tiered_run(
     // filesystem journal.
     let evicted = reservation.take_evicted();
     if !evicted.is_empty() {
-        test_pause_before_evict_unlink().await;
+        test_pause(crate::test_pause_before_evict_unlink_ms()).await;
         let _ = tokio::task::spawn_blocking(move || evicted.unlink()).await;
     }
     let chunk_size = crate::chunk_size();
@@ -1044,7 +1031,7 @@ async fn cmd_set_tiered_run(
             return;
         }
     };
-    test_pause_before_finalize().await;
+    test_pause(crate::test_pause_before_finalize_set_ms()).await;
     // NVMe disk accounting stays with the NVMe caller (no file on the DRAM path).
     let object_id = object_file.object_id();
     let disk_len = object_file.disk_len();

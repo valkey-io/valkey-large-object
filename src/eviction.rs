@@ -22,11 +22,13 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use rand::seq::SliceRandom;
 use rand::RngExt;
 use valkey_module::Context;
 
 use crate::data_type::ObjectId;
 use crate::storage::context::{ObjectContext, SegmentBuffer};
+use crate::storage::nvme::nvme_shortfall;
 use crate::storage::reclaim::RECLAIM_LIST;
 use crate::storage::{lock_inflight, DRAMPool, Evicted, InflightGuard};
 
@@ -196,12 +198,6 @@ pub fn make_disk_room(ctx: &Context, need: u64, keep: Option<ObjectId>) -> Optio
     covered.then_some(evicted)
 }
 
-/// The headroom `need` asks for, given what the ledger holds now and the victims already claimed
-/// (concurrent frees only shrink it).
-fn shortfall(need: u64) -> u64 {
-    crate::storage::nvme::nvme_shortfall(need)
-}
-
 fn evict_until_covered(
     sampler: &mut DirSampler,
     need: u64,
@@ -210,14 +206,14 @@ fn evict_until_covered(
 ) -> bool {
     let mut budget = DISK_MAX_VICTIMS;
     for _ in 0..DISK_MAX_ROUNDS {
-        let missing = shortfall(need);
+        let missing = nvme_shortfall(need);
         if missing == 0 {
             return true;
         }
         let picked = select(sampler, missing, keep, budget);
         // Lowering `nvme-maxmemory` under the usage leaves an overage no one request may cover:
         // shed what was found even if it is short, or refusals that destroy nothing never end it.
-        let over_cap = shortfall(0) > 0;
+        let over_cap = nvme_shortfall(0) > 0;
         if !picked.covers() && !over_cap {
             return false;
         }
@@ -234,7 +230,7 @@ fn evict_until_covered(
             }
         }
     }
-    shortfall(need) == 0
+    nvme_shortfall(need) == 0
 }
 
 /// Victims for one round, with their on-disk sizes, in the order they will be taken.
@@ -451,7 +447,9 @@ impl DirSampler {
             SEQUENTIAL_DRAWS_TOTAL.fetch_add(1, Ordering::Relaxed);
             self.read_on(out);
         }
-        shuffle(&mut out[first..]);
+        // A batch is consecutive in directory order: its first entries would favour whichever
+        // follows the largest gap in the hash.
+        out[first..].shuffle(&mut rand::rng());
     }
 
     /// Append every object in the directory to `out`, at most `limit` of them (give or take a
@@ -557,15 +555,6 @@ impl DirSampler {
             at += reclen;
         }
         batch
-    }
-}
-
-/// Fisher-Yates: a batch is consecutive in directory order, so taking its first entries would
-/// favour whichever follows the largest gap in the hash.
-fn shuffle(ids: &mut [ObjectId]) {
-    let mut rng = rand::rng();
-    for i in (1..ids.len()).rev() {
-        ids.swap(i, rng.random_range(0..=i));
     }
 }
 
