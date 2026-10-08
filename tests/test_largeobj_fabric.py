@@ -323,6 +323,27 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         finally:
             process.kill()
 
+    def test_info_efa_failed_chunk_counts_every_transfer(self):
+        """When one of a chunk's transfers fails, the others are still awaited and counted."""
+        process, regions = self.start_target(split=[1024, 3072])
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.SET', 'key', PATTERN)
+            client.execute_command('BLOB.HELLO', regions[0].address)
+            good, bad = regions
+            self.verify_error_response(
+                client,
+                f'BLOB.GET key {good.rkey} {good.addr} {good.len}'
+                f' {bad.rkey} {bad.addr + bad.len} {bad.len}',
+                'EFA write')
+            efa = client.info('largeobj_efa')
+            assert efa['largeobj_efa_writes_total'] == 2
+            # The good transfer may fail too once the bad one does.
+            assert efa['largeobj_efa_write_bytes_total'] in (0, good.len)
+            assert client.info('largeobj_error_metrics')['largeobj_efa_write_errors'] == 1
+        finally:
+            process.kill()
+
 
 class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
     """Tiered mode with promotion off to run the NVMe paths."""

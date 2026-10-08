@@ -756,25 +756,33 @@ pub(crate) async fn efa_transfer_addrs(
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
     let mut sub_lens: Vec<usize> = Vec::with_capacity(addrs.len());
+    let mut failed = false;
     for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
         let started = Instant::now();
-        let transfer = match direction {
+        let submitted = match direction {
             EfaDirection::Write => {
                 session.write((buf_ptr + buf_offset) as *mut u8, len, rkey, addr)
             }
             EfaDirection::Read => session.read((buf_ptr + buf_offset) as *mut u8, len, rkey, addr),
-        }
-        .map_err(|_| ValkeyError::Str(err_str))?;
+        };
+        let Ok(transfer) = submitted else {
+            failed = true;
+            break;
+        };
         sub_lens.push(len);
         indexed_futures.push(async move { (i, started, transfer.await) });
         buf_offset += len;
     }
     let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
+    // Await every submitted transfer, even after one fails, before the caller reuses the buffer.
     while let Some((idx, started, (outcome, _operand))) = indexed_futures.next().await {
         // Failed transfers count too, with no bytes.
         let moved = if outcome.is_ok() { sub_lens[idx] } else { 0 };
         stats.record(started, moved as u64);
-        let done = outcome.map_err(|_| ValkeyError::Str(err_str))?;
+        let Ok(done) = outcome else {
+            failed = true;
+            continue;
+        };
         results[idx] = match direction {
             // SET path: transport must provide a checksum for CRC combination.
             EfaDirection::Read => Some(
@@ -784,6 +792,9 @@ pub(crate) async fn efa_transfer_addrs(
             // GET path: checksum not needed (already stored in FileHeader).
             EfaDirection::Write => Some(0),
         };
+    }
+    if failed {
+        return Err(ValkeyError::Str(err_str));
     }
     // GET (Write) path: callers ignore the returned CRC — skip combination.
     if matches!(direction, EfaDirection::Write) {
