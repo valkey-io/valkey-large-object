@@ -82,11 +82,21 @@ struct GetObjectInfo {
     crc32c: Crc,
 }
 
+/// What a Tiered SET pins against eviction until it ends.
+struct SetPins {
+    /// The new object's id, from the mint; it passes to the new file's handle.
+    new: storage::InflightGuard,
+    /// The object the SET overwrites, if there is one.
+    overwritten: Option<storage::InflightGuard>,
+}
+
 /// Object identity for SET operations — shared fields passed to async write tasks.
 struct SetObjectInfo {
     object_id: ObjectId,
     obj_len: u64,
     key_name: Vec<u8>,
+    /// Tiered: the object this SET overwrites, pinned until the command ends.
+    overwritten: Option<storage::InflightGuard>,
 }
 
 // ─── Engine Result ────────────────────────────────────────────────────────────
@@ -196,13 +206,13 @@ fn commit_lo_value(
         Ok(Some(_)) => EVENT_UPDATE,
         _ => EVENT_CREATE,
     };
-    let tiered = lo_value.file.is_some();
+    let file = lo_value.file.clone();
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));
     }
     // The key exists now: the file is a live object, which eviction may take.
-    if tiered {
-        storage::KEYLESS_FILES.lock().remove(&object_id);
+    if let Some(file) = file {
+        file.release_pin();
     }
     ctx.notify_keyspace_event(NotifyEvent::MODULE, event, &key_str);
     Ok(CommitOutcome::ValueSet)
@@ -242,6 +252,7 @@ pub fn execute_get(
                 OperatingMode::Tiered => {
                     let file =
                         file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
+                    let file = storage::PinnedFile::new(file);
                     cmd_get_tiered(object_id, obj_len, crc32c, file, transport, blocked_client);
                 }
             }
@@ -318,13 +329,13 @@ fn cmd_get_dram_efa(
 // ─── Tiered GET ──────────────────────────────────────────────
 
 /// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
-/// `file` pins the object's `ObjectFile` (existence) for the whole GET operation; the
-/// open fd is a separate `Arc<OwnedFd>` obtained via `ensure_open`.
+/// `file` pins the object's `ObjectFile` (existence) and its id against eviction for the whole GET
+/// operation; the open fd is a separate `Arc<OwnedFd>` obtained via `ensure_open`.
 fn cmd_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
     crc32c: Crc,
-    file: Arc<ObjectFile>,
+    file: storage::PinnedFile,
     transport: Transport,
     blocked_client: valkey_module::BlockedClient,
 ) {
@@ -613,6 +624,15 @@ pub fn execute_set(
                     );
                 }
                 OperatingMode::Tiered => {
+                    // Pinned from the mint to the end of the command, as is any object it overwrites.
+                    let new_pin = storage::InflightGuard::new(object_id);
+                    let overwritten = ctx
+                        .open_key(key_name)
+                        .get_value::<LoValue>(&LO_TYPE)
+                        .ok()
+                        .flatten()
+                        .filter(|existing| existing.file.is_some())
+                        .map(|existing| storage::InflightGuard::new(existing.object_id));
                     cmd_set_tiered(
                         ctx,
                         key_name_bytes,
@@ -620,6 +640,10 @@ pub fn execute_set(
                         data_source,
                         blocked_client,
                         object_id,
+                        SetPins {
+                            new: new_pin,
+                            overwritten,
+                        },
                     );
                 }
             }
@@ -811,6 +835,7 @@ pub(crate) fn reserve_nvme_or_make_room(
     object_id: ObjectId,
     disk_len: u64,
     keep: Option<ObjectId>,
+    pin: storage::InflightGuard,
 ) -> Option<storage::DiskReservation> {
     let evicted = if nvme::try_reserve_nvme_disk_usage(disk_len) {
         storage::Evicted::default()
@@ -823,7 +848,7 @@ pub(crate) fn reserve_nvme_or_make_room(
         evicted
     };
     Some(storage::DiskReservation::charged(
-        object_id, disk_len, evicted,
+        object_id, disk_len, evicted, pin,
     ))
 }
 
@@ -835,6 +860,7 @@ fn cmd_set_tiered(
     data_source: DataSource,
     blocked_client: valkey_module::BlockedClient,
     object_id: ObjectId,
+    pins: SetPins,
 ) {
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
@@ -861,7 +887,8 @@ fn cmd_set_tiered(
         batch_width,
         None,
     ));
-    let Some(reservation) = reserve_nvme_or_make_room(ctx, object_id, disk_len, None) else {
+    let Some(reservation) = reserve_nvme_or_make_room(ctx, object_id, disk_len, None, pins.new)
+    else {
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         reply_err(
             &thread_ctx,
@@ -881,6 +908,7 @@ fn cmd_set_tiered(
                     object_id,
                     obj_len,
                     key_name,
+                    overwritten: pins.overwritten,
                 };
                 cmd_set_tiered_run(
                     set_info,
@@ -902,6 +930,7 @@ fn cmd_set_tiered(
                     object_id,
                     obj_len,
                     key_name,
+                    overwritten: pins.overwritten,
                 };
                 cmd_set_tiered_run(
                     set_info,
@@ -944,6 +973,7 @@ async fn cmd_set_tiered_run(
         object_id,
         obj_len,
         key_name,
+        overwritten: _overwritten,
     } = set_info;
     // The victims' files go before the write, off the async workers: an unlink can stall on the
     // filesystem journal.
@@ -1065,7 +1095,7 @@ fn cmd_get_from_dram(
     crc32c: Crc,
     transport: Transport,
     thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
-    file: Option<Arc<ObjectFile>>,
+    file: Option<storage::PinnedFile>,
 ) {
     match transport {
         Transport::Tcp => {

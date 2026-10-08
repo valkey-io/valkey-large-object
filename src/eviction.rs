@@ -28,7 +28,7 @@ use valkey_module::Context;
 use crate::data_type::ObjectId;
 use crate::storage::context::{ObjectContext, SegmentBuffer};
 use crate::storage::reclaim::RECLAIM_LIST;
-use crate::storage::{DRAMPool, Evicted, KEYLESS_FILES};
+use crate::storage::{DRAMPool, Evicted, InflightGuard, INFLIGHT};
 
 // ─── Counters and shared helpers ────────────────────────────────────────────────────────────
 
@@ -41,7 +41,7 @@ pub static RECLAIMED_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// SETs that still failed after eviction ran: objects destroyed for nothing.
 pub static EVICTION_FAILURES_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Candidates passed over because something still held them, counted per look: a pinned `Arc` in
-/// Dram mode, a file being written or still read after its key was freed in Tiered mode.
+/// Dram mode, a file with a request in flight (`INFLIGHT`) in Tiered mode.
 pub static PINNED_SKIPS_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Tiered counterparts. Reclaimed is each victim's whole `disk_len`.
 pub static DISK_EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -224,11 +224,11 @@ fn evict_until_covered(
         budget -= picked.victims.len();
         let dram_pool = crate::storage::get_dram_pool();
         for (id, _) in picked.victims {
-            if let Some(size) = take(sampler, id) {
+            if let Some((size, pin)) = take(sampler, id) {
                 // The promoted copy would otherwise hold arena bytes until the key is deleted.
                 dram_pool.remove_cached_copy(&id);
                 crate::storage::nvme::add_pending_free(size);
-                evicted.push(id, size);
+                evicted.push(id, size, pin);
                 DISK_RECLAIMED_BYTES_TOTAL.fetch_add(size, Ordering::Relaxed);
                 DISK_EVICTIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
             }
@@ -261,9 +261,13 @@ impl Selection {
     fn offer(&mut self, sampler: &DirSampler, ids: &mut Vec<ObjectId>) -> usize {
         ids.retain(|id| self.seen.insert(*id));
         let fresh = ids.len();
-        // Victims claimed by earlier requests stay in the directory until their unlink.
-        ids.retain(|id| !RECLAIM_LIST.contains(id));
-        PINNED_SKIPS_TOTAL.fetch_add(KEYLESS_FILES.filter_out(ids) as u64, Ordering::Relaxed);
+        // A file a request is using, or a victim claimed earlier and not yet unlinked, is pinned.
+        {
+            let pins = INFLIGHT.lock();
+            let before = ids.len();
+            ids.retain(|id| !pins.contains_key(id));
+            PINNED_SKIPS_TOTAL.fetch_add((before - ids.len()) as u64, Ordering::Relaxed);
+        }
         for &id in ids.iter() {
             if self.full() {
                 break;
@@ -314,30 +318,31 @@ fn select(
     picked
 }
 
-/// List `id` as reclaimed, which makes its file a victim, unless it is listed already or keyless
-/// (`KEYLESS_FILES`): a SET is writing it, or its key was freed and no key is left for the cron
-/// to find.
-fn claim(id: ObjectId) -> bool {
-    // Under the list lock, so the teardown of a key freed after this point finds the entry, and
-    // leaves the file's unlink to us.
-    RECLAIM_LIST.add_unless(id, || KEYLESS_FILES.lock().contains(&id))
+/// List `id` as reclaimed, which makes its file a victim, and pin it until its unlink, unless it is
+/// listed already or pinned: a request is using it, or it has no live key and is on its way out.
+/// Under the list lock, so the teardown of a key freed after this point finds the entry, and
+/// leaves the file's unlink to us.
+fn claim(id: ObjectId) -> Option<InflightGuard> {
+    let mut pin = None;
+    RECLAIM_LIST.add_unless(id, || {
+        pin = InflightGuard::new_if_unpinned(id);
+        pin.is_none()
+    });
+    pin
 }
 
-/// List `id`; the caller counts its bytes as pending and unlinks the file. Returns the size, or
-/// `None` if `id` was keyless, was listed already, or its file is gone.
-fn take(sampler: &DirSampler, id: ObjectId) -> Option<u64> {
-    if !claim(id) {
-        return None;
-    }
-    // Nothing may serve the object from here on, whatever its key still says. A reader that holds
-    // the fd keeps the blocks until it is done; the pool must not hand the fd to a new one.
+/// List `id`; the caller counts its bytes as pending and unlinks the file. Returns the size and the
+/// victim pin, or `None` if `id` was pinned, was listed already, or its file is gone.
+fn take(sampler: &DirSampler, id: ObjectId) -> Option<(u64, InflightGuard)> {
+    let pin = claim(id)?;
+    // Nothing may serve the object from here on, whatever its key still says: close the cached fd.
     if let Some(pool) = crate::storage::FD_POOL.get() {
         pool.remove(id);
     }
     // The file's own teardown may have finished since the draw: counting a gone file as pending
     // would admit a write the disk has no room for.
     if let Ok(size) = sampler.size_of(id) {
-        return Some(size);
+        return Some((size, pin));
     }
     RECLAIM_LIST.remove(&id);
     None
@@ -577,16 +582,18 @@ mod tests {
     }
 
     #[test]
-    fn a_file_keyless_or_listed_cannot_be_claimed() {
+    fn a_pinned_or_listed_file_cannot_be_claimed() {
         let id = ObjectId(0x7a1e_0001);
-        KEYLESS_FILES.lock().insert(id);
-        assert!(!claim(id), "a SET is writing it");
+        let request = InflightGuard::new(id);
+        assert!(claim(id).is_none(), "a request is using it");
         assert!(!RECLAIM_LIST.contains(&id));
-        KEYLESS_FILES.lock().remove(&id);
+        drop(request);
 
-        assert!(claim(id));
+        let victim = claim(id).expect("unpinned");
         assert!(RECLAIM_LIST.contains(&id));
-        assert!(!claim(id), "already listed");
+        assert!(INFLIGHT.lock().contains_key(&id), "a victim stays pinned");
+        assert!(claim(id).is_none(), "already listed");
+        drop(victim);
         RECLAIM_LIST.remove(&id);
     }
 
@@ -597,7 +604,8 @@ mod tests {
         let id = ObjectId(0x7a1e_0002);
         std::fs::write(id.file_path(&dir), b"x").unwrap();
 
-        assert_eq!(take(&sampler, id), Some(1));
+        let victim = take(&sampler, id);
+        assert_eq!(victim.as_ref().map(|(size, _)| *size), Some(1));
         assert!(
             RECLAIM_LIST.contains(&id),
             "its key reads as a miss from here on"
@@ -605,14 +613,15 @@ mod tests {
 
         // The file is gone, so listing it again would be stale: no tombstone is left.
         RECLAIM_LIST.remove(&id);
+        drop(victim);
         std::fs::remove_file(id.file_path(&dir)).unwrap();
-        assert_eq!(take(&sampler, id), None);
+        assert!(take(&sampler, id).is_none());
         assert!(!RECLAIM_LIST.contains(&id));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_selection_covers_the_need_without_keyless_listed_or_kept_ids() {
+    fn a_selection_covers_the_need_without_pinned_listed_or_kept_ids() {
         let dir = scratch_dir("select");
         for id in 0x7a1e_1001..=0x7a1e_100a {
             std::fs::write(ObjectId(id).file_path(&dir), [0u8; 100]).unwrap();
@@ -622,8 +631,8 @@ mod tests {
             ObjectId(0x7a1e_1005),
             ObjectId(0x7a1e_1007),
         );
-        KEYLESS_FILES.lock().insert(writing);
-        assert!(claim(listed));
+        let _request = InflightGuard::new(writing);
+        let _victim = claim(listed).expect("unpinned");
         let mut sampler = DirSampler::open(&dir).unwrap();
 
         let picked = select(&mut sampler, 350, Some(keep), DISK_MAX_VICTIMS);
@@ -640,7 +649,6 @@ mod tests {
             7,
             "everything but the writing, the kept and the listed"
         );
-        KEYLESS_FILES.lock().remove(&writing);
         RECLAIM_LIST.remove(&listed);
         std::fs::remove_dir_all(&dir).unwrap();
     }

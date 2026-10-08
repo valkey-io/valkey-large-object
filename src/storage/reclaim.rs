@@ -56,10 +56,17 @@ impl ReclaimList {
     /// Take `oid` off the list. Always locks: `remove_object` must wait for a
     /// shrink that is listing this oid. Returns whether it was listed.
     pub fn remove(&self, oid: &ObjectId) -> bool {
+        self.remove_or_else(oid, || {})
+    }
+
+    /// `remove`, running `otherwise` with the list still locked if `oid` was not listed.
+    pub fn remove_or_else(&self, oid: &ObjectId, otherwise: impl FnOnce()) -> bool {
         let mut oids = self.lock();
         let listed = oids.remove(oid);
         if listed {
             self.len.store(oids.len(), Ordering::Release);
+        } else {
+            otherwise();
         }
         listed
     }

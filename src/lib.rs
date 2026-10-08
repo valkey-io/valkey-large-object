@@ -194,6 +194,10 @@ lazy_static::lazy_static! {
     /// evicted, to open the window in which their keys can be deleted. 0 = disabled.
     static ref CFG_TEST_PAUSE_BEFORE_EVICT_UNLINK_MS: AtomicI64 = AtomicI64::new(0);
 
+    /// Test-only: pause an `ObjectFile` teardown for this many milliseconds before it unlinks the
+    /// file, to hold open the window between a key being freed and its file going. 0 = disabled.
+    static ref CFG_TEST_PAUSE_BEFORE_TEARDOWN_UNLINK_MS: AtomicI64 = AtomicI64::new(0);
+
     /// Test-only: 1 makes every unlink of an object file fail, leaving the file in place, to
     /// exercise the failure paths. 0 = disabled.
     static ref CFG_TEST_FAIL_UNLINK: AtomicI64 = AtomicI64::new(0);
@@ -426,6 +430,10 @@ pub fn test_pause_before_finalize_set_ms() -> u64 {
 
 pub fn test_pause_before_evict_unlink_ms() -> u64 {
     CFG_TEST_PAUSE_BEFORE_EVICT_UNLINK_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_pause_before_teardown_unlink_ms() -> u64 {
+    CFG_TEST_PAUSE_BEFORE_TEARDOWN_UNLINK_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn test_fail_unlink() -> bool {
@@ -765,6 +773,8 @@ valkey_module! {
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN, None, None],
             ["test-pause-before-evict-unlink-ms", &*CFG_TEST_PAUSE_BEFORE_EVICT_UNLINK_MS, 0, 0, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
+            ["test-pause-before-teardown-unlink-ms", &*CFG_TEST_PAUSE_BEFORE_TEARDOWN_UNLINK_MS, 0, 0, 60_000,
              ConfigurationFlags::HIDDEN, None, None],
             ["test-fail-unlink", &*CFG_TEST_FAIL_UNLINK, 0, 0, 1,
              ConfigurationFlags::HIDDEN, None, None],

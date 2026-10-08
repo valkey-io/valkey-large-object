@@ -193,10 +193,7 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         )?
         .field("disk_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
         .field("disk_maxmemory_bytes", crate::nvme_maxmemory() as i64)?
-        .field(
-            "disk_keyless_files",
-            storage::KEYLESS_FILES.lock().len() as i64,
-        )?
+        .field("disk_pinned_objects", storage::INFLIGHT.lock().len() as i64)?
         .field(
             "disk_pending_free_bytes",
             storage::nvme::nvme_pending_free() as i64,

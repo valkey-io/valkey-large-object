@@ -14,7 +14,7 @@ use valkey_module::digest::Digest;
 use valkey_module::native_types::ValkeyType;
 use valkey_module::raw;
 
-use crate::storage::{Crc, ObjectFile};
+use crate::storage::{Crc, InflightGuard, ObjectFile};
 
 // ─── ObjectId ────────────────────────────────────────────────────────────────
 
@@ -176,17 +176,19 @@ impl LoValue {
     /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
     fn create_copy_tiered(&self, ctx: &valkey_module::Context) -> Option<LoValue> {
         let src_file = Arc::clone(self.file.as_ref()?);
+        let _src_pin = InflightGuard::new(self.object_id);
         let new_oid = ObjectId::next();
         let reservation = crate::engine::reserve_nvme_or_make_room(
             ctx,
             new_oid,
             src_file.disk_len(),
             Some(self.object_id),
+            InflightGuard::new(new_oid),
         )?;
         let file = Arc::new(src_file.copy(reservation, self.len, self.crc32c)?);
         // Core installs the returned value before the event loop runs anything else, so the copy
         // may be a victim from here.
-        crate::storage::KEYLESS_FILES.lock().remove(&new_oid);
+        file.release_pin();
         Some(LoValue::new(new_oid, self.len, self.crc32c, Some(file)))
     }
 }
@@ -210,11 +212,13 @@ unsafe extern "C" fn lo_free(value: *mut std::ffi::c_void) {
     let lo = Box::from_raw(value as *mut LoValue);
     let pool = crate::storage::get_dram_pool();
     if let Some(file) = &lo.file {
-        // The key is gone but its file lives on until it is unlinked, so it is keyless from here
-        // (a claim checks that under the list lock). If a claim got in first, eviction owns the
-        // unlink and the credit.
-        crate::storage::KEYLESS_FILES.lock().insert(lo.object_id);
-        if crate::storage::reclaim::RECLAIM_LIST.remove(&lo.object_id) {
+        // The key is gone but its file lives on until it is unlinked. Under the list lock, so a
+        // claim lands either before this (eviction then owns the unlink and the credit, and its
+        // victim pin covers the file) or after the file is pinned.
+        let oid = lo.object_id;
+        let eviction_owns_file = crate::storage::reclaim::RECLAIM_LIST
+            .remove_or_else(&oid, || file.hold_pin(InflightGuard::new(oid)));
+        if eviction_owns_file {
             file.leave_to_eviction();
         }
         pool.remove_cached_copy(&lo.object_id);

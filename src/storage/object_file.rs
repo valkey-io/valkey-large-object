@@ -34,12 +34,12 @@
 //! serialized form; on load a handle is reconstructed for the existing file and its
 //! fd opens lazily on the first GET.
 
-use std::collections::HashSet;
 use std::os::unix::io::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use super::fd_pool::FdPool;
+use super::inflight::InflightGuard;
 use super::Crc;
 use crate::data_type::ObjectId;
 
@@ -58,6 +58,10 @@ pub struct ObjectFile {
     /// Eviction had claimed this file when its key was freed (set by `lo_free`): eviction owns the
     /// unlink and the credit, so this handle's `Drop` must do neither.
     owned_by_eviction: AtomicBool,
+    /// Keeps eviction off this file while no live key stands behind it: from the SET or COPY that
+    /// makes it until its key commits (`release_pin`), and from `lo_free` until the unlink
+    /// (`hold_pin`). Dropped by the teardown, after the unlink.
+    pin: Mutex<Option<InflightGuard>>,
 }
 
 impl ObjectFile {
@@ -65,12 +69,26 @@ impl ObjectFile {
     /// exists on NVMe. No read fd is open yet — it opens lazily on the first GET via
     /// `ensure_open`. `disk_len` is the true on-disk size; `Drop` releases exactly
     /// that many bytes.
-    pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
+    pub fn new(object_id: ObjectId, disk_len: u64, pin: Option<InflightGuard>) -> Self {
         Self {
             object_id,
             disk_len,
             owned_by_eviction: AtomicBool::new(false),
+            pin: Mutex::new(pin),
         }
+    }
+
+    /// The key committed: the file is a live object, which eviction may take.
+    pub fn release_pin(&self) {
+        self.pin
+            .lock()
+            .expect("ObjectFile pin lock unavailable")
+            .take();
+    }
+
+    /// The key was freed: keep eviction off the file until it is unlinked.
+    pub fn hold_pin(&self, pin: InflightGuard) {
+        *self.pin.lock().expect("ObjectFile pin lock unavailable") = Some(pin);
     }
 
     /// Leave this file's unlink and credit to eviction. Called when the key is freed while eviction
@@ -158,6 +176,11 @@ impl Drop for ObjectFile {
         let disk_len = self.disk_len;
         // Last reference: `lo_free`'s store is visible through the `Arc`'s own synchronization.
         let owned_by_eviction = *self.owned_by_eviction.get_mut();
+        let pin = self
+            .pin
+            .get_mut()
+            .expect("ObjectFile pin lock unavailable")
+            .take();
 
         // Deregistering drops the pool's Arc<OwnedFd>; if no in-flight reader
         // holds a clone, the fd's OwnedFd closes at this time.
@@ -166,29 +189,27 @@ impl Drop for ObjectFile {
                 pool.remove(object_id);
             }
             // Eviction owns this file's unlink and credit, so the bytes reach only the write that
-            // evicted it. If that is done already, nothing is left to keep eviction away from.
+            // evicted it, and its victim pin outlives this one.
             if owned_by_eviction {
-                if !std::path::Path::new(&object_id.file_path(&crate::nvme_dir())).exists() {
-                    KEYLESS_FILES.lock().remove(&object_id);
-                }
                 return;
             }
+            let pause_ms = crate::test_pause_before_teardown_unlink_ms();
+            if pause_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+            }
             let path = object_id.file_path(&crate::nvme_dir());
-            // Once the file is gone there is nothing left to keep eviction away from.
             match remove_object_file(&path) {
                 Ok(()) => {
-                    KEYLESS_FILES.lock().remove(&object_id);
                     // Release exactly what create added — no stat, so it can't drift.
                     crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    KEYLESS_FILES.lock().remove(&object_id);
-                }
-                // The file stays on disk and stays keyless, so eviction never lists it (no key
-                // leads to it); the bytes are credited anyway.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // The file stays on disk and stays pinned for good, so eviction never lists it (no
+                // key leads to it); the bytes are credited anyway.
                 Err(e) => {
                     super::warn_failed_unlink("teardown", &path, &e);
                     crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
+                    std::mem::forget(pin);
                 }
             }
         };
@@ -214,8 +235,8 @@ fn remove_object_file(path: &str) -> std::io::Result<()> {
 // ─── DiskReservation ───────────────────────────────────────────────────────────
 
 /// A Tiered SET or COPY's claim on the `nvme-maxmemory` budget, made on the main thread before the
-/// write, so the write cannot fail for capacity. It also lists the new file as keyless, so eviction leaves it
-/// alone, until the key commits or the file is gone.
+/// write, so the write cannot fail for capacity. It carries the pin on the new id, which goes to the
+/// new file's handle.
 pub struct DiskReservation {
     object_id: ObjectId,
     disk_len: u64,
@@ -223,17 +244,23 @@ pub struct DiskReservation {
     handed_off: bool,
     /// The victims whose files are to go to make room for this one.
     evicted: Evicted,
+    pin: Option<InflightGuard>,
 }
 
 impl DiskReservation {
     /// `disk_len` is charged already, against the room `evicted` will make.
-    pub fn charged(object_id: ObjectId, disk_len: u64, evicted: Evicted) -> Self {
-        KEYLESS_FILES.lock().insert(object_id);
+    pub fn charged(
+        object_id: ObjectId,
+        disk_len: u64,
+        evicted: Evicted,
+        pin: InflightGuard,
+    ) -> Self {
         Self {
             object_id,
             disk_len,
             handed_off: false,
             evicted,
+            pin: Some(pin),
         }
     }
 
@@ -250,7 +277,7 @@ impl DiskReservation {
     /// Hand the charged bytes to the new version's handle, which now owes the release.
     pub fn into_object_file(mut self) -> ObjectFile {
         self.handed_off = true;
-        ObjectFile::new(self.object_id, self.disk_len)
+        ObjectFile::new(self.object_id, self.disk_len, self.pin.take())
     }
 }
 
@@ -259,8 +286,6 @@ impl Drop for DiskReservation {
         // The write never produced an `ObjectFile`: give the budget back.
         if !self.handed_off {
             super::nvme::decrease_nvme_disk_usage(self.disk_len);
-            // No file was ever created for it.
-            KEYLESS_FILES.lock().remove(&self.object_id);
         }
     }
 }
@@ -272,11 +297,12 @@ impl Drop for DiskReservation {
 /// The main thread must not make the syscall (it can stall on the filesystem journal), so whoever
 /// holds this unlinks off it: the SET's write task, or `Drop` in the background.
 #[derive(Default)]
-pub struct Evicted(Vec<(ObjectId, u64)>);
+pub struct Evicted(Vec<(ObjectId, u64, InflightGuard)>);
 
 impl Evicted {
-    pub fn push(&mut self, id: ObjectId, size: u64) {
-        self.0.push((id, size));
+    /// `pin` keeps the file claimed until it is unlinked.
+    pub fn push(&mut self, id: ObjectId, size: u64, pin: InflightGuard) {
+        self.0.push((id, size, pin));
     }
 
     pub fn is_empty(&self) -> bool {
@@ -303,10 +329,10 @@ impl Drop for Evicted {
     }
 }
 
-fn unlink_victims(files: Vec<(ObjectId, u64)>) {
+fn unlink_victims(files: Vec<(ObjectId, u64, InflightGuard)>) {
     use super::nvme::{decrease_nvme_disk_usage, finish_pending_free};
     let dir = crate::nvme_dir();
-    for (id, size) in files {
+    for (id, size, pin) in files {
         let path = id.file_path(&dir);
         match remove_object_file(&path) {
             // Gone some other way: its bytes are free all the same.
@@ -316,12 +342,15 @@ fn unlink_victims(files: Vec<(ObjectId, u64)>) {
                 super::warn_failed_unlink("eviction", &path, &e);
                 // Still listed: its key lives, the object serves again, and its handle credits the
                 // file when the key goes. Not listed: the key was freed meanwhile and left the
-                // unlink to us, so nobody will ever remove the file.
-                if !super::reclaim::RECLAIM_LIST.remove(&id) {
+                // unlink to us, so nobody will ever remove the file, and it stays pinned.
+                if super::reclaim::RECLAIM_LIST.remove(&id) {
+                    drop(pin);
+                } else {
                     crate::eviction::DISK_LEAKED_FILES_TOTAL.fetch_add(1, Ordering::Relaxed);
                     valkey_module::logging::log_warning(format!(
                         "largeobj: leaked {path}: its key is gone and eviction could not unlink it"
                     ));
+                    std::mem::forget(pin);
                 }
                 finish_pending_free(size);
                 continue;
@@ -329,40 +358,29 @@ fn unlink_victims(files: Vec<(ObjectId, u64)>) {
         }
         finish_pending_free(size);
         decrease_nvme_disk_usage(size);
-        // A key freed meanwhile left the file keyless to keep eviction off it until now.
-        KEYLESS_FILES.lock().remove(&id);
+        drop(pin);
     }
 }
 
-// ─── Keyless files ─────────────────────────────────────────────────────────────
+// ─── PinnedFile ────────────────────────────────────────────────────────────────
 
-/// Files with no live key behind them. Eviction picks victims from the NVMe directory, so it sees
-/// files, not keys, and must not claim one of these:
-/// - a SET or COPY's new file, from its reservation until its key commits: claiming it destroys a
-///   write in flight;
-/// - a freed key's file, until it is unlinked (by its teardown, or by the write that evicted it):
-///   the file lives on for its last reader, and a claim would list an id no key leads to, so the
-///   cron could never delete it, and the unlinks would both credit it.
-///
-/// One set serves both, since they never overlap: a key can only be freed after its write
-/// committed, and a commit holds the GIL.
-///
-/// Lock order: `RECLAIM_LIST`, then this set.
-pub static KEYLESS_FILES: LazyLock<KeylessFiles> = LazyLock::new(KeylessFiles::default);
+/// An `ObjectFile` held by a request, which also pins its id against eviction until it drops.
+pub struct PinnedFile {
+    file: Arc<ObjectFile>,
+    _pin: InflightGuard,
+}
 
-#[derive(Default)]
-pub struct KeylessFiles(Mutex<HashSet<ObjectId>>);
-
-impl KeylessFiles {
-    pub fn lock(&self) -> MutexGuard<'_, HashSet<ObjectId>> {
-        self.0.lock().expect("KEYLESS_FILES lock unavailable")
+impl PinnedFile {
+    pub fn new(file: Arc<ObjectFile>) -> Self {
+        let pin = InflightGuard::new(file.object_id());
+        Self { file, _pin: pin }
     }
+}
 
-    /// Drop from `ids` every keyless file and return how many there were.
-    pub fn filter_out(&self, ids: &mut Vec<ObjectId>) -> usize {
-        let keyless = self.lock();
-        let before = ids.len();
-        ids.retain(|id| !keyless.contains(id));
-        before - ids.len()
+impl std::ops::Deref for PinnedFile {
+    type Target = ObjectFile;
+
+    fn deref(&self) -> &ObjectFile {
+        &self.file
     }
 }
