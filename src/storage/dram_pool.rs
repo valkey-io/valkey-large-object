@@ -68,8 +68,8 @@ impl ObjectMaps {
         decay_time: u64,
     ) -> Option<(ObjectId, Arc<ObjectContext>)> {
         let ids = self.by_segment.get_mut(seg)?;
-        let victim = sample_victim(ids.len(), samples, |index| {
-            let ctx = self.all.get(ids.get_index(index)?)?;
+        let victim = sample_victim(&*ids, samples, |oid| {
+            let ctx = self.all.get(oid)?;
             (Arc::strong_count(ctx) == 1).then(|| ctx.stats.decayed_counter(now_min, decay_time))
         })?;
         let oid = ids.swap_remove_index(victim)?;

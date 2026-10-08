@@ -232,17 +232,46 @@ pub struct TieredCache {
 
 // ─── Sampled victim selection ────────────────────────────────────────────────
 
-/// Index of the lowest-scoring unpinned entry among up to `samples` indices
-/// in `0..len`; `probe` returns `None` for a pinned entry. Maps with
+/// A dense collection that `sample_victim` can read by index.
+pub(super) trait Sampled {
+    type Item;
+    fn len(&self) -> usize;
+    fn at(&self, index: usize) -> Option<&Self::Item>;
+}
+
+impl<V> Sampled for OIDIndexedMap<V> {
+    type Item = V;
+    fn len(&self) -> usize {
+        IndexMap::len(self)
+    }
+    fn at(&self, index: usize) -> Option<&V> {
+        self.get_index(index).map(|(_, v)| v)
+    }
+}
+
+impl Sampled for OIDIndexedSet {
+    type Item = ObjectId;
+    fn len(&self) -> usize {
+        IndexSet::len(self)
+    }
+    fn at(&self, index: usize) -> Option<&ObjectId> {
+        self.get_index(index)
+    }
+}
+
+/// Index of the lowest-scoring unpinned entry among up to `samples` entries
+/// of `items`; `probe` returns `None` for a pinned entry. Collections with
 /// `len <= samples` are scanned fully (exact); larger ones get `samples`
 /// random draws, as in Valkey.
-pub(super) fn sample_victim<F>(len: usize, samples: usize, mut probe: F) -> Option<usize>
+pub(super) fn sample_victim<C, F>(items: &C, samples: usize, mut probe: F) -> Option<usize>
 where
-    F: FnMut(usize) -> Option<u8>,
+    C: Sampled,
+    F: FnMut(&C::Item) -> Option<u8>,
 {
+    let len = items.len();
     let mut best: Option<(usize, u8)> = None;
     let mut consider = |index: usize| {
-        if let Some(score) = probe(index) {
+        if let Some(score) = items.at(index).and_then(&mut probe) {
             if best.is_none_or(|(_, s)| score < s) {
                 best = Some((index, score));
             }
@@ -272,13 +301,12 @@ pub type OIDIndexedSet = IndexSet<ObjectId>;
 pub fn reclaim_one<V, F>(
     map: &mut OIDIndexedMap<V>,
     samples: usize,
-    mut score: F,
+    score: F,
 ) -> Option<(ObjectId, V)>
 where
     F: FnMut(&V) -> Option<u8>,
 {
-    let score_at = |index: usize| score(&map[index]);
-    let victim = sample_victim(map.len(), samples, score_at)?;
+    let victim = sample_victim(map, samples, score)?;
     map.swap_remove_index(victim)
 }
 
@@ -352,23 +380,28 @@ mod tests {
 
     // ─── sample_victim ───
 
+    /// A map of `len` entries whose value is its own index.
+    fn indexed(len: usize) -> OIDIndexedMap<usize> {
+        (0..len).map(|i| (ObjectId(i as u64), i)).collect()
+    }
+
     #[test]
     fn sample_victim_scans_small_maps_and_skips_pinned() {
         // len <= samples: every index is probed exactly once, so the minimum
         // reclaimable score is found exactly. Index 1 (score 3) is pinned.
         let scores = [50u8, 3, 20, 7];
         let mut probed = [0u32; 4];
-        let v = sample_victim(4, 4, |i| {
+        let v = sample_victim(&indexed(4), 4, |&i| {
             probed[i] += 1;
             (i != 1).then_some(scores[i])
         });
         assert_eq!(v, Some(3));
         assert_eq!(probed, [1; 4]);
         // Empty map or everything pinned: no victim.
-        assert_eq!(sample_victim(0, 5, |_| Some(0)), None);
-        assert_eq!(sample_victim(5, 0, |_| Some(0)), None);
-        assert_eq!(sample_victim(4, 16, |_| None), None);
-        assert_eq!(sample_victim(100, 5, |_| None), None);
+        assert_eq!(sample_victim(&indexed(0), 5, |_| Some(0)), None);
+        assert_eq!(sample_victim(&indexed(5), 0, |_| Some(0)), None);
+        assert_eq!(sample_victim(&indexed(4), 16, |_| None), None);
+        assert_eq!(sample_victim(&indexed(100), 5, |_| None), None);
     }
 
     #[test]
@@ -377,7 +410,7 @@ mod tests {
         // any draw. At most `samples` distinct indices are probed (fewer than
         // len), and the victim is the lowest score among exactly those.
         let mut probed = std::collections::BTreeSet::new();
-        let v = sample_victim(100, 64, |i| {
+        let v = sample_victim(&indexed(100), 64, |&i| {
             probed.insert(i);
             Some(i as u8)
         })
