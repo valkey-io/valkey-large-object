@@ -30,6 +30,9 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         SERVER_VERSION: valkey-server version directory name
     """
 
+    def _dat_files(self):
+        return [f for f in os.listdir(self.data_dir) if f.endswith('.dat')]
+
     def get_module_args(self, data_dir, direct_io):
         """Override in subclasses to customize module load args.
         Default: Tiered mode with 1MB pools (small, suitable for basic tests).
@@ -45,6 +48,10 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
             f" direct-io no"
             f" chunk-size 4096"
         )
+
+    def get_server_args(self):
+        """Override in subclasses to add server-level config, such as cluster mode."""
+        return {}
 
     @pytest.fixture(autouse=True)
     def setup_test(self, setup):
@@ -62,6 +69,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         args = {
             'enable-debug-command': 'yes',
             'loadmodule': f"{module_path} {module_args}",
+            **self.get_server_args(),
         }
         server_path = f"{os.path.dirname(os.path.realpath(__file__))}/build/binaries/{os.environ['SERVER_VERSION']}/valkey-server"
         self.server, self.client = self.create_server(

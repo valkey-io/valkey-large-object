@@ -20,6 +20,11 @@ use crate::data_type::ObjectId;
 /// Tracks total NVMe disk usage in bytes. Incremented on file creation, decremented on deletion.
 static NVME_DISK_USAGE: AtomicU64 = AtomicU64::new(0);
 
+/// Bytes of victim files eviction has claimed and not yet unlinked. They stay in `NVME_DISK_USAGE`
+/// until the unlink, but are spoken for: reservations may overshoot the cap by this much, so that
+/// writes overlapping an eviction do not each evict for the same shortfall.
+static NVME_PENDING_FREE: AtomicU64 = AtomicU64::new(0);
+
 /// Increment NVMe disk usage after a file is created.
 pub fn increase_nvme_disk_usage(bytes: u64) {
     NVME_DISK_USAGE.fetch_add(bytes, Ordering::Relaxed);
@@ -40,22 +45,60 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
     }
 }
 
-/// Atomically reserve `bytes` of NVMe disk budget if it fits within nvme-maxmemory.
-/// Returns true and increments the counter on success; returns false and leaves the
-/// counter unchanged if the reservation would exceed the cap (or overflow).
+/// Eviction claimed a victim of `bytes`: its file is to be unlinked, which credits the ledger.
+pub fn add_pending_free(bytes: u64) {
+    NVME_PENDING_FREE.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// A claimed victim is dealt with. Call it BEFORE crediting the ledger for the unlink: readers load
+/// the usage first and this second, so a race can only overstate the usage, never admit a write the
+/// disk has no room for.
+pub fn finish_pending_free(bytes: u64) {
+    if NVME_PENDING_FREE
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            cur.checked_sub(bytes)
+        })
+        .is_err()
+    {
+        panic!("NVMe pending-free underflow: finished {bytes} B more than was claimed");
+    }
+}
+
+/// Bytes of claimed victims whose files are not yet unlinked.
+pub fn nvme_pending_free() -> u64 {
+    NVME_PENDING_FREE.load(Ordering::Relaxed)
+}
+
+/// Atomically reserve `bytes` of NVMe disk budget if it fits within nvme-maxmemory plus the bytes
+/// of victims already claimed. Returns true and increments the counter on success; returns false
+/// and leaves the counter unchanged if the reservation would exceed that (or overflow).
 /// Returns true if nvme-maxmemory is 0 (unlimited).
 pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
     let max = crate::nvme_maxmemory();
     NVME_DISK_USAGE
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             let next = cur.checked_add(bytes)?;
-            if max == 0 || next <= max {
+            // Loaded after `cur`: see `finish_pending_free`.
+            let room = max.saturating_add(nvme_pending_free());
+            if max == 0 || next <= room {
                 Some(next)
             } else {
                 None
             }
         })
         .is_ok()
+}
+
+/// How far reserving `bytes` would take the ledger past `nvme-maxmemory` once the claimed victims
+/// are gone. Zero means it fits (or the budget is unlimited).
+pub fn nvme_shortfall(bytes: u64) -> u64 {
+    let max = crate::nvme_maxmemory();
+    if max == 0 {
+        return 0;
+    }
+    let used = nvme_disk_usage();
+    used.saturating_add(bytes)
+        .saturating_sub(max.saturating_add(nvme_pending_free()))
 }
 
 /// Current tracked NVMe disk usage in bytes.
@@ -414,6 +457,18 @@ mod tests {
             decrease_nvme_disk_usage(disk_len);
         }
         assert_eq!(nvme_disk_usage(), base);
+    }
+
+    #[test]
+    fn test_pending_free_returns_to_baseline() {
+        let _g = lock();
+        let base = nvme_pending_free();
+        add_pending_free(4096);
+        add_pending_free(8192);
+        assert_eq!(nvme_pending_free(), base + 12288);
+        finish_pending_free(8192);
+        finish_pending_free(4096);
+        assert_eq!(nvme_pending_free(), base);
     }
 
     // Decrementing more than is tracked is a corrupt-accounting bug and MUST abort,

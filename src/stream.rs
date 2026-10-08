@@ -603,7 +603,7 @@ async fn drive_window(
         // A source error is fatal to the whole op (bad disk read / lost client read).
         if let Some(e) = source_err {
             if let Some(p) = progress {
-                p.dram_pool.remove_object(&p.object_id); // evict half-filled DRAM entry
+                p.dram_pool.remove_cached_copy(&p.object_id); // drop the half-filled copy
             }
             return Err(e);
         }

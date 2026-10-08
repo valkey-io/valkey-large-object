@@ -48,6 +48,7 @@ pub mod commands;
 pub mod data_type;
 pub mod engine;
 pub mod errors;
+pub mod eviction;
 pub mod info;
 pub mod smartlog;
 pub mod storage;
@@ -93,7 +94,8 @@ lazy_static::lazy_static! {
     /// Default: 1 GiB. Immutable after load.
     static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(1024 * 1024 * 1024);
 
-    /// Max disk usage in nvme-dir. Default: 0 (unlimited).
+    /// Max disk usage in nvme-dir. Default: 0 (unlimited). At the cap a write evicts only if the
+    /// server's `maxmemory` is set with an evicting policy; otherwise it is refused.
     static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
@@ -126,7 +128,7 @@ lazy_static::lazy_static! {
     /// promotes it into DRAMPool. Default: 2.
     static ref CFG_PROMOTE_MIN_HITS: AtomicI64 = AtomicI64::new(2);
 
-    /// Entries sampled per reclaim round; the lowest LFU score is reclaimed.
+    /// Entries sampled per round; the lowest LFU score is reclaimed or evicted.
     static ref CFG_RECLAIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(5);
 
     /// Cap on read fds cached by the FdPool. When full, opening a new fd reclaims
@@ -183,6 +185,18 @@ lazy_static::lazy_static! {
     /// Allows integration tests to inject a DEL in the mid-stream window
     /// and deterministically exercise the delete-during-SET race.
     static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);
+
+    /// Test-only: pause a Tiered SET for this many milliseconds before it unlinks the files it
+    /// evicted, to open the window in which their keys can be deleted. 0 = disabled.
+    static ref CFG_TEST_PAUSE_BEFORE_EVICT_UNLINK_MS: AtomicI64 = AtomicI64::new(0);
+
+    /// Test-only: pause an `ObjectFile` teardown for this many milliseconds before it unlinks the
+    /// file, to hold open the window between a key being freed and its file going. 0 = disabled.
+    static ref CFG_TEST_PAUSE_BEFORE_TEARDOWN_UNLINK_MS: AtomicI64 = AtomicI64::new(0);
+
+    /// Test-only: 1 makes every unlink of an object file fail, leaving the file in place, to
+    /// exercise the failure paths. 0 = disabled.
+    static ref CFG_TEST_FAIL_UNLINK: AtomicI64 = AtomicI64::new(0);
 
     // ─── Streaming Configs ───────────────────────────────────────────────
 
@@ -396,6 +410,18 @@ pub fn min_buffers_per_op() -> usize {
 
 pub fn test_pause_before_finalize_set_ms() -> u64 {
     CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_pause_before_evict_unlink_ms() -> u64 {
+    CFG_TEST_PAUSE_BEFORE_EVICT_UNLINK_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_pause_before_teardown_unlink_ms() -> u64 {
+    CFG_TEST_PAUSE_BEFORE_TEARDOWN_UNLINK_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_fail_unlink() -> bool {
+    CFG_TEST_FAIL_UNLINK.load(std::sync::atomic::Ordering::Relaxed) != 0
 }
 
 pub fn fabric_provider() -> FabricProvider {
@@ -724,6 +750,12 @@ valkey_module! {
             ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, 2, 1, 64,
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
+            ["test-pause-before-evict-unlink-ms", &*CFG_TEST_PAUSE_BEFORE_EVICT_UNLINK_MS, 0, 0, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
+            ["test-pause-before-teardown-unlink-ms", &*CFG_TEST_PAUSE_BEFORE_TEARDOWN_UNLINK_MS, 0, 0, 60_000,
+             ConfigurationFlags::HIDDEN, None, None],
+            ["test-fail-unlink", &*CFG_TEST_FAIL_UNLINK, 0, 0, 1,
              ConfigurationFlags::HIDDEN, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],

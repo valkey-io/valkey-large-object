@@ -6,6 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use valkey_module::{InfoContext, ValkeyResult};
 
+use crate::eviction;
 use crate::smartlog::{snapshot_for_info, CRITICAL_WARNING_BITS};
 use crate::storage;
 use crate::{operating_mode, OperatingMode};
@@ -84,6 +85,10 @@ fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .map(|_| ())
 }
 
+fn count(counter: &AtomicU64) -> i64 {
+    counter.load(Ordering::Relaxed) as i64
+}
+
 fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let dram = storage::DRAM_POOL
         .get()
@@ -148,6 +153,21 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "dram_uring_registered_segments",
             dram.io_uring_registered_count() as i64,
         )?
+        .field("evictions", count(&eviction::EVICTIONS_TOTAL))?
+        .field(
+            "eviction_failures",
+            count(&eviction::EVICTION_FAILURES_TOTAL),
+        )?
+        .field(
+            "eviction_reclaimed_bytes",
+            count(&eviction::RECLAIMED_BYTES_TOTAL),
+        )?
+        .field("pinned_skips", count(&eviction::PINNED_SKIPS_TOTAL))?
+        .field("satisfy_refusals", count(&eviction::SATISFY_REFUSALS_TOTAL))?
+        .field(
+            "fragmentation_aborts",
+            count(&eviction::FRAGMENTATION_ABORTS_TOTAL),
+        )?
         .build_section()?
         .build_info()
         .map(|_| ())
@@ -170,6 +190,31 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "nvme_uring_registered_segments",
             nvme.io_uring_registered_count() as i64,
+        )?
+        .field("disk_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
+        .field("disk_maxmemory_bytes", crate::nvme_maxmemory() as i64)?
+        .field("disk_pinned_objects", storage::lock_inflight().len() as i64)?
+        .field(
+            "disk_pending_free_bytes",
+            storage::nvme::nvme_pending_free() as i64,
+        )?
+        // The `disk_` prefix keeps these apart from the DRAM section's: fields share one namespace.
+        .field("disk_evictions", count(&eviction::DISK_EVICTIONS_TOTAL))?
+        .field(
+            "disk_eviction_failures",
+            count(&eviction::DISK_EVICTION_FAILURES_TOTAL),
+        )?
+        .field(
+            "disk_leaked_files",
+            count(&eviction::DISK_LEAKED_FILES_TOTAL),
+        )?
+        .field(
+            "disk_eviction_reclaimed_bytes",
+            count(&eviction::DISK_RECLAIMED_BYTES_TOTAL),
+        )?
+        .field(
+            "disk_sequential_draws",
+            count(&eviction::SEQUENTIAL_DRAWS_TOTAL),
         )?
         .build_section()?
         .build_info()
