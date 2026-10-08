@@ -118,6 +118,7 @@ fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     fd_pool_section(ctx)?;
     smartlog_section(ctx)?;
     efa_section(ctx)?;
+    requests_section(ctx)?;
     error_metrics_section(ctx)?;
     Ok(())
 }
@@ -365,6 +366,16 @@ fn efa_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("efa_read_usec_total", EFA_READS.transfers.usec_total())?
         .field("efa_writes_total", EFA_WRITES.transfers.count())?
         .field("efa_write_usec_total", EFA_WRITES.transfers.usec_total())?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
+/// Async BLOB.GET and BLOB.SET requests, in both modes.
+fn requests_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    ctx.builder()
+        .add_section("requests")
+        .field("inflight_requests", crate::engine::inflight_requests())?
         .build_section()?
         .build_info()
         .map(|_| ())

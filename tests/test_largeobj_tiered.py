@@ -156,10 +156,9 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client.execute_command('FLUSHALL')
         wait_for_equal(live, 0)
 
-    def test_info_staging_utilization(self):
-        """A Tiered SET holds its staging window until it commits. The pause hook holds the
-        commit long enough to observe the window, and the window returns to the pool once the
-        SET replies."""
+    def test_info_set_in_flight(self):
+        """A Tiered SET holds its staging window and counts in inflight_requests until it
+        replies. The pause hook holds the commit long enough to observe both."""
         client = self.server.get_new_client()
         set_result = [None]
         set_error = [None]
@@ -169,13 +168,16 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             assert set_error[0] is None, f"SET raised: {set_error[0]}"
             return client.info('largeobj_nvme_staging')['largeobj_staging_utilization_pct']
 
+        def inflight():
+            return client.info('largeobj_requests')['largeobj_inflight_requests']
+
         def background_set():
             try:
                 set_result[0] = setter.execute_command('BLOB.SET', 'key', b'S' * (256 * 1024))
             except Exception as e:
                 set_error[0] = e
 
-        assert staging() == 0
+        assert (staging(), inflight()) == (0, 0)
         # 64 buffers x 4 KiB = 256 KiB of the 4 MiB staging pool: 6.25%.
         client.execute_command('CONFIG', 'SET', 'largeobj.max-buffers-per-op', '64')
         client.execute_command(
@@ -185,6 +187,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         t.start()
         try:
             wait_for_equal(staging, 6.25)
+            assert inflight() == 1
         finally:
             t.join(timeout=10)
             client.execute_command(
@@ -193,6 +196,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert set_error[0] is None, f"SET raised: {set_error[0]}"
         assert set_result[0] == b'OK'
         wait_for_equal(staging, 0)
+        assert inflight() == 0
 
     def test_delete_removes_nvme_file(self):
         """DEL removes the NVMe file."""

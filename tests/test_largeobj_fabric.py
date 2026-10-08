@@ -264,8 +264,8 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
 
     def test_info_efa_traffic(self):
         """INFO counts what crossed EFA: a GET pushes out (writes) and a SET pulls in (reads),
-        one transfer per client address. TCP traffic counts nowhere, and the session goes when
-        its connection does."""
+        one transfer per client address. TCP traffic counts nowhere, finished requests are no
+        longer in flight, and the session goes when its connection does."""
         sizes = [1024, 3072]
         process, regions = self.start_target('--read', split=sizes)
         try:
@@ -296,6 +296,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             assert both['largeobj_efa_reads_total'] == len(sizes)
             assert both['largeobj_efa_read_usec_total'] > 0
             assert both['largeobj_efa_write_bytes_total'] == TARGET_LEN
+            assert client.info('largeobj_requests')['largeobj_inflight_requests'] == 0
 
             client.close()
             observer = self.server.get_new_client()
@@ -320,6 +321,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             assert efa['largeobj_efa_write_usec_total'] > 0
             assert efa['largeobj_efa_write_bytes_total'] == 0
             assert client.info('largeobj_error_metrics')['largeobj_efa_write_errors'] == 1
+            assert client.info('largeobj_requests')['largeobj_inflight_requests'] == 0
         finally:
             process.kill()
 
