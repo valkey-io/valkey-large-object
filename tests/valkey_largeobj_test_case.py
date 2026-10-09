@@ -30,9 +30,6 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         SERVER_VERSION: valkey-server version directory name
     """
 
-    def _dat_files(self):
-        return [f for f in os.listdir(self.data_dir) if f.endswith('.dat')]
-
     def get_module_args(self, data_dir, direct_io):
         """Override in subclasses to customize module load args.
         Default: Tiered mode with 1MB pools (small, suitable for basic tests).

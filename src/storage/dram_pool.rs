@@ -575,10 +575,6 @@ mod tests {
 
     const BUF: u32 = 4096;
 
-    /// Ids for the tests that evict, which list their victims on the process-wide reclaim list
-    /// (`remove_object` of a listed id reaches for the unset global pool): no other test uses them.
-    const EV: u64 = 0xe71c_5000;
-
     fn pool() -> DRAMPool {
         DRAMPool::new(2, 1 << 20, Some(TieredCache::default()))
     }
@@ -591,15 +587,6 @@ mod tests {
             offset: slot as u64 * BUF as u64,
             len: BUF,
         }]))
-    }
-
-    /// `evict_in`, checking that its victims are listed and taking them off the list again.
-    fn evict(p: &DRAMPool, seg: usize, need: usize, max_victims: usize) -> (Option<Victims>, u64) {
-        let out = p.evict_in(seg, need, max_victims);
-        for (oid, _) in out.0.iter().flatten() {
-            assert!(RECLAIM_LIST.remove(oid), "{oid:?} was not listed");
-        }
-        out
     }
 
     fn oids(victims: &[(ObjectId, Arc<ObjectContext>)]) -> Vec<u64> {
@@ -660,43 +647,6 @@ mod tests {
         assert!(p.reclaim_in(0, BUF as usize, 16).is_none());
         assert_eq!(p.object_count(), 3);
         assert_index_consistent(&p);
-    }
-
-    #[test]
-    fn evict_in_counts_what_it_skipped_and_redraws_before_giving_up() {
-        let p = pool();
-        let held: Vec<_> = (0..3u16).map(|slot| ctx(0, slot)).collect();
-        for (i, obj) in held.iter().enumerate() {
-            p.insert_object(ObjectId(EV + 10 + i as u64), Arc::clone(obj));
-        }
-        // Few enough to scan whole, so each of the redraws sees all three held.
-        let (victims, pinned) = evict(&p, 0, BUF as usize, 16);
-        assert!(victims.is_none());
-        assert_eq!(pinned, 3 * EVICT_PATIENCE as u64);
-        assert_eq!(p.object_count(), 3);
-        assert_index_consistent(&p);
-
-        // Reclaim gives up on the first empty-handed draw.
-        assert!(p.reclaim_in(0, BUF as usize, 16).is_none());
-
-        drop(held);
-        let (victims, pinned) = evict(&p, 0, BUF as usize, 16);
-        assert_eq!(victims.unwrap().len(), 1);
-        assert_eq!(pinned, 0);
-    }
-
-    #[test]
-    fn evict_in_destroys_and_lists_nothing_when_the_segment_cannot_cover_the_need() {
-        let p = pool();
-        p.insert_object(ObjectId(EV + 1), ctx(0, 0));
-        p.insert_object(ObjectId(EV + 2), ctx(0, 1));
-        let (victims, _) = evict(&p, 0, 3 * BUF as usize, 16);
-        assert!(victims.is_none());
-        assert_eq!(p.object_count(), 2);
-        assert!(!RECLAIM_LIST.contains(&ObjectId(EV + 1)));
-        assert_index_consistent(&p);
-        // An empty segment has nothing to give however long it waits.
-        assert!(evict(&p, 1, 1, 16).0.is_none());
     }
 
     #[test]

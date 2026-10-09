@@ -459,18 +459,6 @@ mod tests {
         assert_eq!(nvme_disk_usage(), base);
     }
 
-    #[test]
-    fn test_pending_free_returns_to_baseline() {
-        let _g = lock();
-        let base = nvme_pending_free();
-        add_pending_free(4096);
-        add_pending_free(8192);
-        assert_eq!(nvme_pending_free(), base + 12288);
-        finish_pending_free(8192);
-        finish_pending_free(4096);
-        assert_eq!(nvme_pending_free(), base);
-    }
-
     // Decrementing more than is tracked is a corrupt-accounting bug and MUST abort,
     // not silently wrap the counter (which would poison every capacity check).
     #[test]

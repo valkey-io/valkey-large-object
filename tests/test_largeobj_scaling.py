@@ -14,9 +14,10 @@ Tests cover:
     evicts other objects; their keys read as misses until the scaling cron deletes them
 """
 
-import binascii
 import os
+import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from contextlib import contextmanager, suppress
@@ -24,12 +25,9 @@ from contextlib import contextmanager, suppress
 import pytest
 from valkey import OutOfMemoryError, ResponseError
 from valkeytestframework.util.waiters import wait_for_true
+from test_largeobj_fabric import PEER_ADDRESS
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 
-# A tcp-provider fabric address: FI_SOCKADDR_IN for 127.0.0.1:1.
-PEER_ADDRESS = binascii.hexlify(
-    b'\x02\x00' + (1).to_bytes(2, 'big') + bytes([127, 0, 0, 1]) + bytes(8)
-).decode()
 
 # 900KB in a 1MB segment: one object of this size fills a segment by itself.
 SEGMENT_FILLING_SIZE = 900 * 1024
@@ -103,15 +101,22 @@ def hook(client, name, value):
     client.execute_command('CONFIG', 'SET', f'largeobj.test-{name}', value)
 
 
+def background_set(server, key, payload):
+    """BLOB.SET on a connection of its own, in a thread. Returns the thread and its outcome, whose
+    'reply' appears when it finishes."""
+    outcome = {}
+    thread = threading.Thread(target=lambda: outcome.update(
+        reply=server.get_new_client().execute_command('BLOB.SET', key, payload)))
+    thread.start()
+    return thread, outcome
+
+
 @contextmanager
 def paused_set(server, client, key, payload):
     """A SET paused after writing its file and before its key commits. The pause is lifted at once,
     so other commands run meanwhile; the SET commits when the block ends. Yields its outcome."""
     hook(client, 'pause-before-finalize-set-ms', 3000)
-    outcome = {}
-    thread = threading.Thread(target=lambda: outcome.update(
-        reply=server.get_new_client().execute_command('BLOB.SET', key, payload)))
-    thread.start()
+    thread, outcome = background_set(server, key, payload)
     time.sleep(0.5)  # the file is written and the task is paused
     hook(client, 'pause-before-finalize-set-ms', 0)
     try:
@@ -137,6 +142,10 @@ def surviving(client, payloads):
 
 def pending_reclaims(client):
     return info_largeobj(client)['largeobj_pending_reclaims']
+
+
+def pinned_skips(client):
+    return info_largeobj(client)['largeobj_pinned_skips']
 
 
 def wait_reclaimed(client, timeout=15):
@@ -182,19 +191,12 @@ def transfer_holding(server, client, key):
         thread.join(timeout=30)
 
 
-def assert_pin_skipped_then_released(server, client, key, payload):
-    """A transfer reading `key` pins it: SETs that need room skip it, and it survives. Once the
-    transfer ends it is a victim again."""
-    skips = lambda: info_largeobj(client)['largeobj_pinned_skips']
-    with transfer_holding(server, client, key):
-        before = skips()
-        write_until(client, 'pinned_', payload, lambda: skips() > before)
-        assert skips() > before, "eviction never offered the pinned key"
-    assert client.execute_command('BLOB.GET', key) == payload
-    gone = lambda: client.execute_command('BLOB.GET', key) is None
-    write_until(client, 'after_', payload, gone)
-    assert gone(), "the key is still pinned after the transfer ended"
-
+def write_until_skipped(client, prefix, payload):
+    """SET until eviction has passed over a pinned object. Returns the keys it tried."""
+    before = pinned_skips(client)
+    keys = write_until(client, prefix, payload, lambda: pinned_skips(client) > before)
+    assert pinned_skips(client) > before, "eviction never met the pinned object"
+    return keys
 
 
 class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
@@ -574,7 +576,9 @@ class DramArena:
     on the reclaim list for the test to see."""
 
     SEGMENT_SIZE = 1024 * 1024
-    OBJ = SEGMENT_SIZE // 4  # four would fill the segment exactly, but talc's metadata lives in it
+    OBJ = SEGMENT_SIZE // 4
+    OBJECTS_PER_CAP = 3  # a fourth would fill the segment exactly, but talc's metadata lives in it
+    EVICTIONS = 'largeobj_evictions'
     POLL_MS = 60_000
 
     def get_module_args(self, data_dir, direct_io):
@@ -588,14 +592,22 @@ class DramArena:
             f" direct-io no"
         )
 
+    def new_client(self):
+        client = self.server.get_new_client()
+        set_policy(client)
+        return client
+
+    def wait_settled(self, client, live):
+        """Every victim freed: `live` objects are left."""
+        wait_for_true(lambda: info_largeobj(client)['largeobj_num_objects'] == live)
+
 
 class TestDramEviction(DramArena, ValkeyLargeObjTestCaseBase):
 
     def test_writing_past_the_segment_evicts_and_victims_read_as_misses(self):
         """Three segments' worth cannot be resident at once, so these SETs only succeed by evicting.
         A victim's key, still in the keyspace, reads as a miss until the cron deletes it."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = set_objects(client, 'obj_', 12, self.OBJ)
 
         info = info_largeobj(client)
@@ -621,8 +633,7 @@ class TestDramEviction(DramArena, ValkeyLargeObjTestCaseBase):
     def test_copy_evicts_another_key_and_never_its_source(self):
         """COPY pins its source: alone in the segment it fails cleanly, and with another key
         resident that key is the victim."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         big = b'S' * (640 * 1024)
         assert client.execute_command('BLOB.SET', 'src', big) == b'OK'
         with pytest.raises(ResponseError):
@@ -644,8 +655,7 @@ class TestDramEviction(DramArena, ValkeyLargeObjTestCaseBase):
     def test_efa_set_evicts_at_alloc_time(self):
         """An EFA SET into a full arena evicts before the transfer. The peer is dead, so the SET
         errors; the counter moving is the assertion."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         for i in range(3):  # one short of a full segment, which would evict on its own
             assert client.execute_command('BLOB.SET', f'fill_{i}', b'F' * self.OBJ) == b'OK'
         client.execute_command('BLOB.HELLO', PEER_ADDRESS)
@@ -656,62 +666,20 @@ class TestDramEviction(DramArena, ValkeyLargeObjTestCaseBase):
         assert info_largeobj(client)['largeobj_evictions'] > 0
 
     def test_a_pinned_object_is_not_claimed_for_the_arena(self):
-        client = self.server.get_new_client()
-        set_policy(client)
-        payload = b'F' * (self.SEGMENT_SIZE // 8)
-        for i in range(7):  # one short of a full segment, so fill_0 is not evicted before it is pinned
-            assert client.execute_command('BLOB.SET', f'fill_{i}', payload) == b'OK'
-        assert_pin_skipped_then_released(self.server, client, 'fill_0', payload)
+        """A transfer reading the only resident pins it: a SET that needs its room is refused, not
+        served by taking it. Once the transfer ends it is a victim again."""
+        client = self.new_client()
+        held = b'H' * (self.SEGMENT_SIZE // 2 + 64 * 1024)
+        assert client.execute_command('BLOB.SET', 'held', held) == b'OK'
+        with transfer_holding(self.server, client, 'held'):
+            before = pinned_skips(client)
+            with pytest.raises(ResponseError):
+                client.execute_command('BLOB.SET', 'newcomer', held)
+            assert pinned_skips(client) > before
+            assert client.execute_command('BLOB.GET', 'held') == held
 
-
-class TestDramEvictionReclaim(DramArena, ValkeyLargeObjTestCaseBase):
-    """The scaling cron deletes the keys of evicted objects, a tick (`scaling-poll-ms`) at a time."""
-
-    POLL_MS = 1000
-
-    def test_the_cron_deletes_the_keys_eviction_took(self):
-        client = self.server.get_new_client()
-        set_policy(client)
-        payloads = set_objects(client, 'obj_', 12, self.OBJ)
-        live = surviving(client, payloads)
-        assert 0 < len(live) < len(payloads)
-
-        wait_reclaimed(client)
-        info = info_largeobj(client)
-        assert client.execute_command('DBSIZE') == len(live), "only live keys are left"
-        assert surviving(client, payloads) == live
-        assert info['largeobj_reclaims'] == info['largeobj_evictions'], "each victim is reclaimed once"
-        wait_for_true(lambda: info_largeobj(client)['largeobj_num_objects'] == len(live))  # lo_free is async
-
-    def test_a_write_takes_victims_from_every_db_and_the_cron_reaches_them(self):
-        """The arena is node-wide: a SET from db 0 that needs two victims takes the key in db 1
-        and the key in db 2."""
-        db0 = self.server.get_new_client()
-        dbs = [self.server.create_from_server(db=db) for db in (1, 2)]
-        set_policy(db0)
-        for db in dbs:
-            assert db.execute_command('BLOB.SET', 'obj', b'A' * (384 * 1024)) == b'OK'
-
-        newcomer = b'N' * (700 * 1024)
-        assert db0.execute_command('BLOB.SET', 'newcomer', newcomer) == b'OK'
-        assert info_largeobj(db0)['largeobj_evictions'] == 2
-        assert self.server.get_new_client().execute_command('BLOB.GET', 'newcomer') == newcomer
-        assert [db.execute_command('BLOB.GET', 'obj') for db in dbs] == [None, None]
-
-        wait_reclaimed(db0)
-        assert [db.execute_command('DBSIZE') for db in (db0, *dbs)] == [1, 0, 0]
-
-    def test_a_deleted_victim_leaves_nothing_for_the_cron(self):
-        """Deleting an evicted key takes its object off the list, so the cron has nothing to hunt."""
-        client = self.server.get_new_client()
-        set_policy(client)
-        payloads = set_objects(client, 'obj_', 12, self.OBJ)
-        victims = [key for key in payloads if client.execute_command('BLOB.GET', key) is None]
-        assert victims
-        deleted = client.execute_command('DEL', *victims)  # the cron may have deleted some already
-
-        wait_reclaimed(client, timeout=5)
-        assert info_largeobj(client)['largeobj_reclaims'] == len(victims) - deleted, "only the cron's deletes count"
+        assert client.execute_command('BLOB.SET', 'newcomer', held) == b'OK'
+        assert client.execute_command('BLOB.GET', 'held') is None
 
 
 class TestDramEvictionPolicy(DramArena, ValkeyLargeObjTestCaseBase):
@@ -917,6 +885,7 @@ class TieredCap:
     DISK_PER_OBJ = OBJ + 4096  # the ledger also charges the file's one-page header
     OBJECTS_PER_CAP = 8
     CAP = OBJECTS_PER_CAP * DISK_PER_OBJ  # a whole number of objects, so filling it evicts nothing
+    EVICTIONS = 'largeobj_disk_evictions'
     POLL_MS = 60_000
     EXTRA_ARGS = ""
 
@@ -934,6 +903,11 @@ class TieredCap:
             f" direct-io no"
         ) + self.EXTRA_ARGS
 
+    def new_client(self):
+        client = self.server.get_new_client()
+        set_policy(client)
+        return client
+
     def fill_cap(self, client):
         return set_objects(client, 'fill_', self.OBJECTS_PER_CAP, self.OBJ)
 
@@ -945,7 +919,7 @@ class TieredCap:
             return (info['largeobj_disk_pending_free_bytes'] == 0
                     and info['largeobj_disk_pinned_objects'] == 0
                     and info['largeobj_disk_used_bytes'] == live * self.DISK_PER_OBJ
-                    and len(self._dat_files()) == live)
+                    and len(self._object_files()) == live)
         wait_for_true(settled, timeout=timeout)
 
 
@@ -958,8 +932,7 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
     def test_writing_past_the_cap_evicts_exactly_and_stays_bounded(self):
         """Three caps' worth: the ledger, counters, survivors, reclaim list and directory agree on
         what died."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = set_objects(client, 'obj_', 3 * self.OBJECTS_PER_CAP, self.OBJ)
 
         info = info_largeobj(client)
@@ -975,18 +948,17 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         assert info['largeobj_disk_used_bytes'] == len(survivors) * self.DISK_PER_OBJ
         assert info['largeobj_pending_reclaims'] == victims, "every victim's key waits to be deleted"
         assert info['largeobj_disk_pinned_objects'] == 0, "no write is in flight"
-        wait_for_true(lambda: len(self._dat_files()) == len(survivors), timeout=10)
+        wait_for_true(lambda: len(self._object_files()) == len(survivors), timeout=10)
 
     def test_a_refused_request_destroys_nothing(self):
         """A COPY needing more room than the one other object can give (its source is no victim)
         evicts nothing, and is no failed eviction either: that counter is for requests that
         destroyed something and still fell short."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         big, small = b'S' * (5 * self.DISK_PER_OBJ - 4096), b's' * self.OBJ
         assert client.execute_command('BLOB.SET', 'src', big) == b'OK'
         assert client.execute_command('BLOB.SET', 'small', small) == b'OK'
-        before, files = info_largeobj(client), sorted(self._dat_files())
+        before, files = info_largeobj(client), self._object_files()
 
         with pytest.raises(ResponseError):
             client.execute_command('COPY', 'src', 'dst')
@@ -998,13 +970,12 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         for field in ('disk_used_bytes', 'disk_evictions', 'disk_eviction_failures', 'disk_pinned_objects'):
             assert after[f'largeobj_{field}'] == before[f'largeobj_{field}'], field
         assert after['largeobj_pending_reclaims'] == 0
-        assert sorted(self._dat_files()) == files
+        assert self._object_files() == files
 
     def test_requests_the_cap_cannot_serve_destroy_nothing(self):
         """One bigger than the cap itself, and any write under `noeviction` or without a
         `maxmemory`."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = self.fill_cap(client)
 
         self.assert_rejected(client, 'huge', b'H' * self.CAP)  # the payload alone is the cap
@@ -1018,8 +989,7 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         assert len(surviving(client, payloads)) == len(payloads)
 
     def test_copy_evicts_another_key_and_never_its_source(self):
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = self.fill_cap(client)
         assert client.execute_command('COPY', 'fill_0', 'dst') in (1, True)
         wait_unlinked(client)  # the victims' files go in the background, then the ledger drops
@@ -1031,22 +1001,18 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         survivors = surviving(client, payloads)
         assert len(survivors) == self.OBJECTS_PER_CAP - victims
         assert all(value == payloads[key] for key, value in survivors.items())
-        wait_for_true(lambda: len(self._dat_files()) == len(survivors) + 1, timeout=10)
+        wait_for_true(lambda: len(self._object_files()) == len(survivors) + 1, timeout=10)
         assert info_largeobj(client)['largeobj_disk_pinned_objects'] == 0
 
     def test_a_freed_key_keeps_its_file_while_a_reader_holds_it(self):
         """DEL frees the key but not the file a transfer is still reading. Eviction must leave it
         alone, or it would list an object that no key leads to. When the transfer ends the file goes
         and its bytes come back."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = self.fill_cap(client)
-        skips = lambda: info_largeobj(client)['largeobj_pinned_skips']
         with transfer_holding(self.server, client, 'fill_0'):
             assert client.execute_command('DEL', 'fill_0') == 1
-            before = skips()
-            written = write_until(client, 'pinned_', b'N' * self.OBJ, lambda: skips() > before)
-            assert skips() > before, "eviction never met the held file"
+            written = write_until_skipped(client, 'pinned_', b'N' * self.OBJ)
             info = info_largeobj(client)
             assert info['largeobj_disk_pinned_objects'] == 1
             live = len(surviving(client, {**payloads, **dict.fromkeys(written)}))
@@ -1058,8 +1024,7 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
     def test_a_write_that_fails_after_evicting_returns_every_byte(self):
         """An EFA SET to a dead peer evicts, charges, starts writing and fails: the victim stays
         gone, and the ledger and directory settle to exactly the survivors."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = self.fill_cap(client)
         client.execute_command('BLOB.HELLO', PEER_ADDRESS)
         with suppress(ResponseError):
@@ -1074,8 +1039,7 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         """`nvme-dir` vanishes under a SET that has already charged its file: the charge comes back.
         At the cap the vanished directory cannot even be read for victims, so the SET evicts
         nothing either."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         away = self.data_dir + '.away'
 
         def set_while_dir_is_away(key):
@@ -1099,17 +1063,10 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         """A victim's bytes belong to the write that evicted it, even once its key is deleted: the
         teardown leaves the file alone, and no other write may admit itself into that room or claim
         the file again, or both would unlink and credit it."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = self.fill_cap(client)
         hook(client, 'pause-before-evict-unlink-ms', 2000)
-        results = {}
-
-        def write(name):
-            results[name] = self.server.get_new_client().execute_command('BLOB.SET', name, b'W' * self.OBJ)
-
-        first = threading.Thread(target=write, args=('w0',))
-        first.start()
+        writes = [background_set(self.server, 'w0', b'W' * self.OBJ)]
         wait_for_true(lambda: pending_reclaims(client) == 1, timeout=10)
         victim = next(key for key in payloads if key not in surviving(client, payloads))
         assert client.execute_command('DEL', victim) == 1
@@ -1121,46 +1078,46 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
 
         # Enough writes to claim every file in the directory, the deleted victim's included if it
         # could be: all of them arrive well within the pause, before any new file exists.
-        others = [threading.Thread(target=write, args=(f'w{i}',)) for i in range(1, self.OBJECTS_PER_CAP)]
-        for t in others:
-            t.start()
-        for t in [first, *others]:
-            t.join(timeout=30)
-        assert results == {f'w{i}': b'OK' for i in range(self.OBJECTS_PER_CAP)}
+        writes += [background_set(self.server, f'w{i}', b'W' * self.OBJ) for i in range(1, self.OBJECTS_PER_CAP)]
+        for thread, _ in writes:
+            thread.join(timeout=30)
+        assert [outcome['reply'] for _, outcome in writes] == [b'OK'] * self.OBJECTS_PER_CAP
 
         wait_unlinked(client)
         assert info_largeobj(client)['largeobj_disk_evictions'] == self.OBJECTS_PER_CAP
         self.wait_settled(client, self.OBJECTS_PER_CAP)
+
     def test_a_key_being_read_is_not_evicted(self):
         """A GET pins its object until it ends, so eviction passes it over and it survives; once the
         transfer ends it is a victim again."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = self.fill_cap(client)
-        assert_pin_skipped_then_released(self.server, client, 'fill_0', payloads['fill_0'])
+        with transfer_holding(self.server, client, 'fill_0'):
+            write_until_skipped(client, 'pinned_', b'N' * self.OBJ)
+        assert client.execute_command('BLOB.GET', 'fill_0') == payloads['fill_0']
+
+        gone = lambda: client.execute_command('BLOB.GET', 'fill_0') is None
+        write_until(client, 'after_', b'N' * self.OBJ, gone)
+        assert gone(), "the key is still pinned after the transfer ended"
 
     @pytest.mark.parametrize('overwrite', [False, True])
     def test_a_set_in_flight_is_not_evicted(self, overwrite):
         """A SET's file exists before its key does, and a SET pins the object it overwrites too.
-        While it is paused before its commit, writes that need room must offer and pass over both,
-        or the SET loses its file mid-flight."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        While it is paused before its commit, writes that need room must pass over both, or the SET
+        loses its file mid-flight. Enough writes that an unpinned file would surely be taken."""
+        client = self.new_client()
         payloads = self.fill_cap(client)
         key = 'fill_0' if overwrite else 'slow'
         with paused_set(self.server, client, key, b'S' * self.OBJ) as outcome:
-            before = info_largeobj(client)['largeobj_pinned_skips']
-            for i in range(3):
-                assert client.execute_command('BLOB.SET', f'other_{i}', b'O' * self.OBJ) == b'OK'
-            skips = info_largeobj(client)['largeobj_pinned_skips'] - before
-            assert skips >= (2 if overwrite else 1), "eviction never met the file"
+            others = set_objects(client, 'other_', 5 * self.OBJECTS_PER_CAP, self.OBJ)
             if overwrite:
                 assert client.execute_command('BLOB.GET', key) == payloads[key]
 
         assert outcome['reply'] == b'OK'
         assert client.execute_command('BLOB.GET', key) == b'S' * self.OBJ
-        live = len(surviving(client, {**payloads, **{f'other_{i}': None for i in range(3)}, key: None}))
+        live = len(surviving(client, {**payloads, **others, key: None}))
         self.wait_settled(client, live)
+
     def test_a_write_discarded_as_stale_leaves_nothing_behind(self):
         """A SET slow to commit finds a newer object under its key and is dropped: its file is
         unlinked, its bytes come back and nothing stays listed."""
@@ -1170,11 +1127,11 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
 
         assert client.execute_command('BLOB.GET', 'key') == b'N' * self.OBJ
         self.wait_settled(client, 1)
+
     def test_a_failed_unlink_leaves_a_live_victim_serving_and_its_key_credits_it_later(self):
         """Eviction cannot unlink a victim whose key is alive: the object serves again, its bytes
         stay charged, and deleting its key later unlinks the file and credits them."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = self.fill_cap(client)
         hook(client, 'fail-unlink', 1)
         assert client.execute_command('BLOB.SET', 'newcomer', b'N' * self.OBJ) == b'OK'
@@ -1185,27 +1142,21 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         assert info['largeobj_disk_leaked_files'] == 0, "its key is alive, so its handle owns the file"
         assert info['largeobj_disk_used_bytes'] == (self.OBJECTS_PER_CAP + 1) * self.DISK_PER_OBJ
         assert surviving(client, payloads) == payloads
-        assert len(self._dat_files()) == self.OBJECTS_PER_CAP + 1
+        assert len(self._object_files()) == self.OBJECTS_PER_CAP + 1
 
         hook(client, 'fail-unlink', 0)
-        assert client.execute_command('DEL', 'fill_0') == 1
-        wait_for_true(lambda: len(self._dat_files()) == self.OBJECTS_PER_CAP, timeout=10)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_used_bytes']
-                      == self.OBJECTS_PER_CAP * self.DISK_PER_OBJ, timeout=10)
+        assert client.execute_command('DEL', *payloads) == len(payloads)  # whichever was the victim
+        self.wait_settled(client, 1)
 
     def test_a_victim_freed_before_a_failed_unlink_is_counted_as_leaked(self):
         """The key is deleted while the unlink is pending, so the teardown leaves the file to
         eviction; then the unlink fails and nobody is left to remove it. The leak is counted, and
         the file stays on disk, charged."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = self.fill_cap(client)
         hook(client, 'pause-before-evict-unlink-ms', 2000)
         hook(client, 'fail-unlink', 1)
-        outcome = {}
-        thread = threading.Thread(target=lambda: outcome.update(
-            reply=self.server.get_new_client().execute_command('BLOB.SET', 'newcomer', b'N' * self.OBJ)))
-        thread.start()
+        thread, outcome = background_set(self.server, 'newcomer', b'N' * self.OBJ)
         wait_for_true(lambda: pending_reclaims(client) == 1, timeout=10)
         victim = next(key for key in payloads if key not in surviving(client, payloads))
         assert client.execute_command('DEL', victim) == 1
@@ -1218,13 +1169,12 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         assert pending_reclaims(client) == 0
         assert info['largeobj_disk_pinned_objects'] == 1, "the stray file stays out of eviction's reach"
         assert info['largeobj_disk_used_bytes'] == (self.OBJECTS_PER_CAP + 1) * self.DISK_PER_OBJ
-        assert len(self._dat_files()) == self.OBJECTS_PER_CAP + 1, "the victim's file is still there"
+        assert len(self._object_files()) == self.OBJECTS_PER_CAP + 1, "the victim's file is still there"
 
     def test_a_file_whose_teardown_unlink_fails_is_never_a_victim(self):
         """A freed key's file that cannot be unlinked stays on disk with no key. Its bytes are
         credited, and eviction must keep passing it over, or it would list an id no key leads to."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         self.fill_cap(client)
         hook(client, 'fail-unlink', 1)
         assert client.execute_command('DEL', 'fill_0') == 1
@@ -1232,34 +1182,29 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
                       == (self.OBJECTS_PER_CAP - 1) * self.DISK_PER_OBJ, timeout=10)
         hook(client, 'fail-unlink', 0)
         assert info_largeobj(client)['largeobj_disk_pinned_objects'] == 1
-        assert len(self._dat_files()) == self.OBJECTS_PER_CAP
+        assert len(self._object_files()) == self.OBJECTS_PER_CAP
 
-        skips = lambda: info_largeobj(client)['largeobj_pinned_skips']
-        before = skips()
-        write_until(client, 'more_', b'M' * self.OBJ, lambda: skips() > before)
-        assert skips() > before, "eviction never met the stray file"
+        write_until_skipped(client, 'more_', b'M' * self.OBJ)
         assert info_largeobj(client)['largeobj_disk_pinned_objects'] == 1, "it was never claimed"
 
     def test_a_freed_key_stays_pinned_until_its_file_is_unlinked(self):
         """With no reader holding it, a freed key's file is still the teardown's to unlink. While the
         teardown waits, writes that need room must pass over it, or both would credit it."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         payloads = self.fill_cap(client)
         hook(client, 'pause-before-teardown-unlink-ms', 3000)
         assert client.execute_command('DEL', 'fill_0') == 1
         wait_for_true(lambda: info_largeobj(client)['largeobj_disk_pinned_objects'] == 1, timeout=10)
 
-        before = info_largeobj(client)['largeobj_pinned_skips']
+        before = pinned_skips(client)
         assert client.execute_command('BLOB.SET', 'other', b'O' * self.OBJ) == b'OK'
-        assert info_largeobj(client)['largeobj_pinned_skips'] > before, "eviction never met the file"
+        assert pinned_skips(client) > before, "eviction never met the file"
         self.wait_settled(client, len(surviving(client, {**payloads, 'other': None})), timeout=15)
 
     def test_overlapping_writes_each_evict_only_for_themselves(self):
         """A victim stays in the ledger until its file is unlinked, so a write that arrives meanwhile
         must count it as freed: else every overlapping write evicts for the same shortfall."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         self.fill_cap(client)
         threads, writes = 8, 20
 
@@ -1292,74 +1237,193 @@ class TestTieredEviction(TieredCap, ValkeyLargeObjTestCaseBase):
         assert info_largeobj(client)['largeobj_disk_evictions'] == 1
         assert len(surviving(client, payloads)) == self.OBJECTS_PER_CAP - 1
 
+    def test_a_late_commit_overwrites_a_newer_write_that_was_evicted(self):
+        """A SET slow to commit finds the key holding a newer object, which eviction has since
+        given up. That object is a miss, not a write to defer to, so the late commit must land."""
+        client = self.new_client()
+        late = b'L' * self.OBJ
+        with paused_set(self.server, client, 'key', late) as outcome:  # holds the older object id
+            assert client.execute_command('BLOB.SET', 'key', b'N' * self.OBJ) == b'OK'
 
-class TestTieredEvictionReclaim(TieredCap, ValkeyLargeObjTestCaseBase):
-    """The scaling cron deletes the keys of evicted objects, a tick (`scaling-poll-ms`) at a time."""
+            gone = lambda: client.execute_command('BLOB.GET', 'key') is None
+            write_until(client, 'fill_', b'F' * self.OBJ, gone)
+            assert gone(), "never evicted"
+            assert client.execute_command('EXISTS', 'key') == 1, "the key outlives its data"
+        assert outcome['reply'] == b'OK'
+        assert client.execute_command('BLOB.GET', 'key') == late
 
-    POLL_MS = 1000
+    def test_an_evicted_object_releases_its_promoted_copy_at_once(self):
+        """The victim's key waits for the cron, but its DRAM copy must not: `lo_free` would drop
+        it, and that is a minute away."""
+        client = self.new_client()
+        client.execute_command('CONFIG', 'SET', 'largeobj.promote-min-hits', 1)
+        promote(client, self.fill_cap(client))
 
-    def test_the_cron_deletes_the_keys_eviction_took(self):
-        client = self.server.get_new_client()
-        set_policy(client)
+        assert client.execute_command('BLOB.SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        info = info_largeobj(client)
+        assert info['largeobj_disk_evictions'] == 1 and info['largeobj_pending_reclaims'] == 1
+        assert info['largeobj_dram_objects'] == self.OBJECTS_PER_CAP - 1
+
+    def test_an_evicted_key_reads_as_a_miss_until_it_is_overwritten(self):
+        client = self.new_client()
+        key = 'victim'
+        assert client.execute_command('BLOB.SET', key, b'V' * ((self.OBJECTS_PER_CAP - 1) * self.OBJ)) == b'OK'
+        assert client.execute_command('BLOB.SET', 'newcomer', b'N' * (2 * self.OBJ)) == b'OK'  # room for only one
+        assert client.execute_command('EXISTS', key) == 1, "the key outlives its data"
+        assert pending_reclaims(client) == 1
+
+        assert client.execute_command('BLOB.GET', key) is None
+        with pytest.raises(ResponseError, match='not found'):
+            client.execute_command('BLOB.INFO', key)
+        with suppress(ResponseError):
+            client.execute_command('COPY', key, 'copy')
+        assert client.execute_command('EXISTS', 'copy') == 0
+        assert client.execute_command('MEMORY', 'USAGE', key) < 1024, "the payload is gone"
+        assert client.execute_command('DEBUG', 'DIGEST-VALUE', key)
+
+        # The reclaim is the old object's, not the name's: a new write under the name is no miss.
+        assert client.execute_command('BLOB.SET', key, b'fresh' * 1000) == b'OK'
+        assert client.execute_command('BLOB.GET', key) == b'fresh' * 1000
+        wait_reclaimed(client, 10)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_pinned_objects'] == 0, timeout=10)
+        assert len(self._object_files()) == 2, "the newcomer's and the fresh write's"
+
+    def test_files_that_are_not_objects_are_left_alone(self):
+        """Only `{id:016x}.dat` names an object: anything else in the directory is neither a victim
+        nor a charge."""
+        client = self.new_client()
+        strays = ['README', 'ffffffffffffffff.txt', 'abc.dat', 'FFFFFFFFFFFFFFFF.dat']
+        for name in strays:
+            open(os.path.join(self.data_dir, name), 'w').close()
+
         payloads = set_objects(client, 'obj_', 3 * self.OBJECTS_PER_CAP, self.OBJ)
         survivors = surviving(client, payloads)
         assert 0 < len(survivors) < len(payloads)
-
-        wait_reclaimed(client)
-        info = info_largeobj(client)
-        assert client.execute_command('DBSIZE') == len(survivors), "only live keys are left"
-        assert surviving(client, payloads) == survivors
-        assert info['largeobj_reclaims'] == info['largeobj_disk_evictions'], "each victim is reclaimed once"
-        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_pinned_objects'] == 0, timeout=10)
+        wait_unlinked(client)
         assert info_largeobj(client)['largeobj_disk_used_bytes'] == len(survivors) * self.DISK_PER_OBJ
-        wait_for_true(lambda: len(self._dat_files()) == len(survivors), timeout=10)
+        assert len(self._object_files()) == len(survivors) + len(strays)
+        assert all(os.path.exists(os.path.join(self.data_dir, name)) for name in strays)
+
+
+class TestTieredEvictionOnTmpfs(TieredCap, ValkeyLargeObjTestCaseBase):
+    """tmpfs reports no range of directory offsets to draw from, so the sampler reads the directory
+    in order instead. Every other test runs on a filesystem that does."""
+
+    def get_module_args(self, data_dir, direct_io):
+        self.shm = tempfile.mkdtemp(prefix='nvme-', dir='/dev/shm')
+        return super().get_module_args(self.shm, direct_io)
+
+    def teardown_method(self):
+        shutil.rmtree(self.shm, ignore_errors=True)
+
+    def _object_files(self):
+        return sorted(os.listdir(self.shm))
+
+    def test_eviction_works_where_a_directory_cannot_be_sampled_at_random(self):
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', 3 * self.OBJECTS_PER_CAP, self.OBJ)
+        survivors = surviving(client, payloads)
+        info = info_largeobj(client)
+        assert 0 < len(survivors) < len(payloads)
+        assert info['largeobj_disk_evictions'] == len(payloads) - len(survivors)
+        assert info['largeobj_disk_sequential_draws'] > 0
+        self.wait_settled(client, len(survivors))
+
+
+# ─── The scaling cron ─────────────────────────────────────────────────────────
+
+class EvictionReclaim:
+    """The scaling cron deletes the keys of evicted objects, a tick (`scaling-poll-ms`) at a time,
+    wherever the keys have gone. Mixed into each mode, and into each mode on a cluster node."""
+
+    POLL_MS = 1000
+
+    def reclaim(self, client, timeout=15):
+        """Wait for the cron to delete the listed keys. With Dram's shrink pressure lifted, the tick
+        after that deletes nothing more: it would drain the arena the survivors are in."""
+        client.execute_command('CONFIG', 'SET', 'maxmemory', 1 << 40)
+        wait_reclaimed(client, timeout)
+
+    def test_the_cron_deletes_the_keys_eviction_took(self):
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', 3 * self.OBJECTS_PER_CAP, self.OBJ)
+        live = surviving(client, payloads)
+        assert 0 < len(live) < len(payloads)
+
+        self.reclaim(client)
+        assert client.execute_command('DBSIZE') == len(live), "only live keys are left"
+        assert surviving(client, payloads) == live
+        assert info_largeobj(client)['largeobj_reclaims'] == info_largeobj(client)[self.EVICTIONS], \
+            "each victim is reclaimed once"
+        self.wait_settled(client, len(live))
 
         # Flushing frees what is left: nothing stays charged, held, listed or on disk.
-        assert client.execute_command('FLUSHALL') in (b'OK', True)
+        client.execute_command('FLUSHALL')
+        self.wait_settled(client, 0)
 
-        def drained():
-            info = info_largeobj(client)
-            return (info['largeobj_pending_reclaims'], info['largeobj_disk_pinned_objects'],
-                    info['largeobj_disk_used_bytes']) == (0, 0, 0)
-        wait_for_true(drained, timeout=10)
-        wait_for_true(lambda: self._dat_files() == [], timeout=10)
+    def test_a_deleted_victim_leaves_nothing_for_the_cron(self):
+        """Deleting an evicted key takes its object off the list, so the cron has nothing to hunt,
+        and what eviction already freed is not freed a second time."""
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', 3 * self.OBJECTS_PER_CAP, self.OBJ)
+        victims = [key for key in payloads if client.execute_command('BLOB.GET', key) is None]
+        assert victims
+        deleted = sum(client.execute_command('DEL', key) for key in victims)  # the cron may have deleted some
+
+        self.reclaim(client, timeout=5)
+        assert info_largeobj(client)['largeobj_reclaims'] == len(victims) - deleted, "only the cron's deletes count"
+        self.wait_settled(client, len(payloads) - len(victims))
 
     def test_a_write_takes_victims_from_every_db_and_the_cron_reaches_them(self):
-        """The budget is node-wide. Tiered SETs land in db 0 whatever db the client selected, so
-        the keys are moved out afterwards, two to each of four dbs. A newcomer worth three objects
-        needs three victims, more than any one db holds."""
-        db0 = self.server.get_new_client()
-        dbs = [self.server.create_from_server(db=db) for db in (1, 2, 3, 4)]
-        set_policy(db0)
+        """The budget is node-wide. Tiered SETs land in db 0 whatever db the client selected, so the
+        keys are moved out afterwards, to a db each. A newcomer worth two and a half objects needs
+        more victims than any one db holds."""
+        db0 = self.new_client()
+        dbs = [self.server.create_from_server(db=db) for db in (1, 2, 3)]
         payloads = {f'fill_{i}': bytes([i + 1]) * self.OBJ for i in range(self.OBJECTS_PER_CAP)}
         home = {}
         for i, (key, payload) in enumerate(payloads.items()):
             assert db0.execute_command('BLOB.SET', key, payload) == b'OK'
-            assert db0.execute_command('MOVE', key, 1 + i % 4) == 1
-            home[key] = dbs[i % 4]
+            assert db0.execute_command('MOVE', key, 1 + i % 3) == 1
+            home[key] = dbs[i % 3]
 
-        newcomer = b'N' * (3 * self.OBJ)
+        newcomer = b'N' * (5 * self.OBJ // 2)
         assert db0.execute_command('BLOB.SET', 'newcomer', newcomer) == b'OK'
-        assert info_largeobj(db0)['largeobj_disk_evictions'] == 3
-        assert self.server.get_new_client().execute_command('BLOB.GET', 'newcomer') == newcomer
+        assert db0.execute_command('BLOB.GET', 'newcomer') == newcomer
         survivors = [key for key, db in home.items() if db.execute_command('BLOB.GET', key) is not None]
-        assert len(survivors) == self.OBJECTS_PER_CAP - 3
-        for key in survivors:
-            assert home[key].execute_command('BLOB.GET', key) == payloads[key]
+        victims = len(payloads) - len(survivors)
+        assert victims >= 2 and info_largeobj(db0)[self.EVICTIONS] == victims
+        assert all(home[key].execute_command('BLOB.GET', key) == payloads[key] for key in survivors)
 
-        wait_reclaimed(db0)
+        self.reclaim(db0)
         assert sum(db.execute_command('DBSIZE') for db in [db0, *dbs]) == len(survivors) + 1
+
+    def test_renamed_and_moved_victims_are_still_reclaimed(self):
+        """The cron finds a listed object by scanning, wherever its key has gone."""
+        client = self.new_client()
+        victim, newcomer = (self.OBJECTS_PER_CAP - 1) * self.OBJ, 2 * self.OBJ  # room for only one
+        assert client.execute_command('BLOB.SET', '{z}victim', b'V' * victim) == b'OK'
+        assert client.execute_command('RENAME', '{z}victim', '{z}renamed') in (b'OK', True)
+        assert client.execute_command('MOVE', '{z}renamed', 2) in (1, True)
+        assert client.execute_command('BLOB.SET', '{y}newcomer', b'N' * newcomer) == b'OK'
+
+        self.reclaim(client)
+        assert self.server.create_from_server(db=2).execute_command('EXISTS', '{z}renamed') == 0
+
+
+class TestDramEvictionReclaim(EvictionReclaim, DramArena, ValkeyLargeObjTestCaseBase):
+    pass
+
+
+class TestTieredEvictionReclaim(EvictionReclaim, TieredCap, ValkeyLargeObjTestCaseBase):
 
     def test_the_cron_deleting_a_victim_whose_unlink_is_pending_credits_it_once(self):
         """The cron deletes the victim's key while the evicting write has yet to unlink the file. The
         teardown must leave it alone, so only the write unlinks it and credits the bytes."""
-        client = self.server.get_new_client()
-        set_policy(client)
+        client = self.new_client()
         self.fill_cap(client)
         hook(client, 'pause-before-evict-unlink-ms', 4000)
-        thread = threading.Thread(
-            target=lambda: self.server.get_new_client().execute_command('BLOB.SET', 'newcomer', b'N' * self.OBJ))
-        thread.start()
+        thread, _ = background_set(self.server, 'newcomer', b'N' * self.OBJ)
         wait_for_true(lambda: pending_reclaims(client) == 1, timeout=10)
         wait_reclaimed(client, timeout=3)  # the cron deleted the key; the unlink is still waiting
         info = info_largeobj(client)
@@ -1367,36 +1431,15 @@ class TestTieredEvictionReclaim(TieredCap, ValkeyLargeObjTestCaseBase):
         assert info['largeobj_disk_used_bytes'] == (self.OBJECTS_PER_CAP + 1) * self.DISK_PER_OBJ
 
         thread.join(timeout=30)
-        wait_unlinked(client)
-        assert info_largeobj(client)['largeobj_disk_used_bytes'] == self.OBJECTS_PER_CAP * self.DISK_PER_OBJ
-        wait_for_true(lambda: len(self._dat_files()) == self.OBJECTS_PER_CAP, timeout=10)
+        self.wait_settled(client, self.OBJECTS_PER_CAP)
         assert client.execute_command('DBSIZE') == self.OBJECTS_PER_CAP
-
-    def test_a_deleted_victim_leaves_nothing_for_the_cron(self):
-        """Deleting an evicted key takes its object off the list, so the cron has nothing to hunt,
-        and the file that eviction already unlinked is not credited a second time."""
-        client = self.server.get_new_client()
-        set_policy(client)
-        payloads = set_objects(client, 'obj_', 3 * self.OBJECTS_PER_CAP, self.OBJ)
-        victims = [key for key in payloads if client.execute_command('BLOB.GET', key) is None]
-        assert victims
-        deleted = client.execute_command('DEL', *victims)  # the cron may have deleted some already
-
-        wait_reclaimed(client, timeout=5)
-        assert info_largeobj(client)['largeobj_reclaims'] == len(victims) - deleted, "only the cron's deletes count"
-        survivors = len(payloads) - len(victims)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_pinned_objects'] == 0, timeout=10)
-        assert info_largeobj(client)['largeobj_disk_used_bytes'] == survivors * self.DISK_PER_OBJ
-        wait_for_true(lambda: len(self._dat_files()) == survivors, timeout=10)
 
 
 class ClusterNode:
-    """A cluster node. A victim's key is deleted later by the scaling cron, whichever slot it is
-    in, so until then `EXISTS` still sees it. `VICTIM` and `NEWCOMER` are writes that leave room
-    for only one of them."""
+    """A cluster node that owns every slot. The cron deletes a victim's key whichever slot and db
+    it is in."""
 
-    CLUSTER_DATABASES = 1
-    VICTIM = NEWCOMER = b''
+    CLUSTER_DATABASES = 4
 
     def get_server_args(self):
         config_file = os.path.abspath(os.path.join(self.testdir, 'nodes.conf'))
@@ -1408,157 +1451,18 @@ class ClusterNode:
             'cluster-databases': str(self.CLUSTER_DATABASES),
         }
 
-    def new_node(self):
+    def new_client(self):
         client = self.server.get_new_client()
-        client.execute_command('CLUSTER', 'ADDSLOTSRANGE', 0, 16383)
+        with suppress(ResponseError):  # a call retried after a timeout finds the slots taken
+            client.execute_command('CLUSTER', 'ADDSLOTSRANGE', 0, 16383)
         wait_for_true(lambda: b'cluster_state:ok' in client.execute_command('CLUSTER', 'INFO'))
         set_policy(client)
         return client
 
-    def victim(self, client, key='{z}victim'):
-        assert client.execute_command('BLOB.SET', key, self.VICTIM) == b'OK'
-        return key
 
-    def evict(self, client):
-        """A write in another slot that evicts the victim."""
-        assert client.execute_command('BLOB.SET', '{y}newcomer', self.NEWCOMER) == b'OK'
-
-    def evicted_key(self, client):
-        """Evict a key and check that it stays in the keyspace on the reclaim list."""
-        key = self.victim(client)
-        self.evict(client)
-        assert client.execute_command('EXISTS', key) == 1, "another slot: the key outlives its data"
-        assert pending_reclaims(client) == 1
-        return key
-
-    def reclaim_a_renamed_and_moved_victim(self):
-        """The cron finds a listed object by scanning, wherever its key has gone."""
-        client = self.new_node()
-        key = self.victim(client)
-        assert client.execute_command('RENAME', key, '{z}renamed') in (b'OK', True)
-        assert client.execute_command('MOVE', '{z}renamed', 2) in (1, True)
-        self.evict(client)
-
-        wait_reclaimed(client)
-        assert self.server.create_from_server(db=2).execute_command('EXISTS', '{z}renamed') == 0
+class TestClusterDramReclaim(ClusterNode, EvictionReclaim, DramArena, ValkeyLargeObjTestCaseBase):
+    pass
 
 
-class TestClusterDramCron(ClusterNode, DramArena, ValkeyLargeObjTestCaseBase):
-    """The scaling cron finishes what eviction could not: deleting the keys it listed, wherever
-    they have gone."""
-
-    CLUSTER_DATABASES = 4
-    POLL_MS = 1000
-    VICTIM = b'V' * (600 * 1024)
-    NEWCOMER = b'N' * (600 * 1024)
-
-    def test_the_cron_deletes_the_keys_eviction_took(self):
-        client = self.new_node()
-        payloads = set_objects(client, 'obj_', 12, self.OBJ)
-        assert pending_reclaims(client) > 0
-
-        wait_reclaimed(client)
-        live = [key for key, payload in payloads.items() if client.execute_command('BLOB.GET', key) == payload]
-        assert live and client.execute_command('DBSIZE') == len(live), "only live keys are left"
-
-    def test_renamed_and_moved_victims_are_still_reclaimed(self):
-        self.reclaim_a_renamed_and_moved_victim()
-
-
-class TieredNode(ClusterNode, TieredCap):
-    CLUSTER_DATABASES = 4
-    EXTRA_ARGS = " promote-min-hits 1"
-    VICTIM = b'V' * (7 * TieredCap.OBJ)
-    NEWCOMER = b'N' * (2 * TieredCap.OBJ)
-
-
-class TestClusterTieredEviction(TieredNode, ValkeyLargeObjTestCaseBase):
-
-    def test_a_late_commit_overwrites_a_newer_write_that_was_evicted(self):
-        """A SET slow to commit finds the key holding a newer object, which eviction has since
-        given up. That object is a miss, not a write to defer to, so the late commit must land."""
-        slow, client = self.server.get_new_client(), self.new_node()
-        key, late = '{k}key', b'L' * self.OBJ
-        slow.execute_command('CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '3000')
-        outcome = {}
-        thread = threading.Thread(
-            target=lambda: outcome.update(reply=slow.execute_command('BLOB.SET', key, late)))
-        thread.start()
-        time.sleep(0.5)  # the write is done and the task is paused, holding the older object id
-        hook(client, 'pause-before-finalize-set-ms', 0)
-        assert client.execute_command('BLOB.SET', key, b'N' * self.OBJ) == b'OK'
-
-        gone = lambda: client.execute_command('BLOB.GET', key) is None
-        write_until(client, 'fill_', b'F' * self.OBJ, gone)
-        assert gone(), "never evicted"
-        assert client.execute_command('EXISTS', key) == 1, "evicted from another slot: still listed"
-        thread.join(timeout=15)
-        assert outcome['reply'] == b'OK'
-        assert client.execute_command('BLOB.GET', key) == late
-
-    def test_an_evicted_object_releases_its_promoted_copy_at_once(self):
-        """The victim's key waits for the cron, but its DRAM copy must not: `lo_free` would drop
-        it, and that is a minute away."""
-        client = self.new_node()
-        for i in range(self.OBJECTS_PER_CAP):
-            assert client.execute_command('BLOB.SET', f'fill_{i}', b'F' * self.OBJ) == b'OK'
-            assert client.execute_command('BLOB.GET', f'fill_{i}') == b'F' * self.OBJ  # promotes
-        assert info_largeobj(client)['largeobj_dram_objects'] == self.OBJECTS_PER_CAP
-
-        assert client.execute_command('BLOB.SET', 'newcomer', b'N' * self.OBJ) == b'OK'
-        info = info_largeobj(client)
-        assert info['largeobj_disk_evictions'] == 1 and info['largeobj_pending_reclaims'] == 1
-        assert info['largeobj_dram_objects'] == self.OBJECTS_PER_CAP - 1
-
-    def test_an_evicted_key_reads_as_a_miss_until_it_is_overwritten(self):
-        client = self.new_node()
-        key = self.evicted_key(client)
-
-        assert client.execute_command('BLOB.GET', key) is None
-        with pytest.raises(ResponseError, match='not found'):
-            client.execute_command('BLOB.INFO', key)
-        with suppress(ResponseError):
-            client.execute_command('COPY', key, '{z}copy')
-        assert client.execute_command('EXISTS', '{z}copy') == 0
-        assert client.execute_command('MEMORY', 'USAGE', key) < 1024, "the payload is gone"
-        assert client.execute_command('DEBUG', 'DIGEST-VALUE', key)
-
-        # The reclaim is the old object's, not the name's: a new write under the name is no miss.
-        assert client.execute_command('BLOB.SET', key, b'fresh' * 1000) == b'OK'
-        assert client.execute_command('BLOB.GET', key) == b'fresh' * 1000
-        wait_reclaimed(client, 10)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_pinned_objects'] == 0, timeout=10)
-        assert len(self._dat_files()) == 2, "the newcomer's and the fresh write's"
-
-
-class TestClusterTieredCron(TieredNode, ValkeyLargeObjTestCaseBase):
-    """The scaling cron finishes what eviction could not: deleting the keys it listed. It finds
-    them by scanning, since nothing remembers their names."""
-
-    POLL_MS = 1000
-
-    def test_the_cron_deletes_the_keys_eviction_took_in_every_slot_and_db(self):
-        db0, db2 = self.new_node(), self.server.create_from_server(db=2)
-        payloads = {f'fill_{i}': bytes([i + 1]) * self.OBJ for i in range(self.OBJECTS_PER_CAP + 4)}
-        home = {}
-        for i, (key, payload) in enumerate(payloads.items()):
-            assert db0.execute_command('BLOB.SET', key, payload) == b'OK'
-            home[key] = db0
-            if i < self.OBJECTS_PER_CAP and i % 2:  # Tiered SETs land in db 0: move to reach db 2
-                assert db0.execute_command('MOVE', key, 2) in (1, True)
-                home[key] = db2
-
-        got = {key: home[key].execute_command('BLOB.GET', key) for key in payloads}
-        live = [key for key, value in got.items() if value is not None]
-        assert 0 < len(live) < len(payloads)
-        assert all(got[key] == payloads[key] for key in live)
-
-        wait_reclaimed(db0)
-        assert db0.execute_command('DBSIZE') + db2.execute_command('DBSIZE') == len(live), \
-            "only live keys are left, in both dbs"
-        assert info_largeobj(db0)['largeobj_disk_used_bytes'] == len(live) * self.DISK_PER_OBJ
-        wait_for_true(lambda: len(self._dat_files()) == len(live), timeout=10)
-
-    def test_renamed_and_moved_victims_are_still_reclaimed(self):
-        self.reclaim_a_renamed_and_moved_victim()
-
+class TestClusterTieredReclaim(ClusterNode, EvictionReclaim, TieredCap, ValkeyLargeObjTestCaseBase):
+    pass

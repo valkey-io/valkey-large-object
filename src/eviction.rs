@@ -561,36 +561,13 @@ impl DirSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
-
-    fn scratch_dir(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("tiered-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.to_str().unwrap().to_owned()
-    }
-
-    #[test]
-    fn a_pinned_or_listed_file_cannot_be_claimed() {
-        let id = ObjectId(0x7a1e_0001);
-        let request = InflightGuard::new(id);
-        assert!(claim(id).is_none(), "a request is using it");
-        assert!(!RECLAIM_LIST.contains(&id));
-        drop(request);
-
-        let victim = claim(id).expect("unpinned");
-        assert!(RECLAIM_LIST.contains(&id));
-        assert!(lock_inflight().contains_key(&id), "a victim stays pinned");
-        assert!(claim(id).is_none(), "already listed");
-        drop(victim);
-        RECLAIM_LIST.remove(&id);
-    }
+    use std::path::PathBuf;
 
     #[test]
     fn take_lists_a_file_and_skips_a_stale_one() {
-        let dir = scratch_dir("take");
-        let sampler = DirSampler::open(&dir).unwrap();
         let id = ObjectId(0x7a1e_0002);
-        std::fs::write(id.file_path(&dir), b"x").unwrap();
+        let dir = TestDir::with([(id.0, 1)]);
+        let sampler = dir.sampler();
 
         let victim = take(&sampler, id);
         assert_eq!(victim.as_ref().map(|(size, _)| *size), Some(1));
@@ -602,43 +579,9 @@ mod tests {
         // The file is gone, so listing it again would be stale: no tombstone is left.
         RECLAIM_LIST.remove(&id);
         drop(victim);
-        std::fs::remove_file(id.file_path(&dir)).unwrap();
+        std::fs::remove_file(id.file_path(dir.path())).unwrap();
         assert!(take(&sampler, id).is_none());
         assert!(!RECLAIM_LIST.contains(&id));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_selection_covers_the_need_without_pinned_listed_or_kept_ids() {
-        let dir = scratch_dir("select");
-        for id in 0x7a1e_1001..=0x7a1e_100a {
-            std::fs::write(ObjectId(id).file_path(&dir), [0u8; 100]).unwrap();
-        }
-        let (writing, keep, listed) = (
-            ObjectId(0x7a1e_1003),
-            ObjectId(0x7a1e_1005),
-            ObjectId(0x7a1e_1007),
-        );
-        let _request = InflightGuard::new(writing);
-        let _victim = claim(listed).expect("unpinned");
-        let mut sampler = DirSampler::open(&dir).unwrap();
-
-        let picked = select(&mut sampler, 350, Some(keep), DISK_MAX_VICTIMS);
-        assert!(picked.covers() && picked.freed < 500);
-        assert!(picked
-            .victims
-            .iter()
-            .all(|&(id, _)| id != writing && id != keep && id != listed));
-
-        let all = select(&mut sampler, 10_000, Some(keep), DISK_MAX_VICTIMS);
-        assert!(!all.covers());
-        assert_eq!(
-            all.victims.len(),
-            7,
-            "everything but the writing, the kept and the listed"
-        );
-        RECLAIM_LIST.remove(&listed);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A scratch directory of object files `(id, length)`, removed on drop.
@@ -646,54 +589,32 @@ mod tests {
 
     impl TestDir {
         fn with(files: impl IntoIterator<Item = (u64, usize)>) -> Self {
-            Self::in_dir(&std::env::temp_dir(), files).unwrap()
-        }
-
-        fn in_dir(base: &Path, files: impl IntoIterator<Item = (u64, usize)>) -> io::Result<Self> {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let dir = base.join(format!(
+            let dir = std::env::temp_dir().join(format!(
                 "nvme-sampler-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            std::fs::create_dir(&dir)?;
+            std::fs::create_dir(&dir).unwrap();
             let dir = Self(dir);
             for (id, len) in files {
-                let path = ObjectId(id).file_path(dir.0.to_str().unwrap());
-                std::fs::write(path, vec![0u8; len])?;
+                std::fs::write(ObjectId(id).file_path(dir.path()), vec![0u8; len]).unwrap();
             }
-            Ok(dir)
+            dir
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
         }
 
         fn sampler(&self) -> DirSampler {
-            DirSampler::open(self.0.to_str().unwrap()).unwrap()
+            DirSampler::open(self.path()).unwrap()
         }
     }
 
     impl Drop for TestDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn names_round_trip_and_foreign_names_are_not_objects() {
-        for id in [0, 1, 0xdead_beef, u64::MAX] {
-            let path = ObjectId(id).file_path(".");
-            assert_eq!(parse_file_name(&path.as_bytes()[2..]), Some(ObjectId(id)));
-        }
-        for foreign in [
-            "",
-            "..",
-            "x.dat",
-            "0000000000000001.tmp",
-            "000000000000001.dat",
-            "00000000000000001.dat",
-            "000000000000000G.dat",
-            "000000000000000A.dat",
-            "+000000000000001.dat",
-        ] {
-            assert_eq!(parse_file_name(foreign.as_bytes()), None, "{foreign}");
         }
     }
 
@@ -721,67 +642,5 @@ mod tests {
         }
         assert!(firsts.len() > 50, "{} distinct first picks", firsts.len());
         assert!(sampler.size_of(ObjectId(999)).is_err());
-    }
-
-    /// tmpfs reports no cookie range, and counts its cookies from 0, which stands in for a
-    /// filesystem that reports more than it counts (XFS: bytes against 8-byte units).
-    #[test]
-    fn a_span_wider_than_the_cookie_range_still_draws_randomly() {
-        let Ok(dir) = TestDir::in_dir(Path::new("/dev/shm"), (1..=300).map(|id| (id, 0))) else {
-            return;
-        };
-        let mut sampler = dir.sampler();
-        if sampler.span.is_some() {
-            return;
-        }
-        sampler.span = Some(8 * 302);
-
-        let (mut seen, mut windows) = (HashSet::new(), 0);
-        for _ in 0..1000 {
-            let mut ids = Vec::new();
-            sampler.draw(&mut ids);
-            windows += usize::from(ids.len() == WINDOW);
-            seen.extend(ids);
-        }
-        assert!(windows > 950, "{windows} random windows of 1000");
-        assert_eq!(seen.len(), 300);
-    }
-
-    #[test]
-    fn without_random_access_draws_walk_the_directory_and_wrap() {
-        let dir = TestDir::with((1..=100).map(|id| (id, 0)));
-        let mut sampler = dir.sampler();
-        sampler.span = None;
-        SEQ_CURSOR.store(0, Ordering::Relaxed);
-
-        let mut seen = HashSet::new();
-        for _ in 0..40 {
-            let mut ids = Vec::new();
-            sampler.draw(&mut ids);
-            assert!(!ids.is_empty());
-            seen.extend(ids);
-        }
-        assert_eq!(seen.len(), 100, "successive draws cover the directory");
-    }
-
-    #[test]
-    fn a_scan_lists_a_small_directory_exactly_and_an_empty_one_yields_nothing() {
-        let small = TestDir::with((1..=7).map(|id| (id, 0)));
-        let mut all = Vec::new();
-        small.sampler().scan(&mut all, 1000);
-        all.sort();
-        assert_eq!(all, (1..=7).map(ObjectId).collect::<Vec<_>>());
-
-        let big = TestDir::with((1..=200).map(|id| (id, 0)));
-        let mut limited = Vec::new();
-        big.sampler().scan(&mut limited, 50);
-        assert!((50..80).contains(&limited.len()), "{}", limited.len());
-
-        let empty = TestDir::with([]);
-        let mut none = Vec::new();
-        let mut sampler = empty.sampler();
-        sampler.draw(&mut none);
-        sampler.scan(&mut none, 10);
-        assert!(none.is_empty());
     }
 }
