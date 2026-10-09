@@ -4,7 +4,7 @@
 
 **One `.so`** — single Valkey module with three internal layers:
 
-- **Data Type** — Valkey keyspace: LoValue struct, commands (BLOB.HELLO, BLOB.GET, BLOB.SET), native DEL free callback, OID generation
+- **Data Type** — Valkey keyspace: LoValue struct, commands (BLOB.RDMA_HELLO, BLOB.TCP_GET, BLOB.RDMA_GET, BLOB.TCP_SET, BLOB.RDMA_SET), native DEL free callback, OID generation
 - **Engine** — Routes commands through (OperatingMode × Transport) matrix. Decides sync vs async. Owns the `EngineResult` pattern.
 - **Storage** — SegmentPool + talc allocator, DRAMPool, NVMePool, io_uring (ReadFixed/WriteFixed), FdPool
 - **Transport** — EFA/libfabric (callback-based, oneshot bridge to tokio)
@@ -165,7 +165,7 @@ async fn efa_write_to_client(session: Arc<Session>, buf_ptr: usize, len, rkey, r
 | `segment-size` | 64mb | Size of each DRAMPool segment |
 | `nvme-dir` | (required if Tiered) | Dedicated, module-owned directory for .dat files. Wiped wholesale on startup and teardown, so it must NOT be shared with other files. |
 | `nvme-maxmemory` | 10gb | Max disk usage |
-| `nvme-staging-size` | 64mb | Single NVMe staging segment (DRAM) |
+| `disk-staging-size` | 64mb | Single NVMe staging segment (DRAM) |
 | `max-promote-size` | 256mb | Max object size for DRAMPool promotion. 0 = disable. |
 | `worker-threads` | 2 | Tokio runtime thread count |
 | `direct-io` | yes | O_DIRECT for NVMe files |

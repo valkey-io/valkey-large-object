@@ -1,6 +1,6 @@
 //! The fabric services: one `asynchronous::FabricService` per libfabric domain, started at module
 //! load and dropped at shutdown. Pool segments are registered on them at load.
-//! `BLOB.HELLO` inserts the client's address on all of them. On disconnect the client's entry on
+//! `BLOB.RDMA_HELLO` inserts the client's address on all of them. On disconnect the client's entry on
 //! each is released.
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -130,7 +130,7 @@ impl Fabric {
             .len()
     }
 
-    /// Insert the client's address into every service's address vector at BLOB.HELLO, so its
+    /// Insert the client's address into every service's address vector at BLOB.RDMA_HELLO, so its
     /// transfers post against a known peer and an unusable address fails the hello instead.
     pub fn add_peer(&self, client_id: u64, address: &[u8]) -> Result<(), String> {
         for (index, service) in self.services.iter().enumerate() {
@@ -141,7 +141,7 @@ impl Fabric {
         Ok(())
     }
 
-    /// One fabric address per service, in service order; what `BLOB.HELLO` returns.
+    /// One fabric address per service, in service order; what `BLOB.RDMA_HELLO` returns.
     pub fn local_addresses(&self) -> impl Iterator<Item = &[u8]> {
         self.services.iter().map(FabricService::local_address)
     }
@@ -157,7 +157,7 @@ impl Fabric {
 // ─── Global Fabric ───────────────────────────────────────────────────────────
 
 /// `None` before `commit` and after `shutdown`. `None` at commit means this instance has no
-/// fabric: the module runs TCP-only and `BLOB.HELLO` reports EFA unavailable.
+/// fabric: the module runs TCP-only and `BLOB.RDMA_HELLO` reports RDMA unavailable.
 static FABRIC: Mutex<Option<Arc<Fabric>>> = Mutex::new(None);
 
 fn slot() -> MutexGuard<'static, Option<Arc<Fabric>>> {

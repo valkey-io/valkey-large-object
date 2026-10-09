@@ -18,7 +18,7 @@ use crate::storage::{Crc, ObjectFile};
 
 // ─── ObjectId ────────────────────────────────────────────────────────────────
 
-/// ObjectId IS the file path: deterministic mapping OID → "{nvme_dir}/{oid:016x}.dat"
+/// ObjectId IS the file path: deterministic mapping OID → "{disk_dir}/{oid:016x}.dat"
 /// No lookup table. Compact u64 safe for replication streams, RDB, and LoValue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(pub u64);
@@ -36,8 +36,8 @@ impl ObjectId {
     }
 
     /// Deterministic file path from OID.
-    pub fn file_path(&self, nvme_dir: &str) -> String {
-        format!("{}/{:016x}.dat", nvme_dir, self.0)
+    pub fn file_path(&self, disk_dir: &str) -> String {
+        format!("{}/{:016x}.dat", disk_dir, self.0)
     }
 }
 
@@ -56,7 +56,7 @@ impl Tier {
     pub fn as_str(self) -> &'static str {
         match self {
             Tier::Dram => "dram",
-            Tier::Nvme => "nvme",
+            Tier::Nvme => "disk",
         }
     }
 }

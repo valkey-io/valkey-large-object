@@ -363,13 +363,16 @@ pub(crate) fn reply_stream_err(
 ) {
     use StreamError::*;
     let (metric, err): (&std::sync::atomic::AtomicU64, &str) = match e {
-        NvmeRead => (&crate::info::NVME_READ_ERRORS, crate::errors::ERR_NVME_READ),
+        NvmeRead => (&crate::info::DISK_READ_ERRORS, crate::errors::ERR_DISK_READ),
         NvmeWrite => (
-            &crate::info::NVME_WRITE_ERRORS,
-            crate::errors::ERR_NVME_WRITE,
+            &crate::info::DISK_WRITE_ERRORS,
+            crate::errors::ERR_DISK_WRITE,
         ),
-        EfaRead => (&crate::info::EFA_READ_ERRORS, crate::errors::ERR_EFA_READ),
-        EfaWrite => (&crate::info::EFA_WRITE_ERRORS, crate::errors::ERR_EFA_WRITE),
+        EfaRead => (&crate::info::RDMA_READ_ERRORS, crate::errors::ERR_RDMA_READ),
+        EfaWrite => (
+            &crate::info::RDMA_WRITE_ERRORS,
+            crate::errors::ERR_RDMA_WRITE,
+        ),
     };
     crate::engine::reply_err(thread_ctx, metric, ValkeyError::Str(err));
 }
@@ -748,10 +751,10 @@ pub(crate) async fn efa_transfer_addrs(
     direction: EfaDirection,
 ) -> Result<u32, ValkeyError> {
     // TODO: Track specific EFA error types (e.g. timeout, connection reset) before
-    // collapsing to the generic ERR_EFA_READ/ERR_EFA_WRITE reply string.
+    // collapsing to the generic ERR_RDMA_READ/ERR_RDMA_WRITE reply string.
     let err_str = match direction {
-        EfaDirection::Write => crate::errors::ERR_EFA_WRITE,
-        EfaDirection::Read => crate::errors::ERR_EFA_READ,
+        EfaDirection::Write => crate::errors::ERR_RDMA_WRITE,
+        EfaDirection::Read => crate::errors::ERR_RDMA_READ,
     };
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
@@ -792,7 +795,7 @@ pub(crate) async fn efa_transfer_addrs(
     while let Some((idx, (outcome, _operand))) = indexed_futures.next().await {
         // Already failing — remaining futures are in-flight RMAs being drained.
         if failed {
-            crate::info::EFA_DISCARDED_TRANSFERS.fetch_add(1, Ordering::Relaxed);
+            crate::info::RDMA_DISCARDED_TRANSFERS.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         let done = match outcome {

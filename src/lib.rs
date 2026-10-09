@@ -7,7 +7,7 @@
 //!       ↓ passes buffers to
 //!   Transport (EFA, fi_write/fi_read)
 //!
-//! Commands: BLOB.HELLO, BLOB.GET, BLOB.SET
+//! Commands: BLOB.RDMA_HELLO, BLOB.TCP_GET, BLOB.RDMA_GET, BLOB.TCP_SET, BLOB.RDMA_SET
 //! Deletion: native Valkey DEL triggers module free callback.
 
 // ─── Initialization Order ────────────────────────────────────────────────────
@@ -16,9 +16,9 @@
 // all steps complete:
 //
 //   1. Fabric::start()         — one libfabric service per domain. On missing
-//                                fabric, the EFA path is unavailable and BLOB.HELLO
+//                                fabric, the EFA path is unavailable and BLOB.RDMA_HELLO
 //                                gives an error.
-//   2. storage::init(mode, nvme_dir)
+//   2. storage::init(mode, disk_dir)
 //                              — validate config, allocate pool segments, create
 //                                the per-pool io_uring engines and start the
 //                                smartlog poller (Tiered only). All resources are
@@ -29,7 +29,7 @@
 //                              — fi_mr_reg pool buffers with EFA domains.
 //   4. RUNTIME.set(rt)         — commit tokio runtime last (only used by commands).
 //
-// After step 4, commands (BLOB.GET, BLOB.SET, BLOB.HELLO) may execute safely.
+// After step 4, commands (BLOB.TCP_GET, BLOB.RDMA_GET, BLOB.TCP_SET, BLOB.RDMA_SET, BLOB.RDMA_HELLO) may execute safely.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::sync::atomic::{AtomicBool, AtomicI64};
@@ -79,8 +79,8 @@ pub const MODULE_VERSION: i32 = 1;
 // ─── Module Configurations (ValkeyModule Config API) ─────────────────────────
 
 lazy_static::lazy_static! {
-    /// Data directory for NVMe object files. Required. Immutable after load.
-    static ref CFG_NVME_DIR: Mutex<String> = Mutex::new(String::new());
+    /// Data directory for disk object files. Required. Immutable after load.
+    static ref CFG_DISK_DIR: Mutex<String> = Mutex::new(String::new());
 
     /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 1GiB.
     /// Used in Tiered mode for read/write staging. Split into uniform
@@ -93,8 +93,8 @@ lazy_static::lazy_static! {
     /// Default: 1 GiB. Immutable after load.
     static ref CFG_SEGMENT_SIZE: AtomicI64 = AtomicI64::new(1024 * 1024 * 1024);
 
-    /// Max disk usage in nvme-dir. Default: 0 (unlimited).
-    static ref CFG_NVME_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
+    /// Max disk usage in disk-dir. Default: 0 (unlimited).
+    static ref CFG_DISK_MAXMEMORY: AtomicI64 = AtomicI64::new(0);
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
     static ref CFG_WORKER_THREADS: AtomicI64 = AtomicI64::new(2);
@@ -141,7 +141,7 @@ lazy_static::lazy_static! {
     /// the scaling cron evicts the least-used DRAM segment. Default: 0.90 (90%).
     static ref CFG_SCALING_SHRINK_WATERMARK: AtomicI64 = AtomicI64::new(90); // stored as percent
 
-    /// Bench mode: BLOB.GET TCP path replies with size integer instead of bulk value bytes.
+    /// Bench mode: BLOB.TCP_GET path replies with size integer instead of bulk value bytes.
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
     static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
 
@@ -201,7 +201,7 @@ lazy_static::lazy_static! {
     /// Min buffers to start a streaming operation. Below this → reject. Default: 2.
     static ref CFG_MIN_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(2);
 
-    /// Maximum allowed object size for BLOB.SET. Rejects writes exceeding this limit.
+    /// Maximum allowed object size for BLOB.TCP_SET / BLOB.RDMA_SET. Rejects writes exceeding this limit.
     /// Default: 512 MiB. Must fit in one segment in Dram mode (object_fits_segment
     /// check). Supports memory notation (e.g., "512mb").
     static ref CFG_MAX_OBJECT_SIZE: AtomicI64 = AtomicI64::new(512 * 1024 * 1024);
@@ -234,10 +234,10 @@ pub fn is_main_thread() -> bool {
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
-pub fn nvme_dir() -> String {
-    CFG_NVME_DIR
+pub fn disk_dir() -> String {
+    CFG_DISK_DIR
         .lock()
-        .expect("CFG_NVME_DIR lock unavailable")
+        .expect("CFG_DISK_DIR lock unavailable")
         .clone()
 }
 
@@ -254,8 +254,8 @@ pub fn segment_size() -> usize {
     CFG_SEGMENT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
-pub fn nvme_maxmemory() -> u64 {
-    CFG_NVME_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn disk_maxmemory() -> u64 {
+    CFG_DISK_MAXMEMORY.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn worker_threads() -> usize {
@@ -474,7 +474,7 @@ fn config_constraints() -> &'static [ConfigConstraint] {
     static CONSTRAINTS: LazyLock<Vec<ConfigConstraint>> = LazyLock::new(|| {
         vec![
             ConfigConstraint {
-                parent: &CFG_NVME_MAXMEMORY,
+                parent: &CFG_DISK_MAXMEMORY,
                 child: &CFG_MAX_OBJECT_SIZE,
                 enforce_condition: || operating_mode() == OperatingMode::Tiered,
                 // 0 = unlimited; skip the check.
@@ -585,7 +585,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
-    let dir = nvme_dir();
+    let dir = disk_dir();
 
     // Validate cross-config constraints now that all configs are finalized.
     // Per-config callbacks skip validation at load time (non-deterministic processing
@@ -600,7 +600,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // unclean exit — a hard crash / SIGKILL never reaches our shutdown handler.
     // If the reset fails we can't guarantee a clean slate, so refuse to load
     // rather than start dirty.
-    if let Err(e) = storage::validate_and_clean_nvme_dir(mode, &dir) {
+    if let Err(e) = storage::validate_and_clean_disk_dir(mode, &dir) {
         ctx.log_warning(&format!(
             "largeobj: startup failed to reset nvme-dir {}: {}; aborting module load",
             dir, e
@@ -642,7 +642,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     if let Some(fabric) = &fabric {
         for (index, address) in fabric.local_addresses().enumerate() {
             ctx.log_notice(&format!(
-                "largeobj: fabric service {index} address {}",
+                "largeobj: fabric service {index} rdma address {}",
                 encode_hex(address)
             ));
         }
@@ -691,8 +691,8 @@ fn deinitialize(_ctx: &Context) -> Status {
 fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     smartlog::signal_shutdown();
     transport::shutdown();
-    let dir = nvme_dir();
-    if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
+    let dir = disk_dir();
+    if let Err(e) = storage::validate_and_clean_disk_dir(operating_mode(), &dir) {
         ctx.log_warning(&format!(
             "largeobj: shutdown cleanup failed to reset nvme-dir {}: {}",
             dir, e
@@ -712,18 +712,20 @@ valkey_module! {
         "largeobj",
     ]
     commands: [
-        ["BLOB.HELLO", commands::lo_hello, "fast", 0, 0, 0, "connection largeobj fast"],
-        ["BLOB.GET", commands::lo_get, "readonly fast", 1, 1, 1, "read largeobj fast"],
-        ["BLOB.SET", commands::lo_set, "write deny-oom fast", 1, 1, 1, "write largeobj fast"],
+        ["BLOB.TCP_GET", commands::lo_tcp_get, "readonly fast", 1, 1, 1, "read largeobj fast"],
+        ["BLOB.TCP_SET", commands::lo_tcp_set, "write deny-oom fast", 1, 1, 1, "write largeobj fast"],
+        ["BLOB.RDMA_HELLO", commands::lo_rdma_hello, "fast", 0, 0, 0, "connection largeobj fast"],
+        ["BLOB.RDMA_GET", commands::lo_rdma_get, "readonly fast", 1, 1, 1, "read largeobj fast"],
+        ["BLOB.RDMA_SET", commands::lo_rdma_set, "write deny-oom fast", 1, 1, 1, "write largeobj fast"],
         ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1, "read largeobj fast"],
     ],
     configurations: [
         i64: [
             ["segment-size", &*CFG_SEGMENT_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
+            ["disk-staging-size", &*CFG_NVME_STAGING_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 0, 0, i64::MAX,
+            ["disk-maxmemory", &*CFG_DISK_MAXMEMORY, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["worker-threads", &*CFG_WORKER_THREADS, 2, 1, 32,
              ConfigurationFlags::IMMUTABLE, None, None],
@@ -765,7 +767,7 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
         ],
         string: [
-            ["nvme-dir", &*CFG_NVME_DIR, "", ConfigurationFlags::IMMUTABLE, None],
+            ["disk-dir", &*CFG_DISK_DIR, "", ConfigurationFlags::IMMUTABLE, None],
             ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
@@ -795,7 +797,7 @@ mod tests {
     /// Reset all constrained configs to their compile-time defaults. Other tests
     /// (e.g. segment_pool) may mutate shared statics without restoring them.
     fn reset_constrained_defaults() {
-        CFG_NVME_MAXMEMORY.store(0, Relaxed); // 0 = unlimited
+        CFG_DISK_MAXMEMORY.store(0, Relaxed); // 0 = unlimited
         CFG_NVME_STAGING_SIZE.store(1024 * 1024 * 1024, Relaxed); // 1 GiB
         CFG_SEGMENT_SIZE.store(1024 * 1024 * 1024, Relaxed); // 1 GiB
         CFG_CHUNK_SIZE.store(8 * 1024 * 1024, Relaxed); // 8 MiB
@@ -818,7 +820,7 @@ mod tests {
     /// their current value. Used to snapshot defaults and restore between cases.
     fn all_constrained_configs() -> Vec<(&'static AtomicI64, i64)> {
         vec![
-            (&CFG_NVME_MAXMEMORY, CFG_NVME_MAXMEMORY.load(Relaxed)),
+            (&CFG_DISK_MAXMEMORY, CFG_DISK_MAXMEMORY.load(Relaxed)),
             (&CFG_NVME_STAGING_SIZE, CFG_NVME_STAGING_SIZE.load(Relaxed)),
             (&CFG_SEGMENT_SIZE, CFG_SEGMENT_SIZE.load(Relaxed)),
             (&CFG_CHUNK_SIZE, CFG_CHUNK_SIZE.load(Relaxed)),
@@ -877,7 +879,7 @@ mod tests {
             (
                 "mode_conditional_constraint_skipped_when_inactive",
                 OperatingMode::Dram,
-                vec![(&CFG_NVME_MAXMEMORY, 1)],
+                vec![(&CFG_DISK_MAXMEMORY, 1)],
                 None,
             ),
             (
@@ -916,7 +918,7 @@ mod tests {
                 "staging_lt_segment_rejected",
                 OperatingMode::Tiered,
                 vec![(&CFG_NVME_STAGING_SIZE, segment - 1)],
-                Some("nvme-staging-size must be >= segment-size"),
+                Some("disk-staging-size must be >= segment-size"),
             ),
             (
                 "buffers_max_lt_min_rejected",
@@ -927,8 +929,8 @@ mod tests {
             (
                 "tiered_mode_nvme_lt_max_obj_rejected",
                 OperatingMode::Tiered,
-                vec![(&CFG_NVME_MAXMEMORY, max_obj - 1)],
-                Some("nvme-maxmemory must be >= max-object-size in Tiered mode"),
+                vec![(&CFG_DISK_MAXMEMORY, max_obj - 1)],
+                Some("disk-maxmemory must be >= max-object-size in Tiered mode"),
             ),
         ]
     }

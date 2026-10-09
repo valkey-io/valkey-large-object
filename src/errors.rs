@@ -16,42 +16,45 @@ macro_rules! define_errors {
 
 define_errors! {
     // Command Errors
-    ERR_EFA_UNAVAILABLE => "ERR EFA unavailable on this instance",
-    ERR_INVALID_PEER_ADDR_HEX => "ERR invalid peer address hex",
-    ERR_PEER_ADDR_LEN => "ERR peer address must be 32 bytes",
-    ERR_PEER_ADDR_EMPTY => "ERR peer address must not be empty",
-    ERR_MALFORMED_ADDR_ARGS => "ERR address args must be rkey, addr, len triples",
-    ERR_TOO_MANY_ADDRESSES => "ERR too many addresses (max 256)",
+    ERR_RDMA_UNAVAILABLE => "ERR RDMA provider unavailable on this instance",
+    ERR_INVALID_RDMA_ADDR_HEX => "ERR invalid rdma address hex",
+    ERR_RDMA_ADDR_LEN => "ERR rdma address must be 32 bytes",
+    ERR_RDMA_ADDR_EMPTY => "ERR rdma address must not be empty",
+    ERR_MALFORMED_MEMORY_ADDR_ARGS => "ERR memory address args must be rkey, addr, len triples",
+    ERR_TOO_MANY_MEMORY_ADDRESSES => "ERR too many memory addresses (max 256)",
     ERR_INVALID_RKEY => "ERR invalid rkey",
-    ERR_INVALID_REMOTE_ADDR => "ERR invalid remote_addr",
-    ERR_INVALID_ADDR_LEN => "ERR invalid addr len",
-    ERR_INSUFFICIENT_ADDR_SPACE => "ERR client address space smaller than object length",
+    ERR_INVALID_MEMORY_ADDR => "ERR invalid memory address",
+    ERR_INVALID_MEMORY_ADDR_LEN => "ERR invalid memory address len",
     ERR_INVALID_LEN => "ERR invalid len",
     ERR_MAX_OBJECT_SIZE_EXCEEDED => "ERR max object size exceeded",
-    ERR_NO_DMA_SESSION => "ERR no DMA session (call BLOB.HELLO first)",
-    ERR_DMA_SESSION_EXISTS => "ERR DMA session already established (one BLOB.HELLO per connection)",
-    ERR_DRAM_POOL_EXHAUSTED => "ERR DRAM buffer pool exhausted",
-    ERR_NOT_FOUND => "ERR not found",
-    ERR_INVALID_INFO_FIELD => "ERR invalid information value",
+    ERR_NO_RDMA_SESSION => "ERR no RDMA session (call BLOB.RDMA_HELLO first)",
+    ERR_RDMA_SESSION_EXISTS => "ERR RDMA session already established",
+    ERR_INVALID_INFO_FIELD => "ERR invalid information field",
+
+    // OOM — matches the standard Valkey OOM error prefix so clients can
+    // distinguish memory exhaustion from other errors programmatically.
+    // The INFO metric counters (dram_pool_exhausted, disk_staging_buffer_exhausted,
+    // disk_capacity_exceeded) tell the operator which resource was exhausted.
+    ERR_OOM => "OOM command not allowed when used memory > 'maxmemory'.",
+    ERR_OOM_DISK => "OOM command not allowed when used disk space > 'disk-maxmemory'.",
 
     // Storage/Engine Errors
-    ERR_NVME_READ => "ERR NVMe read",
-    ERR_NVME_WRITE => "ERR NVMe write",
-    ERR_EFA_WRITE => "ERR EFA write",
-    ERR_EFA_READ => "ERR EFA read",
+    ERR_DISK_READ => "ERR disk read failed",
+    ERR_DISK_WRITE => "ERR disk write failed",
+    ERR_RDMA_WRITE => "ERR RDMA write failed",
+    ERR_RDMA_READ => "ERR RDMA read failed",
     ERR_SESSION_CREATE => "ERR session create",
 
     // Streaming Errors
-    ERR_INSUFFICIENT_NVME_BUFFERS => "ERR NVMe staging buffer pool exhausted",
-    ERR_NVME_CAPACITY_EXCEEDED => "ERR NVMe disk capacity exceeded",
+    ERR_DISK_STAGING_EXHAUSTED => "ERR disk staging buffer pool exhausted",
     ERR_SET_VALUE => "ERR failed to set key",
 
     // Config Validation Errors
     ERR_ZERO_LENGTH_OBJECT => "ERR object length must be > 0",
-    ERR_NVME_GE_MAX_OBJ => "ERR nvme-maxmemory must be >= max-object-size in Tiered mode",
+    ERR_NVME_GE_MAX_OBJ => "ERR disk-maxmemory must be >= max-object-size in Tiered mode",
     ERR_SEGMENT_GE_MAX_OBJ => "ERR segment-size is insufficient for max-object-size",
     ERR_SEGMENT_GE_PROMOTE => "ERR segment-size is insufficient for max-promote-size",
-    ERR_STAGING_GE_SEGMENT => "ERR nvme-staging-size must be >= segment-size",
+    ERR_STAGING_GE_SEGMENT => "ERR disk-staging-size must be >= segment-size",
     ERR_SEGMENT_GE_CHUNK => "ERR segment-size must be >= chunk-size",
     ERR_MAX_BUF_GE_MIN_BUF => "ERR max-buffers-per-op must be >= min-buffers-per-op",
 }
@@ -63,11 +66,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_all_errors_have_err_prefix() {
+    fn test_all_errors_have_err_or_oom_prefix() {
         for err in ALL_ERRORS {
             assert!(
-                err.starts_with("ERR "),
-                "Error string missing 'ERR ' prefix: {:?}",
+                err.starts_with("ERR ") || err.starts_with("OOM "),
+                "Error string missing 'ERR ' or 'OOM ' prefix: {:?}",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_errors_fit_in_128_bytes() {
+        for err in ALL_ERRORS {
+            assert!(
+                err.len() <= 128,
+                "Error string exceeds 128 bytes ({} bytes): {:?}",
+                err.len(),
                 err
             );
         }

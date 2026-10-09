@@ -2,7 +2,7 @@
 
 ## Overview
 
-`bench.sh` measures BLOB.GET throughput across four modes:
+`bench.sh` measures BLOB.TCP_GET throughput across four modes:
 
 | Mode | What it tests |
 |------|---------------|
@@ -55,7 +55,7 @@ For each mode × size combination:
 
 ## bench-mode
 
-The module is loaded with `bench-mode yes`. This makes BLOB.GET reply with an integer (the object size) instead of the actual bulk data. This isolates storage + io_uring throughput from TCP output buffer overhead. The full NVMe read still happens — only the reply is shortened.
+The module is loaded with `bench-mode yes`. This makes BLOB.TCP_GET reply with an integer (the object size) instead of the actual bulk data. This isolates storage + io_uring throughput from TCP output buffer overhead. The full NVMe read still happens — only the reply is shortened.
 
 ## Key Format
 

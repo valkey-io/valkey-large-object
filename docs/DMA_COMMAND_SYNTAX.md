@@ -23,8 +23,8 @@ Three designs were evaluated. **Option 2 (per-request rkey with session routing)
 
 **Option 2 is chosen for the initial integration** for clarity and because it's the natural first step toward option 3, should it be found necessary.
 - The libfabric connection management is still stateful, and without a client lifetime to bind to it, the connection address vector registry grows without bound. Ignoring state does not make it stateless.
-- Swimlanes are easier to debug and understand, and client address errors are better communicated at HELLO during a handshake than at the first BLOB.GET down in some workflow.
-- Opting into 3 in the future can be done by making the commands modal - HELLO without an address makes BLOB.GET require a target address.
+- Swimlanes are easier to debug and understand, and client address errors are better communicated at HELLO during a handshake than at the first BLOB.RDMA_GET down in some workflow.
+- Opting into 3 in the future can be done by making the commands modal - HELLO without an address makes BLOB.RDMA_GET require a target address.
 
 ---
 
@@ -65,16 +65,16 @@ Each term builds on the previous.
 
 ## 2. Option 2: Per-Request rkey with HELLO
 
-Client establishes a session once via `BLOB.HELLO` using the provided client EFA addr. Server registers the client EFA addr on all its N EFA devices. Subsequent GET/SET commands carry the client's rkey and remote_addr — the client chooses which memory address to use per request. A second `BLOB.HELLO` on the same connection is refused (`ERR DMA session already established`), because the efa-direct provider cannot hold a client's old and new endpoint at once when the new one reuses the old QPN.
+Client establishes a session once via `BLOB.RDMA_HELLO` using the provided client EFA addr. Server registers the client EFA addr on all its N EFA devices. Subsequent RDMA_GET/RDMA_SET commands carry the client's rkey and remote_addr — the client chooses which memory address to use per request. A second `BLOB.RDMA_HELLO` on the same connection is refused (`ERR DMA session already established`), because the efa-direct provider cannot hold a client's old and new endpoint at once when the new one reuses the old QPN.
 
 **Threading model:** The session holds routing handles for all N server EFA devices. Any thread can use any device for a given operation — the server picks the least-loaded device (least-loaded). Threads do not own specific devices.
 
 **Session:** Module-level bookkeeping only — not an EFA-level connection (EFA is connectionless datagrams). Stores one routing handle (`dest_fi_addr`) per server EFA device for targeting the client. No memory regions, no rkeys stored. Created at HELLO, freed on disconnect. The EFA layer itself has no concept of a session.
 
-### BLOB.HELLO
+### BLOB.RDMA_HELLO
 
 ```
-BLOB.HELLO <client_efa_addr_hex>
+BLOB.RDMA_HELLO <client_efa_addr_hex>
 ```
 
 **What happens:**
@@ -82,17 +82,17 @@ BLOB.HELLO <client_efa_addr_hex>
 | Step | Who | Action |
 |------|-----|--------|
 | 1 | Client | `fi_getname()` → gets own EFA address |
-| 2 | Client | Sends `BLOB.HELLO` with its EFA address |
+| 2 | Client | Sends `BLOB.RDMA_HELLO` with its EFA address |
 | 3 | Server | `fi_av_insert(client_addr)` on ALL N EFA devices → N dest_fi_addr handles |
 | 4 | Server | Returns array of ALL N server EFA addresses |
 | 5 | Client | `fi_av_insert(server_addr)` for each returned address |
 
 **Result:** Server can fi_write/fi_read to the client's single EFA address from any of its N devices (1 client EFA addr : N server EFA devices). Client accepts writes from any server device.
 
-### BLOB.GET (DMA)
+### BLOB.RDMA_GET (DMA)
 
 ```
-BLOB.GET <key> <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
+BLOB.RDMA_GET <key> <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
 ```
 
 One or more addresses per request, so a client whose object spans several registered
@@ -108,10 +108,10 @@ command. The address count is inferred from the argument count (must be a multip
 | 5 | Server | Waits for CQ completions, replies `[obj_len, crc32c]` |
 | 6 | Client | Data is already in GPU memory across its addresses; `obj_len` says where the object ends and any surplus buffer begins. |
 
-### BLOB.SET (DMA)
+### BLOB.RDMA_SET (DMA)
 
 ```
-BLOB.SET <key> <total_len> <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
+BLOB.RDMA_SET <key> <total_len> <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
 ```
 
 `total_len` is the object's length; the addresses are where its bytes currently live.
@@ -131,7 +131,7 @@ The address count is inferred from the argument count (must be a multiple of 3).
 
 | What | Lifetime | Set when |
 |------|----------|----------|
-| dest_fi_addr handles (N per client) | Session | BLOB.HELLO |
+| dest_fi_addr handles (N per client) | Session | BLOB.RDMA_HELLO |
 | TCP connection | Session | Client connects |
 | rkey | Per-request | Client chooses |
 | remote_addr | Per-request | Client chooses |
@@ -201,7 +201,7 @@ BLOB.SET <key> <client_efa_addr> <remote_addr> <rkey> <len>
 
 | Aspect | Option 2 (implemented) | Option 3 (deferred) |
 |--------|:---:|:---:|
-| Setup command | `BLOB.HELLO` (client addr) | `BLOB.EFAINFO` (discovery only) |
+| Setup command | `BLOB.RDMA_HELLO` (client addr) | `BLOB.EFAINFO` (discovery only) |
 | Setup reply | ALL server EFA addrs | ONE server EFA addr |
 | fi_av_insert timing | Once at HELLO, on ALL devices | Lazy, per thread, on first request from each client |
 | GET/SET args (beyond key) | rkey, remote_addr, len | client_efa_addr, rkey, remote_addr, len |
@@ -213,7 +213,7 @@ BLOB.SET <key> <client_efa_addr> <remote_addr> <rkey> <len>
 | Per-command overhead | ~26 bytes | ~90 bytes |
 | Session metrics/limits | Yes | No (would need cache-based counting) |
 | Multi-device LB | Explicit, optimal | Implicit, depends on thread distribution |
-| Migration direction | → delete session map, add client_addr arg | ← add HELLO, remove client_addr arg |
+| Migration direction | → delete session map, add client_addr arg | ← add RDMA_HELLO, remove client_addr arg |
 
 ---
 
@@ -222,9 +222,9 @@ BLOB.SET <key> <client_efa_addr> <remote_addr> <rkey> <len>
 Client declares all memory regions at HELLO. Server stores them. Commands reference regions by index.
 
 ```
-BLOB.HELLO <client_efa_addr> <num_regions> <rkey_0> <addr_0> <len_0> ...
-BLOB.GET <key> <region_idx> <offset>
-BLOB.SET <key> <len> <region_idx> <offset>
+BLOB.RDMA_HELLO <client_efa_addr> <num_regions> <rkey_0> <addr_0> <len_0> ...
+BLOB.RDMA_GET <key> <region_idx> <offset>
+BLOB.RDMA_SET <key> <len> <region_idx> <offset>
 ```
 
 **Rejected because:**

@@ -30,7 +30,7 @@ pub use object_file::ObjectFile;
 // Re-exports from nvme.rs
 pub use nvme::{
     object_disk_len, open_nvme_file_for_write, read_and_verify_file_header,
-    validate_and_clean_nvme_dir, write_file_header, FileHeader, FILE_HEADER_MAGIC,
+    validate_and_clean_disk_dir, write_file_header, FileHeader, FILE_HEADER_MAGIC,
     FILE_HEADER_SIZE, FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN,
 };
 
@@ -147,7 +147,7 @@ pub fn get_fd_pool() -> &'static FdPool {
 /// All OnceLock statics are set at the very end after everything succeeds.
 /// On failure, local variables drop naturally — no cleanup needed, module load retryable.
 /// Returns Ok(summary string) on success, Err(message) on validation/environment failure.
-pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String> {
+pub fn init(mode: crate::OperatingMode, disk_dir: &str) -> Result<String, String> {
     let dram_seg_size = crate::dram_segment_size();
     let nvme_staging = crate::nvme_staging_size();
     // DRAMPool always starts with 1 segment and grows on demand — reactively
@@ -246,9 +246,9 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         }
     }
     Ok(format!(
-        "mode={:?} nvme_dir={} dram_segments={}x{}MB nvme_staging={}MB",
+        "mode={:?} disk_dir={} dram_segments={}x{}MB nvme_staging={}MB",
         mode,
-        nvme_dir,
+        disk_dir,
         dram_segment_count,
         dram_seg_size / (1024 * 1024),
         nvme_staging / (1024 * 1024),

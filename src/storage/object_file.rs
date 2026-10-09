@@ -86,7 +86,7 @@ impl ObjectFile {
     /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
     /// the command rather than aborting the node), leaving no partial file behind.
     pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
-        let dir = crate::nvme_dir();
+        let dir = crate::disk_dir();
         let disk_len = self.disk_len;
         if !super::nvme::try_reserve_nvme_disk_usage(disk_len) {
             return None;
@@ -117,7 +117,7 @@ impl ObjectFile {
         crc32c: Crc,
     ) -> std::io::Result<()> {
         use std::io::{Seek, SeekFrom, Write};
-        let mut src = std::fs::File::open(self.object_id.file_path(&crate::nvme_dir()))?;
+        let mut src = std::fs::File::open(self.object_id.file_path(&crate::disk_dir()))?;
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -143,7 +143,7 @@ impl Drop for ObjectFile {
             if let Some(pool) = super::FD_POOL.get() {
                 pool.remove(object_id);
             }
-            let path = object_id.file_path(&crate::nvme_dir());
+            let path = object_id.file_path(&crate::disk_dir());
             if let Err(e) = std::fs::remove_file(&path) {
                 super::warn_failed_unlink("teardown", &path, &e);
             }

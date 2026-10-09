@@ -191,7 +191,7 @@ fn commit_lo_value(
     Ok(CommitOutcome::ValueSet)
 }
 
-/// Keyspace event names published after a successful BLOB.SET.
+/// Keyspace event names published after a successful BLOB.TCP_SET / BLOB.RDMA_SET.
 pub(crate) const EVENT_CREATE: &str = "largeobj.create";
 pub(crate) const EVENT_UPDATE: &str = "largeobj.update";
 
@@ -199,7 +199,7 @@ pub(crate) const EVENT_UPDATE: &str = "largeobj.update";
 // GET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute BLOB.GET with mode + transport routing.
+/// Execute BLOB.TCP_GET / BLOB.RDMA_GET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_get(
     ctx: &valkey_module::Context,
@@ -337,7 +337,7 @@ fn cmd_get_tiered(
     };
     if let Some(obj_ctx) = promoted {
         let fd_pool = storage::get_fd_pool();
-        let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
+        let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
             Some(fd) => fd,
             None => {
                 // remove_object drops the map's Arc; obj_ctx drops at end of scope
@@ -347,8 +347,8 @@ fn cmd_get_tiered(
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 reply_err(
                     &thread_ctx,
-                    &info::NVME_READ_ERRORS,
-                    ValkeyError::Str(errors::ERR_NVME_READ),
+                    &info::DISK_READ_ERRORS,
+                    ValkeyError::Str(errors::ERR_DISK_READ),
                 );
                 return;
             }
@@ -404,22 +404,22 @@ fn cmd_get_tiered(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
-                &info::NVME_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
+                &info::DISK_STAGING_BUFFER_EXHAUSTED,
+                ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
             );
             return;
         }
     };
     let stream_ctx = storage::StreamingContext::new(buffers);
     let fd_pool = storage::get_fd_pool();
-    let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
+    let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
         Some(fd) => fd,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
-                &info::NVME_READ_ERRORS,
-                ValkeyError::Str(errors::ERR_NVME_READ),
+                &info::DISK_READ_ERRORS,
+                ValkeyError::Str(errors::ERR_DISK_READ),
             );
             return;
         }
@@ -554,7 +554,7 @@ async fn cmd_get_tiered_run(
 // SET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute BLOB.SET with mode + transport routing.
+/// Execute BLOB.TCP_SET / BLOB.RDMA_SET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_set(
     ctx: &valkey_module::Context,
@@ -617,7 +617,7 @@ fn cmd_set_dram_tcp(
         Some(bufs) => bufs,
         None => {
             info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-            return Err(ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED));
+            return Err(ValkeyError::Str(errors::ERR_OOM));
         }
     };
     // DRAM-only SET allocates one buffer per chunk (no sliding window), so the
@@ -692,7 +692,7 @@ fn cmd_set_dram_efa(
             reply_err(
                 &thread_ctx,
                 &info::DRAM_POOL_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_DRAM_POOL_EXHAUSTED),
+                ValkeyError::Str(errors::ERR_OOM),
             );
             return;
         }
@@ -781,8 +781,8 @@ fn cmd_set_tiered(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
-                &info::NVME_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
+                &info::DISK_STAGING_BUFFER_EXHAUSTED,
+                ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
             );
             return;
         }
@@ -869,22 +869,22 @@ async fn cmd_set_tiered_run(
     if !nvme::try_reserve_nvme_disk_usage(disk_len) {
         reply_err(
             &thread_ctx,
-            &info::NVME_CAPACITY_EXCEEDED,
-            ValkeyError::Str(errors::ERR_NVME_CAPACITY_EXCEEDED),
+            &info::DISK_CAPACITY_EXCEEDED,
+            ValkeyError::Str(errors::ERR_OOM_DISK),
         );
         return;
     }
     // FdPool not used on SET: this write fd is short-lived and never cached.
     // FdPool caches read fds lazily on first GET via ensure_open.
-    let file_path = object_id.file_path(&crate::nvme_dir());
+    let file_path = object_id.file_path(&crate::disk_dir());
     let fd = match storage::open_nvme_file_for_write(&file_path) {
         Ok(fd) => fd,
         Err(_e) => {
             nvme::decrease_nvme_disk_usage(disk_len);
             reply_err(
                 &thread_ctx,
-                &info::NVME_WRITE_ERRORS,
-                ValkeyError::Str(errors::ERR_NVME_WRITE),
+                &info::DISK_WRITE_ERRORS,
+                ValkeyError::Str(errors::ERR_DISK_WRITE),
             );
             return;
         }
@@ -940,7 +940,7 @@ async fn cmd_set_tiered_run(
     // NVMe disk accounting stays with the NVMe caller (no file on the DRAM path).
     let object_id = object_file.object_id();
     let disk_len = object_file.disk_len();
-    let file_path = object_id.file_path(&crate::nvme_dir());
+    let file_path = object_id.file_path(&crate::disk_dir());
     let on_disk = std::fs::metadata(&file_path)
         .unwrap_or_else(|e| {
             panic!(

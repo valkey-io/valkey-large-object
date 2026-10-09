@@ -219,9 +219,9 @@ In Dram mode, there is no io_uring engine — NVMe I/O does not exist — so nei
 - NVMePool: fi_write to client during serve-and-discard GET
 - DRAMPool: fi_write to client from cached objects (the hot serving path)
 
-If EFA init fails at startup, `fi_mr_reg` is skipped for all segments. EFA-transport
-command paths are unusable for the module's lifetime: `BLOB.HELLO` fails, and
-`BLOB.SET`/`BLOB.GET` with addresses require a HELLO session. The fabric is opened once
+If EFA init fails at startup, `fi_mr_reg` is skipped for all segments. RDMA
+command paths are unusable for the module's lifetime: `BLOB.RDMA_HELLO` fails, and
+`BLOB.RDMA_SET`/`BLOB.RDMA_GET` with addresses require a HELLO session. The fabric is opened once
 at load; there is no runtime re-detection. TCP-transport paths continue normally.
 
 **Why separate segments per layer:**
@@ -1417,11 +1417,11 @@ this section owns the semantics.
 
 | Config | Default | Min | Max | Live/Immutable | Governs |
 |---|---|---|---|---|---|
-| `operating-mode` | `Dram` | — | — | Immutable | `Dram` (DRAMPool is the store) vs `Tiered` (NVMe is the store, DRAMPool is a cache) |
+| `operating-mode` | `Dram` | — | — | Immutable | `Dram` (DRAMPool is the store) vs `Tiered` (NVMe is the store, DRAMPool is a cache) |dde
 | `segment-size` | `1GiB` | `1MB` | `1GiB` | Immutable | Uniform segment size for both pools. DRAMPool growth unit |
-| `nvme-staging-size` | `1GiB` | `1MB` | `1GiB` | Immutable | NVMePool staging capacity, split into `ceil(nvme-staging-size / segment-size)` segments of `segment-size`. Sized for max concurrent I/O, not object capacity |
-| `nvme-maxmemory` | `0` (unlimited) | `0` | i64::MAX | Live | NVMe **disk** ceiling; SET-admission bound in Tiered (enforcement: §9.3) |
-| `nvme-dir` | `""` | — | — | Immutable | NVMe object directory (Tiered) |
+| `disk-staging-size` | `1GiB` | `1MB` | `1GiB` | Immutable | NVMePool staging capacity, split into `ceil(disk-staging-size / segment-size)` segments of `segment-size`. Sized for max concurrent I/O, not object capacity |
+| `disk-maxmemory` | `0` (unlimited) | `0` | i64::MAX | Live | NVMe **disk** ceiling; SET-admission bound in Tiered (enforcement: §9.3) |
+| `disk-dir` | `""` | — | — | Immutable | NVMe object directory (Tiered) |
 | `direct-io` | `yes` | — | — | Immutable | O_DIRECT on NVMe files (must be `no` on tmpfs) |
 | `max-promote-size` | `256MB` | `0` (disable) | `1TB` | Live | Promotion eligibility; objects above this never enter DRAMPool (detail: §7.5) |
 | `promote-min-hits` | `2` | `1` | `255` | Live | Admission-filter misses before a GET promotes an object |
@@ -1444,7 +1444,7 @@ this section owns the semantics.
 | `fabric-crc-pool-threads` | `1` | `1` | `1024` | Immutable | Threads hashing checksummed transfers off the fabric workers |
 
 **Segment size is capped at 1 GiB** for both `segment-size` and
-`nvme-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):
+`disk-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):
 NVMe staging is always io_uring-registered, and DRAMPool is io_uring-registered in
 Tiered mode (for promotion ReadFixed). Larger capacity comes from *more* segments,
 never bigger ones. (EFA `fi_mr_reg` itself has no such cap — a Dram-mode segment is

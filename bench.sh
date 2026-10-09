@@ -1,14 +1,14 @@
 #!/bin/bash
 # valkey-large-object Benchmark Script
 #
-# Cycles through operating modes and object sizes, measuring BLOB.GET throughput.
+# Cycles through operating modes and object sizes, measuring BLOB.TCP_GET throughput.
 #
 # Three modes:
 #   Dram    — all objects in DRAMPool (no NVMe)
 #   Tiered  — NVMe persistence + DRAM read cache with promotion
 #   NVMe    — NVMe persistence, no DRAM cache (max-promote-size 0)
 #
-# bench-mode: BLOB.GET does full storage path but replies with integer size only
+# bench-mode: BLOB.TCP_GET does full storage path but replies with integer size only
 # (no TCP bulk copy). Isolates storage throughput from network bandwidth.
 #
 # Prerequisites:
@@ -188,7 +188,7 @@ print_scaling() {
     local label="$1"
     local info
     info=$($VALKEY_CLI -p $PORT INFO largeobj 2>/dev/null | tr -d '\r')
-    local live nvme_live util expands shrinks dram_uring nvme_uring efa
+    local live nvme_live util expands shrinks dram_uring nvme_uring rdma
     live=$(echo       "$info" | grep -E "dram_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
     nvme_live=$(echo  "$info" | grep -E "nvme_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
     util=$(echo       "$info" | grep -E "utilization_pct"                 | awk -F: '{print $2}' | tr -d '[:space:]')
@@ -196,17 +196,17 @@ print_scaling() {
     shrinks=$(echo    "$info" | grep -E "scaling_shrinks"            | awk -F: '{print $2}' | tr -d '[:space:]')
     dram_uring=$(echo "$info" | grep -E "dram_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
     nvme_uring=$(echo "$info" | grep -E "nvme_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
-    efa=$(echo        "$info" | grep -E "efa_registered_segments"         | awk -F: '{print $2}' | tr -d '[:space:]')
+    rdma=$(echo       "$info" | grep -E "rdma_registered_segments"         | awk -F: '{print $2}' | tr -d '[:space:]')
     local total_live=$(( ${live:-0} + ${nvme_live:-0} ))
     echo "     [scaling: $label] dram_live=${live:-?} nvme_live=${nvme_live:-0} total_live=${total_live} util_pct=${util:-?} expand=${expands:-?} shrink=${shrinks:-?}"
     # io_uring registration coverage, per pool: each should equal that pool's live
     # count once the post-expand re-register has completed. Dram mode shows dram=0 (no
-    # io_uring engine). EFA is fabric-global (one MR per segment, not per-pool), so
+    # io_uring engine). RDMA is fabric-global (one MR per segment, not per-pool), so
     # it is reported once against total_live.
-    echo "     [registered: $label] io_uring dram=${dram_uring:-0}/${live:-?} nvme=${nvme_uring:-0}/${nvme_live:-0}  efa=${efa:-?}/${total_live}"
+    echo "     [registered: $label] io_uring dram=${dram_uring:-0}/${live:-?} nvme=${nvme_uring:-0}/${nvme_live:-0}  rdma=${rdma:-?}/${total_live}"
 }
 
-# Run one BLOB.GET benchmark pass and print throughput + latency. Arg: label.
+# Run one BLOB.TCP_GET benchmark pass and print throughput + latency. Arg: label.
 # Leaves output in $BENCH_TMPFILE and exit code in $BENCH_EXIT for the caller
 # to assert on / clean up. Needs BENCH_TIMEOUT / EFFECTIVE_* set by the caller.
 run_bench_pass() {
@@ -216,7 +216,7 @@ run_bench_pass() {
     timeout $BENCH_TIMEOUT \
         taskset -c $BENCH_CPUS \
         $VALKEY_BENCH -p $PORT --duration $DURATION -c $EFFECTIVE_CLIENTS -r $EFFECTIVE_KEYS \
-        -- BLOB.GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1 || BENCH_EXIT=$?
+        -- BLOB.TCP_GET "k:__rand_int__" > "$BENCH_TMPFILE" 2>&1 || BENCH_EXIT=$?
     echo "  ┌─ $label"
     tr '\r' '\n' < "$BENCH_TMPFILE" | grep -A3 "throughput summary" | sed 's/^/  │ /' || true
 }
@@ -364,18 +364,18 @@ for BENCH_MODE in $MODES_STR; do
                 ;;
             Tiered)
                 MODULE_ARGS="operating-mode Tiered"
-                MODULE_ARGS="$MODULE_ARGS nvme-dir $NVME_DIR"
+                MODULE_ARGS="$MODULE_ARGS disk-dir $NVME_DIR"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
-                MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
+                MODULE_ARGS="$MODULE_ARGS disk-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
                 MODULE_ARGS="$MODULE_ARGS max-object-size $MAX_OBJECT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS max-promote-size $MAX_OBJECT_SIZE"
                 ;;
             NVMe)
                 MODULE_ARGS="operating-mode Tiered"
-                MODULE_ARGS="$MODULE_ARGS nvme-dir $NVME_DIR"
+                MODULE_ARGS="$MODULE_ARGS disk-dir $NVME_DIR"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
-                MODULE_ARGS="$MODULE_ARGS nvme-maxmemory $NVME_MAXMEMORY"
+                MODULE_ARGS="$MODULE_ARGS disk-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS nvme-staging-size $STAGING_NEEDED"
                 MODULE_ARGS="$MODULE_ARGS max-object-size $MAX_OBJECT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS max-promote-size 0"
@@ -461,7 +461,7 @@ s.setsockopt(6, 1, 1)
 payload = os.urandom($BYTES)
 start = time.monotonic()
 for i in range($EFFECTIVE_KEYS):
-    s.sendall(resp('BLOB.SET', f'k:{i:012d}', payload))
+    s.sendall(resp('BLOB.TCP_SET', f'k:{i:012d}', payload))
     r = s.recv(1024)
 elapsed = time.monotonic() - start
 s.close()
@@ -477,7 +477,7 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
         echo "  DBSIZE: $DBSIZE"
         if [ "$DBSIZE" != "$EFFECTIVE_KEYS" ]; then
             echo "  FATAL: DBSIZE mismatch — expected $EFFECTIVE_KEYS, got $DBSIZE."
-            echo "         BLOB.SET populate failed or keys were not stored correctly."
+            echo "         BLOB.TCP_SET populate failed or keys were not stored correctly."
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
             exit 1
         fi
@@ -582,7 +582,7 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
             exit 1
         fi
-        # Hits must be > 0 (proves BLOB.GET actually ran and found keys)
+        # Hits must be > 0 (proves BLOB.TCP_GET actually ran and found keys)
         if [ "$CACHE_HITS" -eq 0 ]; then
             echo "  FATAL: 0 cache hits — benchmark did not perform any valid key lookups."
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true

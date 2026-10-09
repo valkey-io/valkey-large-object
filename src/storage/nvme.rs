@@ -45,7 +45,7 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
 /// counter unchanged if the reservation would exceed the cap (or overflow).
 /// Returns true if nvme-maxmemory is 0 (unlimited).
 pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
-    let max = crate::nvme_maxmemory();
+    let max = crate::disk_maxmemory();
     NVME_DISK_USAGE
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             let next = cur.checked_add(bytes)?;
@@ -330,7 +330,7 @@ pub async fn write_file_header(
 }
 
 /// Warn that an object file couldn't be unlinked (the next
-/// `validate_and_clean_nvme_dir` reclaims the orphan).
+/// `validate_and_clean_disk_dir` reclaims the orphan).
 pub(crate) fn warn_failed_unlink(during: &str, path: &str, err: &std::io::Error) {
     valkey_module::logging::log_warning(format!(
         "largeobj: failed to unlink object file {path} during {during}: {err}"
@@ -346,7 +346,7 @@ pub(crate) fn warn_failed_unlink(during: &str, path: &str, err: &std::io::Error)
 /// this instance's files at shutdown. Returns `Ok(())` once nvme-dir exists and
 /// is empty (or immediately, in Dram mode); `Err` if nvme-dir is unset in Tiered
 /// mode, or the directory could not be removed or recreated.
-pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
+pub fn validate_and_clean_disk_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
     if mode != crate::OperatingMode::Tiered {
         return Ok(());
     }

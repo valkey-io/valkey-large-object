@@ -28,13 +28,13 @@ unsafe impl Send for PoolOperand {}
 // user allocated memory type. This binds PoolOperand to how the memory is used inside of
 // dma-libfabric.
 impl Operands for PoolOperand {
-    // Used when the operand is a byte source for an RDMA. This is used in case of `BLOB.GET`.
+    // Used when the operand is a byte source for an RDMA. This is used in case of `BLOB.RDMA_GET`.
     fn source(&self) -> Option<&[u8]> {
         // SAFETY: see `new`; the initiator holds the allocation for the transfer's duration.
         Some(unsafe { std::slice::from_raw_parts(self.pointer, self.length) })
     }
 
-    // Used when the operand is a byte destination for an RDMA. This is used in case of `BLOB.SET`.
+    // Used when the operand is a byte destination for an RDMA. This is used in case of `BLOB.RDMA_SET`.
     fn allocate(&mut self, length: usize) -> Option<&mut [u8]> {
         if self.length < length {
             // The RDMA transfer length exceeds the allocated buffer - it can't be used for the
