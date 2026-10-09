@@ -779,7 +779,10 @@ pub(crate) async fn efa_transfer_addrs(
             }
             // Posted RMAs can't be aborted, so break and let the await loop
             // drain already-submitted transfers before returning the error.
-            Err(_) => {
+            Err(e) => {
+                valkey_module::logging::log_debug(format!(
+                    "EFA submit failed on sub-transfer {i}: {e}"
+                ));
                 failed = true;
                 break;
             }
@@ -794,7 +797,10 @@ pub(crate) async fn efa_transfer_addrs(
         }
         let done = match outcome {
             Ok(d) => d,
-            Err(_) => {
+            Err(e) => {
+                valkey_module::logging::log_debug(format!(
+                    "EFA transfer {idx} completed with error: {e}"
+                ));
                 failed = true;
                 continue;
             }
