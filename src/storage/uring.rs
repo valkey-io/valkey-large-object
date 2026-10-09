@@ -13,6 +13,7 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use tokio::sync::oneshot;
@@ -105,6 +106,15 @@ impl PendingOp {
         match self {
             PendingOp::Read { fixed, .. } | PendingOp::Write { fixed, .. } => *fixed,
         }
+    }
+
+    /// Record this op's time since its SQE push in INFO, including failed and short I/Os.
+    fn record_completion(&self, pushed_at: Instant) {
+        let stats = match self {
+            PendingOp::Read { .. } => &crate::info::DISK_READS,
+            PendingOp::Write { .. } => &crate::info::DISK_WRITES,
+        };
+        stats.record(pushed_at);
     }
 
     /// Send an error to the waiting caller. Used when submit fails fatally.
@@ -264,7 +274,8 @@ impl UringEngine {
         shutdown: Arc<AtomicBool>,
         mut ring: io_uring::IoUring,
     ) {
-        let mut pending: HashMap<u64, PendingOp> = HashMap::new();
+        // token → (when its SQE was pushed, the op).
+        let mut pending: HashMap<u64, (Instant, PendingOp)> = HashMap::new();
         let mut next_token: u64 = 1;
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
@@ -418,7 +429,7 @@ impl UringEngine {
                         // SQ full even after flush — error the caller directly.
                         op.send_error(libc::EAGAIN);
                     } else {
-                        pending.insert(token, op);
+                        pending.insert(token, (Instant::now(), op));
                         if op_is_fixed {
                             fixed_in_flight += 1;
                         }
@@ -464,10 +475,11 @@ impl UringEngine {
                 completed.push((cqe.user_data(), cqe.result()));
             }
             for (token, result) in completed {
-                if let Some(op) = pending.remove(&token) {
+                if let Some((pushed_at, op)) = pending.remove(&token) {
                     if op.is_fixed() {
                         fixed_in_flight -= 1;
                     }
+                    op.record_completion(pushed_at);
                     match op {
                         PendingOp::Read {
                             tx, expected_bytes, ..
@@ -507,7 +519,7 @@ impl UringEngine {
                     .copied()
                     .collect();
                 for token in batch_tokens {
-                    if let Some(op) = pending.remove(&token) {
+                    if let Some((_, op)) = pending.remove(&token) {
                         if op.is_fixed() {
                             fixed_in_flight -= 1;
                         }

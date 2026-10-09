@@ -7,13 +7,18 @@ import logging
 
 
 def info_largeobj(client):
-    """Return the largeobj INFO section as a dict with integer values decoded."""
+    """Return the largeobj INFO section as a dict with numeric values decoded."""
     raw = client.execute_command('INFO', 'largeobj')
     result = {}
     for k, v in raw.items():
         key = k.decode() if isinstance(k, bytes) else k
         val = v.decode() if isinstance(v, bytes) else str(v)
-        result[key] = int(val) if val.lstrip('-').isdigit() else val
+        if val.lstrip('-').isdigit():
+            result[key] = int(val)
+        elif val.lstrip('-').replace('.', '', 1).isdigit():
+            result[key] = float(val)  # the *_pct fields, e.g. 99.99
+        else:
+            result[key] = val
     return result
 
 

@@ -112,6 +112,11 @@ pub fn lookup(client_id: u64) -> Option<Arc<Session>> {
     sessions().get(&client_id).cloned()
 }
 
+/// Live sessions: connections that opened an RDMA session and haven't disconnected.
+pub fn count() -> usize {
+    sessions().len()
+}
+
 /// Remove a client's EFA session on disconnect, and let the fabric services drop its
 /// address-vector entries once its transfers drain.
 /// Valkey calls this on client disconnect.

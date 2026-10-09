@@ -1,9 +1,10 @@
-//! INFO largeobj — pool and error statistics exposed via `INFO largeobj`.
+//! INFO largeobj — pool, I/O and error statistics exposed via `INFO largeobj`.
 //!
 //! Add new subsections by adding a `fn *_section(ctx) -> ValkeyResult<()>` and
 //! calling it from `info_sections`. Each section is a discrete group of fields.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use valkey_module::{InfoContext, ValkeyResult};
 
 use crate::smartlog::{snapshot_for_info, CRITICAL_WARNING_BITS};
@@ -28,6 +29,80 @@ pub static SET_VALUE_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
 pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// ─── I/O Metrics ─────────────────────────────────────────────────────────────
+
+/// Count and total duration of one kind of I/O. `usec / count` is the mean.
+#[derive(Default)]
+pub struct IoStats {
+    count: AtomicU64,
+    usec: AtomicU64,
+}
+
+impl IoStats {
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            usec: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one I/O that started at `started` and has just completed.
+    pub fn record(&self, started: Instant) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.usec
+            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    pub fn usec(&self) -> u64 {
+        self.usec.load(Ordering::Relaxed)
+    }
+}
+
+/// One direction of RDMA traffic: transfers and the bytes they moved.
+#[derive(Default)]
+pub struct RdmaStats {
+    transfers: IoStats,
+    bytes: AtomicU64,
+}
+
+impl RdmaStats {
+    pub const fn new() -> Self {
+        Self {
+            transfers: IoStats::new(),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one transfer that started at `started` and moved `bytes`.
+    pub fn record(&self, started: Instant, bytes: u64) {
+        self.transfers.record(started);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+/// io_uring reads and writes of object files on disk, on either ring, timed from
+/// SQE push to CQE reap. Every reaped CQE counts, including failed and short I/Os.
+pub static DISK_READS: IoStats = IoStats::new();
+pub static DISK_WRITES: IoStats = IoStats::new();
+
+/// RDMA transfers, timed from submission to completion, one per client
+/// address of a chunk. Reads pull client memory (the SET path); writes push into
+/// it (the GET path). The time includes any wait behind `fabric-max-in-flight`.
+pub static RDMA_READS: RdmaStats = RdmaStats::new();
+pub static RDMA_WRITES: RdmaStats = RdmaStats::new();
+
+/// `part` as a percentage of `whole`, to two decimals ("99.99").
+fn pct(part: u64, whole: u64) -> String {
+    if whole == 0 {
+        return "0.00".to_string();
+    }
+    format!("{:.2}", part as f64 * 100.0 / whole as f64)
+}
+
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
     if let Err(e) = info_sections(ctx) {
@@ -39,8 +114,10 @@ fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     core_metrics_section(ctx)?;
     dram_pool_section(ctx)?;
     nvme_staging_section(ctx)?;
+    disk_section(ctx)?;
     fd_pool_section(ctx)?;
     smartlog_section(ctx)?;
+    rdma_section(ctx)?;
     error_metrics_section(ctx)?;
     Ok(())
 }
@@ -61,6 +138,10 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "reclaims",
             storage::get_dram_pool().reclaims.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "inflight_requests",
+            crate::engine::inflight_requests() as i64,
         )?
         .build_section()?
         .build_info()?;
@@ -93,7 +174,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let seg_size = crate::dram_segment_size();
     let capacity = (total - draining) * seg_size;
     let allocated = dram.allocated_bytes();
-    let util_pct = (allocated * 100).checked_div(capacity).unwrap_or(0) as i64;
+    let util_pct = pct(allocated as u64, capacity as u64);
 
     let mut section = ctx
         .builder()
@@ -159,6 +240,9 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     };
 
     let (total, _draining, unused) = nvme.segment_counts();
+    // Whole segments, so it can exceed nvme-staging-size.
+    let capacity = total * crate::dram_segment_size();
+    let util_pct = pct(nvme.allocated_bytes() as u64, capacity as u64);
 
     ctx.builder()
         .add_section("nvme_staging")
@@ -166,11 +250,34 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("nvme_unused_segments", unused as i64)?
         .field("nvme_fragment_count", nvme.fragment_count() as i64)?
         .field("nvme_staging_size_bytes", crate::nvme_staging_size() as i64)?
+        .field("nvme_staging_utilization_pct", util_pct)?
         .field("nvme_segment_size_bytes", crate::dram_segment_size() as i64)?
         .field(
             "nvme_uring_registered_segments",
             nvme.io_uring_registered_count() as i64,
         )?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
+/// Object files on disk, Tiered mode only: disk budget and io_uring I/O timing.
+fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    if operating_mode() != OperatingMode::Tiered {
+        return Ok(());
+    }
+    let used = storage::nvme::nvme_disk_usage();
+    // nvme-maxmemory 0 means unlimited: no budget to be a percentage of.
+    let util_pct = pct(used, crate::nvme_maxmemory());
+
+    ctx.builder()
+        .add_section("disk")
+        .field("disk_used_bytes", used)?
+        .field("disk_utilization_pct", util_pct)?
+        .field("disk_reads", DISK_READS.count())?
+        .field("disk_read_usec", DISK_READS.usec())?
+        .field("disk_writes", DISK_WRITES.count())?
+        .field("disk_write_usec", DISK_WRITES.usec())?
         .build_section()?
         .build_info()
         .map(|_| ())
@@ -242,6 +349,26 @@ fn smartlog_section(ctx: &InfoContext) -> ValkeyResult<()> {
     warnings.build_section()?.build_info().map(|_| ())
 }
 
+/// RDMA sessions and traffic, in both modes. Emitted as zeros where no fabric
+/// is available, so consumers can depend on a fixed key set.
+fn rdma_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    ctx.builder()
+        .add_section("rdma")
+        .field("rdma_sessions", crate::transport::session::count() as u64)?
+        .field("rdma_read_bytes", RDMA_READS.bytes.load(Ordering::Relaxed))?
+        .field(
+            "rdma_write_bytes",
+            RDMA_WRITES.bytes.load(Ordering::Relaxed),
+        )?
+        .field("rdma_reads", RDMA_READS.transfers.count())?
+        .field("rdma_read_usec", RDMA_READS.transfers.usec())?
+        .field("rdma_writes", RDMA_WRITES.transfers.count())?
+        .field("rdma_write_usec", RDMA_WRITES.transfers.usec())?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
 fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
     ctx.builder()
         .add_section("error_metrics")
@@ -284,4 +411,28 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .build_section()?
         .build_info()
         .map(|_| ())
+}
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pct_has_two_decimals() {
+        assert_eq!(pct(5, 0), "0.00");
+        assert_eq!(pct(2, 3), "66.67");
+        assert_eq!(pct(1, 8), "12.50");
+        assert_eq!(pct(4096, 4096), "100.00");
+    }
+
+    #[test]
+    fn test_rdma_stats_record_count_and_bytes() {
+        let rdma = RdmaStats::new();
+        rdma.record(Instant::now(), 4096);
+        rdma.record(Instant::now(), 1024);
+        assert_eq!(rdma.transfers.count(), 2);
+        assert_eq!(rdma.bytes.load(Ordering::Relaxed), 5120);
+    }
 }

@@ -191,7 +191,7 @@ print_scaling() {
     local live nvme_live util expands shrinks dram_uring nvme_uring efa
     live=$(echo       "$info" | grep -E "dram_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
     nvme_live=$(echo  "$info" | grep -E "nvme_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
-    util=$(echo       "$info" | grep -E "utilization_pct"                 | awk -F: '{print $2}' | tr -d '[:space:]')
+    util=$(echo       "$info" | grep -E "^largeobj_dram_utilization_pct:" | awk -F: '{print $2}' | tr -d '[:space:]')
     expands=$(echo    "$info" | grep -E "scaling_expands"            | awk -F: '{print $2}' | tr -d '[:space:]')
     shrinks=$(echo    "$info" | grep -E "scaling_shrinks"            | awk -F: '{print $2}' | tr -d '[:space:]')
     dram_uring=$(echo "$info" | grep -E "dram_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
