@@ -140,6 +140,15 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "dram_scaling_shrinks",
             dram.shrink_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
+        .field(
+            "dram_evictions",
+            dram.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "dram_eviction_failures",
+            dram.eviction_failures
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
         .field("dram_segment_size_bytes", seg_size as i64)?
         .field(
             "efa_registered_segments",

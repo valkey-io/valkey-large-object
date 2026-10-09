@@ -42,6 +42,9 @@ pub const ADMISSION_FILTER_CAPACITY: usize = 65_536;
 /// Bounds the reclaim loop under the objects write lock.
 pub const RECLAIM_MAX_VICTIMS: usize = 16;
 
+/// Least-loaded segments one reclaim may try.
+pub const RECLAIM_SEGMENTS: usize = 3;
+
 const COUNTER_MASK: u32 = 0xFF;
 const MINUTES_SHIFT: u32 = 8;
 const MINUTES_MASK: u32 = 0xFFFF;

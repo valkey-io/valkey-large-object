@@ -1,5 +1,5 @@
 """
-Integration tests for DRAMPool expand/shrink scaling behavior.
+Integration tests for DRAMPool expand/shrink scaling behavior, and Dram eviction.
 
 Tests cover:
   - Dram mode: reactive expand (TCP and EFA SET) and proactive expand
@@ -10,6 +10,8 @@ Tests cover:
   - Tiered mode: shrink drops cached copies, NVMe data survives
   - Tiered mode: expand, shrink to zero segments, expand again
   - Tiered mode: shrink releases an EFA-registered segment
+  - Dram mode: a SET or COPY that finds the arena full evicts other objects; their keys read as
+    misses until the scaling cron deletes them
 """
 
 import os
@@ -61,6 +63,37 @@ def promote(client, keys):
     for key in keys:
         client.execute_command('BLOB.TCP_GET', key)
     wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == len(keys))
+
+
+def set_policy(client, policy='allkeys-lru'):
+    """Let the module evict: it needs maxmemory > 0 and a policy other than noeviction. Also freezes
+    the pool, so a full segment can only be served by evicting: with the shrink watermark at its 50%
+    floor, a maxmemory about two segments above usage stops `try_expand` (any tighter and core
+    evicts or refuses the command itself)."""
+    used = int(client.info('memory')['used_memory'])
+    segment = info_largeobj(client)['largeobj_dram_segment_size_bytes']
+    client.config_set('largeobj.scaling-shrink-watermark', 50)
+    client.config_set('maxmemory', 2 * (used + segment) - 512 * 1024)
+    client.config_set('maxmemory-policy', policy)
+
+
+def set_objects(client, prefix, count, size):
+    """SET `count` objects of `size` bytes, each filled with its own byte; return them by key."""
+    payloads = {f'{prefix}{i}': bytes([i % 251 + 1]) * size for i in range(count)}
+    for key, payload in payloads.items():
+        assert client.execute_command('BLOB.TCP_SET', key, payload) == b'OK'
+    return payloads
+
+
+def surviving(client, payloads):
+    """The objects that survive, by key, read back. `EXISTS` is no judge: an evicted key outlives
+    its object until the scaling cron deletes it."""
+    got = {key: client.execute_command('BLOB.TCP_GET', key) for key in payloads}
+    return {key: value for key, value in got.items() if value is not None}
+
+
+def pending_reclaims(client):
+    return info_largeobj(client)['largeobj_pending_reclaims']
 
 
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
@@ -442,6 +475,125 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         assert regrown['largeobj_dram_scaling_expands'] == shrunk['largeobj_dram_scaling_expands'] + 1
         assert regrown['largeobj_dram_segments'] == 1
         assert client.execute_command('BLOB.TCP_GET', 'after') == b'Z' * SEGMENT_FILLING_SIZE
+
+
+# ─── Dram Mode Eviction ───────────────────────────────────────────────────────
+class DramArena(ValkeyLargeObjTestCaseBase):
+    """Dram mode with one 1MB segment that `set_policy` freezes, so eviction is the only way a SET
+    succeeds once it is full. `POLL_MS` keeps the scaling cron out of the way: a victim's key stays
+    on the reclaim list for the test to see."""
+
+    SEGMENT_SIZE = 1024 * 1024
+    OBJ = SEGMENT_SIZE // 4
+    OBJECTS_PER_CAP = 3  # a fourth would fill the segment exactly, but talc's metadata lives in it
+    POLL_MS = 60_000
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Dram"
+            f" segment-size {self.SEGMENT_SIZE}"
+            f" max-object-size {self.SEGMENT_SIZE - 64 * 1024}"
+            f" chunk-size 65536"
+            f" scaling-poll-ms {self.POLL_MS}"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def new_client(self, policy='allkeys-lru'):
+        client = self.server.get_new_client()
+        set_policy(client, policy)
+        return client
+
+
+class TestDramEviction(DramArena):
+
+    def test_writing_past_the_segment_evicts_and_victims_read_as_misses(self):
+        """Three segments' worth cannot be resident at once, so these SETs only succeed by evicting.
+        A victim's key, still in the keyspace, reads as a miss until the cron deletes it."""
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', 3 * self.OBJECTS_PER_CAP, self.OBJ)
+
+        info = info_largeobj(client)
+        survivors = surviving(client, payloads)
+        victims = len(payloads) - len(survivors)
+        assert info['largeobj_dram_evictions'] == victims > 0
+        assert info['largeobj_dram_segments'] == 1
+        assert 'obj_8' in survivors, "the last write cannot have been anyone's victim"
+        assert all(survivors[key] == payloads[key] for key in survivors)
+        assert pending_reclaims(client) == victims
+        assert client.execute_command('EXISTS', *payloads) == len(payloads), "no key is gone yet"
+
+    def test_a_full_arena_is_refused_not_evicted_under_noeviction(self):
+        client = self.new_client('noeviction')
+        payloads = set_objects(client, 'obj_', self.OBJECTS_PER_CAP, self.OBJ)
+
+        with pytest.raises(ResponseError, match='pool exhausted'):
+            client.execute_command('BLOB.TCP_SET', 'refused', b'R' * self.OBJ)
+        assert info_largeobj(client)['largeobj_dram_evictions'] == 0
+        assert surviving(client, payloads) == payloads
+
+    def test_copy_evicts_another_key_and_never_its_source(self):
+        """COPY pins its source: alone in the segment it fails cleanly, and with another key
+        resident that key is the victim."""
+        client = self.new_client()
+        big = b'S' * (640 * 1024)
+        assert client.execute_command('BLOB.TCP_SET', 'src', big) == b'OK'
+        with pytest.raises(ResponseError):
+            client.execute_command('COPY', 'src', 'dst')
+        assert client.execute_command('BLOB.TCP_GET', 'src') == big
+        assert info_largeobj(client)['largeobj_dram_evictions'] == 0
+
+        client.execute_command('FLUSHALL')
+        obj = b'A' * (384 * 1024)
+        assert client.execute_command('BLOB.TCP_SET', 'src', obj) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'other', b'O' * len(obj)) == b'OK'
+        assert client.execute_command('COPY', 'src', 'dst') in (1, True)
+        assert info_largeobj(client)['largeobj_dram_evictions'] == 1
+        assert client.execute_command('BLOB.TCP_GET', 'other') is None
+        assert client.execute_command('BLOB.TCP_GET', 'src') == obj
+        assert client.execute_command('BLOB.TCP_GET', 'dst') == obj
+
+    def test_deleting_a_victim_takes_it_off_the_list(self):
+        """Deleting an evicted key frees its object, which clears the oid: nothing stays listed
+        for a key that no longer exists."""
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', 3 * self.OBJECTS_PER_CAP, self.OBJ)
+        victims = [key for key in payloads if client.execute_command('BLOB.TCP_GET', key) is None]
+        assert victims and pending_reclaims(client) == len(victims)
+
+        assert client.execute_command('DEL', *victims) == len(victims)
+        wait_for_true(lambda: pending_reclaims(client) == 0)
+        assert info_largeobj(client)['largeobj_reclaims'] == 0, "the cron deleted nothing"
+
+    def test_flushall_async_clears_the_list(self):
+        """Objects freed in bulk on a background thread can include listed victims."""
+        client = self.new_client()
+        set_objects(client, 'obj_', 3 * self.OBJECTS_PER_CAP, self.OBJ)
+        assert pending_reclaims(client) > 0
+
+        client.execute_command('FLUSHALL', 'ASYNC')
+        wait_for_true(lambda: pending_reclaims(client) == 0)
+
+
+class TestDramEvictionReclaim(DramArena):
+    """The scaling cron deletes the keys of evicted objects, a tick (`scaling-poll-ms`) at a time."""
+
+    POLL_MS = 1000
+
+    def test_the_cron_deletes_the_keys_eviction_took(self):
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', 3 * self.OBJECTS_PER_CAP, self.OBJ)
+        live = surviving(client, payloads)
+        assert 0 < len(live) < len(payloads)
+
+        # Lift the pressure: the tick after the sweep would otherwise shrink the arena the
+        # survivors are in.
+        client.config_set('maxmemory', 1 << 40)
+        wait_for_true(lambda: pending_reclaims(client) == 0, timeout=15)
+        assert client.execute_command('DBSIZE') == len(live), "only live keys are left"
+        assert surviving(client, payloads) == live
+        info = info_largeobj(client)
+        assert info['largeobj_reclaims'] == info['largeobj_dram_evictions'] == len(payloads) - len(live)
 
 
 # ─── Tiered Mode Scaling ──────────────────────────────────────────────────────

@@ -114,13 +114,15 @@ impl SegmentPool {
         self.alloc_object_in_one_segment(&Self::chunk_sizes(size), Some(seg_idx))
     }
 
-    /// `(seg_idx, bytes_short)`: the segment `alloc_exact(size)` would pick
-    /// (least-loaded live one) and how many bytes it lacks for `size`. 0 means
-    /// the bytes fit and only talc overhead could block the alloc.
-    pub(super) fn segment_shortfall(&self, size: usize) -> Option<(usize, usize)> {
+    /// `(seg_idx, bytes_short)` for the `n` least-loaded live segments, emptiest
+    /// first. 0 means the bytes fit and only talc overhead could block the alloc.
+    pub(super) fn segment_shortfalls(&self, size: usize, n: usize) -> Vec<(usize, usize)> {
         let total: usize = Self::chunk_sizes(size).iter().sum();
-        let (i, cur) = self.find_shrink_victim()?;
-        Some((i, (cur + total).saturating_sub(self.segment_size)))
+        let st = self.state.lock().expect("state lock unavailable");
+        Self::least_loaded(&st, n)
+            .into_iter()
+            .map(|(i, cur)| (i, (cur + total).saturating_sub(self.segment_size)))
+            .collect()
     }
 
     /// Per-chunk aligned sizes: first N-1 are chunk_size, last is trimmed.
@@ -163,7 +165,7 @@ impl SegmentPool {
         // can. `target` pins the segment instead.
         let seg_idx = match target {
             Some(i) => i,
-            None => Self::least_loaded(&st)?.0,
+            None => Self::least_loaded(&st, 1).first()?.0,
         };
         let seg = st.slots.get(seg_idx)?.as_ref()?;
         if seg.draining.load(std::sync::atomic::Ordering::Acquire)
@@ -495,14 +497,15 @@ impl SegmentPool {
     /// Returns `(slot_idx, allocated_bytes)` without marking the segment draining.
     pub fn find_shrink_victim(&self) -> Option<(usize, usize)> {
         let st = self.state.lock().expect("state lock unavailable");
-        Self::least_loaded(&st)
+        Self::least_loaded(&st, 1).first().copied()
     }
 
-    /// Least-loaded non-draining segment as `(slot_idx, allocated_bytes)`.
-    /// Single O(N) pass; the caller holds the state lock so slots stay stable.
-    /// The allocator's pick, the shrink victim, and `segment_shortfall` use it.
-    fn least_loaded(st: &SegmentState) -> Option<(usize, usize)> {
-        st.slots
+    /// The `n` least-loaded non-draining segments as `(slot_idx, allocated_bytes)`,
+    /// emptiest first. The caller holds the state lock so slots stay stable.
+    /// The allocator's pick, the shrink victim, and `segment_shortfalls` use it.
+    fn least_loaded(st: &SegmentState, n: usize) -> Vec<(usize, usize)> {
+        let mut live: Vec<(usize, usize)> = st
+            .slots
             .iter()
             .enumerate()
             .filter_map(|(i, opt)| {
@@ -515,7 +518,10 @@ impl SegmentPool {
                     )
                 })
             })
-            .min_by_key(|&(_, bytes)| bytes)
+            .collect();
+        live.sort_by_key(|&(_, bytes)| bytes);
+        live.truncate(n);
+        live
     }
 
     /// Mark a specific segment as draining by slot index.
@@ -742,16 +748,18 @@ mod tests {
     // ── alloc_exact ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_segment_shortfall_picks_least_loaded() {
+    fn test_segment_shortfalls_pick_least_loaded() {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
         let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
         let a = pool.alloc_exact(4096 * 4).unwrap(); // seg 0: 16 KiB
         let b = pool.alloc_exact(4096 * 2).unwrap(); // seg 1: 8 KiB (least loaded)
         assert_eq!((a[0].segment_idx, b[0].segment_idx), (0, 1));
         // 60 KiB into seg 1 (8 KiB used of 64 KiB) is 4 KiB short.
-        assert_eq!(pool.segment_shortfall(4096 * 15), Some((1, 4096)));
+        assert_eq!(pool.segment_shortfalls(4096 * 15, 1), [(1, 4096)]);
         // Fits by bytes: nothing short.
-        assert_eq!(pool.segment_shortfall(4096), Some((1, 0)));
+        assert_eq!(pool.segment_shortfalls(4096, 1), [(1, 0)]);
+        // The `n` least loaded, emptiest first.
+        assert_eq!(pool.segment_shortfalls(4096, 2), [(1, 0), (0, 0)]);
         pool.free_n(&a);
         pool.free_n(&b);
     }

@@ -613,7 +613,7 @@ fn cmd_set_dram_tcp(
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    let buffers = match dram_pool.alloc_exact_or_expand(ctx, obj_len) {
+    let buffers = match dram_pool.alloc_exact_expand_evict(ctx, obj_len) {
         Some(bufs) => bufs,
         None => {
             info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
@@ -684,8 +684,8 @@ fn cmd_set_dram_efa(
     // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
-    // DRAMPool::alloc_exact_or_expand: all-or-nothing with reactive expansion.
-    let buffers = match dram_pool.alloc_exact_or_expand(ctx, obj_len) {
+    // DRAMPool::alloc_exact_expand_evict: all-or-nothing; expands, then evicts.
+    let buffers = match dram_pool.alloc_exact_expand_evict(ctx, obj_len) {
         Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
