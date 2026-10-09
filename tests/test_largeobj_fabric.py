@@ -244,14 +244,14 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             client = self.server.get_new_client()
             client.execute_command('BLOB.SET', 'key', payload)
             client.execute_command('BLOB.HELLO', regions[0].address)
-            before = info_largeobj(client).get('largeobj_efa_drain_count', 0)
+            before = info_largeobj(client).get('largeobj_efa_discarded_transfers', 0)
             client.execute_command(
                 'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'yes')
             with pytest.raises(ResponseError, match="EFA write"):
                 client.execute_command('BLOB.GET', 'key', *address_args(regions))
             after = info_largeobj(client)
-            assert after['largeobj_efa_drain_count'] - before == 1, \
-                f"expected exactly 1 drained transfer, got {after['largeobj_efa_drain_count'] - before}"
+            assert after['largeobj_efa_discarded_transfers'] - before == 1, \
+                f"expected exactly 1 discarded transfer, got {after['largeobj_efa_discarded_transfers'] - before}"
             # Recovery: disable the hook and confirm the next transfer succeeds.
             client.execute_command(
                 'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'no')

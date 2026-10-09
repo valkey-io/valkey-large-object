@@ -792,7 +792,7 @@ pub(crate) async fn efa_transfer_addrs(
     while let Some((idx, (outcome, _operand))) = indexed_futures.next().await {
         // Already failing — remaining futures are in-flight RMAs being drained.
         if failed {
-            crate::info::EFA_DRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
+            crate::info::EFA_DISCARDED_TRANSFERS.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         let done = match outcome {
