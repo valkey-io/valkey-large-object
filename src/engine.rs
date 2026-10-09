@@ -181,7 +181,8 @@ fn commit_lo_value(
             return Ok(CommitOutcome::StaleDiscarded);
         }
         Ok(Some(_)) => EVENT_UPDATE,
-        _ => EVENT_CREATE,
+        Ok(None) => EVENT_CREATE,
+        Err(_) => return Err(ValkeyError::WrongType),
     };
     if key.set_value(&LO_TYPE, lo_value).is_err() {
         return Err(ValkeyError::Str(errors::ERR_SET_VALUE));

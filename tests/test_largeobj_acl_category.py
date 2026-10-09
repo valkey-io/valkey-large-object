@@ -69,10 +69,10 @@ class TestLargeObjACLCategory(ValkeyLargeObjTestCaseBase):
     def test_large_obj_command_acl_categories(self):
         # List of large object commands and their acl categories
         large_object_commands = [
-            ('BLOB.HELLO', [b'module'], [b'@connection', b'@largeobj']),
+            ('BLOB.HELLO', [b'module', b'fast'], [b'@connection', b'@largeobj', b'@fast']),
             ('BLOB.INFO', [b'readonly', b'module', b'fast'], [b'@read', b'@fast', b'@largeobj']),
-            ('BLOB.SET', [b'write', b'denyoom', b'module'], [b'@write', b'@slow', b'@largeobj']),
-            ('BLOB.GET', [b'readonly', b'module'], [b'@read', b'@slow', b'@largeobj']),
+            ('BLOB.SET', [b'write', b'denyoom', b'module', b'fast'], [b'@write', b'@fast', b'@largeobj']),
+            ('BLOB.GET', [b'readonly', b'module', b'fast'], [b'@read', b'@fast', b'@largeobj']),
         ]
         for cmd in large_object_commands:
             # Get the info of the commands and compare the acl categories

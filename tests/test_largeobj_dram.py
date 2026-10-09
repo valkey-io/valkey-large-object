@@ -253,7 +253,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             client.execute_command('BLOB.INFO', 'strkey')
             assert False, "Expected WRONGTYPE error"
         except ResponseError as e:
-            assert 'existing key has wrong valkey type' in str(e).lower(), f"Unexpected error: {e}"
+            assert str(e).startswith('WRONGTYPE'), f"Unexpected error: {e}"
         # Wrong number of arguments error
         client.execute_command('BLOB.SET', 'badkey', b'x' * 4096)
         try:

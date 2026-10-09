@@ -703,9 +703,9 @@ valkey_module! {
         "largeobj",
     ]
     commands: [
-        ["BLOB.HELLO", commands::lo_hello, "", 0, 0, 0, "connection largeobj"],
-        ["BLOB.GET", commands::lo_get, "readonly", 1, 1, 1, "read largeobj slow"],
-        ["BLOB.SET", commands::lo_set, "write deny-oom", 1, 1, 1, "write largeobj slow"],
+        ["BLOB.HELLO", commands::lo_hello, "fast", 0, 0, 0, "connection largeobj fast"],
+        ["BLOB.GET", commands::lo_get, "readonly fast", 1, 1, 1, "read largeobj fast"],
+        ["BLOB.SET", commands::lo_set, "write deny-oom fast", 1, 1, 1, "write largeobj fast"],
         ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1, "read largeobj fast"],
     ],
     configurations: [

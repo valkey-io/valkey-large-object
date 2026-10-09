@@ -137,7 +137,10 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     // Lookup LoValue in keyspace.
     let key = ctx.open_key(&args[1]);
-    let lo_value: &LoValue = match key.get_value::<LoValue>(&LO_TYPE)? {
+    let lo_value: &LoValue = match key
+        .get_value::<LoValue>(&LO_TYPE)
+        .map_err(|_| ValkeyError::WrongType)?
+    {
         Some(v) if !v.reclaim_in_progress() => v,
         _ => return Ok(ValkeyValue::Null),
     };
@@ -181,6 +184,15 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         len if len >= 6 => true,
         _ => return Err(ValkeyError::WrongArity),
     };
+
+    // Reject a key of another type before any transfer, matching valkey-bloom.
+    if ctx
+        .open_key(&args[1])
+        .get_value::<LoValue>(&LO_TYPE)
+        .is_err()
+    {
+        return Err(ValkeyError::WrongType);
+    }
 
     // Determine data source and obj_len based on transport.
     let (obj_len, data_source) = if efa {
@@ -234,7 +246,10 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let key = ctx.open_key(&args[1]);
-    let value = match key.get_value::<LoValue>(&LO_TYPE)? {
+    let value = match key
+        .get_value::<LoValue>(&LO_TYPE)
+        .map_err(|_| ValkeyError::WrongType)?
+    {
         Some(v) if !v.reclaim_in_progress() => v,
         _ => return Err(ValkeyError::Str(errors::ERR_NOT_FOUND)),
     };
