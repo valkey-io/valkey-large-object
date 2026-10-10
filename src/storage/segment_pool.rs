@@ -5,10 +5,10 @@
 //! ## Design
 //!
 //! `slots: Vec<Option<Segment>>` behind a `Mutex` — each slot is either
-//! `Some(segment)` (live) or `None` (empty/removed). Slot index == this pool's
-//! LOCAL iovec index in its own io_uring buffer table (each pool has its own
-//! ring). A segment's `iovec_index` is assigned at creation and recomputed on
-//! each dense table rebuild.
+//! `Some(segment)` (live) or `None` (empty/removed). Slot index is what
+//! `SegmentBuffer.segment_idx` names. A segment's `iovec_index` is its position
+//! in this pool's own io_uring buffer table (each pool has its own ring); it
+//! starts equal to the slot index but diverges after a dense table rebuild.
 //!
 //! Each `Segment` owns its own `Talc<>` instance covering exactly its own
 //! `[base, base+size)` range. There is NO shared allocator across segments.
@@ -46,9 +46,9 @@ struct SegmentState {
     /// Segment slots. `None` = empty slot (a drained hole or unused capacity).
     slots: Vec<Option<Segment>>,
     /// This pool's io_uring registered-buffer table as `(base, len)` pairs,
-    /// index-aligned with `slots`. The index is the pool-local `iovec_index` a
-    /// ReadFixed/WriteFixed op passes to name its buffer. `None` = a free index
-    /// reused by the next expand.
+    /// indexed by each segment's `iovec_index` (not its slot: a dense rebuild
+    /// compacts this table but not `slots`). `None` = a free index reused by
+    /// the next expand.
     iovecs: Vec<Option<(usize, usize)>>,
 }
 
@@ -469,14 +469,14 @@ impl SegmentPool {
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
 
-    /// Add a new segment to the pool at the pool-local `iovec_index` that the
-    /// first-free-hole search assigns, so `slots[i]` and this pool's `iovecs[i]`
-    /// stay index-aligned by construction. Each new Segment carries its own fresh
-    /// talc allocator.
+    /// Add a new segment to the pool. The slot and the iovec index are picked
+    /// separately (first hole in each, else append): `rebuild_dense_iovecs`
+    /// compacts `iovecs` but not `slots`, so the two can differ. Each new
+    /// Segment carries its own fresh talc allocator.
     ///
     /// Called from the main event-loop thread only (scaling cron or reactive expand).
     ///
-    /// Returns `(iovec_index, segment_slice)` on success. The slice is `'static` (segment memory
+    /// Returns `(slot_idx, segment_slice)` on success. The slice is `'static` (segment memory
     /// is stable for the module's lifetime) so the caller can register it with the transport
     /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if this pool's
     /// iovec table is already at `MAX_SEGMENTS`.
@@ -508,14 +508,20 @@ impl SegmentPool {
         };
         let mut seg = seg;
         seg.iovec_index = idx as u16;
-        // Place at slots[idx] so slots and iovecs stay index-aligned. Pad in case
-        // idx is past the current len.
-        if idx >= st.slots.len() {
-            st.slots.resize_with(idx + 1, || None);
-        }
-        st.slots[idx] = Some(seg);
+        // Slot: first empty slot, else append. Never reuse `idx` here: after a
+        // dense rebuild, slots[idx] can hold a live segment.
+        let slot = match st.slots.iter().position(|s| s.is_none()) {
+            Some(i) => {
+                st.slots[i] = Some(seg);
+                i
+            }
+            None => {
+                st.slots.push(Some(seg));
+                st.slots.len() - 1
+            }
+        };
 
-        Some((idx as u16, slice))
+        Some((slot as u16, slice))
     }
 
     /// Select the least-loaded non-draining segment as a shrink candidate.

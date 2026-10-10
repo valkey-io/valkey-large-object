@@ -414,7 +414,7 @@ impl DRAMPool {
     /// same unbounded behavior as core Valkey with `maxmemory 0`.
     ///
     /// Called reactively when alloc fails, or proactively when utilization > watermark.
-    /// Returns the new iovec_index on success, `None` if the watermark would be
+    /// Returns the new segment's slot index on success, `None` if the watermark would be
     /// crossed. Must be called on the main event-loop thread (reads server memory).
     pub fn try_expand(&self, ctx: &valkey_module::Context) -> Option<u16> {
         // Server-wide OOM guard: never grow into memory the shrink path would
