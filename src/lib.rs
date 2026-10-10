@@ -106,8 +106,8 @@ lazy_static::lazy_static! {
     static ref CFG_MAX_PROMOTE_SIZE: AtomicI64 = AtomicI64::new(256 * 1024 * 1024);
 
     /// Scaling cron poll interval in milliseconds. Controls how often the scaling
-    /// timer fires to check utilization and memory pressure. Default: 5000ms.
-    static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(5000);
+    /// timer fires to check utilization and memory pressure. Default: 2500ms.
+    static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(2500);
 
     /// Main-thread time, in microseconds, one scaling-cron tick may spend
     /// scanning for and deleting reclaim-list keys. Default: 1000us.
@@ -165,7 +165,7 @@ lazy_static::lazy_static! {
     // ─── Fabric Configs ──────────────────────────────────────────────────
 
     /// libfabric provider for transfers. Emulated exercises DMA path over libfabric's tcp provider, EfaDirect needs EFA hardware.
-    static ref CFG_FABRIC_PROVIDER: Mutex<FabricProvider> = Mutex::new(FabricProvider::Emulated);
+    static ref CFG_FABRIC_PROVIDER: Mutex<FabricProvider> = Mutex::new(FabricProvider::EfaDirect);
 
     /// Comma-separated fabric domains to open a service on. Default: All domains.
     static ref CFG_FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
@@ -721,7 +721,7 @@ valkey_module! {
         i64: [
             ["segment-size", &*CFG_SEGMENT_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
-            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 1_073_741_824, 1_048_576, 1_073_741_824,
+            ["nvme-staging-size", &*CFG_NVME_STAGING_SIZE, 1_073_741_824, 1_048_576, i64::MAX,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["nvme-maxmemory", &*CFG_NVME_MAXMEMORY, 0, 0, i64::MAX,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
@@ -736,8 +736,8 @@ valkey_module! {
             ["min-buffers-per-op", &*CFG_MIN_BUFFERS_PER_OP, 2, 1, 64,
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, 0, 0, 60_000,
-             ConfigurationFlags::HIDDEN, None, None],
-            ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 5_000, 1_000, 60_000,
+             ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
+            ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, 2_500, 1_000, 60_000,
              ConfigurationFlags::DEFAULT, None, None],
             ["reclaim-scan-budget-us", &*CFG_RECLAIM_SCAN_BUDGET_US, 1_000, 100, 100_000,
              ConfigurationFlags::DEFAULT, None, None],
@@ -769,14 +769,14 @@ valkey_module! {
             ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None],
         ],
         bool: [
-            ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN, None],
-            ["test-efa-fail-partial", &*CFG_TEST_EFA_FAIL_PARTIAL, false, ConfigurationFlags::HIDDEN, None],
+            ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
+            ["test-efa-fail-partial", &*CFG_TEST_EFA_FAIL_PARTIAL, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
         ],
         enum: [
             ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Dram,
              ConfigurationFlags::IMMUTABLE, None],
-            ["fabric-provider", &*CFG_FABRIC_PROVIDER, FabricProvider::Emulated,
+            ["fabric-provider", &*CFG_FABRIC_PROVIDER, FabricProvider::EfaDirect,
              ConfigurationFlags::IMMUTABLE, None],
         ],
         module_args_as_configuration: true,

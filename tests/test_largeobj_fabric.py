@@ -237,32 +237,6 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('BLOB.GET', 'copy') == payload
         finally:
             process.kill()
-        # Partial failure with drain: inject an error after the first EFA post so the
-        # await loop drains the already-submitted transfer before returning the error.
-        process, regions = self.start_target(split=[2048, 2048])
-        try:
-            client = self.server.get_new_client()
-            client.execute_command('BLOB.SET', 'key', payload)
-            client.execute_command('BLOB.HELLO', regions[0].address)
-            before = info_largeobj(client).get('largeobj_efa_discarded_transfers', 0)
-            client.execute_command(
-                'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'yes')
-            with pytest.raises(ResponseError, match="EFA write"):
-                client.execute_command('BLOB.GET', 'key', *address_args(regions))
-            after = info_largeobj(client)
-            assert after['largeobj_efa_discarded_transfers'] - before == 1, \
-                f"expected exactly 1 discarded transfer, got {after['largeobj_efa_discarded_transfers'] - before}"
-            # Recovery: disable the hook and confirm the next transfer succeeds.
-            client.execute_command(
-                'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'no')
-            reply = client.execute_command('BLOB.GET', 'key', *address_args(regions))
-            assert reply == [TARGET_LEN, crc32c.crc32c(payload)]
-            output = process.communicate(timeout=30)[0]
-            assert 'payload verified' in output, output
-        finally:
-            client.execute_command(
-                'CONFIG', 'SET', 'largeobj.test-efa-fail-partial', 'no')
-            process.kill()
 
     def test_address_coverage_is_validated(self):
         """Addresses must cover the object, and may exceed it.
@@ -354,5 +328,50 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
             assert client.execute_command(
                 'BLOB.SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
             assert client.execute_command('BLOB.GET', 'copy') == payload
+        finally:
+            process.kill()
+
+
+class TestLargeObjEfaPartialFailure(ValkeyLargeObjTestCaseBase):
+    """EFA partial failure + inline drain: test-efa-fail-partial is set at module load
+    (immutable), so the first multi-address EFA transfer always injects a synthetic
+    submit failure after the first successful post. Runs in its own server instance."""
+
+    def get_module_args(self, data_dir, direct_io):
+        base = TestLargeObjFabricTransfer.get_module_args(self, data_dir, direct_io)
+        return base + " test-efa-fail-partial yes"
+
+    def start_target(self, *flags, split=None):
+        """Launch the passive peer and return it with the regions it advertised."""
+        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
+        command = [target, '127.0.0.1', *flags]
+        if split is not None:
+            command.append('--split=' + ','.join(str(size) for size in split))
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        regions = []
+        for _ in range(1 if split is None else len(split)):
+            line = process.stdout.readline()
+            assert line.startswith('advertisement: '), line
+            address, rkey, remote_addr, length = line.split()[1:]
+            regions.append(Region(address, int(rkey), int(remote_addr), int(length)))
+        return process, regions
+
+    def test_partial_failure_drains_and_returns_error(self):
+        """Inject an error after the first EFA post so the await loop drains
+        the already-submitted transfer before returning the error."""
+        payload = PATTERN
+        process, regions = self.start_target(split=[2048, 2048])
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.SET', 'key', payload)
+            client.execute_command('BLOB.HELLO', regions[0].address)
+            before = info_largeobj(client).get('largeobj_efa_discarded_transfers', 0)
+            with pytest.raises(ResponseError, match="EFA write"):
+                client.execute_command('BLOB.GET', 'key', *address_args(regions))
+            after = info_largeobj(client)
+            assert after['largeobj_efa_discarded_transfers'] - before == 1, \
+                f"expected exactly 1 discarded transfer, got {after['largeobj_efa_discarded_transfers'] - before}"
         finally:
             process.kill()

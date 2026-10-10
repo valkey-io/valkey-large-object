@@ -17,6 +17,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
+            f" fabric-provider Emulated"
         )
 
     def test_set_get_roundtrip(self):
@@ -288,6 +289,7 @@ class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def test_copy_pool_exhausted(self):

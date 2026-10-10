@@ -44,6 +44,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
+            f" fabric-provider Emulated"
         )
 
     @pytest.fixture(autouse=True)

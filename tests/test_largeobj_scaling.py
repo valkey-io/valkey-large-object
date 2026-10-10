@@ -209,6 +209,7 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def test_proactive_expand_fires_when_watermark_exceeded(self):
@@ -254,6 +255,7 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def test_expansion_capped_by_server_maxmemory(self):
@@ -302,6 +304,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
+            f" fabric-provider Emulated"
         )
 
     def _write_payloads(self, client):
@@ -454,6 +457,7 @@ TIERED_ARGS = (
     " chunk-size 65536"
     " bench-mode no"
     " direct-io no"
+    " fabric-provider Emulated"
 )
 
 
@@ -579,7 +583,7 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
     def get_module_args(self, data_dir, direct_io):
         # Fabric up (Emulated on loopback) so expanded segments are actually EFA-registered.
         return (TIERED_ARGS.format(data_dir=data_dir)
-                + " fabric-provider Emulated fabric-interfaces lo")
+                + " fabric-interfaces lo")
 
     def test_shrink_releases_efa_registered_expanded_segment(self):
         client = self.server.get_new_client()
