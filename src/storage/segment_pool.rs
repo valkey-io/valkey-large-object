@@ -40,16 +40,10 @@ use allocator_api2::alloc::Allocator;
 use super::context::SegmentBuffer;
 use super::segment::Segment;
 
-/// Mutable segment state: the slot vector plus this pool's own io_uring iovec
-/// table.
+/// Mutable segment state: the slot vector.
 struct SegmentState {
     /// Segment slots. `None` = empty slot (a drained hole or unused capacity).
     slots: Vec<Option<Segment>>,
-    /// This pool's io_uring registered-buffer table as `(base, len)` pairs,
-    /// indexed by each segment's `iovec_index` (not its slot: a dense rebuild
-    /// compacts this table but not `slots`). `None` = a free index reused by
-    /// the next expand.
-    iovecs: Vec<Option<(usize, usize)>>,
 }
 
 pub struct SegmentPool {
@@ -63,33 +57,26 @@ pub struct SegmentPool {
 
 impl SegmentPool {
     /// Create a new SegmentPool with `segment_count` pre-allocated segments of
-    /// `segment_size` bytes. Each segment's iovec_index = its position in this
-    /// pool's own local iovec table (assigned in-order here), which lines
-    /// up with its position in the slot table.
+    /// `segment_size` bytes. Each segment's iovec_index = its slot index.
     pub fn new(segment_count: usize, segment_size: usize, pool_id: super::uring::PoolType) -> Self {
         assert!(
             segment_count >= 1,
             "SegmentPool requires at least 1 segment"
         );
+        assert!(
+            segment_count <= super::MAX_SEGMENTS,
+            "startup segment count exceeds MAX_SEGMENTS — init validation bypassed"
+        );
 
         let mut slots: Vec<Option<Segment>> = Vec::with_capacity(segment_count);
-        let mut iovecs: Vec<Option<(usize, usize)>> = Vec::with_capacity(segment_count);
-        for _ in 0..segment_count {
+        for idx in 0..segment_count {
             let mut seg = Segment::new(segment_size);
-            let iov = seg.iovec();
-            // Pool-local index: position in this pool's own iovec table.
-            let idx = iovecs.len();
-            assert!(
-                idx < super::MAX_SEGMENTS,
-                "startup segment count exceeds MAX_SEGMENTS — init validation bypassed"
-            );
-            iovecs.push(Some((iov.iov_base as usize, iov.iov_len)));
             seg.iovec_index = idx as u16;
             slots.push(Some(seg));
         }
 
         Self {
-            state: Mutex::new(SegmentState { slots, iovecs }),
+            state: Mutex::new(SegmentState { slots }),
             segment_size,
             pool_id,
         }
@@ -97,19 +84,12 @@ impl SegmentPool {
 
     // ─── io_uring iovec table (pool-local) ─────────────────────────────────────
 
-    /// Dense snapshot of this pool's iovec table (holes skipped) for the ring's
-    /// startup `IORING_REGISTER_BUFFERS`. Dense because 5.10 has no sparse table.
+    /// Dense iovec array for the ring's startup `IORING_REGISTER_BUFFERS`, one
+    /// entry per segment. Dense because 5.10 has no sparse table. Only called
+    /// from init.
     pub fn startup_iovecs(&self) -> Vec<libc::iovec> {
         let st = self.state.lock().expect("state lock unavailable");
-        st.iovecs
-            .iter()
-            .filter_map(|opt| {
-                opt.map(|(ptr, len)| libc::iovec {
-                    iov_base: ptr as *mut libc::c_void,
-                    iov_len: len,
-                })
-            })
-            .collect()
+        st.slots.iter().flatten().map(|seg| seg.iovec()).collect()
     }
 
     // ─── Allocator ───────────────────────────────────────────────────────────
@@ -469,47 +449,32 @@ impl SegmentPool {
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
 
-    /// Add a new segment to the pool. The slot and the iovec index are picked
-    /// separately (first hole in each, else append): `rebuild_dense_iovecs`
-    /// compacts `iovecs` but not `slots`, so the two can differ. Each new
-    /// Segment carries its own fresh talc allocator.
+    /// Add a new segment in the first empty slot (else append), with its own
+    /// fresh talc allocator. Its `iovec_index` is a placeholder until the
+    /// post-expand dense rebuild assigns the real one; it is unregistered until
+    /// then, so the placeholder never reaches the kernel.
     ///
     /// Called from the main event-loop thread only (scaling cron or reactive expand).
     ///
     /// Returns `(slot_idx, segment_slice)` on success. The slice is `'static` (segment memory
     /// is stable for the module's lifetime) so the caller can register it with the transport
-    /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if this pool's
-    /// iovec table is already at `MAX_SEGMENTS`.
+    /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if this pool
+    /// already has `MAX_SEGMENTS` live segments.
     pub fn expand(&self) -> Option<(u16, &'static [u8])> {
-        let seg = Segment::new(self.segment_size);
+        let mut seg = Segment::new(self.segment_size);
         // Segment memory is stable for the module's lifetime (never freed until
         // the segment is released, and a live segment is not released while a
         // registration references it). SAFETY: base/size describe the just-
         // allocated backing buffer.
         let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(seg.base, seg.size) };
-        let iov = seg.iovec();
 
         let mut st = self.state.lock().expect("state lock unavailable");
-        // Pool-local iovec index: reuse the first hole, else append (rejected at
-        // MAX_SEGMENTS). On None, `seg` drops here and nothing enters `slots`.
-        let entry = Some((iov.iov_base as usize, iov.iov_len));
-        let idx = match st.iovecs.iter().position(|s| s.is_none()) {
-            Some(i) => {
-                st.iovecs[i] = entry;
-                i
-            }
-            None => {
-                if st.iovecs.len() >= super::MAX_SEGMENTS {
-                    return None;
-                }
-                st.iovecs.push(entry);
-                st.iovecs.len() - 1
-            }
-        };
-        let mut seg = seg;
-        seg.iovec_index = idx as u16;
-        // Slot: first empty slot, else append. Never reuse `idx` here: after a
-        // dense rebuild, slots[idx] can hold a live segment.
+        // On None, `seg` drops here and nothing enters `slots`.
+        let live = st.slots.iter().flatten().count();
+        if live >= super::MAX_SEGMENTS {
+            return None;
+        }
+        seg.iovec_index = live as u16; // placeholder
         let slot = match st.slots.iter().position(|s| s.is_none()) {
             Some(i) => {
                 st.slots[i] = Some(seg);
@@ -585,19 +550,14 @@ impl SegmentPool {
         }
     }
 
-    /// Complete the drain: pull the Segment out of its slot, clear this pool's
-    /// iovec entry, drop it. Segment::drop deallocates the backing memory (its
-    /// talc's metadata lived inside that memory and vanishes with it).
+    /// Complete the drain: pull the Segment out of its slot and drop it.
+    /// Segment::drop deallocates the backing memory (its talc's metadata lived
+    /// inside that memory and vanishes with it).
     fn release_drained(&self, seg_idx: usize) {
         let mut st = self.state.lock().expect("state lock unavailable");
         let Some(seg) = st.slots[seg_idx].take() else {
             return; // already released
         };
-        let iovec_index = seg.iovec_index as usize;
-        // Null this pool's iovec slot so the ring's dense rebuild omits it.
-        if iovec_index < st.iovecs.len() {
-            st.iovecs[iovec_index] = None;
-        }
         drop(st);
         // seg dropped here → Segment::drop → talc drops (no external state) →
         // std::alloc::dealloc frees backing memory.
@@ -659,19 +619,11 @@ impl SegmentPool {
     pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
         let mut st = self.state.lock().expect("state lock unavailable");
         let mut out = Vec::new();
-        let mut next: u16 = 0;
-        let mut new_iovecs: Vec<Option<(usize, usize)>> = Vec::new();
-        for slot in st.slots.iter_mut() {
-            if let Some(seg) = slot.as_mut() {
-                seg.iovec_index = next;
-                next += 1;
-                let iov = seg.iovec();
-                out.push(iov);
-                new_iovecs.push(Some((iov.iov_base as usize, iov.iov_len)));
-                seg.mark_io_uring_registered();
-            }
+        for seg in st.slots.iter_mut().flatten() {
+            seg.iovec_index = out.len() as u16;
+            out.push(seg.iovec());
+            seg.mark_io_uring_registered();
         }
-        st.iovecs = new_iovecs; // compacted to match the dense reindex above
         out
     }
 

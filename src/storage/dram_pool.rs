@@ -397,11 +397,10 @@ impl DRAMPool {
     /// A segment marked draining is freed asynchronously: its memory is not
     /// reclaimed until all in-flight Arc holders drop and refcount reaches 0.
     /// This function scans for segments where `draining && refcount == 0` and
-    /// physically frees them: takes the Segment out of its slot, nulls this
-    /// pool's io_uring iovec slot, and drops it. Each segment owns its
-    /// own talc whose metadata lives inside the segment's memory, so dropping
-    /// the Segment deallocates that memory and the talc vanishes with it — no
-    /// `talc.truncate` is needed.
+    /// physically frees them: takes the Segment out of its slot and drops it.
+    /// Each segment owns its own talc whose metadata lives inside the segment's
+    /// memory, so dropping the Segment deallocates that memory and the talc
+    /// vanishes with it — no `talc.truncate` is needed.
     ///
     /// Must be called from the Valkey main event-loop thread only.
     pub fn release_drained_segments(&self) {
