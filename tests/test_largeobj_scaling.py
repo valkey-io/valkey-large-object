@@ -742,7 +742,7 @@ class TieredBudget(Budget):
     PER_BUDGET = 8
     BUDGET = PER_BUDGET * DISK_PER_OBJ
     FULL = 'capacity exceeded'
-    EVICTIONS = 'largeobj_nvme_evictions'
+    EVICTIONS = 'largeobj_disk_evictions'
 
     def get_module_args(self, data_dir, direct_io):
         return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET}"
@@ -776,8 +776,8 @@ class TieredBudget(Budget):
             info = info_largeobj(client)
             files = self.object_files()
             on_disk = sum(os.path.getsize(os.path.join(self.data_dir, name)) for name in files)
-            return (info['largeobj_nvme_unevictable_objects'] == 0
-                    and info['largeobj_nvme_used_bytes'] == on_disk
+            return (info['largeobj_disk_unevictable_objects'] == 0
+                    and info['largeobj_disk_used_bytes'] == on_disk
                     and (live is None or len(files) == live))
         wait_for_true(settled, timeout=timeout)
 
@@ -891,7 +891,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         client.config_set('maxmemory', 0)
         self.assert_refused(client, 'overflow', b'O' * self.OBJ)
         info = info_largeobj(client)
-        assert info['largeobj_nvme_evictions'] == info['largeobj_nvme_eviction_failures'] == 0
+        assert info['largeobj_disk_evictions'] == info['largeobj_disk_eviction_failures'] == 0
         assert surviving(client, payloads) == payloads
 
     def test_a_write_that_needs_more_than_16_victims_is_refused_but_they_stay_evicted(self):
@@ -900,8 +900,8 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         set_objects(client, 's_', 64, 60 * 1024)  # 64KB on disk each: they fill the budget
         self.assert_refused(client, 'big', b'B' * int(self.BUDGET * 0.6))
         info = info_largeobj(client)
-        assert info['largeobj_nvme_evictions'] == 16
-        assert info['largeobj_nvme_eviction_failures'] == 1
+        assert info['largeobj_disk_evictions'] == 16
+        assert info['largeobj_disk_eviction_failures'] == 1
         self.settle(client, 64 - 16)
 
     def test_files_that_are_not_objects_are_never_victims(self):
@@ -963,7 +963,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         promote(client, set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ))
         assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
         info = info_largeobj(client)
-        assert info['largeobj_nvme_evictions'] == info['largeobj_pending_reclaims'] == 1
+        assert info['largeobj_disk_evictions'] == info['largeobj_pending_reclaims'] == 1
         assert info['largeobj_dram_objects'] == self.PER_BUDGET - 1
 
     def test_a_failed_eviction_unlink_leaks_the_victim(self):
@@ -975,8 +975,8 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         self.assert_refused(client, 'newcomer', b'N' * self.OBJ)
         hook(client, 'fail-evict-unlink', 'no')
         info = info_largeobj(client)
-        assert info['largeobj_nvme_evictions'] == 0
-        assert info['largeobj_nvme_eviction_failures'] == info['largeobj_pending_reclaims'] == 1
+        assert info['largeobj_disk_evictions'] == 0
+        assert info['largeobj_disk_eviction_failures'] == info['largeobj_pending_reclaims'] == 1
         survivors = surviving(client, payloads)
         assert len(survivors) == self.PER_BUDGET - 1
 
@@ -984,7 +984,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         assert client.execute_command('DEL', victim) == 1
         wait_for_true(lambda: pending_reclaims(client) == 0, timeout=10)
         self.settle(client, self.PER_BUDGET)  # still on disk, still charged
-        assert info_largeobj(client)['largeobj_nvme_used_bytes'] == self.BUDGET
+        assert info_largeobj(client)['largeobj_disk_used_bytes'] == self.BUDGET
 
 
 class TestTieredEvictionCron(EvictionCronTests, TieredBudget):
@@ -1071,4 +1071,4 @@ class TestTieredEvictionMixed(TieredBudget):
         wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
         self.settle(client, None, timeout=15)
         assert len(self.object_files()) == client.dbsize()
-        assert info_largeobj(client)['largeobj_nvme_used_bytes'] == client.dbsize() * self.DISK_PER_OBJ
+        assert info_largeobj(client)['largeobj_disk_used_bytes'] == client.dbsize() * self.DISK_PER_OBJ

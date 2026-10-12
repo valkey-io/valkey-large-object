@@ -126,7 +126,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
     let reserved = reserve(bytes as i64 - freed as i64);
     if !reserved {
         decrease_nvme_disk_usage(freed);
-        crate::info::NVME_EVICTION_FAILURES.fetch_add(1, Ordering::Relaxed);
+        crate::info::DISK_EVICTION_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
     reserved
 }
@@ -167,7 +167,7 @@ fn evict(victims: &[(ObjectId, u64)]) -> u64 {
         match unlinked {
             Ok(()) => {
                 freed += size;
-                crate::info::NVME_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                crate::info::DISK_EVICTIONS.fetch_add(1, Ordering::Relaxed);
             }
             // Leak hazard: the file stays on disk, charged and in the reclaim list;
             // its teardown only removes it from the reclaim list.

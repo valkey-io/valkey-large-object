@@ -31,8 +31,8 @@ pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Tiered: objects unlinked to make room for a write, and writes refused despite
 /// eviction.
-pub static NVME_EVICTIONS: AtomicU64 = AtomicU64::new(0);
-pub static NVME_EVICTION_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub static DISK_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+pub static DISK_EVICTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
@@ -69,16 +69,16 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             storage::get_dram_pool().reclaims.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "nvme_evictions",
-            NVME_EVICTIONS.load(Ordering::Relaxed) as i64,
+            "disk_evictions",
+            DISK_EVICTIONS.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "nvme_eviction_failures",
-            NVME_EVICTION_FAILURES.load(Ordering::Relaxed) as i64,
+            "disk_eviction_failures",
+            DISK_EVICTION_FAILURES.load(Ordering::Relaxed) as i64,
         )?
-        .field("nvme_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
+        .field("disk_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
         .field(
-            "nvme_unevictable_objects",
+            "disk_unevictable_objects",
             storage::object_file::unevictable_count() as i64,
         )?
         .build_section()?
