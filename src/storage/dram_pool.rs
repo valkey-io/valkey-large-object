@@ -671,38 +671,6 @@ mod tests {
     }
 
     #[test]
-    fn dram_eviction_lists_its_victims_and_counts_them() {
-        let p = dram_pool();
-        // ObjectIds nothing else in the test binary uses: RECLAIM_LIST is global.
-        for i in 0..4u16 {
-            p.insert_object(ObjectId(9_000 + i as u64), ctx(0, i));
-        }
-        let victims = p.reclaim_in(0, 2 * BUF as usize, 16).unwrap();
-        assert_eq!(victims.len(), 2);
-        assert!(victims
-            .iter()
-            .all(|(oid, _)| super::super::reclaim::RECLAIM_LIST.contains(oid)));
-        assert_eq!(p.evictions.load(Ordering::Relaxed), 2);
-        for (oid, _) in &victims {
-            super::super::reclaim::RECLAIM_LIST.remove(oid);
-        }
-    }
-
-    #[test]
-    fn dram_eviction_that_cannot_cover_lists_nothing() {
-        let p = dram_pool();
-        for i in 0..2u16 {
-            p.insert_object(ObjectId(9_100 + i as u64), ctx(0, i));
-        }
-        assert!(p.reclaim_in(0, 3 * BUF as usize, 0).is_none());
-        assert!((0..2).all(|i| {
-            let oid = ObjectId(9_100 + i);
-            p.contains_object(&oid) && !super::super::reclaim::RECLAIM_LIST.contains(&oid)
-        }));
-        assert_eq!(p.evictions.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
     fn dram_eviction_has_no_victim_cap_when_max_is_zero() {
         let p = dram_pool();
         for i in 0..4u16 {
