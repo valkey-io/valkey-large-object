@@ -6,9 +6,10 @@
 //!
 //! `slots: Vec<Option<Segment>>` behind a `Mutex` — each slot is either
 //! `Some(segment)` (live) or `None` (empty/removed). Slot index is what
-//! `SegmentBuffer.segment_idx` names. A segment's `iovec_index` is its position
-//! in this pool's own io_uring buffer table (each pool has its own ring); it
-//! starts equal to the slot index but diverges after a dense table rebuild.
+//! `SegmentBuffer.segment_idx` names: it only locates the segment in `slots`.
+//! A segment's `iovec_index` is its position in this pool's own io_uring buffer
+//! table (each pool has its own ring) and is read from the segment itself. The
+//! two are independent; never derive one from the other.
 //!
 //! Each `Segment` owns its own `Talc<>` instance covering exactly its own
 //! `[base, base+size)` range. There is NO shared allocator across segments.
@@ -57,7 +58,8 @@ pub struct SegmentPool {
 
 impl SegmentPool {
     /// Create a new SegmentPool with `segment_count` pre-allocated segments of
-    /// `segment_size` bytes. Each segment's iovec_index = its slot index.
+    /// `segment_size` bytes. `iovec_index` is assigned 0..n in slot order, so
+    /// the startup table is dense.
     pub fn new(segment_count: usize, segment_size: usize, pool_id: super::uring::PoolType) -> Self {
         assert!(
             segment_count >= 1,

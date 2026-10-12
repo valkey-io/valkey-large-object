@@ -30,7 +30,7 @@ pub struct Segment {
     /// Total size in bytes.
     pub size: usize,
     /// Index into this pool's io_uring iovec table (ReadFixed/WriteFixed).
-    /// Not the slot index: equal at startup, but a dense rebuild renumbers it.
+    /// Independent of the slot index; reassigned by each dense table rebuild.
     pub iovec_index: u16,
     /// This segment's own talc allocator. Claims exactly `[base, base+size)`.
     /// Each alloc/free on this segment locks THIS mutex — never contends with
