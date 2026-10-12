@@ -1,9 +1,12 @@
 //! Reclaim list: objects whose memory a background job (e.g. Dram-mode shrink)
 //! already freed while their keys still exist.
 //!
-//! Commands check it upfront and treat a listed key as missing; the scaling
-//! cron deletes the keys. An oid leaves the list when its object is removed
-//! (`DRAMPool::remove_object`, reached from `lo_free` once the key is deleted).
+//! Commands check it upfront and treat a key in the list as missing; the scaling
+//! cron deletes the keys. An oid leaves the list:
+//! - Dram: when its object is removed (`DRAMPool::remove_object`, reached from
+//!   `lo_free` once the key is deleted), or when the cron deletes its key.
+//! - Tiered: when its file is torn down (`ObjectFile::drop`), or when an NVMe
+//!   eviction finds its file already gone (a stale directory entry).
 //!
 //! Lock order: `RECLAIM_LIST` before `DRAMPool.objects` when both are held.
 
@@ -41,6 +44,14 @@ impl ReclaimList {
         self.len.store(oids.len(), Ordering::Release);
     }
 
+    /// Add `oid` to the reclaim list. False if it was already there.
+    pub fn insert(&self, oid: ObjectId) -> bool {
+        let mut oids = self.lock();
+        let inserted = oids.insert(oid);
+        self.len.store(oids.len(), Ordering::Release);
+        inserted
+    }
+
     pub fn contains(&self, oid: &ObjectId) -> bool {
         !self.is_empty() && self.lock().contains(oid)
     }
@@ -53,13 +64,15 @@ impl ReclaimList {
         self.len() == 0
     }
 
-    /// Take `oid` off the list. Always locks: `remove_object` must wait for a
-    /// shrink that is listing this oid.
-    pub fn remove(&self, oid: &ObjectId) {
+    /// Remove `oid` from the list; false if it was not there. Always locks:
+    /// `remove_object` must wait for a shrink that is adding this oid.
+    pub fn remove(&self, oid: &ObjectId) -> bool {
         let mut oids = self.lock();
-        if oids.remove(oid) {
+        let removed = oids.remove(oid);
+        if removed {
             self.len.store(oids.len(), Ordering::Release);
         }
+        removed
     }
 }
 
@@ -112,8 +125,11 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
                     .reclaims
                     .fetch_add(1, Ordering::Relaxed);
                 // lo_free runs later on the BIO thread; clear now so the scan
-                // stops once every listed key is gone.
-                RECLAIM_LIST.remove(&oid);
+                // stops once every listed key is gone. Tiered: the file's
+                // teardown clears it.
+                if crate::operating_mode() == crate::OperatingMode::Dram {
+                    RECLAIM_LIST.remove(&oid);
+                }
             }
             if !more {
                 scan.cursor.restart();

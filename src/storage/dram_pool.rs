@@ -254,16 +254,19 @@ impl DRAMPool {
             .insert(oid, ctx);
     }
 
-    /// Remove an ObjectContext (free callback / eviction). Also clears `oid`
+    /// Remove an ObjectContext (free callback / eviction). Dram: also clears `oid`
     /// from the reclaim list: its key is gone. Map first, then list: a shrink
     /// that runs in between no longer sees the object, so cannot list it.
+    /// Tiered: the file's teardown clears it instead.
     pub fn remove_object(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
         let removed = self
             .objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
             .remove(oid);
-        super::reclaim::RECLAIM_LIST.remove(oid);
+        if crate::operating_mode() == crate::OperatingMode::Dram {
+            super::reclaim::RECLAIM_LIST.remove(oid);
+        }
         removed
     }
 
@@ -344,7 +347,7 @@ impl DRAMPool {
     /// buffers while holding `objects`, so today the order is objects -> state).
     fn make_room_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
         // Dram victims are the data: no cap.
-        let max_victims = if self.cache.is_none() {
+        let max_victims = if crate::operating_mode() == crate::OperatingMode::Dram {
             0
         } else {
             RECLAIM_MAX_VICTIMS

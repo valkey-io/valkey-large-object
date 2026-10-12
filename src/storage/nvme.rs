@@ -40,20 +40,29 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
     }
 }
 
-/// Atomically reserve `bytes` of NVMe disk budget if it fits within disk-maxmemory.
-/// Returns true and increments the counter on success; returns false and leaves the
-/// counter unchanged if the reservation would exceed the cap (or overflow).
+/// Reserve `bytes` of NVMe disk budget, evicting other objects to make room if it
+/// does not fit within disk-maxmemory. Returns true and increments the counter on
+/// success; returns false and leaves the counter unchanged otherwise.
 /// Returns true if disk-maxmemory is 0 (unlimited).
 pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
+    reserve(bytes as i64) || evict_and_reserve(bytes)
+}
+
+/// Atomically add `delta` to the usage if the result fits within disk-maxmemory;
+/// false on overflow. Negative when an eviction freed more than it reserves. FATAL
+/// below 0.
+fn reserve(delta: i64) -> bool {
     let max = crate::nvme_maxmemory();
     NVME_DISK_USAGE
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            let next = cur.checked_add(bytes)?;
-            if max == 0 || next <= max {
-                Some(next)
-            } else {
-                None
-            }
+            let Some(next) = cur.checked_add_signed(delta) else {
+                assert!(
+                    delta > 0,
+                    "NVMe disk-usage underflow: {cur} B tracked, delta {delta} B"
+                );
+                return None;
+            };
+            (max == 0 || next <= max).then_some(next)
         })
         .is_ok()
 }
@@ -61,6 +70,112 @@ pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
 /// Current tracked NVMe disk usage in bytes.
 pub fn nvme_disk_usage() -> u64 {
     NVME_DISK_USAGE.load(Ordering::Relaxed)
+}
+
+// ─── NVMe Eviction ───────────────────────────────────────────────────────────
+
+/// Directory entries read per eviction.
+const EVICT_BATCH: usize = 64;
+
+/// Evict objects to make room for `bytes`, then reserve them. True if reserved.
+/// Each claim runs under the server lock: COPY already holds it on main; a SET's
+/// tokio task takes it per claim.
+fn evict_and_reserve(bytes: u64) -> bool {
+    // Eviction cannot make room for more than the cap.
+    if bytes > crate::nvme_maxmemory() {
+        return false;
+    }
+    let lock = (!crate::is_main_thread()).then(valkey_module::ThreadSafeContext::new);
+    let locked = |f: &dyn Fn(&valkey_module::Context) -> bool| match &lock {
+        Some(lock) => f(&lock.lock()),
+        None => f(&valkey_module::Context::dummy()),
+    };
+    if !locked(&|ctx| crate::eviction_allowed(ctx)) {
+        return false;
+    }
+    let need = (nvme_disk_usage() + bytes).saturating_sub(crate::nvme_maxmemory());
+    // Claim, then stat: a claimed file cannot change under us.
+    let mut victims = Vec::new();
+    let mut covered = 0;
+    for oid in victim_batch(EVICT_BATCH) {
+        if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
+            break;
+        }
+        // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
+        if !locked(&|_| super::object_file::claim_victim(oid)) {
+            continue;
+        }
+        match std::fs::metadata(oid.file_path(&crate::nvme_dir())) {
+            Ok(meta) => {
+                covered += meta.len();
+                victims.push((oid, meta.len()));
+            }
+            // Stale readdir entry: torn down before the claim, so its key is gone.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                super::reclaim::RECLAIM_LIST.remove(&oid);
+                super::remove_unevictable(oid);
+            }
+            // Leak hazard: the file stays on disk, charged and in the reclaim list;
+            // its teardown only removes it from the reclaim list.
+            Err(_) => super::remove_unevictable(oid),
+        }
+    }
+    // No lock.
+    let freed = evict(&victims);
+    // One update, so a competing reservation cannot take the freed bytes.
+    let reserved = reserve(bytes as i64 - freed as i64);
+    if !reserved {
+        decrease_nvme_disk_usage(freed);
+        crate::info::NVME_EVICTION_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+    reserved
+}
+
+/// The first `n` object files in `nvme_dir`.
+fn victim_batch(n: usize) -> Vec<ObjectId> {
+    let Ok(dir) = std::fs::read_dir(crate::nvme_dir()) else {
+        return Vec::new();
+    };
+    dir.filter_map(|entry| {
+        let name = entry.ok()?.file_name();
+        let hex = name.to_str()?.strip_suffix(".dat")?;
+        if hex.len() != 16 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        u64::from_str_radix(hex, 16).ok().map(ObjectId)
+    })
+    .take(n)
+    .collect()
+}
+
+/// Unlink claimed `victims` (oid, size) and remove them from the unevictable list.
+/// Returns the bytes freed. They stay in the reclaim list: their keys read as missing
+/// until the cron deletes them, and their teardown then only removes them from it.
+fn evict(victims: &[(ObjectId, u64)]) -> u64 {
+    let mut freed = 0;
+    for &(oid, size) in victims {
+        if let Some(pool) = super::FD_POOL.get() {
+            pool.remove(oid);
+        }
+        super::get_dram_pool().remove_object(&oid);
+        let path = oid.file_path(&crate::nvme_dir());
+        let unlinked = if crate::test_fail_evict_unlink() {
+            Err(std::io::Error::other("test-fail-evict-unlink"))
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match unlinked {
+            Ok(()) => {
+                freed += size;
+                crate::info::NVME_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+            }
+            // Leak hazard: the file stays on disk, charged and in the reclaim list;
+            // its teardown only removes it from the reclaim list.
+            Err(e) => warn_failed_unlink("eviction", &path, &e),
+        }
+        super::remove_unevictable(oid);
+    }
+    freed
 }
 
 // ─── FileHeader ──────────────────────────────────────────────────────────────

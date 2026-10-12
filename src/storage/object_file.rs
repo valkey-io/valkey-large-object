@@ -29,12 +29,63 @@
 //! serialized form; on load a handle is reconstructed for the existing file and its
 //! fd opens lazily on the first GET.
 
+use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use super::fd_pool::FdPool;
 use super::Crc;
 use crate::data_type::ObjectId;
+
+/// Object id -> number of holders. Eviction never takes an id in this map.
+pub static UNEVICTABLE: LazyLock<Mutex<HashMap<ObjectId, u32>>> = LazyLock::new(Mutex::default);
+
+/// Hold `oid`: eviction will not claim it until every hold is released. Holds
+/// count, so each must be paired with one `remove_unevictable`.
+pub fn add_unevictable(oid: ObjectId) {
+    *UNEVICTABLE
+        .lock()
+        .expect("UNEVICTABLE lock unavailable")
+        .entry(oid)
+        .or_insert(0) += 1;
+}
+
+/// Release one hold on `oid`; it becomes evictable again once the last is released.
+pub fn remove_unevictable(oid: ObjectId) {
+    let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
+    let Some(n) = unevictable.get_mut(&oid) else {
+        debug_assert!(
+            false,
+            "remove_unevictable: {oid:?} is not in the unevictable list"
+        );
+        return;
+    };
+    *n -= 1;
+    if *n == 0 {
+        unevictable.remove(&oid);
+    }
+}
+
+/// Oids in the unevictable list (INFO).
+pub fn unevictable_count() -> usize {
+    UNEVICTABLE
+        .lock()
+        .expect("UNEVICTABLE lock unavailable")
+        .len()
+}
+
+/// Claim `oid` for eviction: add it to the reclaim list and the unevictable list,
+/// unless it is in either already. One `UNEVICTABLE` critical section, so a
+/// teardown either adds `oid` to the unevictable list first (the claim fails) or
+/// finds it in the reclaim list. Call under the server lock.
+pub fn claim_victim(oid: ObjectId) -> bool {
+    let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
+    if unevictable.contains_key(&oid) || !super::reclaim::RECLAIM_LIST.insert(oid) {
+        return false;
+    }
+    unevictable.insert(oid, 1);
+    true
+}
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
 
@@ -88,12 +139,16 @@ impl ObjectFile {
     pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
         let dir = crate::nvme_dir();
         let disk_len = self.disk_len;
+        // We do not allow the eviction of the source or the new file mid-copy.
+        add_unevictable(self.object_id);
         if !super::nvme::try_reserve_nvme_disk_usage(disk_len) {
+            remove_unevictable(self.object_id);
             return None;
         }
         let new_oid = ObjectId::next();
+        add_unevictable(new_oid);
         let dst_path = new_oid.file_path(&dir);
-        match self.copy_file(&dst_path, new_oid, len, crc32c) {
+        let copied = match self.copy_file(&dst_path, new_oid, len, crc32c) {
             Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
             Err(e) => {
                 let _ = std::fs::remove_file(&dst_path);
@@ -104,7 +159,10 @@ impl ObjectFile {
                 ));
                 None
             }
-        }
+        };
+        remove_unevictable(new_oid);
+        remove_unevictable(self.object_id);
+        copied
     }
 
     /// Header write + payload copy for `copy`. Buffered I/O on purpose: this runs off
@@ -132,10 +190,12 @@ impl ObjectFile {
 impl Drop for ObjectFile {
     fn drop(&mut self) {
         // Runs once, when the last ref drops: a completed deletion with no
-        // remaining ObjectFile refs. Means "object gone" — deregister the fd and
-        // unlink the file.
+        // remaining ObjectFile refs. Means "object gone" — deregister the fd and,
+        // unless an eviction owns it, unlink the file.
         let object_id = self.object_id;
         let disk_len = self.disk_len;
+        // We do not allow the eviction of a file that is being torn down.
+        add_unevictable(object_id);
 
         // Deregistering drops the pool's Arc<OwnedFd>; if no in-flight reader
         // holds a clone, the fd's OwnedFd closes at this time.
@@ -143,12 +203,17 @@ impl Drop for ObjectFile {
             if let Some(pool) = super::FD_POOL.get() {
                 pool.remove(object_id);
             }
-            let path = object_id.file_path(&crate::nvme_dir());
-            if let Err(e) = std::fs::remove_file(&path) {
-                super::warn_failed_unlink("teardown", &path, &e);
+            // In the reclaim list: an eviction claimed the file and owns its unlink and
+            // credit. The key is gone, so nothing else will remove it from the list.
+            if !super::reclaim::RECLAIM_LIST.remove(&object_id) {
+                let path = object_id.file_path(&crate::nvme_dir());
+                if let Err(e) = std::fs::remove_file(&path) {
+                    super::warn_failed_unlink("teardown", &path, &e);
+                }
+                // Release exactly what create added — no stat, so it can't drift.
+                crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
             }
-            // Release exactly what create added — no stat, so it can't drift.
-            crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
+            remove_unevictable(object_id);
         };
 
         // The main event-loop thread must be kept syscall-free. Hand the operation

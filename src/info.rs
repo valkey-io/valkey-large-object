@@ -29,6 +29,11 @@ pub static EFA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
 /// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
 pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Tiered: objects unlinked to make room for a write, and writes refused despite
+/// eviction.
+pub static NVME_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+pub static NVME_EVICTION_FAILURES: AtomicU64 = AtomicU64::new(0);
+
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
     if let Err(e) = info_sections(ctx) {
@@ -62,6 +67,19 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "reclaims",
             storage::get_dram_pool().reclaims.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "nvme_evictions",
+            NVME_EVICTIONS.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "nvme_eviction_failures",
+            NVME_EVICTION_FAILURES.load(Ordering::Relaxed) as i64,
+        )?
+        .field("nvme_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
+        .field(
+            "nvme_unevictable_objects",
+            storage::object_file::unevictable_count() as i64,
         )?
         .build_section()?
         .build_info()?;

@@ -350,6 +350,7 @@ fn cmd_get_tiered(
                     &info::NVME_READ_ERRORS,
                     ValkeyError::Str(errors::ERR_NVME_READ),
                 );
+                storage::remove_unevictable(object_id);
                 return;
             }
         };
@@ -389,6 +390,7 @@ fn cmd_get_tiered(
                 target,
             )
             .await;
+            storage::remove_unevictable(object_id);
         });
         return;
     }
@@ -407,6 +409,7 @@ fn cmd_get_tiered(
                 &info::NVME_BUFFER_EXHAUSTED,
                 ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
             );
+            storage::remove_unevictable(object_id);
             return;
         }
     };
@@ -421,6 +424,7 @@ fn cmd_get_tiered(
                 &info::NVME_READ_ERRORS,
                 ValkeyError::Str(errors::ERR_NVME_READ),
             );
+            storage::remove_unevictable(object_id);
             return;
         }
     };
@@ -452,6 +456,7 @@ fn cmd_get_tiered(
             target,
         )
         .await;
+        storage::remove_unevictable(object_id);
     });
 }
 
@@ -561,6 +566,7 @@ pub fn execute_set(
     key_name: &valkey_module::ValkeyString,
     obj_len: u64,
     data_source: DataSource,
+    old_oid: Option<ObjectId>,
 ) -> EngineResult {
     let mode = crate::operating_mode();
     // Assign object_id at command dispatch time (main thread) — establishes
@@ -593,6 +599,7 @@ pub fn execute_set(
                         data_source,
                         blocked_client,
                         object_id,
+                        old_oid,
                     );
                 }
             }
@@ -771,6 +778,7 @@ fn cmd_set_tiered(
     data_source: DataSource,
     blocked_client: valkey_module::BlockedClient,
     object_id: ObjectId,
+    old_oid: Option<ObjectId>,
 ) {
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
@@ -790,6 +798,12 @@ fn cmd_set_tiered(
     let stream_ctx = storage::StreamingContext::new(buffers);
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
+    // We do not allow the eviction of the new file until it is committed, nor of
+    // the one it replaces.
+    storage::add_unevictable(object_id);
+    if let Some(old_oid) = old_oid {
+        storage::add_unevictable(old_oid);
+    }
     match data_source {
         DataSource::Tcp(data) => {
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
@@ -809,6 +823,10 @@ fn cmd_set_tiered(
                     SetSource::Tcp(data),
                 )
                 .await;
+                storage::remove_unevictable(object_id);
+                if let Some(old_oid) = old_oid {
+                    storage::remove_unevictable(old_oid);
+                }
             });
         }
         DataSource::Efa { session, addrs } => {
@@ -829,6 +847,10 @@ fn cmd_set_tiered(
                     SetSource::Efa(session),
                 )
                 .await;
+                storage::remove_unevictable(object_id);
+                if let Some(old_oid) = old_oid {
+                    storage::remove_unevictable(old_oid);
+                }
             });
         }
     }
@@ -1001,13 +1023,16 @@ fn cmd_get_from_dram(
                     &mut chunk_iter,
                 ))));
             }
+            if let Some(file) = file {
+                storage::remove_unevictable(file.object_id());
+            }
         }
         Transport::Efa { session, addrs } => {
             // EFA: write every DRAM buffer to the client via the ONE streaming
             // driver (source=DRAM resident, target=EFA client).
             let obj_ctx = obj_ctx.clone();
             crate::runtime_handle().spawn(async move {
-                let _keep_alive = (&obj_ctx, file);
+                let _keep_alive = &obj_ctx;
                 let dram_pool = storage::get_dram_pool();
                 let chunk_size = crate::chunk_size();
                 let chunk_iter =
@@ -1030,6 +1055,9 @@ fn cmd_get_from_dram(
                         thread_ctx.reply(Ok(efa_get_reply(obj_len, crc32c)));
                     }
                     Err(e) => crate::stream::reply_stream_err(&thread_ctx, e),
+                }
+                if let Some(file) = file {
+                    storage::remove_unevictable(file.object_id());
                 }
             });
         }

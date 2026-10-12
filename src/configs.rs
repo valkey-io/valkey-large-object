@@ -234,6 +234,9 @@ lazy_static::lazy_static! {
     /// drain path. Default: false. Hidden test hook.
     pub static ref CFG_TEST_RDMA_FAIL_PARTIAL: AtomicBool = AtomicBool::new(false);
 
+    /// Test-only: fail every NVMe eviction unlink. false = disabled.
+    pub static ref CFG_TEST_FAIL_EVICT_UNLINK: AtomicBool = AtomicBool::new(false);
+
     // ─── Streaming Configs ───────────────────────────────────────────────
 
     /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
@@ -397,6 +400,10 @@ pub fn min_buffers_per_op() -> usize {
 
 pub fn test_pause_before_finalize_set_ms() -> u64 {
     CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_fail_evict_unlink() -> bool {
+    CFG_TEST_FAIL_EVICT_UNLINK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn test_rdma_fail_partial() -> bool {

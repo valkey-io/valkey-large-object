@@ -35,9 +35,12 @@ pub fn scaling_cron(ctx: &Context) {
     super::reclaim::delete_reclaimed_keys(ctx);
 
     // A shrink is still in progress: finish it before any more scaling.
-    // A SET that needs room meanwhile still expands reactively.
+    // A SET that needs room meanwhile still expands reactively. In Tiered mode the
+    // reclaim list holds NVMe evictions, not shrinks.
     let (_, draining, _) = pool.segment_counts();
-    if draining > 0 || !super::reclaim::RECLAIM_LIST.is_empty() {
+    let reclaiming = crate::operating_mode() == crate::OperatingMode::Dram
+        && !super::reclaim::RECLAIM_LIST.is_empty();
+    if draining > 0 || reclaiming {
         rearm_scaling_cron(ctx, next_poll_ms());
         return;
     }
