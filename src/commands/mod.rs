@@ -15,7 +15,7 @@ use valkey_module::{Context, ValkeyError, ValkeyResult, ValkeyString, ValkeyValu
 use crate::data_type::{LoValue, LO_TYPE};
 use crate::engine::{self, DataSource, Transport};
 use crate::errors;
-use crate::storage::{self, ClientEFAAddress};
+use crate::storage::ClientEFAAddress;
 use crate::transport::config::FabricProvider;
 use crate::transport::{self, session, Session};
 
@@ -142,11 +142,6 @@ pub fn lo_tcp_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let crc32c = lo_value.crc32c;
     // Pin the file to protect it from asynchronous deletion in tiered mode.
     let file = lo_value.file.clone();
-    // We do not allow the eviction of files that are inflight.
-    if file.is_some() {
-        storage::add_unevictable(object_id);
-    }
-
     // Dispatch to engine — it decides sync vs async internally.
     match engine::execute_get(ctx, object_id, obj_len, crc32c, file, Transport::Tcp) {
         engine::EngineResult::Sync(result) => result,
@@ -184,11 +179,6 @@ pub fn lo_rdma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let addrs = parse_efa_addresses(&args, 2, obj_len)?;
     let session = efa_session(ctx)?;
     let transport = Transport::Efa { session, addrs };
-    // We do not allow the eviction of files that are inflight.
-    if file.is_some() {
-        storage::add_unevictable(object_id);
-    }
-
     // Dispatch to engine — it decides sync vs async internally.
     match engine::execute_get(ctx, object_id, obj_len, crc32c, file, transport) {
         engine::EngineResult::Sync(result) => result,

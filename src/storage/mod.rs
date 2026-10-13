@@ -25,7 +25,7 @@ pub mod uring;
 
 // Re-exports for convenience.
 pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
-pub use object_file::{add_unevictable, remove_unevictable, ObjectFile};
+pub use object_file::{ObjectFile, UnevictableGuard};
 
 // Re-exports from nvme.rs
 pub use nvme::{

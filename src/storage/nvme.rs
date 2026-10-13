@@ -85,12 +85,17 @@ fn evict_and_reserve(bytes: u64) -> bool {
     if bytes > crate::nvme_maxmemory() {
         return false;
     }
+    fn locked<T>(
+        lock: &Option<valkey_module::ThreadSafeContext<valkey_module::DetachedFromClient>>,
+        f: impl FnOnce(&valkey_module::Context) -> T,
+    ) -> T {
+        match lock {
+            Some(lock) => f(&lock.lock()),
+            None => f(&valkey_module::Context::dummy()),
+        }
+    }
     let lock = (!crate::is_main_thread()).then(valkey_module::ThreadSafeContext::new);
-    let locked = |f: &dyn Fn(&valkey_module::Context) -> bool| match &lock {
-        Some(lock) => f(&lock.lock()),
-        None => f(&valkey_module::Context::dummy()),
-    };
-    if !locked(&|ctx| crate::eviction_allowed(ctx)) {
+    if !locked(&lock, crate::eviction_allowed) {
         return false;
     }
     let need = (nvme_disk_usage() + bytes).saturating_sub(crate::nvme_maxmemory());
@@ -102,26 +107,25 @@ fn evict_and_reserve(bytes: u64) -> bool {
             break;
         }
         // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
-        if !locked(&|_| super::object_file::claim_victim(oid)) {
+        let Some(unevictable) = locked(&lock, |_| super::object_file::claim_victim(oid)) else {
             continue;
-        }
+        };
         match std::fs::metadata(oid.file_path(&crate::nvme_dir())) {
             Ok(meta) => {
                 covered += meta.len();
-                victims.push((oid, meta.len()));
+                victims.push((oid, meta.len(), unevictable));
             }
             // Stale readdir entry: torn down before the claim, so its key is gone.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 super::reclaim::RECLAIM_LIST.remove(&oid);
-                super::remove_unevictable(oid);
             }
             // Leak hazard: the file stays on disk, charged and in the reclaim list;
             // its teardown only removes it from the reclaim list.
-            Err(_) => super::remove_unevictable(oid),
+            Err(_) => {}
         }
     }
     // No lock.
-    let freed = evict(&victims);
+    let freed = evict(victims);
     // One update, so a competing reservation cannot take the freed bytes.
     let reserved = reserve(bytes as i64 - freed as i64);
     if !reserved {
@@ -148,12 +152,12 @@ fn victim_batch(n: usize) -> Vec<ObjectId> {
     .collect()
 }
 
-/// Unlink claimed `victims` (oid, size) and remove them from the unevictable list.
+/// Unlink claimed `victims` (oid, size, guard) and remove them from the unevictable list.
 /// Returns the bytes freed. They stay in the reclaim list: their keys read as missing
 /// until the cron deletes them, and their teardown then only removes them from it.
-fn evict(victims: &[(ObjectId, u64)]) -> u64 {
+fn evict(victims: Vec<(ObjectId, u64, super::UnevictableGuard)>) -> u64 {
     let mut freed = 0;
-    for &(oid, size) in victims {
+    for (oid, size, _unevictable) in victims {
         if let Some(pool) = super::FD_POOL.get() {
             pool.remove(oid);
         }
@@ -173,7 +177,6 @@ fn evict(victims: &[(ObjectId, u64)]) -> u64 {
             // its teardown only removes it from the reclaim list.
             Err(e) => warn_failed_unlink("eviction", &path, &e),
         }
-        super::remove_unevictable(oid);
     }
     freed
 }
