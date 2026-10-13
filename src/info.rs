@@ -33,6 +33,11 @@ pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Tiered files. Cached copies Tiered drops are demotions, not evictions.
 pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// RDMA payload bytes of successful transfers. Reads pull client memory (the SET
+/// path); writes push into it (the GET path).
+pub static RDMA_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static RDMA_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+
 /// `part` as a percentage of `whole`, to two decimals ("99.99").
 fn pct(part: u64, whole: u64) -> String {
     // No budget, e.g. disk-maxmemory 0 (unlimited).
@@ -290,12 +295,14 @@ fn smartlog_section(ctx: &InfoContext) -> ValkeyResult<()> {
     warnings.build_section()?.build_info().map(|_| ())
 }
 
-/// RDMA sessions, in both modes. Emitted as zeros where no fabric
+/// RDMA sessions and payload bytes, in both modes. Emitted as zeros where no fabric
 /// is available, so consumers can depend on a fixed key set.
 fn rdma_section(ctx: &InfoContext) -> ValkeyResult<()> {
     ctx.builder()
         .add_section("rdma")
         .field("rdma_sessions", crate::transport::session::count() as u64)?
+        .field("rdma_read_bytes", RDMA_READ_BYTES.load(Ordering::Relaxed))?
+        .field("rdma_write_bytes", RDMA_WRITE_BYTES.load(Ordering::Relaxed))?
         .build_section()?
         .build_info()
         .map(|_| ())

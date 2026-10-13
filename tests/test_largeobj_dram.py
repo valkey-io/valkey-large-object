@@ -220,7 +220,8 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         assert client.info('largeobj_disk') == {}
         assert client.info('largeobj_disk_staging') == {}
         rdma = client.info('largeobj_rdma')
-        assert rdma['largeobj_rdma_sessions'] == 0
+        for field in ('sessions', 'read_bytes', 'write_bytes'):
+            assert rdma[f'largeobj_rdma_{field}'] == 0, field
         assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
 
     # ─── BLOB.INFO tests ───────────────────────────────────────────────────

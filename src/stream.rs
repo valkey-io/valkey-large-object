@@ -752,9 +752,12 @@ pub(crate) async fn efa_transfer_addrs(
 ) -> Result<u32, ValkeyError> {
     // TODO: Track specific EFA error types (e.g. timeout, connection reset) before
     // collapsing to the generic ERR_RDMA_READ/ERR_RDMA_WRITE reply string.
-    let err_str = match direction {
-        EfaDirection::Write => crate::errors::ERR_RDMA_WRITE,
-        EfaDirection::Read => crate::errors::ERR_RDMA_READ,
+    let (err_str, moved_bytes) = match direction {
+        EfaDirection::Write => (
+            crate::errors::ERR_RDMA_WRITE,
+            &crate::info::RDMA_WRITE_BYTES,
+        ),
+        EfaDirection::Read => (crate::errors::ERR_RDMA_READ, &crate::info::RDMA_READ_BYTES),
     };
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
@@ -793,6 +796,10 @@ pub(crate) async fn efa_transfer_addrs(
     }
     let mut results: Vec<Option<u32>> = vec![None; addrs.len()];
     while let Some((idx, (outcome, _operand))) = indexed_futures.next().await {
+        // Drained transfers count too: their bytes still moved.
+        if outcome.is_ok() {
+            moved_bytes.fetch_add(addrs[idx].1 as u64, Ordering::Relaxed);
+        }
         // Already failing — remaining futures are in-flight RMAs being drained.
         if failed {
             crate::info::RDMA_DISCARDED_TRANSFERS.fetch_add(1, Ordering::Relaxed);

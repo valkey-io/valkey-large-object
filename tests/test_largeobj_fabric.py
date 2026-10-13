@@ -266,8 +266,9 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             process.kill()
 
     def test_info_rdma_traffic(self):
-        """A connection that ran BLOB.RDMA_HELLO counts as an RDMA session until it disconnects,
-        and its finished requests are no longer in flight."""
+        """INFO counts the bytes that crossed RDMA: a GET pushes out (writes) and a SET pulls
+        in (reads). TCP traffic counts nowhere, finished requests are no longer in flight, and
+        the session goes when its connection does."""
         process, regions = self.start_target('--read', split=[1024, 3072])
         try:
             client = self.server.get_new_client()
@@ -276,19 +277,43 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 return client.info('largeobj_rdma')
 
             client.execute_command('BLOB.TCP_SET', 'key', PATTERN)
-            assert rdma()['largeobj_rdma_sessions'] == 0
+            assert client.execute_command('BLOB.TCP_GET', 'key') == PATTERN
+            assert set(rdma().values()) == {0}
 
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
             assert rdma()['largeobj_rdma_sessions'] == 1
             assert client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions)) == [
                 TARGET_LEN, crc32c.crc32c(PATTERN)]
+            assert rdma()['largeobj_rdma_write_bytes'] == TARGET_LEN
+            assert rdma()['largeobj_rdma_read_bytes'] == 0
+
             assert client.execute_command(
                 'BLOB.RDMA_SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
+            assert rdma()['largeobj_rdma_read_bytes'] == TARGET_LEN
+            assert rdma()['largeobj_rdma_write_bytes'] == TARGET_LEN
             assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
 
             client.close()
             observer = self.server.get_new_client()
             wait_for_equal(lambda: observer.info('largeobj_rdma')['largeobj_rdma_sessions'], 0)
+        finally:
+            process.kill()
+
+    def test_info_rdma_failed_transfer_moves_no_bytes(self):
+        """A failed transfer adds no bytes, and its request is no longer in flight."""
+        process, regions = self.start_target()
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.TCP_SET', 'key', PATTERN)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            # Just past the end of the target's registered region.
+            region = regions[0]
+            self.verify_error_response(
+                client, f'BLOB.RDMA_GET key {region.rkey} {region.addr + region.len} {region.len}',
+                'RDMA write failed')
+            assert client.info('largeobj_rdma')['largeobj_rdma_write_bytes'] == 0
+            assert client.info('largeobj_error_metrics')['largeobj_rdma_write_errors'] == 1
+            assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
         finally:
             process.kill()
 
@@ -395,10 +420,13 @@ class TestLargeObjEfaPartialFailure(ValkeyLargeObjTestCaseBase):
             client.execute_command('BLOB.TCP_SET', 'key', payload)
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
             before = info_largeobj(client).get('largeobj_rdma_discarded_transfers', 0)
+            write_bytes_before = info_largeobj(client)['largeobj_rdma_write_bytes']
             with pytest.raises(ResponseError, match="RDMA write"):
                 client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions))
             after = info_largeobj(client)
             assert after['largeobj_rdma_discarded_transfers'] - before == 1, \
                 f"expected exactly 1 discarded transfer, got {after['largeobj_rdma_discarded_transfers'] - before}"
+            # The drained transfer still moved its bytes.
+            assert after['largeobj_rdma_write_bytes'] - write_bytes_before == regions[0].len
         finally:
             process.kill()
