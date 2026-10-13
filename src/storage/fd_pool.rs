@@ -71,7 +71,7 @@ impl FdPool {
         cap: usize,
     ) -> Option<Arc<OwnedFd>> {
         let now_min = now_minutes();
-        let decay_time = crate::tiered_decay_time();
+        let decay_time = crate::lfu_decay_time();
         let hit = |entry: &FdEntry| {
             entry.stats.touch(now_min, decay_time);
             Arc::clone(&entry.fd)

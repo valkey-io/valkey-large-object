@@ -29,9 +29,11 @@ pub static EFA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
 /// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
 pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Tiered: objects unlinked to make room for a write, and writes refused despite
-/// eviction.
-pub static DISK_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+/// Objects evicted to make room for a write: Dram objects or Tiered files. Cached
+/// copies a Tiered promotion drops are demotions, not evictions.
+pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Tiered: writes refused despite eviction.
 pub static DISK_EVICTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
@@ -68,10 +70,7 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "reclaims",
             storage::get_dram_pool().reclaims.load(Ordering::Relaxed) as i64,
         )?
-        .field(
-            "disk_evictions",
-            DISK_EVICTIONS.load(Ordering::Relaxed) as i64,
-        )?
+        .field("evictions", EVICTIONS.load(Ordering::Relaxed) as i64)?
         .field(
             "disk_eviction_failures",
             DISK_EVICTION_FAILURES.load(Ordering::Relaxed) as i64,
@@ -157,15 +156,6 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "dram_scaling_shrinks",
             dram.shrink_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "dram_evictions",
-            dram.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "dram_eviction_failures",
-            dram.eviction_failures
-                .load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field("dram_segment_size_bytes", seg_size as i64)?
         .field(

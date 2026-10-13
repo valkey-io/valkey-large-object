@@ -241,6 +241,11 @@ fn cmd_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, Va
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
+            // Eviction ranks by use, as for a Tiered cache hit.
+            obj_ctx.stats.touch(
+                storage::cache_policy::now_minutes(),
+                crate::lfu_decay_time(),
+            );
             if crate::bench_mode() {
                 Ok(ValkeyValue::Integer(obj_len as i64))
             } else {
@@ -276,6 +281,11 @@ fn cmd_get_dram_efa(
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
+            // Eviction ranks by use, as for a Tiered cache hit.
+            obj_ctx.stats.touch(
+                storage::cache_policy::now_minutes(),
+                crate::lfu_decay_time(),
+            );
             // Serve from DRAMPool.
             cmd_get_from_dram(
                 dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, None,

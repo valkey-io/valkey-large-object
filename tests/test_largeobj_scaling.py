@@ -700,7 +700,7 @@ class Budget(ValkeyLargeObjTestCaseBase):
     POLL_MS = 60_000
 
     def evictions(self, client):
-        return info_largeobj(client)[self.EVICTIONS]
+        return info_largeobj(client)['largeobj_evictions']
 
     def assert_refused(self, client, key, payload):
         with pytest.raises(ResponseError, match=self.FULL):
@@ -714,7 +714,6 @@ class DramBudget(Budget):
     OBJ = BUDGET // 4
     PER_BUDGET = 3  # a fourth would fill the segment exactly, but talc's metadata lives in it
     FULL = 'pool exhausted'
-    EVICTIONS = 'largeobj_dram_evictions'
 
     def get_module_args(self, data_dir, direct_io):
         return (f"operating-mode Dram segment-size {self.BUDGET} max-object-size {self.BUDGET - 64 * 1024}"
@@ -742,7 +741,6 @@ class TieredBudget(Budget):
     PER_BUDGET = 8
     BUDGET = PER_BUDGET * DISK_PER_OBJ
     FULL = 'capacity exceeded'
-    EVICTIONS = 'largeobj_disk_evictions'
 
     def get_module_args(self, data_dir, direct_io):
         return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET}"
@@ -873,7 +871,19 @@ class EvictionCronTests:
 
 
 class TestDramEviction(EvictionTests, DramBudget):
-    pass
+
+    def test_a_read_object_outlives_unread_ones(self):
+        """A GET ranks the object by use, so eviction takes the objects never read first."""
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        read = self.first_in_line(payloads)
+        # Twice: a minute's decay can cost the first GET its gain.
+        for _ in range(2):
+            assert client.execute_command('BLOB.TCP_GET', read) == payloads[read]
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        survivors = surviving(client, payloads)
+        assert read in survivors
+        assert len(survivors) == self.PER_BUDGET - 1
 
 
 class TestDramEvictionCron(EvictionCronTests, DramBudget):
@@ -891,7 +901,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         client.config_set('maxmemory', 0)
         self.assert_refused(client, 'overflow', b'O' * self.OBJ)
         info = info_largeobj(client)
-        assert info['largeobj_disk_evictions'] == info['largeobj_disk_eviction_failures'] == 0
+        assert info['largeobj_evictions'] == info['largeobj_disk_eviction_failures'] == 0
         assert surviving(client, payloads) == payloads
 
     def test_a_write_that_needs_more_than_16_victims_is_refused_but_they_stay_evicted(self):
@@ -900,7 +910,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         set_objects(client, 's_', 64, 60 * 1024)  # 64KB on disk each: they fill the budget
         self.assert_refused(client, 'big', b'B' * int(self.BUDGET * 0.6))
         info = info_largeobj(client)
-        assert info['largeobj_disk_evictions'] == 16
+        assert info['largeobj_evictions'] == 16
         assert info['largeobj_disk_eviction_failures'] == 1
         self.settle(client, 64 - 16)
 
@@ -963,7 +973,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         promote(client, set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ))
         assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
         info = info_largeobj(client)
-        assert info['largeobj_disk_evictions'] == info['largeobj_pending_reclaims'] == 1
+        assert info['largeobj_evictions'] == info['largeobj_pending_reclaims'] == 1
         assert info['largeobj_dram_objects'] == self.PER_BUDGET - 1
 
     def test_a_failed_eviction_unlink_leaks_the_victim(self):
@@ -975,7 +985,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         self.assert_refused(client, 'newcomer', b'N' * self.OBJ)
         hook(client, 'fail-evict-unlink', 'no')
         info = info_largeobj(client)
-        assert info['largeobj_disk_evictions'] == 0
+        assert info['largeobj_evictions'] == 0
         assert info['largeobj_disk_eviction_failures'] == info['largeobj_pending_reclaims'] == 1
         survivors = surviving(client, payloads)
         assert len(survivors) == self.PER_BUDGET - 1

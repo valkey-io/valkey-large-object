@@ -66,10 +66,10 @@ pub const MAX_RECLAIM_POLL_MS: i64 = 60_000;
 pub const DEFAULT_SMARTLOG_POLL_SECS: i64 = 60;
 pub const MIN_SMARTLOG_POLL_SECS: i64 = 0;
 pub const MAX_SMARTLOG_POLL_SECS: i64 = 86_400;
-// tiered-decay-time
-pub const DEFAULT_TIERED_DECAY_TIME: i64 = 1;
-pub const MIN_TIERED_DECAY_TIME: i64 = 0;
-pub const MAX_TIERED_DECAY_TIME: i64 = 65_535;
+// lfu-decay-time
+pub const DEFAULT_LFU_DECAY_TIME: i64 = 1;
+pub const MIN_LFU_DECAY_TIME: i64 = 0;
+pub const MAX_LFU_DECAY_TIME: i64 = 65_535;
 // promote-min-hits
 pub const DEFAULT_PROMOTE_MIN_HITS: i64 = 2;
 pub const MIN_PROMOTE_MIN_HITS: i64 = 1;
@@ -165,7 +165,7 @@ lazy_static::lazy_static! {
     pub static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(DEFAULT_SMARTLOG_POLL_SECS);
 
     /// LFU counter decay: minutes per one-point decrement. 0 disables decay.
-    pub static ref CFG_TIERED_DECAY_TIME: AtomicI64 = AtomicI64::new(DEFAULT_TIERED_DECAY_TIME);
+    pub static ref CFG_LFU_DECAY_TIME: AtomicI64 = AtomicI64::new(DEFAULT_LFU_DECAY_TIME);
 
     /// How many misses an object must accumulate in the admission filter before a GET
     /// promotes it into DRAMPool. Default: 2.
@@ -316,8 +316,8 @@ pub fn smartlog_poll_secs() -> u64 {
     CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn tiered_decay_time() -> u64 {
-    CFG_TIERED_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn lfu_decay_time() -> u64 {
+    CFG_LFU_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn promote_min_hits() -> u8 {

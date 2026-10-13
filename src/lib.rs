@@ -308,7 +308,7 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, DEFAULT_SCALING_SHRINK_WATERMARK, MIN_SCALING_SHRINK_WATERMARK, MAX_SCALING_SHRINK_WATERMARK,
              ConfigurationFlags::DEFAULT, None, None],
-            ["tiered-decay-time", &*CFG_TIERED_DECAY_TIME, DEFAULT_TIERED_DECAY_TIME, MIN_TIERED_DECAY_TIME, MAX_TIERED_DECAY_TIME,
+            ["lfu-decay-time", &*CFG_LFU_DECAY_TIME, DEFAULT_LFU_DECAY_TIME, MIN_LFU_DECAY_TIME, MAX_LFU_DECAY_TIME,
              ConfigurationFlags::DEFAULT, None, None],
             ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, DEFAULT_PROMOTE_MIN_HITS, MIN_PROMOTE_MIN_HITS, MAX_PROMOTE_MIN_HITS,
              ConfigurationFlags::DEFAULT, None, None],

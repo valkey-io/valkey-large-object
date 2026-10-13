@@ -77,7 +77,7 @@ valkey-server --port 7380 \
 | `reclaim-scan-budget-us` | 1000 | Yes | Microseconds per tick for reclaim-list key deletion. Min 100, max 100000. |
 | `reclaim-sample-size` | 5 | Yes | Tiered: cached entries sampled per reclaim; the lowest LFU score goes. Min 1, max 64. |
 | `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Min 1, max 255. |
-| `tiered-decay-time` | 1 | Yes | Tiered: minutes per one-point decay of the LFU score used for DRAM and fd reclaim. 0 = no decay. Max 65535. |
+| `lfu-decay-time` | 1 | Yes | Minutes per one-point decay of the LFU score used to rank DRAM objects and fds for eviction and reclaim. 0 = no decay. Max 65535. |
 | `max-cached-fds` | 1024 | Yes | Tiered: cap on cached read fds. 0 = unlimited. Max 1048576. |
 | `smartlog-poll-secs` | 60 | Immutable | NVMe SMART poll interval in seconds. 0 = disabled. Max 86400. |
 | `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. Min 1, max 32. |

@@ -205,7 +205,8 @@ impl Drop for ObjectFile {
                 pool.remove(object_id);
             }
             // In the reclaim list: an eviction claimed the file and owns its unlink and
-            // credit. The key is gone, so nothing else will remove it from the list.
+            // credit. The ledger has no per-object entry, so this check is what prevents
+            // a double credit. The key is gone, so nothing else will remove it from the list.
             if !super::reclaim::RECLAIM_LIST.remove(&object_id) {
                 let path = object_id.file_path(&crate::nvme_dir());
                 if let Err(e) = std::fs::remove_file(&path) {

@@ -171,7 +171,7 @@ fn evict(victims: Vec<(ObjectId, u64, super::UnevictableGuard)>) -> u64 {
         match unlinked {
             Ok(()) => {
                 freed += size;
-                crate::info::DISK_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
             }
             // Leak hazard: the file stays on disk, charged and in the reclaim list;
             // its teardown only removes it from the reclaim list.
