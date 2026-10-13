@@ -38,6 +38,7 @@ use std::sync::Mutex;
 
 use allocator_api2::alloc::Allocator;
 
+use super::cache_policy::RECLAIM_MAX_SEGMENTS;
 use super::context::SegmentBuffer;
 use super::segment::Segment;
 
@@ -142,13 +143,12 @@ impl SegmentPool {
             .collect()
     }
 
-    /// Allocate every chunk of the object from ONE least-loaded eligible segment.
-    /// Single `min_by_key` pass, no fallback loop (same as `alloc_one`): segments
-    /// are uniform, so if the emptiest eligible one can't fit — only possible by
-    /// talc's per-chunk boundary-tag overhead — none can, and `None` = pool full,
-    /// which the caller handles via reactive expand. Keeps an object co-located —
-    /// see `alloc_exact`.
-    /// `target` pins the segment (reclaim retry); `None` picks the least-loaded.
+    /// Allocate every chunk of the object from ONE segment: `target` if set (reclaim
+    /// retry), else the first of the `RECLAIM_MAX_SEGMENTS` least-loaded eligible
+    /// segments that fits. The emptiest can have the bytes yet fail in talc
+    /// (fragmentation, per-chunk boundary tags) where a fuller one fits. `None` =
+    /// no candidate fits, which the caller handles via expand or eviction. Keeps an
+    /// object co-located — see `alloc_exact`.
     fn alloc_object_in_one_segment(
         &self,
         sizes: &[usize],
@@ -160,13 +160,26 @@ impl SegmentPool {
         );
         let total: usize = sizes.iter().sum();
         let st = self.state.lock().expect("state lock unavailable");
-        // Single O(N) pass: least-loaded eligible segment, checked against the
-        // object's TOTAL size. Segments are uniform, so if it can't fit, none
-        // can. `target` pins the segment instead.
-        let seg_idx = match target {
-            Some(i) => i,
-            None => Self::least_loaded(&st, 1).first()?.0,
+        let candidates = match target {
+            Some(i) => vec![i],
+            None => Self::least_loaded(&st, RECLAIM_MAX_SEGMENTS)
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect(),
         };
+        candidates
+            .into_iter()
+            .find_map(|seg_idx| self.alloc_object_in(&st, seg_idx, sizes, total))
+    }
+
+    /// `alloc_object_in_one_segment` in segment `seg_idx`, holding the state lock.
+    fn alloc_object_in(
+        &self,
+        st: &SegmentState,
+        seg_idx: usize,
+        sizes: &[usize],
+        total: usize,
+    ) -> Option<Vec<SegmentBuffer>> {
         let seg = st.slots.get(seg_idx)?.as_ref()?;
         if seg.draining.load(std::sync::atomic::Ordering::Acquire)
             || seg
@@ -185,9 +198,8 @@ impl SegmentPool {
                 .expect("alloc_object_in_one_segment: invalid chunk layout");
             // TalcCell::allocate (Allocator trait) is safe and the all-or-nothing fit check.
             let Ok(ptr) = talc.allocate(layout) else {
-                // Partial failure by talc overhead: roll back what we took from
-                // this segment and report pool-full. No next-segment fallback —
-                // uniform segments mean no other segment would fit either.
+                // Partial failure by talc overhead or fragmentation: roll back
+                // what we took from this segment; the caller tries the next.
                 for buf in &buffers {
                     let l = Layout::from_size_align(buf.len as usize, super::IO_ALIGN)
                         .expect("alloc_object_in_one_segment: rollback layout");
@@ -778,6 +790,32 @@ mod tests {
         assert!(pool.alloc_exact_in(5, 4096).is_none());
         pool.free_n(&a);
         pool.free_n(&b);
+    }
+
+    #[test]
+    fn test_alloc_falls_back_past_a_fragmented_segment() {
+        // Explicit chunk sizes: independent of the global chunk-size other tests set.
+        let pool = SegmentPool::new(2, 65536, super::super::uring::PoolType::Dram);
+        let alloc_in = |seg, size| pool.alloc_object_in_one_segment(&[size], Some(seg));
+        // Seg 0: 4 KiB objects with every other one freed, so no 16 KiB hole.
+        let mut small = Vec::new();
+        while let Some(b) = alloc_in(0, 4096) {
+            small.push(b);
+        }
+        let (freed, kept): (Vec<_>, Vec<_>) =
+            small.into_iter().enumerate().partition(|(i, _)| i % 2 == 0);
+        freed.iter().for_each(|(_, b)| pool.free_n(b));
+        // Seg 1: fuller than seg 0, but with one contiguous free tail.
+        let big: Vec<_> = (0..2).map(|_| alloc_in(1, 12288).unwrap()).collect();
+        let least = SegmentPool::least_loaded(&pool.state.lock().unwrap(), 1)[0].0;
+        assert_eq!(least, 0, "seg 0 is least loaded");
+        assert!(alloc_in(0, 16384).is_none(), "seg 0 is fragmented");
+
+        let bufs = pool.alloc_object_in_one_segment(&[16384], None).unwrap();
+        assert!(bufs.iter().all(|b| b.segment_idx == 1));
+        pool.free_n(&bufs);
+        kept.iter().for_each(|(_, b)| pool.free_n(b));
+        big.iter().for_each(|b| pool.free_n(b));
     }
 
     #[test]
