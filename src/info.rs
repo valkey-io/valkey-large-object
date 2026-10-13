@@ -29,12 +29,9 @@ pub static EFA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
 /// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
 pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Objects evicted to make room for a write: Dram objects or Tiered files. Cached
-/// copies a Tiered promotion drops are demotions, not evictions.
+/// Objects evicted to make room for a write, or by a Dram shrink: Dram objects or
+/// Tiered files. Cached copies Tiered drops are demotions, not evictions.
 pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
-
-/// Tiered: writes refused despite eviction.
-pub static DISK_EVICTION_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
@@ -66,15 +63,7 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "pending_reclaims",
             storage::reclaim::RECLAIM_LIST.len() as i64,
         )?
-        .field(
-            "reclaims",
-            storage::get_dram_pool().reclaims.load(Ordering::Relaxed) as i64,
-        )?
         .field("evictions", EVICTIONS.load(Ordering::Relaxed) as i64)?
-        .field(
-            "disk_eviction_failures",
-            DISK_EVICTION_FAILURES.load(Ordering::Relaxed) as i64,
-        )?
         .field("disk_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
         .field(
             "disk_unevictable_objects",

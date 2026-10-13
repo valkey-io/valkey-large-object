@@ -389,7 +389,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         surviving_keys = [k for k in self.PAYLOADS if client.exists(k)]
         deleted_keys = set(self.PAYLOADS) - set(surviving_keys)
         assert deleted_keys
-        assert after['largeobj_reclaims'] == before['largeobj_reclaims'] + len(deleted_keys)
+        assert after['largeobj_evictions'] == before['largeobj_evictions'] + len(deleted_keys)
         # Keys whose segments were not released read back unchanged.
         for key in surviving_keys:
             assert client.execute_command('BLOB.TCP_GET', key) == self.PAYLOADS[key]
@@ -403,7 +403,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
     def test_reclaimed_key_reads_as_missing(self):
         """Between the shrink and its key deletion, the victim key still exists
         but every module command treats it as missing. A user DEL in that window
-        takes it off the reclaim list but is not counted as a reclaim."""
+        takes it off the reclaim list."""
         client = self.server.get_new_client()
         # The shrink tick re-arms the cron 60s out, holding the window open.
         client.config_set('largeobj.reclaim-poll-ms', 60000)
@@ -423,11 +423,8 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         with pytest.raises(ResponseError, match='module key failed to copy'):
             client.execute_command('COPY', victim, 'copy_dst')
 
-        reclaims = info_largeobj(client)['largeobj_reclaims']
         client.delete(victim)
         wait_for_true(lambda: info_largeobj(client)['largeobj_pending_reclaims'] == 0)
-        # The user deleted it, not the module, so it isn't counted.
-        assert info_largeobj(client)['largeobj_reclaims'] == reclaims
 
     def test_no_shrink_under_noeviction(self):
         """Dram shrink deletes keys, so noeviction disables it."""
@@ -470,7 +467,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
                       and shrink_completed(client), timeout=self.TIMEOUT_S)
         shrunk = info_largeobj(client)
         assert shrunk['largeobj_dram_scaling_shrinks'] == expanded['largeobj_dram_scaling_shrinks'] + 4
-        assert shrunk['largeobj_reclaims'] == expanded['largeobj_reclaims'] + 4
+        assert shrunk['largeobj_evictions'] == expanded['largeobj_evictions'] + 4
         assert shrunk['largeobj_num_objects'] == 0
         assert client.dbsize() == 0
 
@@ -562,7 +559,8 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         shrinks = after['largeobj_dram_scaling_shrinks'] - before['largeobj_dram_scaling_shrinks']
         assert after['largeobj_dram_segments'] == 4 - shrinks
         assert after['largeobj_dram_objects'] == 4 - shrinks
-        assert after['largeobj_reclaims'] == before['largeobj_reclaims']  # no key deleted
+        assert after['largeobj_evictions'] == before['largeobj_evictions']
+        assert after['largeobj_cache_demotions'] == before['largeobj_cache_demotions'] + shrinks
         assert client.dbsize() == 4
         self._assert_reads_from_nvme(client)
         # The released segment left its ring's io_uring table too.
@@ -839,7 +837,6 @@ class EvictionTests:
         wait_for_true(lambda: pending_reclaims(client) == self.evictions(client) - 2)
         client.execute_command('FLUSHALL', 'ASYNC')
         wait_for_true(lambda: pending_reclaims(client) == 0)
-        assert info_largeobj(client)['largeobj_reclaims'] == 0, "the cron deleted nothing"
         self.settle(client, 0)
 
 
@@ -859,7 +856,7 @@ class EvictionCronTests:
         wait_for_true(lambda: pending_reclaims(client) == 0, timeout=15)
 
         evictions = self.evictions(client)
-        assert info_largeobj(client)['largeobj_reclaims'] == evictions > 0
+        assert evictions > 0
         keys = 0
         for db in range(3):
             client.execute_command('SELECT', db)
@@ -901,7 +898,8 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         client.config_set('maxmemory', 0)
         self.assert_refused(client, 'overflow', b'O' * self.OBJ)
         info = info_largeobj(client)
-        assert info['largeobj_evictions'] == info['largeobj_disk_eviction_failures'] == 0
+        assert info['largeobj_evictions'] == 0
+        assert info['largeobj_nvme_capacity_exceeded'] == 2
         assert surviving(client, payloads) == payloads
 
     def test_a_write_that_needs_more_than_16_victims_is_refused_but_they_stay_evicted(self):
@@ -911,7 +909,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         self.assert_refused(client, 'big', b'B' * int(self.BUDGET * 0.6))
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 16
-        assert info['largeobj_disk_eviction_failures'] == 1
+        assert info['largeobj_nvme_capacity_exceeded'] == 1
         self.settle(client, 64 - 16)
 
     def test_files_that_are_not_objects_are_never_victims(self):
@@ -986,7 +984,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         hook(client, 'fail-evict-unlink', 'no')
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 0
-        assert info['largeobj_disk_eviction_failures'] == info['largeobj_pending_reclaims'] == 1
+        assert info['largeobj_nvme_capacity_exceeded'] == info['largeobj_pending_reclaims'] == 1
         survivors = surviving(client, payloads)
         assert len(survivors) == self.PER_BUDGET - 1
 

@@ -94,10 +94,6 @@ pub struct DRAMPool {
     pub expand_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
     pub shrink_count: AtomicU64,
-    /// Keys the module deleted because their objects were already freed
-    /// (Dram shrink and eviction). Like core's `evicted_keys`: a key deleted by
-    /// anything else (user DEL, overwrite, expiry) is not counted.
-    pub reclaims: AtomicU64,
     /// Admission filter and cache stats. `Some` in Tiered mode, `None` in Dram
     /// mode where the DRAMPool is the data, not a cache.
     pub cache: Option<TieredCache>,
@@ -110,7 +106,6 @@ impl DRAMPool {
             objects: RwLock::new(ObjectMaps::default()),
             expand_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
-            reclaims: AtomicU64::new(0),
             cache,
         }
     }
@@ -537,10 +532,16 @@ impl DRAMPool {
                 .write()
                 .expect("DRAMPool.objects lock unavailable")
                 .remove_by_segment_id(victim_idx);
+            let n = removed.len() as u64;
             // Tiered: the objects live on in NVMe, so their keys stay valid.
             if crate::operating_mode() == crate::OperatingMode::Dram {
+                crate::info::EVICTIONS.fetch_add(n, Ordering::Relaxed);
                 removed
             } else {
+                self.tiered_cache()
+                    .stats
+                    .demotions
+                    .fetch_add(n, Ordering::Relaxed);
                 Default::default()
             }
         });

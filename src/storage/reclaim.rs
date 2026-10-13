@@ -1,5 +1,6 @@
-//! Reclaim list: objects whose memory a background job (e.g. Dram-mode shrink)
-//! already freed while their keys still exist.
+//! Reclaim list: oids of ghost keys, whose payload is gone or going (a Tiered
+//! eviction unlinks the file after claiming it) while the key still exists. In
+//! Tiered mode, in the list means the eviction owns the file's unlink and credit.
 //!
 //! Commands check it upfront and treat a key in the list as missing; the scaling
 //! cron deletes the keys. An oid leaves the list:
@@ -25,12 +26,12 @@ pub static RECLAIM_LIST: LazyLock<ReclaimList> = LazyLock::new(ReclaimList::defa
 #[derive(Default)]
 pub struct ReclaimList {
     oids: Mutex<HashSet<ObjectId>>,
-    /// `oids.len()`, written under the lock: readers skip it when empty.
+    /// `oids.len()`. Store only under the `oids` lock, or it can read 0 for a non-empty set.
     len: AtomicUsize,
 }
 
 impl ReclaimList {
-    /// Private so every change goes through `add_with` / `remove`, which update `len`.
+    /// Private so every change goes through `add_with` / `insert` / `remove`, which update `len`.
     fn lock(&self) -> MutexGuard<'_, HashSet<ObjectId>> {
         self.oids.lock().expect("RECLAIM_LIST lock unavailable")
     }
@@ -96,9 +97,7 @@ thread_local! {
 /// `reclaim-scan-budget-us` of main-thread time per tick. Scans db by db,
 /// resuming across ticks, until the reclaim list is empty. An oid leaves the
 /// list when its key is deleted, here or by any other path (`lo_free` ->
-/// `remove_object`), so the scan cannot outlive its keys. Only a delete made
-/// here counts as a reclaim; a normal delete (user DEL, overwrite, expiry ->
-/// `lo_free`) just takes the oid off the list.
+/// `remove_object`), so the scan cannot outlive its keys.
 ///
 /// Cross-slot deletion is safe here: a timer callback runs outside command
 /// execution (`server.current_client` is NULL), so key lookups hash each key's
@@ -119,11 +118,8 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
             let (listed_keys, more) = listed_keys_in_next_bucket(ctx, &scan.cursor);
             for (name, oid) in listed_keys {
                 let _ = ctx.open_key_writable(&name).unlink();
-                // Same keyspace event and count core makes for its own evictions.
+                // Same keyspace event core fires for its own evictions.
                 ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
-                super::get_dram_pool()
-                    .reclaims
-                    .fetch_add(1, Ordering::Relaxed);
                 // lo_free runs later on the BIO thread; clear now so the scan
                 // stops once every listed key is gone. Tiered: the file's
                 // teardown clears it.

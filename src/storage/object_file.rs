@@ -37,8 +37,10 @@ use super::fd_pool::FdPool;
 use super::Crc;
 use crate::data_type::ObjectId;
 
-/// Object id -> number of live `UnevictableGuard`s. Eviction never takes an id in this map.
-pub static UNEVICTABLE: LazyLock<Mutex<HashMap<ObjectId, u32>>> = LazyLock::new(Mutex::default);
+/// Unevictable list (Tiered): oids whose files are in use by a GET, SET, COPY,
+/// teardown or eviction, as oid -> live `UnevictableGuard`s. Eviction never
+/// claims an oid in it.
+static UNEVICTABLE: LazyLock<Mutex<HashMap<ObjectId, u32>>> = LazyLock::new(Mutex::default);
 
 /// Keeps `oid` in the unevictable list until every guard for it drops.
 /// Never call `new` or drop one under the `UNEVICTABLE` or `RECLAIM_LIST` lock.
@@ -204,10 +206,14 @@ impl Drop for ObjectFile {
             if let Some(pool) = super::FD_POOL.get() {
                 pool.remove(object_id);
             }
-            // In the reclaim list: an eviction claimed the file and owns its unlink and
-            // credit. The ledger has no per-object entry, so this check is what prevents
-            // a double credit. The key is gone, so nothing else will remove it from the list.
-            if !super::reclaim::RECLAIM_LIST.remove(&object_id) {
+            // An eviction may have claimed this file. If so, it owns the unlink and the
+            // ledger credit (the ledger can't detect a second one); we only take the oid
+            // off the reclaim list, which only this teardown can do now that the key is
+            // gone. Otherwise we unlink and credit.
+            let claimed_by_eviction = super::reclaim::RECLAIM_LIST.remove(&object_id);
+            if claimed_by_eviction {
+                // The eviction unlinks the file and credits its bytes.
+            } else {
                 let path = object_id.file_path(&crate::nvme_dir());
                 if let Err(e) = std::fs::remove_file(&path) {
                     super::warn_failed_unlink("teardown", &path, &e);

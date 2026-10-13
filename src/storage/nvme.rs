@@ -77,25 +77,24 @@ pub fn nvme_disk_usage() -> u64 {
 /// Directory entries read per eviction.
 const EVICT_BATCH: usize = 64;
 
+/// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
+/// tokio task) take it. Never call off main while holding it: it would deadlock.
+fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
+    if crate::is_main_thread() {
+        f(&valkey_module::Context::dummy())
+    } else {
+        f(&valkey_module::ThreadSafeContext::new().lock())
+    }
+}
+
 /// Evict objects to make room for `bytes`, then reserve them. True if reserved.
-/// Each claim runs under the server lock: COPY already holds it on main; a SET's
-/// tokio task takes it per claim.
+/// A refused write keeps its victims evicted: a claim is never undone.
 fn evict_and_reserve(bytes: u64) -> bool {
     // Eviction cannot make room for more than the cap.
     if bytes > crate::nvme_maxmemory() {
         return false;
     }
-    fn locked<T>(
-        lock: &Option<valkey_module::ThreadSafeContext<valkey_module::DetachedFromClient>>,
-        f: impl FnOnce(&valkey_module::Context) -> T,
-    ) -> T {
-        match lock {
-            Some(lock) => f(&lock.lock()),
-            None => f(&valkey_module::Context::dummy()),
-        }
-    }
-    let lock = (!crate::is_main_thread()).then(valkey_module::ThreadSafeContext::new);
-    if !locked(&lock, crate::eviction_allowed) {
+    if !with_server_lock(crate::eviction_allowed) {
         return false;
     }
     let need = (nvme_disk_usage() + bytes).saturating_sub(crate::nvme_maxmemory());
@@ -107,7 +106,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
             break;
         }
         // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
-        let Some(unevictable) = locked(&lock, |_| super::object_file::claim_victim(oid)) else {
+        let Some(unevictable) = with_server_lock(|_| super::object_file::claim_victim(oid)) else {
             continue;
         };
         match std::fs::metadata(oid.file_path(&crate::nvme_dir())) {
@@ -130,7 +129,6 @@ fn evict_and_reserve(bytes: u64) -> bool {
     let reserved = reserve(bytes as i64 - freed as i64);
     if !reserved {
         decrease_nvme_disk_usage(freed);
-        crate::info::DISK_EVICTION_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
     reserved
 }
@@ -140,16 +138,9 @@ fn victim_batch(n: usize) -> Vec<ObjectId> {
     let Ok(dir) = std::fs::read_dir(crate::nvme_dir()) else {
         return Vec::new();
     };
-    dir.filter_map(|entry| {
-        let name = entry.ok()?.file_name();
-        let hex = name.to_str()?.strip_suffix(".dat")?;
-        if hex.len() != 16 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-            return None;
-        }
-        u64::from_str_radix(hex, 16).ok().map(ObjectId)
-    })
-    .take(n)
-    .collect()
+    dir.filter_map(|entry| ObjectId::from_filename(entry.ok()?.file_name().to_str()?))
+        .take(n)
+        .collect()
 }
 
 /// Unlink claimed `victims` (oid, size, guard) and remove them from the unevictable list.

@@ -210,7 +210,7 @@ pub struct CacheStats {
     /// Successful `try_promote_object` calls.
     pub promotions: AtomicU64,
     /// Cached copies demoted (dropped from DRAM, NVMe copy kept) by
-    /// `make_room_for` to free space.
+    /// `make_room_for` to free space, or by a shrink.
     pub demotions: AtomicU64,
 }
 
