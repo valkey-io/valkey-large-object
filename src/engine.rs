@@ -20,7 +20,7 @@
 //!   Concurrent GETs coalesce on Filling ObjectContext.
 
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use valkey_module::{NotifyEvent, ValkeyError, ValkeyValue, VALKEY_OK};
@@ -97,6 +97,41 @@ pub enum EngineResult {
     Sync(Result<ValkeyValue, ValkeyError>),
     /// Async path — client is blocked, reply will come from tokio task.
     Async,
+}
+
+// ─── Blocked Request ─────────────────────────────────────────────────────────
+
+/// INFO `inflight_requests`: `BlockedRequest::new` counts a request in, its `Drop` counts it out.
+static INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn inflight_requests() -> u64 {
+    INFLIGHT_REQUESTS.load(Ordering::Relaxed)
+}
+
+/// An async GET or SET, over TCP or RDMA. Its client stays blocked until this drops.
+pub(crate) struct BlockedRequest(valkey_module::ThreadSafeContext<valkey_module::BlockedClient>);
+
+impl BlockedRequest {
+    fn new(ctx: &valkey_module::Context) -> Self {
+        INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        Self(valkey_module::ThreadSafeContext::with_blocked_client(
+            ctx.block_client(),
+        ))
+    }
+}
+
+impl std::ops::Deref for BlockedRequest {
+    type Target = valkey_module::ThreadSafeContext<valkey_module::BlockedClient>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for BlockedRequest {
+    fn drop(&mut self) {
+        INFLIGHT_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -217,15 +252,15 @@ pub fn execute_get(
         }
         _ => {
             // Async — block client, dispatch to tokio.
-            let blocked_client = ctx.block_client();
+            let thread_ctx = BlockedRequest::new(ctx);
             match mode {
                 OperatingMode::Dram => {
-                    cmd_get_dram_efa(object_id, obj_len, crc32c, transport, blocked_client);
+                    cmd_get_dram_efa(object_id, obj_len, crc32c, transport, thread_ctx);
                 }
                 OperatingMode::Tiered => {
                     let file =
                         file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
-                    cmd_get_tiered(object_id, obj_len, crc32c, file, transport, blocked_client);
+                    cmd_get_tiered(object_id, obj_len, crc32c, file, transport, thread_ctx);
                 }
             }
             EngineResult::Async
@@ -275,10 +310,9 @@ fn cmd_get_dram_efa(
     obj_len: u64,
     crc32c: Crc,
     transport: Transport,
-    blocked_client: valkey_module::BlockedClient,
+    thread_ctx: BlockedRequest,
 ) {
     let dram_pool = storage::get_dram_pool();
-    let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
             // Eviction ranks by use, as for a Tiered cache hit.
@@ -309,7 +343,7 @@ fn cmd_get_tiered(
     crc32c: Crc,
     file: Arc<ObjectFile>,
     transport: Transport,
-    blocked_client: valkey_module::BlockedClient,
+    thread_ctx: BlockedRequest,
 ) {
     // We do not allow the eviction of files that are inflight.
     let unevictable = storage::UnevictableOID::new(object_id);
@@ -320,7 +354,6 @@ fn cmd_get_tiered(
     if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
         if obj_ctx.is_ready() {
             cache.stats.record_hit(&obj_ctx.stats);
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             cmd_get_from_dram(
                 dram_pool,
                 &obj_ctx,
@@ -355,8 +388,6 @@ fn cmd_get_tiered(
                 // remove_object drops the map's Arc; obj_ctx drops at end of scope
                 // → ObjectContext::Drop frees the buffer automatically.
                 dram_pool.remove_object(&object_id);
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 reply_err(
                     &thread_ctx,
                     &info::DISK_READ_ERRORS,
@@ -378,9 +409,8 @@ fn cmd_get_tiered(
         };
         let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
         crate::runtime_handle().spawn(async move {
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            // Declared after thread_ctx so it drops first: the fd clone is gone
-            // before the client unblocks, so its next GET sees the fd unpinned.
+            // Drops before the captured thread_ctx: the fd clone is gone before
+            // the client unblocks, so its next GET sees the fd unpinned.
             let _keep_alive = (file, fd, unevictable);
             // Promotion: read the NVMe file INTO the DRAM buffers (pool=Dram), and the
             // progress hook marks the cached entry Ready.
@@ -413,7 +443,6 @@ fn cmd_get_tiered(
     let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
         Some(bufs) => bufs,
         None => {
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
                 &info::DISK_STAGING_BUFFER_EXHAUSTED,
@@ -427,7 +456,6 @@ fn cmd_get_tiered(
     let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
         Some(fd) => fd,
         None => {
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
                 &info::DISK_READ_ERRORS,
@@ -449,8 +477,7 @@ fn cmd_get_tiered(
         // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
         // open fd are held alive for the read's duration. No promotion → no cache,
         // source reads straight from the NVMe pool window.
-        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-        // Declared after thread_ctx so it drops first (see the promotion path).
+        // Drops before the captured thread_ctx (see the promotion path).
         let _keep_alive = (file, fd, unevictable);
         cmd_get_tiered_run(
             get_info,
@@ -586,7 +613,7 @@ pub fn execute_set(
         }
         _ => {
             // Async — block client, dispatch to tokio.
-            let blocked_client = ctx.block_client();
+            let thread_ctx = BlockedRequest::new(ctx);
             let key_name_bytes = key_name.as_slice().to_vec();
             match mode {
                 OperatingMode::Dram => {
@@ -595,7 +622,7 @@ pub fn execute_set(
                         key_name_bytes,
                         obj_len,
                         data_source,
-                        blocked_client,
+                        thread_ctx,
                         object_id,
                     );
                 }
@@ -604,7 +631,7 @@ pub fn execute_set(
                         key_name_bytes,
                         obj_len,
                         data_source,
-                        blocked_client,
+                        thread_ctx,
                         object_id,
                         old_oid,
                     );
@@ -690,7 +717,7 @@ fn cmd_set_dram_efa(
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
-    blocked_client: valkey_module::BlockedClient,
+    thread_ctx: BlockedRequest,
     object_id: ObjectId,
 ) {
     let dram_pool = storage::get_dram_pool();
@@ -702,7 +729,6 @@ fn cmd_set_dram_efa(
     let buffers = match dram_pool.alloc_exact_expand_evict(ctx, obj_len) {
         Some(bufs) => bufs,
         None => {
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
                 &info::DRAM_POOL_EXHAUSTED,
@@ -716,8 +742,6 @@ fn cmd_set_dram_efa(
         DataSource::Efa { session, addrs } => {
             // EFA SET: parallel reads into all buffers, then sequential CRC pass.
             crate::runtime_handle().spawn(async move {
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 let dram_pool = storage::get_dram_pool();
                 let chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(addrs));
@@ -783,7 +807,7 @@ fn cmd_set_tiered(
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
-    blocked_client: valkey_module::BlockedClient,
+    thread_ctx: BlockedRequest,
     object_id: ObjectId,
     old_oid: Option<ObjectId>,
 ) {
@@ -793,7 +817,6 @@ fn cmd_set_tiered(
     let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
         Some(bufs) => bufs,
         None => {
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             reply_err(
                 &thread_ctx,
                 &info::DISK_STAGING_BUFFER_EXHAUSTED,
@@ -816,8 +839,6 @@ fn cmd_set_tiered(
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
             crate::runtime_handle().spawn(async move {
                 let _unevictable = unevictable;
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 let set_info = SetObjectInfo {
                     object_id,
                     obj_len,
@@ -837,8 +858,6 @@ fn cmd_set_tiered(
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs));
             crate::runtime_handle().spawn(async move {
                 let _unevictable = unevictable;
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 let set_info = SetObjectInfo {
                     object_id,
                     obj_len,
@@ -876,7 +895,7 @@ async fn cmd_set_tiered_run(
     set_info: SetObjectInfo,
     stream_ctx: storage::StreamingContext,
     chunk_iter: ChunkIterator,
-    thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    thread_ctx: BlockedRequest,
     variant: SetSource,
 ) {
     let SetObjectInfo {
@@ -1007,7 +1026,7 @@ fn cmd_get_from_dram(
     obj_len: u64,
     crc32c: Crc,
     transport: Transport,
-    thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    thread_ctx: BlockedRequest,
     file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOID>)>,
 ) {
     match transport {

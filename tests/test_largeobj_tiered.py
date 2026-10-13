@@ -431,6 +431,40 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         )
         assert client.execute_command('BLOB.TCP_GET', 'delset_key') == payload2
 
+    def test_info_sets_in_flight(self):
+        """Concurrent Tiered SETs each count in inflight_requests until they reply. The
+        pause holds their commits long enough to observe them."""
+        n = 3
+        client = self.server.get_new_client()
+        setters = [self.server.get_new_client() for _ in range(n)]
+        results = [None] * n
+        errors = [None] * n
+
+        def inflight():
+            # A failed SET would otherwise only show up as a wait timeout.
+            assert errors == [None] * n, f"SET raised: {errors}"
+            return client.info('largeobj_core_metrics')['largeobj_inflight_requests']
+
+        def background_set(i):
+            try:
+                results[i] = setters[i].execute_command('BLOB.TCP_SET', f'key{i}', b'S' * 4096)
+            except Exception as e:
+                errors[i] = e
+
+        assert inflight() == 0
+        threads = [threading.Thread(target=background_set, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        try:
+            wait_for_equal(inflight, n)
+        finally:
+            for t in threads:
+                t.join(timeout=10)
+        assert not any(t.is_alive() for t in threads), "SET threads did not finish"
+        assert errors == [None] * n, f"SET raised: {errors}"
+        assert results == [b'OK'] * n
+        assert inflight() == 0
+
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
     """Tiered mode with max-promote-size=0 (no promotion, all reads from NVMe)."""
@@ -518,9 +552,10 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
 class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
     """Shared helpers for the NVMe disk-usage accounting tests.
 
-    The usage counter is not observable directly (no INFO section / command), so
-    these tests exercise it through its only externally-visible effect: the
-    reserve-if-capacity gate (`try_reserve_nvme_disk_usage`) on the Tiered SET path.
+    INFO reports the usage counter as a percentage of `disk-maxmemory`
+    (`largeobj_disk_utilization_pct`). These tests also exercise its other
+    externally-visible effect: the reserve-if-capacity gate
+    (`try_reserve_nvme_disk_usage`) on the Tiered SET path.
     A SET that would push tracked usage past `disk-maxmemory` is rejected with
     "pool exhausted"; a SET that fits succeeds. By filling to the cap, freeing,
     and re-filling we prove the counter is incremented on create and -- critically --
@@ -643,6 +678,25 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
             self._set_ok(client, f"g{i}", payload)
         assert client.execute_command("DBSIZE") == 7
         wait_for_equal(self._dat_count, 7)
+
+    def test_info_reports_disk_usage(self):
+        """INFO reports the usage the capacity gate enforces, as a percentage of disk-maxmemory."""
+        client = self.server.get_new_client()
+
+        def util():
+            return client.info('largeobj_disk')['largeobj_disk_utilization_pct']
+
+        for i in range(7):
+            self._set_ok(client, f"k{i}", b"X" * self.OBJ)
+        # Two decimals: 7 files of 266240 bytes = 1863680 / 2097152 = 88.867...%.
+        assert util() == 88.87
+        client.execute_command("DEL", "k0")
+        self._wait_free_settled(client)
+        # 6 * 266240 / 2097152 = 76.171875%.
+        wait_for_equal(util, 76.17)
+        client.execute_command("FLUSHALL")
+        self._wait_free_settled(client)
+        wait_for_equal(util, 0)
 
     def test_overwrite_does_not_leak_capacity(self):
         client = self.server.get_new_client()

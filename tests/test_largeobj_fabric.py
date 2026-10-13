@@ -6,6 +6,7 @@ import pytest
 import subprocess
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
+from valkeytestframework.util.waiters import wait_for_equal
 
 
 # A tcp-provider fabric address: FI_SOCKADDR_IN for 127.0.0.1:1. The server only records it until
@@ -261,6 +262,33 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             self.verify_error_response(
                 client, f'BLOB.RDMA_SET key {TARGET_LEN} {first}',
                 f'client memory address length {regions[0].len} smaller than object length {TARGET_LEN}')
+        finally:
+            process.kill()
+
+    def test_info_rdma_traffic(self):
+        """A connection that ran BLOB.RDMA_HELLO counts as an RDMA session until it disconnects,
+        and its finished requests are no longer in flight."""
+        process, regions = self.start_target('--read', split=[1024, 3072])
+        try:
+            client = self.server.get_new_client()
+
+            def rdma():
+                return client.info('largeobj_rdma')
+
+            client.execute_command('BLOB.TCP_SET', 'key', PATTERN)
+            assert rdma()['largeobj_rdma_sessions'] == 0
+
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            assert rdma()['largeobj_rdma_sessions'] == 1
+            assert client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions)) == [
+                TARGET_LEN, crc32c.crc32c(PATTERN)]
+            assert client.execute_command(
+                'BLOB.RDMA_SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
+            assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
+
+            client.close()
+            observer = self.server.get_new_client()
+            wait_for_equal(lambda: observer.info('largeobj_rdma')['largeobj_rdma_sessions'], 0)
         finally:
             process.kill()
 

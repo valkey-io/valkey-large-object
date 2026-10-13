@@ -33,6 +33,15 @@ pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Tiered files. Cached copies Tiered drops are demotions, not evictions.
 pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// `part` as a percentage of `whole`, to two decimals ("99.99").
+fn pct(part: u64, whole: u64) -> String {
+    // No budget, e.g. disk-maxmemory 0 (unlimited).
+    if whole == 0 {
+        return "0.00".to_string();
+    }
+    format!("{:.2}", part as f64 * 100.0 / whole as f64)
+}
+
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
     if let Err(e) = info_sections(ctx) {
@@ -44,8 +53,10 @@ fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     core_metrics_section(ctx)?;
     dram_pool_section(ctx)?;
     disk_staging_section(ctx)?;
+    disk_section(ctx)?;
     fd_pool_section(ctx)?;
     smartlog_section(ctx)?;
+    rdma_section(ctx)?;
     error_metrics_section(ctx)?;
     Ok(())
 }
@@ -76,6 +87,10 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "disk_unevictable_objects",
             storage::object_file::unevictable_count() as i64,
+        )?
+        .field(
+            "inflight_requests",
+            crate::engine::inflight_requests() as i64,
         )?
         .build_section()?
         .build_info()?;
@@ -194,6 +209,21 @@ fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .map(|_| ())
 }
 
+/// Object files on disk, Tiered mode only: how full the disk budget is.
+fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    if operating_mode() != OperatingMode::Tiered {
+        return Ok(());
+    }
+    let util_pct = pct(storage::nvme::nvme_disk_usage(), crate::nvme_maxmemory());
+
+    ctx.builder()
+        .add_section("disk")
+        .field("disk_utilization_pct", util_pct)?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
 /// NVMe SMART log health, Tiered mode only, aggregated across all
 /// controllers. Emits two sections from one snapshot: `smartlog_usage`
 /// (lifetime counters summed, percentages averaged over devices that
@@ -260,6 +290,17 @@ fn smartlog_section(ctx: &InfoContext) -> ValkeyResult<()> {
     warnings.build_section()?.build_info().map(|_| ())
 }
 
+/// RDMA sessions, in both modes. Emitted as zeros where no fabric
+/// is available, so consumers can depend on a fixed key set.
+fn rdma_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    ctx.builder()
+        .add_section("rdma")
+        .field("rdma_sessions", crate::transport::session::count() as u64)?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
 fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
     ctx.builder()
         .add_section("error_metrics")
@@ -306,4 +347,19 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .build_section()?
         .build_info()
         .map(|_| ())
+}
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pct_has_two_decimals() {
+        assert_eq!(pct(5, 0), "0.00");
+        assert_eq!(pct(2, 3), "66.67");
+        assert_eq!(pct(1, 8), "12.50");
+        assert_eq!(pct(4096, 4096), "100.00");
+    }
 }
