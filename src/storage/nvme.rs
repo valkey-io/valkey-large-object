@@ -98,7 +98,15 @@ fn evict_and_reserve(bytes: u64) -> bool {
     if !with_server_lock(crate::eviction_allowed) {
         return false;
     }
-    let need = (nvme_disk_usage() + bytes).saturating_sub(crate::nvme_maxmemory());
+    let max = crate::nvme_maxmemory();
+    // Take the headroom first, so no other write can use it while we evict.
+    let prev = NVME_DISK_USAGE
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur + bytes.min(max.saturating_sub(cur)))
+        })
+        .unwrap_or_else(|cur| cur);
+    let taken = bytes.min(max.saturating_sub(prev));
+    let need = bytes - taken;
     // Claim, then stat: a claimed file cannot change under us.
     let mut victims = Vec::new();
     let mut covered = 0;
@@ -127,9 +135,10 @@ fn evict_and_reserve(bytes: u64) -> bool {
     // No lock.
     let freed = evict(victims);
     // One update, so a competing reservation cannot take the freed bytes.
-    let reserved = reserve(bytes as i64 - freed as i64);
+    let reserved = reserve(bytes as i64 - taken as i64 - freed as i64);
     if !reserved {
-        decrease_nvme_disk_usage(freed);
+        // Release the headroom; the victims stay evicted.
+        decrease_nvme_disk_usage(taken + freed);
     }
     reserved
 }
