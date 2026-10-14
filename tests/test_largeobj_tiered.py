@@ -1,7 +1,11 @@
 import os
 import glob
 import time
+import socket
+import resource
+import subprocess
 import threading
+import pytest
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
@@ -1176,3 +1180,124 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 1
         assert info['largeobj_fd_reclaims'] == 2
+
+
+# ─── Object File fd Placement ───
+
+
+class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
+    """Cached object-file fds must not take the fd numbers Valkey serves clients on.
+
+    Valkey's event loop only covers fds below maxclients + 128, and Linux hands out
+    the lowest free fd. With maxclients 100 and 300 cached fds left low, every new
+    client socket lands past the event loop: it is accepted and counted, but its
+    commands are never read. The module moves its fds above that range instead."""
+
+    OBJECTS = 300
+    NEW_CLIENTS = 90
+
+    def get_server_args(self):
+        return {'maxclients': '100'}
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 1048576"
+            f" segment-size 1048576"
+            f" max-promote-size 520192"
+            f" promote-min-hits 255"
+            f" bench-mode no"
+            f" direct-io no"
+            f" chunk-size 4096"
+        )
+
+    def object_fds(self, client):
+        """fd numbers the server holds open on object files, from /proc."""
+        fd_dir = f"/proc/{client.info('server')['process_id']}/fd"
+        return [int(fd) for fd in os.listdir(fd_dir)
+                if os.readlink(f"{fd_dir}/{fd}").startswith(self.data_dir)]
+
+    def test_new_clients_served_with_full_fd_cache(self):
+        client = self.server.get_new_client()
+        for i in range(self.OBJECTS):
+            client.execute_command('BLOB.SET', f'obj_{i}', b'x' * 4096)
+        for i in range(self.OBJECTS):
+            assert client.execute_command('BLOB.GET', f'obj_{i}') == b'x' * 4096
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == self.OBJECTS
+        assert min(self.object_fds(client)) >= 228  # maxclients 100 + 128
+
+        host = self.server.bind_ip or 'localhost'
+        socks = [socket.create_connection((host, self.server.port), timeout=2)
+                 for _ in range(self.NEW_CLIENTS)]
+        try:
+            for s in socks:
+                s.sendall(b'PING\r\n')
+            served = 0
+            for s in socks:
+                try:
+                    served += s.recv(16) == b'+PONG\r\n'
+                except socket.timeout:
+                    pass
+            assert served == self.NEW_CLIENTS
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_config_set_maxclients_moves_cached_fds_above_grown_range(self):
+        """CONFIG SET maxclients grows the event loop over the fds placed at load
+        (228+). The module evicts those from the cache, so none stays in the client
+        range, and the next GETs reopen them above the new range (500 + 128 = 628)."""
+        client = self.server.get_new_client()
+        for i in range(self.OBJECTS):
+            client.execute_command('BLOB.SET', f'obj_{i}', b'x' * 4096)
+            client.execute_command('BLOB.GET', f'obj_{i}')
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == self.OBJECTS
+        assert min(self.object_fds(client)) >= 228
+
+        client.execute_command('CONFIG', 'SET', 'maxclients', '500')
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == 0
+
+        for i in range(self.OBJECTS):
+            assert client.execute_command('BLOB.GET', f'obj_{i}') == b'x' * 4096
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == self.OBJECTS
+        object_fds = self.object_fds(client)
+        assert len(object_fds) == self.OBJECTS
+        assert min(object_fds) >= 628
+
+    def test_config_set_maxclients_without_room_aborts(self):
+        """Raising maxclients until fewer than max-cached-fds (1024) fds fit between
+        the event loop's end and the hard limit would put object fds back on client
+        fd numbers. The module logs why and aborts the server instead."""
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        maxclients = hard - 200  # event loop ends at hard - 72: 72 fds of room
+        client = self.server.get_new_client()
+        with self.server.expect_crash(self):
+            client.execute_command('CONFIG', 'SET', 'maxclients', str(maxclients))
+        assert self.server.verify_string_in_logfile("above Valkey's client range")
+
+
+class TestTieredFdRoomRequiredAtLoad(ValkeyLargeObjTestCaseBase):
+    """No setUp server: this class starts valkey-server itself, expecting it to fail."""
+
+    @pytest.fixture(autouse=True)
+    def setup_test(self, setup):
+        pass
+
+    def test_module_load_fails_without_room_above_client_range(self):
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        data_dir = os.path.abspath(os.path.join(self.testdir, "nvme"))
+        os.makedirs(data_dir, exist_ok=True)
+        server_path = (f"{os.path.dirname(os.path.realpath(__file__))}/build/binaries/"
+                       f"{os.environ['SERVER_VERSION']}/valkey-server")
+        with socket.socket() as s:
+            s.bind(('localhost', 0))
+            port = s.getsockname()[1]
+        module_args = self.get_module_args(data_dir, "no").split()
+        proc = subprocess.run(
+            [server_path, '--port', str(port), '--maxclients', str(hard - 200),
+             '--loadmodule', os.environ['MODULE_PATH'], *module_args],
+            cwd=self.testdir, capture_output=True, text=True, timeout=30)
+        assert proc.returncode != 0
+        assert "above Valkey's client range" in proc.stdout
+        assert "aborting module load" in proc.stdout

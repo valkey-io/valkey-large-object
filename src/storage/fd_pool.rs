@@ -21,7 +21,7 @@
 //! `Drop for FdPool` — it is a process-lifetime static, so any fds still cached at
 //! teardown are reclaimed by process exit.
 
-use std::os::unix::io::{FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -112,8 +112,7 @@ impl FdPool {
         if crate::direct_io() {
             flags |= libc::O_DIRECT;
         }
-        // SAFETY: c_path is a valid NUL-terminated path; open returns a fd or -1.
-        let raw = unsafe { libc::open(c_path.as_ptr(), flags) };
+        let raw = super::nvme::open_object_file(&c_path, flags, 0);
         if raw < 0 {
             return None;
         }
@@ -138,6 +137,26 @@ impl FdPool {
             .write()
             .expect("FdPool.fds lock unavailable")
             .swap_remove(&object_id);
+        drop(removed);
+    }
+
+    /// Drop the pool's ref to every cached fd in Valkey's client fd range, so the
+    /// next GET reopens it above the floor. Like `remove`: an in-flight reader's
+    /// clone keeps its fd open until the read finishes. Called when the floor rises.
+    pub fn evict_in_client_range(&self) {
+        let removed: Vec<FdEntry> = {
+            let mut fds = self.fds.write().expect("FdPool.fds lock unavailable");
+            let stale: Vec<ObjectId> = fds
+                .iter()
+                .filter(|(_, e)| super::nvme::in_client_range(e.fd.as_raw_fd()))
+                .map(|(oid, _)| *oid)
+                .collect();
+            stale
+                .iter()
+                .filter_map(|oid| fds.swap_remove(oid))
+                .collect()
+        };
+        // Drop outside the lock, as in `remove`.
         drop(removed);
     }
 

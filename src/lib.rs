@@ -32,15 +32,16 @@
 // After step 4, commands (BLOB.GET, BLOB.SET, BLOB.HELLO) may execute safely.
 // ─────────────────────────────────────────────────────────────────────────────
 
+use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
 use dma_libfabric_protocol::encode_hex;
 use valkey_module::configuration::ConfigurationFlags;
 use valkey_module::{
-    valkey_module, Context, ContextFlags, InfoContext, Status, ValkeyResult, ValkeyString,
+    raw, valkey_module, Context, ContextFlags, InfoContext, Status, ValkeyResult, ValkeyString,
 };
-use valkey_module_macros::shutdown_event_handler;
+use valkey_module_macros::{config_changed_event_handler, shutdown_event_handler};
 
 use tokio::runtime::Runtime;
 
@@ -608,6 +609,15 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
+    // Tiered mode keeps object files open (fd cache + in-flight SETs). Move those
+    // fds above Valkey's client range, or they stop new clients being served.
+    if mode == OperatingMode::Tiered {
+        if let Err(msg) = place_object_fds(ctx) {
+            ctx.log_warning(&format!("{msg}; aborting module load"));
+            return Status::Err;
+        }
+    }
+
     // Step 0: Create tokio runtime as a local. Set in OnceLock only after all init succeeds.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads())
@@ -678,6 +688,101 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 /// shutdown.
 fn deinitialize(_ctx: &Context) -> Status {
     Status::Ok
+}
+
+/// Put object-file fds above Valkey's client range for the current `maxclients`.
+/// Tiered only. Errs when the open-file hard limit leaves no room for the fd cache
+/// above that range: object fds would then take client fd numbers, and clients
+/// past them are never served.
+fn place_object_fds(ctx: &Context) -> Result<(), String> {
+    let maxclients: u64 = ctx
+        .config_get("maxclients".to_string())
+        .expect("CONFIG GET maxclients")
+        .to_string()
+        .parse()
+        .expect("maxclients is numeric");
+    let needed = max_cached_fds() as u64;
+    match storage::nvme::reserve_fd_range(maxclients) {
+        Some((floor, _)) if !outside_event_loop(floor) => Err(format!(
+            "largeobj: fd {floor} (maxclients + 128) is inside Valkey's event loop; \
+             this server sizes its client range differently and object-file fds \
+             would take client fd numbers"
+        )),
+        Some((floor, room)) if room >= needed => {
+            ctx.log_notice(&format!(
+                "largeobj: object-file fds placed at {floor}+ ({room} available)"
+            ));
+            Ok(())
+        }
+        Some((floor, room)) => Err(format!(
+            "largeobj: only {room} fds above Valkey's client range ({floor}) for \
+             max-cached-fds {needed}; raise LimitNOFILE (soft and hard) above {}",
+            floor as u64 + needed
+        )),
+        None => Err(format!(
+            "largeobj: open-file hard limit has no room above Valkey's client range \
+             (maxclients {maxclients} + 128); raise LimitNOFILE (soft and hard) above {}",
+            maxclients + 128 + needed
+        )),
+    }
+}
+
+/// One-shot check that `floor` is past the end of Valkey's event loop, so the
+/// copied `maxclients + 128` really marks where client fds end. `EventLoopAdd`
+/// answers ERANGE exactly when `fd >= setsize`. The probe is a pipe we own, placed
+/// at `floor`, so no client's event is touched; if it registers, it is removed at
+/// once. A probe we cannot place counts as a failure. Main thread only.
+fn outside_event_loop(floor: i32) -> bool {
+    unsafe extern "C" fn noop(_fd: c_int, _data: *mut c_void, _mask: c_int) {}
+    let mut pipe = [-1; 2];
+    // SAFETY: pipe is a valid 2-element out-array.
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: pipe[0] is a valid fd we own; returns a new fd >= floor or -1.
+    let probe = unsafe { libc::fcntl(pipe[0], libc::F_DUPFD_CLOEXEC, floor) };
+    let readable = raw::REDISMODULE_EVENTLOOP_READABLE as c_int;
+    // SAFETY: the module API is initialized (we are in OnLoad or a server event on
+    // the main thread); probe is our own pipe fd.
+    let added = probe >= 0
+        && unsafe {
+            raw::RedisModule_EventLoopAdd.expect("EventLoopAdd API available")(
+                probe,
+                readable,
+                Some(noop),
+                std::ptr::null_mut(),
+            )
+        } == raw::REDISMODULE_OK as c_int;
+    if added {
+        // SAFETY: probe was just registered by us.
+        unsafe {
+            raw::RedisModule_EventLoopDel.expect("EventLoopDel API available")(probe, readable)
+        };
+    }
+    // SAFETY: all three fds are ours; close(-1) is a harmless EBADF.
+    unsafe {
+        libc::close(probe);
+        libc::close(pipe[0]);
+        libc::close(pipe[1]);
+    }
+    probe >= 0 && !added
+}
+
+/// `CONFIG SET maxclients` grows Valkey's event loop, possibly up into the fds
+/// the module placed at load. Raise the floor, then evict the cached fds now below
+/// it so their next GET reopens them above the floor. No room above the new range
+/// means clients would be stranded behind object fds again, so that is fatal.
+#[config_changed_event_handler]
+fn on_config_changed(ctx: &Context, changed: &[&str]) {
+    if let Some(pool) = storage::FD_POOL.get() {
+        if changed.contains(&"maxclients") {
+            if let Err(msg) = place_object_fds(ctx) {
+                // The panic hook logs the message and aborts the server.
+                panic!("{msg}");
+            }
+            pool.evict_in_client_range();
+        }
+    }
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
