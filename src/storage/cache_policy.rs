@@ -38,8 +38,8 @@ pub const LFU_LOG_FACTOR: u64 = 10;
 /// Admission filter capacity in ObjectIds (about 24 bytes each).
 pub const ADMISSION_FILTER_CAPACITY: usize = 65_536;
 
-/// Most cached objects one promotion may reclaim from its target segment.
-/// Bounds the reclaim loop under the objects write lock.
+/// Most entries one promotion (DRAM pool) or one fd-cache miss (FdPool) may
+/// reclaim. Bounds the reclaim loop under the pool's write lock.
 pub const RECLAIM_MAX_VICTIMS: usize = 16;
 
 const COUNTER_MASK: u32 = 0xFF;

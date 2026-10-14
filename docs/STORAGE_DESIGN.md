@@ -489,7 +489,7 @@ struct FdPool {
     fds: RwLock<OIDIndexedMap<FdEntry>>, // IndexMap: dense storage enables sampled reclaim
     reclaims: AtomicU64,                 // fds dropped to stay under max-cached-fds
 }
-// The cap is the `max-cached-fds` config (0 = unlimited), read at call time.
+// The cap is the `max-cached-fds` config, read at call time.
 ```
 
 The lifetime-safety primitive is `Arc<OwnedFd>`: each in-flight read holds a clone,

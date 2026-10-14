@@ -79,8 +79,8 @@ pub const DEFAULT_RECLAIM_SAMPLE_SIZE: i64 = 5;
 pub const MIN_RECLAIM_SAMPLE_SIZE: i64 = 1;
 pub const MAX_RECLAIM_SAMPLE_SIZE: i64 = 64;
 // max-cached-fds
-pub const DEFAULT_MAX_CACHED_FDS: i64 = 1024;
-pub const MIN_MAX_CACHED_FDS: i64 = 0;
+pub const DEFAULT_MAX_CACHED_FDS: i64 = 16_384;
+pub const MIN_MAX_CACHED_FDS: i64 = 1;
 pub const MAX_MAX_CACHED_FDS: i64 = 1_048_576;
 // scaling-expand-watermark
 pub const DEFAULT_SCALING_EXPAND_WATERMARK: i64 = 80; // stored as percent
@@ -175,7 +175,8 @@ lazy_static::lazy_static! {
     pub static ref CFG_RECLAIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_RECLAIM_SAMPLE_SIZE);
 
     /// Cap on read fds cached by the FdPool. When full, opening a new fd reclaims
-    /// the lowest LFU score among samples. 0 means unlimited.
+    /// the lowest LFU score among samples. Raising it at runtime is rejected
+    /// when the fds do not fit above Valkey's client range.
     pub static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(DEFAULT_MAX_CACHED_FDS);
 
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
@@ -560,6 +561,18 @@ pub fn validate_config_constraint(
         return Ok(());
     }
     validate_all_constraints().map_err(valkey_module::ValkeyError::String)
+}
+
+/// `max-cached-fds` CONFIG SET: the new cap must fit above Valkey's client range.
+/// At load, `fd_placement::place` runs the same check. The framework has already
+/// stored the new value; on Err core restores the old one.
+pub fn validate_max_cached_fds(
+    _ctx: &valkey_module::configuration::ConfigurationContext,
+    _name: &str,
+    val: &'static AtomicI64,
+) -> Result<(), valkey_module::ValkeyError> {
+    storage::fd_placement::check_room(val.load(std::sync::atomic::Ordering::Relaxed) as u64)
+        .map_err(valkey_module::ValkeyError::String)
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

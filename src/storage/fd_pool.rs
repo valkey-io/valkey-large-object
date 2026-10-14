@@ -25,7 +25,9 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use super::cache_policy::{now_minutes, reclaim_one, AccessStats, OIDIndexedMap};
+use super::cache_policy::{
+    now_minutes, reclaim_one, AccessStats, OIDIndexedMap, RECLAIM_MAX_VICTIMS,
+};
 use crate::data_type::ObjectId;
 
 /// One cached fd plus its LFU score.
@@ -62,7 +64,7 @@ impl FdPool {
         self.get_or_open_with(object_id, dir, crate::max_cached_fds())
     }
 
-    /// `get_or_open` with an explicit `max-cached-fds` cap (0 = unlimited), so
+    /// `get_or_open` with an explicit `max-cached-fds` cap, so
     /// parallel unit tests do not share the global config.
     pub(crate) fn get_or_open_with(
         &self,
@@ -94,16 +96,20 @@ impl FdPool {
 
         // Make room before opening, so the cap counts the new entry. Removing an
         // entry only drops the map's ref: a reader still holding a clone keeps the
-        // fd open until its read finishes, then it closes.
-        if cap > 0 {
-            let samples = crate::reclaim_sample_size();
-            while fds.len() >= cap {
-                reclaim_one(&mut fds, samples, |e| {
-                    Some(e.stats.decayed_counter(now_min, decay_time))
-                })
-                .expect("a non-empty map always yields a victim");
-                self.reclaims.fetch_add(1, Ordering::Relaxed);
+        // fd open until its read finishes, then it closes. After the cap is lowered
+        // the pool is over it by many entries; reclaiming at most
+        // RECLAIM_MAX_VICTIMS per miss shrinks it gradually instead of stalling
+        // every GET behind one huge reclaim under the write lock.
+        let samples = crate::reclaim_sample_size();
+        for _ in 0..RECLAIM_MAX_VICTIMS {
+            if fds.len() < cap {
+                break;
             }
+            reclaim_one(&mut fds, samples, |e| {
+                Some(e.stats.decayed_counter(now_min, decay_time))
+            })
+            .expect("a non-empty map always yields a victim");
+            self.reclaims.fetch_add(1, Ordering::Relaxed);
         }
 
         let path = object_id.file_path(dir);
@@ -288,6 +294,42 @@ mod tests {
 
             drop(reader);
             assert!(weak.upgrade().is_none(), "fd closes with its last reader");
+        }
+
+        for oid in &oids {
+            let _ = std::fs::remove_file(oid.file_path(dir));
+        }
+    }
+
+    #[test]
+    fn lowered_cap_shrinks_by_at_most_reclaim_max_victims_per_miss() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let full = RECLAIM_MAX_VICTIMS + 4;
+        let oids: Vec<ObjectId> = (0..full as u64 + 2).map(|i| ObjectId(0x7400 + i)).collect();
+        for oid in &oids {
+            std::fs::write(oid.file_path(dir), b"x").unwrap();
+        }
+        let pool = FdPool::new();
+
+        if pool.get_or_open_with(oids[0], dir, full).is_some() {
+            for oid in &oids[1..full] {
+                pool.get_or_open_with(*oid, dir, full).unwrap();
+            }
+            assert_eq!(pool.len(), full);
+
+            // Cap lowered to 1: one miss reclaims RECLAIM_MAX_VICTIMS, not the whole
+            // overflow, then caches the new fd.
+            pool.get_or_open_with(oids[full], dir, 1).unwrap();
+            assert_eq!(pool.len(), full - RECLAIM_MAX_VICTIMS + 1);
+            assert_eq!(
+                pool.reclaims.load(Ordering::Relaxed),
+                RECLAIM_MAX_VICTIMS as u64
+            );
+
+            // The next miss finishes the job: the overflow left fits in one bound.
+            pool.get_or_open_with(oids[full + 1], dir, 1).unwrap();
+            assert_eq!(pool.len(), 1);
         }
 
         for oid in &oids {

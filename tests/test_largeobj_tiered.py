@@ -3,6 +3,7 @@ import glob
 import time
 import resource
 import threading
+import pytest
 from valkey import ResponseError, Valkey
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
@@ -1268,8 +1269,22 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
         assert len(object_fds) == self.OBJECTS
         assert min(object_fds) >= 628
 
+    def test_raise_max_cached_fds_rejected_without_room(self):
+        """The room above the client range (hard - 228) must hold the cache plus one
+        in-flight fd per client (maxclients 100). The largest cap that fits is
+        accepted; one more is rejected, and the old cap stays."""
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        fits = hard - 228 - 100
+        client = self.server.get_new_client()
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', str(fits))
+        with pytest.raises(ResponseError, match="raise LimitNOFILE"):
+            client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds',
+                                   str(fits + 1))
+        assert client.config_get('largeobj.max-cached-fds') == {
+            'largeobj.max-cached-fds': str(fits)}
+
     def test_config_set_maxclients_without_room_aborts(self):
-        """Raising maxclients until fewer than max-cached-fds (1024) fds fit between
+        """Raising maxclients until fewer than max-cached-fds fds fit between
         the event loop's end and the hard limit would put object fds back on client
         fd numbers. The module logs why and aborts the server instead."""
         _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)

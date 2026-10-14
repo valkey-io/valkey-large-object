@@ -341,7 +341,7 @@ valkey_module! {
             ["reclaim-sample-size", &*CFG_RECLAIM_SAMPLE_SIZE, DEFAULT_RECLAIM_SAMPLE_SIZE, MIN_RECLAIM_SAMPLE_SIZE, MAX_RECLAIM_SAMPLE_SIZE,
              ConfigurationFlags::DEFAULT, None, None],
             ["max-cached-fds", &*CFG_MAX_CACHED_FDS, DEFAULT_MAX_CACHED_FDS, MIN_MAX_CACHED_FDS, MAX_MAX_CACHED_FDS,
-             ConfigurationFlags::DEFAULT, None, None],
+             ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_max_cached_fds))],
             ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, DEFAULT_FABRIC_MAX_IN_FLIGHT, MIN_FABRIC_MAX_IN_FLIGHT, MAX_FABRIC_MAX_IN_FLIGHT,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, MIN_FABRIC_CRC_POOL_THREADS, MAX_FABRIC_CRC_POOL_THREADS,

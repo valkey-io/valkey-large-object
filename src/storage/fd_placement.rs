@@ -32,39 +32,71 @@ pub fn place(ctx: &Context) -> Result<(), String> {
         .to_string()
         .parse()
         .expect("maxclients is numeric");
-    let needed = crate::max_cached_fds() as u64;
-    match reserve_fd_range(maxclients) {
-        Some((floor, _)) if !outside_event_loop(floor) => Err(format!(
+    let cap = crate::max_cached_fds() as u64;
+    let Some(floor) = reserve_fd_range(maxclients) else {
+        return Err(format!(
+            "largeobj: open-file hard limit has no room above Valkey's client range \
+             (maxclients {maxclients} + 128); raise LimitNOFILE (soft and hard) above {}",
+            maxclients + 128 + cap + maxclients
+        ));
+    };
+    if !outside_event_loop(floor) {
+        return Err(format!(
             "largeobj: fd {floor} (maxclients + 128) is inside Valkey's event loop; \
              this server sizes its client range differently and object-file fds \
              would take client fd numbers"
-        )),
-        Some((floor, room)) if room >= needed => {
-            ctx.log_notice(&format!(
-                "largeobj: object-file fds placed at {floor}+ ({room} available)"
-            ));
-            Ok(())
-        }
-        Some((floor, room)) => Err(format!(
-            "largeobj: only {room} fds above Valkey's client range ({floor}) for \
-             max-cached-fds {needed}; raise LimitNOFILE (soft and hard) above {}",
-            floor as u64 + needed
-        )),
-        None => Err(format!(
-            "largeobj: open-file hard limit has no room above Valkey's client range \
-             (maxclients {maxclients} + 128); raise LimitNOFILE (soft and hard) above {}",
-            maxclients + 128 + needed
-        )),
+        ));
     }
+    check_room(cap)?;
+    ctx.log_notice(&format!("largeobj: object-file fds placed at {floor}+"));
+    Ok(())
+}
+
+/// Whether every object fd the module can hold fits between the floor and the
+/// open-file hard limit: `cap` cached read fds, plus one in-flight fd per client
+/// (a SET's write fd, or a GET's fd evicted mid-read; both block their client, so
+/// a client holds at most one). With this room, failing to move an fd above the
+/// floor means misprovisioning or a bug.
+/// Always Ok before `place` has set a floor (non-Tiered, or still loading).
+pub fn check_room(cap: u64) -> Result<(), String> {
+    let floor = FD_FLOOR.load(Ordering::Relaxed);
+    if floor == 0 {
+        return Ok(());
+    }
+    // The floor tracks the highest maxclients seen; Valkey keeps clients above a
+    // lowered maxclients connected, so that is the client bound.
+    let maxclients = floor as u64 - VALKEY_FDSET_INCR;
+    let needed = cap + maxclients;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit is a valid rlimit out-parameter.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(format!(
+            "largeobj: getrlimit(RLIMIT_NOFILE): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let room = limit.rlim_max.saturating_sub(floor as u64);
+    if room >= needed {
+        return Ok(());
+    }
+    Err(format!(
+        "largeobj: only {room} fds above Valkey's client range ({floor}) for \
+         max-cached-fds {cap} + maxclients {maxclients}; raise LimitNOFILE \
+         (soft and hard) above {}",
+        floor as u64 + needed
+    ))
 }
 
 /// Raises the soft `RLIMIT_NOFILE` to the hard limit and sets the floor that
-/// `open_object_file` moves fds above. Returns the floor and the room above it
-/// (hard limit − floor), or `None` when the hard limit leaves no room.
+/// `open_object_file` moves fds above. Returns the floor, or `None` when the
+/// hard limit leaves no room above it.
 ///
 /// The floor only rises: Valkey grows its event loop when maxclients grows but
 /// does not shrink it.
-fn reserve_fd_range(maxclients: u64) -> Option<(i32, u64)> {
+fn reserve_fd_range(maxclients: u64) -> Option<i32> {
     let floor = maxclients + VALKEY_FDSET_INCR;
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -80,8 +112,7 @@ fn reserve_fd_range(maxclients: u64) -> Option<(i32, u64)> {
         return None;
     }
     let floor = i32::try_from(floor).ok()?;
-    let floor = FD_FLOOR.fetch_max(floor, Ordering::Relaxed).max(floor);
-    Some((floor, limit.rlim_max - floor as u64))
+    Some(FD_FLOOR.fetch_max(floor, Ordering::Relaxed).max(floor))
 }
 
 /// One-shot check that `floor` is past the end of Valkey's event loop, so the
@@ -134,8 +165,9 @@ pub fn in_client_range(fd: RawFd) -> bool {
 
 /// `open(2)` an object file, then move the fd above the floor set by `place`.
 /// Same contract as `open`: an fd, or -1 with errno set.
-/// Panics when no fd is free above the floor: keeping the low fd would take a
-/// client's fd number, and that client would never be served.
+/// Panics when no fd is free above the floor: `check_room` guarantees room for
+/// every object fd the module can hold, so this is misprovisioning or a bug, and
+/// keeping the low fd would take a client's fd number.
 pub fn open_object_file(path: &CStr, flags: libc::c_int, mode: libc::mode_t) -> RawFd {
     // SAFETY: path is NUL-terminated; open returns an fd or -1.
     let fd = unsafe { libc::open(path.as_ptr(), flags, mode as libc::c_uint) };
@@ -165,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_open_object_file_places_fd_above_client_range() {
-        let (floor, _) = reserve_fd_range(100).expect("hard limit has room above 228");
+        let floor = reserve_fd_range(100).expect("hard limit has room above 228");
         assert_eq!(floor, 228);
         let path = std::ffi::CString::new("/dev/null").unwrap();
         let fd = open_object_file(&path, libc::O_RDONLY, 0);
