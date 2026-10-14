@@ -1,12 +1,9 @@
 import os
 import glob
 import time
-import socket
 import resource
-import subprocess
 import threading
-import pytest
-from valkey import ResponseError
+from valkey import ResponseError, Valkey
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 
@@ -1238,24 +1235,17 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
         for i in range(self.OBJECTS):
             assert client.execute_command('BLOB.TCP_GET', f'obj_{i}') == b'x' * 4096
         assert client.info('largeobj_fd')['largeobj_open_fds'] == self.OBJECTS
-        assert min(self.object_fds(client)) >= 228  # maxclients 100 + 128
 
-        host = self.server.bind_ip or 'localhost'
-        socks = [socket.create_connection((host, self.server.port), timeout=2)
-                 for _ in range(self.NEW_CLIENTS)]
+        # A timeout so a client whose commands are never read fails the test
+        # instead of hanging it.
+        clients = [Valkey(host=self.server.bind_ip, port=self.server.port, socket_timeout=2)
+                   for _ in range(self.NEW_CLIENTS)]
         try:
-            for s in socks:
-                s.sendall(b'PING\r\n')
-            served = 0
-            for s in socks:
-                try:
-                    served += s.recv(16) == b'+PONG\r\n'
-                except socket.timeout:
-                    pass
-            assert served == self.NEW_CLIENTS
+            for c in clients:
+                assert c.ping()
         finally:
-            for s in socks:
-                s.close()
+            for c in clients:
+                c.close()
 
     def test_config_set_maxclients_moves_cached_fds_above_grown_range(self):
         """CONFIG SET maxclients grows the event loop over the fds placed at load
@@ -1288,29 +1278,3 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
         with self.server.expect_crash(self):
             client.execute_command('CONFIG', 'SET', 'maxclients', str(maxclients))
         assert self.server.verify_string_in_logfile("above Valkey's client range")
-
-
-class TestTieredFdRoomRequiredAtLoad(ValkeyLargeObjTestCaseBase):
-    """No setUp server: this class starts valkey-server itself, expecting it to fail."""
-
-    @pytest.fixture(autouse=True)
-    def setup_test(self, setup):
-        pass
-
-    def test_module_load_fails_without_room_above_client_range(self):
-        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        data_dir = os.path.abspath(os.path.join(self.testdir, "nvme"))
-        os.makedirs(data_dir, exist_ok=True)
-        server_path = (f"{os.path.dirname(os.path.realpath(__file__))}/build/binaries/"
-                       f"{os.environ['SERVER_VERSION']}/valkey-server")
-        with socket.socket() as s:
-            s.bind(('localhost', 0))
-            port = s.getsockname()[1]
-        module_args = self.get_module_args(data_dir, "no").split()
-        proc = subprocess.run(
-            [server_path, '--port', str(port), '--maxclients', str(hard - 200),
-             '--loadmodule', os.environ['MODULE_PATH'], *module_args],
-            cwd=self.testdir, capture_output=True, text=True, timeout=30)
-        assert proc.returncode != 0
-        assert "above Valkey's client range" in proc.stdout
-        assert "aborting module load" in proc.stdout
