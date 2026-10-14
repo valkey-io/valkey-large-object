@@ -731,8 +731,8 @@ class DramBudget(Budget):
 
 class TieredBudget(Budget):
     """`disk-maxmemory` of 8 objects, with pools bigger than any object: only the ledger can refuse
-    a write, and it is exact. Victims are the directory's first files in readdir order, the
-    filesystem's choice: tests assert counts and the ledger, not names, unless they pin one down."""
+    a write, and it is exact. Victims are a uniform random sample of the live objects: tests assert
+    counts and the ledger, not names."""
 
     OBJ = 512 * 1024
     DISK_PER_OBJ = OBJ + 4096  # the ledger also charges the file's one-page header
@@ -755,11 +755,11 @@ class TieredBudget(Budget):
         return client
 
     def object_files(self):
-        """In readdir order, the order eviction takes them in."""
-        return [name for name in os.listdir(self.data_dir) if OBJECT_FILE.match(name)]
+        """Lowest oid first (file names are zero-padded hex oids)."""
+        return sorted(name for name in os.listdir(self.data_dir) if OBJECT_FILE.match(name))
 
     def first_in_line(self, payloads):
-        """The key eviction takes first, read back from the first file's payload byte."""
+        """The oldest key (lowest oid), read back from its file's payload byte."""
         with open(os.path.join(self.data_dir, self.object_files()[0]), 'rb') as f:
             f.seek(4096)
             byte = f.read(1)[0]
@@ -823,8 +823,9 @@ class EvictionTests:
         self.settle(client, self.PER_BUDGET)
 
     def test_a_victims_key_cannot_be_copied_and_leaves_the_list_when_overwritten_or_deleted(self):
-        """Any policy but noeviction evicts: the policy only decides whether to."""
-        client = self.new_client('volatile-ttl')
+        """A victim's key reads as missing to COPY too, and an overwrite or DEL takes it off the
+        reclaim list."""
+        client = self.new_client('allkeys-random')
         payloads = set_objects(client, 'obj_', 2 * self.PER_BUDGET, self.OBJ)
         overwritten, deleted = [key for key in payloads if key not in surviving(client, payloads)][:2]
         with pytest.raises(ResponseError):
@@ -1092,3 +1093,44 @@ class TestTieredEvictionMixed(TieredBudget):
         self.settle(client, None, timeout=15)
         assert len(self.object_files()) == client.dbsize()
         assert info_largeobj(client)['largeobj_disk_used_bytes'] == client.dbsize() * self.DISK_PER_OBJ
+
+
+# ─── Tiered eviction policies ───────────────────────────────────────────────
+
+
+class TestTieredEvictionPolicy(TieredBudget):
+    """Eviction samples the live index by `maxmemory-policy`: `volatile-*` takes only keys with a
+    TTL."""
+
+    def test_volatile_evicts_only_keys_with_a_ttl(self):
+        """With no TTL key left, a volatile policy refuses the write, as in core."""
+        client = self.new_client('volatile-lru')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        volatile = [f'obj_{i}' for i in range(4, self.PER_BUDGET)]
+        for key in volatile:
+            assert client.execute_command('EXPIRE', key, 1000) == 1
+        for i in range(len(volatile)):
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+        survivors = surviving(client, payloads)
+        assert sorted(survivors) == [f'obj_{i}' for i in range(4)]
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        assert self.evictions(client) == len(volatile)
+
+    def test_persist_and_copy_carry_the_ttl_into_eviction(self):
+        """PERSIST takes a key out of volatile eviction; COPY copies its source's TTL into it."""
+        client = self.new_client('volatile-random')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        assert client.execute_command('EXPIRE', 'obj_0', 1000) == 1
+        assert client.execute_command('PERSIST', 'obj_0') == 1
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+
+        client.execute_command('DEL', 'obj_7')
+        self.settle(client, self.PER_BUDGET - 1)
+        assert client.execute_command('EXPIRE', 'obj_1', 1000) == 1
+        assert client.execute_command('COPY', 'obj_1', 'copy_1') == 1
+        for i in range(2):
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+        survivors = surviving(client, {**payloads, 'copy_1': payloads['obj_1']})
+        assert 'obj_1' not in survivors and 'copy_1' not in survivors
+        assert len(survivors) == self.PER_BUDGET - 2
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)

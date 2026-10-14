@@ -128,6 +128,7 @@ impl ObjectFile {
     /// `ensure_open`. `disk_len` is the true on-disk size; `Drop` releases exactly
     /// that many bytes.
     pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
+        super::live::insert(object_id);
         Self {
             object_id,
             disk_len,
@@ -212,6 +213,8 @@ impl Drop for ObjectFile {
         // unless an eviction owns it, unlink the file.
         let object_id = self.object_id;
         let disk_len = self.disk_len;
+        // Sampling must not draw a file that is being torn down.
+        super::live::remove(object_id);
         // We do not allow the eviction of a file that is being torn down.
         let unevictable = UnevictableOID::new(object_id);
 

@@ -75,7 +75,7 @@ pub fn nvme_disk_usage() -> u64 {
 
 // ─── NVMe Eviction ───────────────────────────────────────────────────────────
 
-/// Directory entries read per eviction.
+/// Candidates sampled per eviction.
 const EVICT_BATCH: usize = 64;
 
 /// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
@@ -96,9 +96,11 @@ fn evict_and_reserve(bytes: u64) -> bool {
     if bytes > max {
         return false;
     }
-    if !with_server_lock(crate::tiered_eviction_allowed) {
+    let Some(policy) = with_server_lock(|ctx| {
+        crate::tiered_eviction_allowed(ctx).then(|| super::live::Policy::read(ctx))
+    }) else {
         return false;
-    }
+    };
     // Take the headroom first, so no other write can use it while we evict.
     let prev = NVME_DISK_USAGE.update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
         cur + bytes.min(max.saturating_sub(cur))
@@ -108,7 +110,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
     // Claim, then stat: a claimed file cannot change under us.
     let mut victims = Vec::new();
     let mut covered = 0;
-    for oid in victim_batch(EVICT_BATCH) {
+    for oid in super::live::sample(policy, EVICT_BATCH) {
         if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
             break;
         }
@@ -121,9 +123,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
                 covered += len;
                 victims.push((unevictable, len));
             }
-            // We collect our victim candidates via a readdir snapshot. Between the
-            // readdir and the victim claim (adding the oid to the RECLAIM_LIST), the
-            // file may be deleted by an ObjectFile's drop.
+            // Torn down between the sample and the claim, so its key is gone.
             Ok(None) => {
                 super::reclaim::RECLAIM_LIST.remove(&oid);
             }
@@ -133,6 +133,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
                     "largeobj: failed to stat object file {} during eviction, will retry: {e}",
                     oid.file_path(&crate::disk_dir())
                 ));
+                super::live::remove(oid);
                 crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
                 ORPHANED_FILES.push(unevictable, 0);
             }
@@ -149,16 +150,6 @@ fn evict_and_reserve(bytes: u64) -> bool {
     reserved
 }
 
-/// The first `n` object files in `disk_dir`.
-fn victim_batch(n: usize) -> Vec<ObjectId> {
-    let Ok(dir) = std::fs::read_dir(crate::disk_dir()) else {
-        return Vec::new();
-    };
-    dir.filter_map(|entry| ObjectId::from_filename(entry.ok()?.file_name().to_str()?))
-        .take(n)
-        .collect()
-}
-
 /// Unlink claimed `victims` and remove them from the unevictable list,
 /// except orphans, which stay in it until the retry. Returns the bytes freed, not counting
 /// orphans. Victims stay in the reclaim list: their keys read as missing until the cron
@@ -167,6 +158,7 @@ fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
     let mut freed = 0;
     for (unevictable, size) in victims {
         let oid = unevictable.oid();
+        super::live::remove(oid);
         if let Some(pool) = super::FD_POOL.get() {
             pool.remove(oid);
         }

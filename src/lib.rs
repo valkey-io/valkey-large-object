@@ -274,6 +274,9 @@ valkey_module! {
         ["BLOB.RDMA_SET", commands::lo_rdma_set, "write deny-oom fast", 1, 1, 1, "write largeobj fast"],
         ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1, "read largeobj fast"],
     ],
+    event_handlers: [
+        [@GENERIC: storage::live::on_keyspace_event],
+    ],
     configurations: [
         i64: [
             ["segment-size", &*CFG_SEGMENT_SIZE, DEFAULT_SEGMENT_SIZE, MIN_SEGMENT_SIZE, MAX_SEGMENT_SIZE,
