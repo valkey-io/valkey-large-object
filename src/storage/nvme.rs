@@ -7,7 +7,8 @@
 
 use std::mem::size_of;
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use super::context::SegmentBuffer;
 use super::uring;
@@ -143,33 +144,114 @@ fn victim_batch(n: usize) -> Vec<ObjectId> {
         .collect()
 }
 
-/// Unlink claimed `victims` (oid, size, guard) and remove them from the unevictable list.
-/// Returns the bytes freed. They stay in the reclaim list: their keys read as missing
-/// until the cron deletes them, and their teardown then only removes them from it.
+/// Unlink claimed `victims` (oid, size, guard) and remove them from the unevictable list,
+/// except orphans, which stay in it until the retry. Returns the bytes freed, not counting
+/// orphans. Victims stay in the reclaim list: their keys read as missing until the cron
+/// deletes them, and their teardown then only removes them from it.
 fn evict(victims: Vec<(ObjectId, u64, super::UnevictableGuard)>) -> u64 {
     let mut freed = 0;
-    for (oid, size, _unevictable) in victims {
+    for (oid, size, unevictable) in victims {
         if let Some(pool) = super::FD_POOL.get() {
             pool.remove(oid);
         }
         super::get_dram_pool().remove_object(&oid);
-        let path = oid.file_path(&crate::nvme_dir());
-        let unlinked = if crate::test_fail_evict_unlink() {
-            Err(std::io::Error::other("test-fail-evict-unlink"))
-        } else {
-            std::fs::remove_file(&path)
-        };
-        match unlinked {
-            Ok(()) => {
-                freed += size;
-                crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
-            }
-            // Leak hazard: the file stays on disk, charged and in the reclaim list;
-            // its teardown only removes it from the reclaim list.
-            Err(e) => warn_failed_unlink("eviction", &path, &e),
+        crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        if try_unlink(oid, size, unevictable, "eviction") {
+            freed += size;
         }
     }
     freed
+}
+
+// ─── Orphans ─────────────────────────────────────────────────────────────────
+
+/// Files whose unlink failed transiently: still charged, and in the unevictable list
+/// so no eviction takes them. The cron's retry unlinks them and credits their bytes.
+pub struct Orphans {
+    files: Mutex<Vec<(ObjectId, u64, super::UnevictableGuard)>>,
+    pub count: AtomicU64,
+    pub bytes: AtomicU64,
+    retrying: AtomicBool,
+}
+
+pub static ORPHANS: Orphans = Orphans {
+    files: Mutex::new(Vec::new()),
+    count: AtomicU64::new(0),
+    bytes: AtomicU64::new(0),
+    retrying: AtomicBool::new(false),
+};
+
+impl Orphans {
+    fn push(&self, oid: ObjectId, size: u64, unevictable: super::UnevictableGuard) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(size, Ordering::Relaxed);
+        self.files
+            .lock()
+            .expect("ORPHANS lock unavailable")
+            .push((oid, size, unevictable));
+    }
+
+    /// Scaling cron: retry the unlinks on tokio, one retry at a time.
+    pub fn retry(&'static self) {
+        if self.count.load(Ordering::Relaxed) == 0 || self.retrying.swap(true, Ordering::Acquire) {
+            return;
+        }
+        crate::runtime_handle().spawn(async {
+            let files = std::mem::take(&mut *self.files.lock().expect("ORPHANS lock unavailable"));
+            for (oid, size, unevictable) in files {
+                if unlink(oid).is_ok() {
+                    decrease_nvme_disk_usage(size);
+                    self.count.fetch_sub(1, Ordering::Relaxed);
+                    self.bytes.fetch_sub(size, Ordering::Relaxed);
+                } else {
+                    let mut files = self.files.lock().expect("ORPHANS lock unavailable");
+                    files.push((oid, size, unevictable));
+                }
+            }
+            self.retrying.store(false, Ordering::Release);
+        });
+    }
+}
+
+/// Unlink `oid`'s file.
+/// - Ok: unlinked, or already gone (`ENOENT`).
+/// - Err, transient: `EINTR`, `EAGAIN`, `EBUSY`, `ENOMEM`. A retry may succeed.
+/// - Fatal, aborts the server: anything else, e.g. `EIO` (hardware), `EROFS` (the
+///   filesystem went read-only), `EACCES`/`EPERM` (permissions changed), path errors (a bug).
+fn unlink(oid: ObjectId) -> std::io::Result<()> {
+    let path = oid.file_path(&crate::nvme_dir());
+    let Err(e) = std::fs::remove_file(&path) else {
+        return Ok(());
+    };
+    match e.raw_os_error() {
+        Some(libc::ENOENT) => Ok(()),
+        Some(libc::EINTR | libc::EAGAIN | libc::EBUSY | libc::ENOMEM) => Err(e),
+        _ => panic!("largeobj: failed to unlink object file {path}: {e}"),
+    }
+}
+
+/// Unlink `oid`'s file of `size` charged bytes. True if it is gone: the caller credits
+/// them. False if it is orphaned: the bytes stay charged until the retry credits them.
+pub(crate) fn try_unlink(
+    oid: ObjectId,
+    size: u64,
+    unevictable: super::UnevictableGuard,
+    during: &str,
+) -> bool {
+    let unlinked = if crate::test_fail_unlink() {
+        Err(std::io::Error::from_raw_os_error(libc::EBUSY))
+    } else {
+        unlink(oid)
+    };
+    let Err(e) = unlinked else {
+        return true;
+    };
+    valkey_module::logging::log_warning(format!(
+        "largeobj: failed to unlink object file {} during {during}, will retry: {e}",
+        oid.file_path(&crate::nvme_dir())
+    ));
+    ORPHANS.push(oid, size, unevictable);
+    false
 }
 
 // ─── FileHeader ──────────────────────────────────────────────────────────────
@@ -436,14 +518,6 @@ pub async fn write_file_header(
             );
         }
     }
-}
-
-/// Warn that an object file couldn't be unlinked (the next
-/// `validate_and_clean_nvme_dir` reclaims the orphan).
-pub(crate) fn warn_failed_unlink(during: &str, path: &str, err: &std::io::Error) {
-    valkey_module::logging::log_warning(format!(
-        "largeobj: failed to unlink object file {path} during {during}: {err}"
-    ));
 }
 
 /// Reset the NVMe object directory (Tiered mode only): delete it and everything

@@ -66,6 +66,14 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("evictions", EVICTIONS.load(Ordering::Relaxed) as i64)?
         .field("disk_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
         .field(
+            "disk_orphaned_files",
+            storage::nvme::ORPHANS.count.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "disk_orphaned_bytes",
+            storage::nvme::ORPHANS.bytes.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
             "disk_unevictable_objects",
             storage::object_file::unevictable_count() as i64,
         )?

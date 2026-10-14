@@ -34,9 +34,6 @@ pub use nvme::{
     FILE_HEADER_SIZE, FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN,
 };
 
-// Re-export for crate-internal use only.
-pub(crate) use nvme::warn_failed_unlink;
-
 pub use dram_pool::DRAMPool;
 pub use fd_pool::FdPool;
 pub use nvme_pool::NVMePool;

@@ -974,50 +974,62 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         assert info['largeobj_evictions'] == info['largeobj_pending_reclaims'] == 1
         assert info['largeobj_dram_objects'] == self.PER_BUDGET - 1
 
-    def test_a_failed_eviction_unlink_leaks_the_victim(self):
-        """The documented hazard: the victim stays on disk, charged and in the reclaim list. Its key
-        reads as missing, and its teardown only removes it from the list."""
-        client = self.new_client()
-        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        hook(client, 'fail-evict-unlink', 'yes')
-        self.assert_refused(client, 'newcomer', b'N' * self.OBJ)
-        hook(client, 'fail-evict-unlink', 'no')
-        info = info_largeobj(client)
-        assert info['largeobj_evictions'] == 0
-        assert info['largeobj_nvme_capacity_exceeded'] == info['largeobj_pending_reclaims'] == 1
-        survivors = surviving(client, payloads)
-        assert len(survivors) == self.PER_BUDGET - 1
-
-        victim = next(key for key in payloads if key not in survivors)
-        assert client.execute_command('DEL', victim) == 1
-        wait_for_true(lambda: pending_reclaims(client) == 0, timeout=10)
-        self.settle(client, self.PER_BUDGET)  # still on disk, still charged
-        assert info_largeobj(client)['largeobj_disk_used_bytes'] == self.BUDGET
-
 
 class TestTieredEvictionCron(EvictionCronTests, TieredBudget):
+    pass
 
-    @pytest.mark.xfail(strict=True, reason="bug: an evicted file with no key stays listed forever")
-    def test_a_leaked_file_evicted_later_leaves_nothing_listed(self):
-        """A victim whose unlink failed is left on disk once the cron deletes its key: no key, not in
-        the reclaim list, still charged. A later eviction takes it like any other file, and must not
-        leave it in the list, or the sweep scans for a key that will never come."""
+
+class TestTieredUnlinkFailure(TieredBudget):
+    """Every unlink fails transiently except the cron's retry, which runs once a second here. A
+    file left in place stays charged and unevictable until the retry unlinks it."""
+
+    POLL_MS = 1000
+
+    def get_module_args(self, data_dir, direct_io):
+        return super().get_module_args(data_dir, direct_io) + " test-fail-unlink yes"
+
+    def assert_no_orphans(self, client):
+        info = info_largeobj(client)
+        assert info['largeobj_disk_orphaned_files'] == info['largeobj_disk_orphaned_bytes'] == 0
+
+    def test_a_victim_whose_unlink_fails_frees_nothing_until_the_retry(self):
         client = self.new_client()
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        leaked = self.object_files()[0]
-        hook(client, 'fail-evict-unlink', 'yes')
         self.assert_refused(client, 'refused', b'R' * self.OBJ)
-        hook(client, 'fail-evict-unlink', 'no')
-        wait_for_true(lambda: pending_reclaims(client) == 0, timeout=15)
-        assert client.dbsize() == self.PER_BUDGET - 1
-        assert self.object_files()[0] == leaked
-
-        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
-        assert leaked not in self.object_files()
-        self.settle(client, self.PER_BUDGET)
+        assert self.evictions(client) == 1
         assert len(surviving(client, payloads)) == self.PER_BUDGET - 1
-        time.sleep(3)
-        assert pending_reclaims(client) == 0
+        self.settle(client, self.PER_BUDGET - 1)
+        self.assert_no_orphans(client)
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        assert self.evictions(client) == 1, "the retry's credit made the room"
+
+    def test_a_deleted_object_whose_unlink_fails_stays_charged_until_the_retry(self):
+        client = self.new_client()
+        set_objects(client, 'obj_', 2, self.OBJ)
+        client.delete('obj_0')
+        self.settle(client, 1)
+        self.assert_no_orphans(client)
+
+
+class TestTieredOrphanHeld(TieredBudget):
+    """Unlinks fail as above, but the cron never ticks during a test, so orphans stay put."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return super().get_module_args(data_dir, direct_io) + " test-fail-unlink yes"
+
+    def test_an_orphan_stays_charged_and_is_never_evicted(self):
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        orphan = self.first_in_line(payloads)
+        client.delete(orphan)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_orphaned_files'] == 1)
+        info = info_largeobj(client)
+        assert info['largeobj_disk_orphaned_bytes'] == self.DISK_PER_OBJ
+        assert info['largeobj_disk_used_bytes'] == self.BUDGET
+        assert info['largeobj_disk_unevictable_objects'] == 1
+        assert len(self.object_files()) == self.PER_BUDGET
+        self.assert_refused(client, 'newcomer', b'N' * self.OBJ)
+        assert len(surviving(client, payloads)) == self.PER_BUDGET - 2, "the victim was not the orphan"
 
 
 class TestTieredEvictionMixed(TieredBudget):
