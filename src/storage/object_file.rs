@@ -31,44 +31,55 @@
 
 use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use super::fd_pool::FdPool;
 use super::Crc;
 use crate::data_type::ObjectId;
 
 /// Unevictable list (Tiered): oids whose files are in use by a GET, SET, COPY,
-/// teardown or eviction, as oid -> live `UnevictableGuard`s. Eviction never
-/// claims an oid in it.
-static UNEVICTABLE: LazyLock<Mutex<HashMap<ObjectId, u32>>> = LazyLock::new(Mutex::default);
+/// teardown or eviction, as oid -> the `Arc` its live `UnevictableGuard`s share.
+/// Eviction never claims an oid whose `Weak` is live.
+static UNEVICTABLE: LazyLock<Mutex<HashMap<ObjectId, Weak<Unevictable>>>> =
+    LazyLock::new(Mutex::default);
+
+/// Shared by every guard for one oid. Dropping the last guard removes the oid from
+/// the unevictable list.
+struct Unevictable(ObjectId);
+
+impl Drop for Unevictable {
+    fn drop(&mut self) {
+        let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
+        // A new guard may have replaced the entry before this took the lock.
+        if unevictable
+            .get(&self.0)
+            .is_some_and(|w| w.strong_count() == 0)
+        {
+            unevictable.remove(&self.0);
+        }
+    }
+}
 
 /// Keeps `oid` in the unevictable list until every guard for it drops.
 /// Never call `new` or drop one under the `UNEVICTABLE` or `RECLAIM_LIST` lock.
 #[must_use]
-pub struct UnevictableGuard(ObjectId);
+pub struct UnevictableGuard {
+    _shared: Arc<Unevictable>,
+}
 
 impl UnevictableGuard {
     pub fn new(oid: ObjectId) -> Self {
-        *UNEVICTABLE
-            .lock()
-            .expect("UNEVICTABLE lock unavailable")
-            .entry(oid)
-            .or_insert(0) += 1;
-        Self(oid)
-    }
-}
-
-impl Drop for UnevictableGuard {
-    fn drop(&mut self) {
         let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
-        let Some(n) = unevictable.get_mut(&self.0) else {
-            debug_assert!(false, "{:?} is not in the unevictable list", self.0);
-            return;
-        };
-        *n -= 1;
-        if *n == 0 {
-            unevictable.remove(&self.0);
+        match unevictable.get(&oid).and_then(Weak::upgrade) {
+            Some(shared) => Self { _shared: shared },
+            None => Self::insert(&mut unevictable, oid),
         }
+    }
+
+    fn insert(unevictable: &mut HashMap<ObjectId, Weak<Unevictable>>, oid: ObjectId) -> Self {
+        let shared = Arc::new(Unevictable(oid));
+        unevictable.insert(oid, Arc::downgrade(&shared));
+        Self { _shared: shared }
     }
 }
 
@@ -77,7 +88,9 @@ pub fn unevictable_count() -> usize {
     UNEVICTABLE
         .lock()
         .expect("UNEVICTABLE lock unavailable")
-        .len()
+        .values()
+        .filter(|w| w.strong_count() > 0)
+        .count()
 }
 
 /// Claim `oid` for eviction: add it to the reclaim list and the unevictable list,
@@ -86,11 +99,12 @@ pub fn unevictable_count() -> usize {
 /// finds it in the reclaim list. Call under the server lock.
 pub fn claim_victim(oid: ObjectId) -> Option<UnevictableGuard> {
     let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
-    if unevictable.contains_key(&oid) || !super::reclaim::RECLAIM_LIST.insert(oid) {
+    if unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0)
+        || !super::reclaim::RECLAIM_LIST.insert(oid)
+    {
         return None;
     }
-    unevictable.insert(oid, 1);
-    Some(UnevictableGuard(oid))
+    Some(UnevictableGuard::insert(&mut unevictable, oid))
 }
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
