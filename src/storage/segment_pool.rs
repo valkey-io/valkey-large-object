@@ -4,7 +4,7 @@
 //!
 //! ## Design
 //!
-//! `slots: Vec<Option<Segment>>` behind a `Mutex` — each slot is either
+//! `slots: Vec<Option<Segment>>` behind a `RwLock` — each slot is either
 //! `Some(segment)` (live) or `None` (empty/removed). Slot index is what
 //! `SegmentBuffer.segment_idx` names: it only locates the segment in `slots`.
 //! A segment's `iovec_index` is its position in this pool's own io_uring buffer
@@ -34,7 +34,7 @@
 
 use std::alloc::Layout;
 use std::ptr::NonNull;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use allocator_api2::alloc::Allocator;
 
@@ -48,7 +48,10 @@ struct SegmentState {
 }
 
 pub struct SegmentPool {
-    state: Mutex<SegmentState>,
+    /// RwLock: alloc/free/lookups only read `slots` (per-segment talc locks
+    /// serialize the allocator), so they run in parallel. Only expand,
+    /// release and the iovec rebuild take the write lock.
+    state: RwLock<SegmentState>,
     /// Size of each segment (uniform within a pool).
     pub segment_size: usize,
     /// Which pool (ring) this is — routes reregister to the correct io_uring
@@ -78,7 +81,7 @@ impl SegmentPool {
         }
 
         Self {
-            state: Mutex::new(SegmentState { slots }),
+            state: RwLock::new(SegmentState { slots }),
             segment_size,
             pool_id,
         }
@@ -90,7 +93,7 @@ impl SegmentPool {
     /// entry per segment. Dense because 5.10 has no sparse table. Only called
     /// from init.
     pub fn startup_iovecs(&self) -> Vec<libc::iovec> {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         st.slots.iter().flatten().map(|seg| seg.iovec()).collect()
     }
 
@@ -157,7 +160,7 @@ impl SegmentPool {
             "alloc_object_in_one_segment: empty sizes"
         );
         let total: usize = sizes.iter().sum();
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         // Single O(N) pass: least-loaded eligible segment, checked against the
         // object's TOTAL size. Segments are uniform, so if it can't fit, none
         // can. `target` pins the segment instead.
@@ -366,7 +369,7 @@ impl SegmentPool {
     /// expand. A fallback loop would add machinery for a case that yields the
     /// same result.
     fn alloc_one(&self, aligned_size: usize, layout: Layout) -> Option<SegmentBuffer> {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
 
         // Single O(N) pass: least-loaded eligible segment. Done under the state
         // lock so slots stay stable through the subsequent malloc.
@@ -428,7 +431,7 @@ impl SegmentPool {
             // No align_up needed — buf.len is already the aligned size talc allocated.
             let layout = Layout::from_size_align(buf.len as usize, super::IO_ALIGN)
                 .expect("SegmentBuffer layout");
-            let st = self.state.lock().expect("state lock unavailable");
+            let st = self.state.read().expect("state lock unavailable");
             let seg = st.slots[seg_idx]
                 .as_ref()
                 .expect("segment slot empty for live buffer — invariant broken");
@@ -470,7 +473,7 @@ impl SegmentPool {
         // allocated backing buffer.
         let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(seg.base, seg.size) };
 
-        let mut st = self.state.lock().expect("state lock unavailable");
+        let mut st = self.state.write().expect("state lock unavailable");
         // On None, `seg` drops here and nothing enters `slots`.
         let live = st.slots.iter().flatten().count();
         if live >= super::MAX_SEGMENTS {
@@ -494,7 +497,7 @@ impl SegmentPool {
     /// Select the least-loaded non-draining segment as a shrink candidate.
     /// Returns `(slot_idx, allocated_bytes)` without marking the segment draining.
     pub fn find_shrink_victim(&self) -> Option<(usize, usize)> {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         Self::least_loaded(&st)
     }
 
@@ -522,7 +525,9 @@ impl SegmentPool {
     /// After this, the picker skips this segment; existing allocations continue
     /// to be freed naturally, and once refcount==0 the segment is releasable.
     pub fn mark_segment_draining(&self, seg_idx: usize) {
-        let st = self.state.lock().expect("state lock unavailable");
+        // Write lock waits out any alloc that already passed the draining check,
+        // so its inc_ref lands before the cron can see refcount == 0.
+        let st = self.state.write().expect("state lock unavailable");
         if let Some(Some(seg)) = st.slots.get(seg_idx) {
             seg.draining
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -533,7 +538,7 @@ impl SegmentPool {
     /// Called from the scaling cron on the main thread each tick.
     pub fn release_all_releasable(&self) {
         let releasable: Vec<usize> = {
-            let st = self.state.lock().expect("state lock unavailable");
+            let st = self.state.read().expect("state lock unavailable");
             st.slots
                 .iter()
                 .enumerate()
@@ -542,8 +547,7 @@ impl SegmentPool {
         };
         let mut released_any = false;
         for idx in releasable {
-            self.release_drained(idx);
-            released_any = true;
+            released_any |= self.release_drained(idx);
         }
         if released_any {
             // A segment left this pool — rebuild its ring's table without it
@@ -555,22 +559,29 @@ impl SegmentPool {
     /// Complete the drain: pull the Segment out of its slot and drop it.
     /// Segment::drop deallocates the backing memory (its talc's metadata lived
     /// inside that memory and vanishes with it).
-    fn release_drained(&self, seg_idx: usize) {
-        let mut st = self.state.lock().expect("state lock unavailable");
-        let Some(seg) = st.slots[seg_idx].take() else {
-            return; // already released
-        };
+    fn release_drained(&self, seg_idx: usize) -> bool {
+        let mut st = self.state.write().expect("state lock unavailable");
+        // Re-check under the write lock: the scan in release_all_releasable ran
+        // under a read lock that has since been dropped.
+        if !st.slots[seg_idx]
+            .as_ref()
+            .is_some_and(|seg| seg.is_releasable())
+        {
+            return false; // already released, or picked up a ref since the scan
+        }
+        let seg = st.slots[seg_idx].take().expect("checked above");
         drop(st);
         // seg dropped here → Segment::drop → talc drops (no external state) →
         // std::alloc::dealloc frees backing memory.
         drop(seg);
+        true
     }
 
     // ─── Segment Helpers ─────────────────────────────────────────────────────
 
     /// Get absolute pointer for a SegmentBuffer.
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         unsafe {
             st.slots[buf.segment_idx as usize]
                 .as_ref()
@@ -582,7 +593,7 @@ impl SegmentPool {
 
     /// Return the io_uring iovec_index for the segment owning `buf`.
     pub fn iovec_index_for_buf(&self, buf: &SegmentBuffer) -> u16 {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         st.slots[buf.segment_idx as usize]
             .as_ref()
             .expect("segment slot empty for live buffer")
@@ -596,7 +607,7 @@ impl SegmentPool {
     /// returns false so its I/O never issues a fixed op against an unregistered
     /// iovec_index (which would EFAULT).
     pub fn is_buf_io_uring_registered(&self, buf: &SegmentBuffer) -> bool {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         st.slots[buf.segment_idx as usize]
             .as_ref()
             .expect("segment slot empty for live buffer")
@@ -607,7 +618,7 @@ impl SegmentPool {
     /// startup after the initial IORING_REGISTER_BUFFERS succeeds, since those
     /// segments' iovecs are in the kernel table.
     pub fn mark_all_registered(&self) {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         for slot in st.slots.iter() {
             if let Some(seg) = slot.as_ref() {
                 seg.mark_io_uring_registered();
@@ -619,7 +630,7 @@ impl SegmentPool {
     /// them registered, and return the iovec array for `register_buffers`. Dense
     /// because 5.10 cannot register a sparse table.
     pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
-        let mut st = self.state.lock().expect("state lock unavailable");
+        let mut st = self.state.write().expect("state lock unavailable");
         let mut out = Vec::new();
         for seg in st.slots.iter_mut().flatten() {
             seg.iovec_index = out.len() as u16;
@@ -632,7 +643,7 @@ impl SegmentPool {
     /// Count of live segments marked io_uring-registered. Below this pool's live
     /// count means an expanded segment's re-register hasn't completed yet. INFO metric.
     pub fn io_uring_registered_count(&self) -> usize {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         st.slots
             .iter()
             .filter_map(|s| s.as_ref())
@@ -644,7 +655,7 @@ impl SegmentPool {
     /// Sums the per-segment atomics directly — the exact figure INFO reports,
     /// with no ratio round-trip.
     pub fn allocated_bytes(&self) -> usize {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         st.slots
             .iter()
             .flatten()
@@ -661,7 +672,7 @@ impl SegmentPool {
     /// A count, not a byte figure: rising against flat `allocated_bytes` means
     /// free space is scattering into small holes.
     pub fn fragment_count(&self) -> usize {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         st.slots
             .iter()
             .flatten()
@@ -676,7 +687,7 @@ impl SegmentPool {
     /// Utilization ratio: allocated_bytes / total_live_capacity.
     /// 0.0 = empty, 1.0 = fully allocated.
     pub fn utilization_ratio(&self) -> f64 {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         let mut live = 0usize;
         let mut allocated = 0usize;
         for seg in st.slots.iter().flatten() {
@@ -696,7 +707,7 @@ impl SegmentPool {
 
     /// Counts of (total, draining, unused) segments; total includes draining.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         let mut total = 0usize;
         let mut draining = 0usize;
         let mut unused = 0usize;
@@ -720,7 +731,7 @@ impl SegmentPool {
     where
         F: FnMut(*const u8, usize),
     {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         for s in st.slots.iter().flatten() {
             f(s.base, s.size);
         }
@@ -728,7 +739,7 @@ impl SegmentPool {
 
     /// Returns true if segment `seg_idx` is draining.
     pub fn is_segment_draining(&self, seg_idx: u16) -> bool {
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         st.slots[seg_idx as usize]
             .as_ref()
             .is_some_and(|seg| seg.draining.load(std::sync::atomic::Ordering::Acquire))
@@ -1087,5 +1098,38 @@ mod tests {
     fn test_alloc_n_panics_when_min_exceeds_count() {
         let pool = SegmentPool::new(1, 65536, super::super::uring::PoolType::Dram);
         pool.alloc_n(4096, 2, 3);
+    }
+
+    // ── drain / release ──────────────────────────────────────────────────
+
+    /// Drain and release while allocs are in flight on other threads. The
+    /// segment must only be dropped once every live buffer has been freed; a
+    /// buffer freed into a released slot would panic in `free_n`.
+    #[test]
+    fn test_drain_release_races_with_alloc_free() {
+        use super::super::uring::PoolType;
+        use std::sync::Arc;
+        for _ in 0..50 {
+            let pool = Arc::new(SegmentPool::new(1, 1 << 20, PoolType::Dram));
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    let pool = pool.clone();
+                    // Exits once the segment is draining and alloc returns None.
+                    std::thread::spawn(move || {
+                        while let Some(bufs) = pool.alloc_exact(4096) {
+                            pool.free_n(&bufs);
+                        }
+                    })
+                })
+                .collect();
+            std::thread::yield_now();
+            pool.mark_segment_draining(0);
+            while pool.segment_counts() != (0, 0, 1) {
+                pool.release_all_releasable();
+            }
+            for w in workers {
+                w.join().expect("worker panicked");
+            }
+        }
     }
 }
