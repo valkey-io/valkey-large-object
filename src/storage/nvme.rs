@@ -118,18 +118,24 @@ fn evict_and_reserve(bytes: u64) -> bool {
         let Some(unevictable) = with_server_lock(|_| super::object_file::claim_victim(oid)) else {
             continue;
         };
-        match std::fs::metadata(oid.file_path(&crate::nvme_dir())) {
-            Ok(meta) => {
-                covered += meta.len();
-                victims.push((oid, meta.len(), unevictable));
+        match stat(oid) {
+            Ok(Some(len)) => {
+                covered += len;
+                victims.push((oid, len, unevictable));
             }
             // Stale readdir entry: torn down before the claim, so its key is gone.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None) => {
                 super::reclaim::RECLAIM_LIST.remove(&oid);
             }
-            // Leak hazard: the file stays on disk, charged and in the reclaim list;
-            // its teardown only removes it from the reclaim list.
-            Err(_) => {}
+            // Evicted, but orphaned with its size unknown: the retry stats and frees it.
+            Err(e) => {
+                valkey_module::logging::log_warning(format!(
+                    "largeobj: failed to stat object file {} during eviction, will retry: {e}",
+                    oid.file_path(&crate::nvme_dir())
+                ));
+                crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                ORPHANS.push(oid, 0, unevictable);
+            }
         }
     }
     // No lock.
@@ -176,6 +182,7 @@ fn evict(victims: Vec<(ObjectId, u64, super::UnevictableGuard)>) -> u64 {
 
 /// Files whose unlink failed transiently: still charged, and in the unevictable list
 /// so no eviction takes them. The cron's retry unlinks them and credits their bytes.
+/// Size 0: an eviction could not stat the file, so the retry does first.
 pub struct Orphans {
     files: Mutex<Vec<(ObjectId, u64, super::UnevictableGuard)>>,
     pub count: AtomicU64,
@@ -207,8 +214,14 @@ impl Orphans {
         }
         crate::runtime_handle().spawn(async {
             let files = std::mem::take(&mut *self.files.lock().expect("ORPHANS lock unavailable"));
-            for (oid, size, unevictable) in files {
-                if unlink(oid).is_ok() {
+            for (oid, mut size, unevictable) in files {
+                let sized = size > 0
+                    || stat(oid).is_ok_and(|len| {
+                        size = len.unwrap_or(0);
+                        self.bytes.fetch_add(size, Ordering::Relaxed);
+                        true
+                    });
+                if sized && unlink(oid).is_ok() {
                     decrease_nvme_disk_usage(size);
                     self.count.fetch_sub(1, Ordering::Relaxed);
                     self.bytes.fetch_sub(size, Ordering::Relaxed);
@@ -234,9 +247,28 @@ fn unlink(oid: ObjectId) -> std::io::Result<()> {
     };
     match e.raw_os_error() {
         Some(libc::ENOENT) => Ok(()),
-        Some(libc::EINTR | libc::EAGAIN | libc::EBUSY | libc::ENOMEM) => Err(e),
+        _ if transient(&e) => Err(e),
         _ => panic!("largeobj: failed to unlink object file {path}: {e}"),
     }
+}
+
+/// Size of `oid`'s file; `None` if it is gone (`ENOENT`). Errors as for `unlink`:
+/// transient ones are returned, anything else aborts the server.
+fn stat(oid: ObjectId) -> std::io::Result<Option<u64>> {
+    let path = oid.file_path(&crate::nvme_dir());
+    match std::fs::metadata(&path) {
+        Ok(meta) => Ok(Some(meta.len())),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(e) if transient(&e) => Err(e),
+        Err(e) => panic!("largeobj: failed to stat object file {path}: {e}"),
+    }
+}
+
+fn transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EINTR | libc::EAGAIN | libc::EBUSY | libc::ENOMEM)
+    )
 }
 
 /// Unlink `oid`'s file of `size` charged bytes. True if it is gone: the caller credits
