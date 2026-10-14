@@ -294,6 +294,8 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, DEFAULT_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, MIN_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, MAX_TEST_PAUSE_BEFORE_FINALIZE_SET_MS,
              ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
+            ["test-pause-during-promotion-ms", &*CFG_TEST_PAUSE_DURING_PROMOTION_MS, DEFAULT_TEST_PAUSE_DURING_PROMOTION_MS, MIN_TEST_PAUSE_DURING_PROMOTION_MS, MAX_TEST_PAUSE_DURING_PROMOTION_MS,
+             ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, DEFAULT_SCALING_POLL_MS, MIN_SCALING_POLL_MS, MAX_SCALING_POLL_MS,
              ConfigurationFlags::DEFAULT, None, None],
             ["reclaim-scan-budget-us", &*CFG_RECLAIM_SCAN_BUDGET_US, DEFAULT_RECLAIM_SCAN_BUDGET_US, MIN_RECLAIM_SCAN_BUDGET_US, MAX_RECLAIM_SCAN_BUDGET_US,

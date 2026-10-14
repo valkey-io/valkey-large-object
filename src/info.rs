@@ -21,6 +21,7 @@ pub static NVME_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static NVME_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
 pub static SET_FINALIZE_STALE: AtomicU64 = AtomicU64::new(0);
 pub static SET_VALUE_FAILURES: AtomicU64 = AtomicU64::new(0);
+pub static COALESCED_READS: AtomicU64 = AtomicU64::new(0);
 pub static EFA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
 
 // ─── Core Metrics ────────────────────────────────────────────────────────────
@@ -281,6 +282,10 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "set_value_failures",
             SET_VALUE_FAILURES.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "coalesced_reads",
+            COALESCED_READS.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "efa_discarded_transfers",
