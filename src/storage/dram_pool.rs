@@ -13,14 +13,15 @@
 //! list; their keys read as missing until the cron deletes them.
 //!
 //! Evict (Dram): a SET or COPY into a full arena evicts cold objects the same
-//! way (`alloc_exact_expand_evict`), where the server allows eviction.
+//! way (`alloc_exact_expand_evict`), where the server allows eviction, taking
+//! only keys the `maxmemory-policy` allows.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::cache_policy::{
-    now_minutes, sample_victim, OIDIndexedMap, OIDIndexedSet, TieredCache, RECLAIM_MAX_SEGMENTS,
-    RECLAIM_MAX_VICTIMS,
+    now_minutes, sample_victim, MaxmemoryPolicy, OIDIndexedMap, OIDIndexedSet, TieredCache,
+    RECLAIM_MAX_SEGMENTS, RECLAIM_MAX_VICTIMS,
 };
 use super::context::{ObjectContext, SegmentBuffer};
 use super::segment_pool::SegmentPool;
@@ -66,21 +67,44 @@ impl ObjectMaps {
     }
 
     /// Remove and return the lowest-scoring unpinned object among up to
-    /// `samples` drawn from segment `seg`.
+    /// `samples` drawn from segment `seg`. `score` returns `None` for an object
+    /// eviction may not take.
     fn take_victim(
         &mut self,
         seg: usize,
         samples: usize,
-        now_min: u16,
-        decay_time: u64,
+        score: impl Fn(&ObjectContext) -> Option<u8>,
     ) -> Option<(ObjectId, Arc<ObjectContext>)> {
         let ids = self.by_segment.get_mut(seg)?;
         let victim = sample_victim(&*ids, samples, |oid| {
             let ctx = self.all.get(oid)?;
-            (Arc::strong_count(ctx) == 1).then(|| ctx.stats.decayed_counter(now_min, decay_time))
+            if Arc::strong_count(ctx) == 1 {
+                score(ctx)
+            } else {
+                None
+            }
         })?;
         let oid = ids.swap_remove_index(victim)?;
         Some((oid, self.all.swap_remove(&oid)?))
+    }
+}
+
+/// Rank objects by LFU score, read at one time for the whole search.
+fn by_lfu() -> impl Fn(&ObjectContext) -> Option<u8> + Copy {
+    let now_min = now_minutes();
+    let decay_time = crate::blob_decay_time();
+    move |ctx| Some(ctx.stats.decayed_counter(now_min, decay_time))
+}
+
+/// Dram eviction's ranking: LFU, over the objects `policy` allows to go.
+fn by_policy(policy: MaxmemoryPolicy) -> impl Fn(&ObjectContext) -> Option<u8> + Copy {
+    let lfu = by_lfu();
+    move |ctx| {
+        if policy.volatile && !ctx.ttl_present() {
+            None
+        } else {
+            lfu(ctx)
+        }
     }
 }
 
@@ -145,8 +169,9 @@ impl DRAMPool {
     }
 
     /// `alloc_exact_or_expand`. If that fails and `eviction_allowed`, evict in the
-    /// least-loaded segments and retry the alloc in each (`make_room_for`).
-    /// Dram mode, main thread only. `ctx` may be a dummy.
+    /// least-loaded segments and retry the alloc in each (`make_room_for`). Only
+    /// keys the `maxmemory-policy` allows are evicted: under `volatile-*`, keys
+    /// with a TTL. Dram mode, main thread only. `ctx` may be a dummy.
     pub fn alloc_exact_expand_evict(
         &self,
         ctx: &valkey_module::Context,
@@ -166,7 +191,7 @@ impl DRAMPool {
         if !crate::eviction_allowed(ctx) {
             return None;
         }
-        self.make_room_for(obj_len as usize)
+        self.make_room_for(obj_len as usize, by_policy(MaxmemoryPolicy::read(ctx)))
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {
@@ -264,6 +289,20 @@ impl DRAMPool {
         removed
     }
 
+    /// Dram: record whether `oid`'s key has a TTL. Ignored for an object already
+    /// reclaimed, whose key is going.
+    pub fn set_ttl(&self, oid: &ObjectId, has_ttl: bool) {
+        if let Some(ctx) = self
+            .objects
+            .read()
+            .expect("DRAMPool.objects lock unavailable")
+            .all
+            .get(oid)
+        {
+            ctx.set_ttl_present(has_ttl);
+        }
+    }
+
     /// Check if object exists (coalesce check — is promotion in progress?).
     pub fn contains_object(&self, oid: &ObjectId) -> bool {
         self.objects
@@ -307,7 +346,7 @@ impl DRAMPool {
         // skip promotion and the GET is served from NVMe.
         let buffers = self
             .alloc_exact_or_expand(&dummy, obj_len)
-            .or_else(|| self.make_room_for(obj_len as usize))?;
+            .or_else(|| self.make_room_for(obj_len as usize, by_lfu()))?;
         // Atomic check-and-insert under write lock to prevent TOCTOU race
         // (concurrent GETs promoting the same OID simultaneously).
         let mut objects = self
@@ -339,7 +378,11 @@ impl DRAMPool {
     /// lock-taking variants of the segment APIs and of the free path that
     /// `ObjectContext::drop` uses, and a fix for the lock order (shrink frees
     /// buffers while holding `objects`, so today the order is objects -> state).
-    fn make_room_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
+    fn make_room_for(
+        &self,
+        obj_len: usize,
+        score: impl Fn(&ObjectContext) -> Option<u8> + Copy,
+    ) -> Option<Vec<SegmentBuffer>> {
         // Tiered only drops cached copies, so only Dram needs eviction allowed.
         assert!(
             crate::operating_mode() != crate::OperatingMode::Dram
@@ -349,7 +392,7 @@ impl DRAMPool {
         for (seg, short) in self.pool.segment_shortfalls(obj_len, RECLAIM_MAX_SEGMENTS) {
             // short == 0: the bytes fit but talc overhead blocked the alloc, so
             // free at least one victim.
-            let Some(victims) = self.reclaim_in(seg, short.max(1)) else {
+            let Some(victims) = self.reclaim_in(seg, short.max(1), score) else {
                 continue;
             };
             // take_victim only takes objects no reader holds, and removes them from the map,
@@ -367,13 +410,19 @@ impl DRAMPool {
     /// Remove the lowest-scoring unpinned objects in segment `seg` until their
     /// bytes cover `need`, at most `RECLAIM_MAX_VICTIMS` in Tiered. All or nothing: if
     /// they fall short, every victim goes back and this returns None. The victims
-    /// are returned so they drop after the locks are released.
+    /// are returned so they drop after the locks are released. `score` returns
+    /// `None` for an object eviction may not take.
     ///
     /// Dram: the victims' oids go on the reclaim list, as in `try_shrink`.
-    fn reclaim_in(&self, seg: usize, need: usize) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
+    fn reclaim_in(
+        &self,
+        seg: usize,
+        need: usize,
+        score: impl Fn(&ObjectContext) -> Option<u8>,
+    ) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
         match &self.cache {
             Some(cache) => {
-                let victims = self.take_victims(seg, need, RECLAIM_MAX_VICTIMS)?;
+                let victims = self.take_victims(seg, need, RECLAIM_MAX_VICTIMS, score)?;
                 cache
                     .stats
                     .demotions
@@ -385,7 +434,7 @@ impl DRAMPool {
                 // List before `objects`, as in `try_shrink`.
                 super::reclaim::RECLAIM_LIST.add_with(|| {
                     // Dram victims are the data: no cap.
-                    victims = self.take_victims(seg, need, usize::MAX);
+                    victims = self.take_victims(seg, need, usize::MAX, score);
                     victims
                         .iter()
                         .flatten()
@@ -407,10 +456,9 @@ impl DRAMPool {
         seg: usize,
         need: usize,
         max_victims: usize,
+        score: impl Fn(&ObjectContext) -> Option<u8>,
     ) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
         let samples = crate::victim_sample_size();
-        let now_min = now_minutes();
-        let decay_time = crate::blob_decay_time();
         let mut objects = self
             .objects
             .write()
@@ -418,7 +466,7 @@ impl DRAMPool {
         let mut victims = Vec::new();
         let mut freed = 0usize;
         while freed < need && victims.len() < max_victims {
-            let Some((oid, ctx)) = objects.take_victim(seg, samples, now_min, decay_time) else {
+            let Some((oid, ctx)) = objects.take_victim(seg, samples, &score) else {
                 break;
             };
             freed += ctx.buffers.iter().map(|b| b.len as usize).sum::<usize>();
@@ -596,7 +644,7 @@ mod tests {
     fn reclaims_lowest_unpinned_in_target_segment_only() {
         let p = pool();
         // Empty segment: nothing to take.
-        assert!(p.reclaim_in(0, 1).is_none());
+        assert!(p.reclaim_in(0, 1, by_lfu()).is_none());
         let hot = ctx(0, 0);
         hot.stats.set(LFU_INIT_VAL + 10, now_minutes());
         let pinned = ctx(0, 2); // counter 5 but held by us
@@ -608,7 +656,7 @@ mod tests {
         other.stats.set(0, now_minutes());
         p.insert_object(ObjectId(10), other);
 
-        let victims = p.reclaim_in(0, BUF as usize).unwrap();
+        let victims = p.reclaim_in(0, BUF as usize, by_lfu()).unwrap();
         assert_eq!(oids(&victims), vec![2], "cold object is the victim");
         assert!(p.contains_object(&ObjectId(1)), "hot object must survive");
         assert!(
@@ -625,7 +673,7 @@ mod tests {
 
         // Pin the hot entry too: segment 0 is all pinned, so nothing goes.
         let _hot = p.get_object(&ObjectId(1)).unwrap();
-        assert!(p.reclaim_in(0, BUF as usize).is_none());
+        assert!(p.reclaim_in(0, BUF as usize, by_lfu()).is_none());
         assert_eq!(p.object_count(), 3);
         assert_index_consistent(&p);
     }
@@ -636,7 +684,7 @@ mod tests {
         for i in 0..4u16 {
             p.insert_object(ObjectId(i as u64), ctx(0, i));
         }
-        let victims = p.reclaim_in(0, 2 * BUF as usize).unwrap();
+        let victims = p.reclaim_in(0, 2 * BUF as usize, by_lfu()).unwrap();
         assert_eq!(victims.len(), 2, "no over-reclaim past the first fit");
         assert_eq!(p.object_count(), 2);
         assert_eq!(p.tiered_cache().stats.demotions.load(Ordering::Relaxed), 2);
@@ -650,15 +698,15 @@ mod tests {
             p.insert_object(ObjectId(100 + i as u64), ctx(1, i));
         }
         // Segment 0 holds 4 BUF; other segments' bytes do not count.
-        assert!(p.reclaim_in(0, 5 * BUF as usize).is_none());
+        assert!(p.reclaim_in(0, 5 * BUF as usize, by_lfu()).is_none());
         // The victim cap stops short of 3 BUF.
-        assert!(p.take_victims(0, 3 * BUF as usize, 2).is_none());
+        assert!(p.take_victims(0, 3 * BUF as usize, 2, by_lfu()).is_none());
         assert_eq!(p.object_count(), 8);
         assert_eq!(p.tiered_cache().stats.demotions.load(Ordering::Relaxed), 0);
         assert_index_consistent(&p);
 
         // Exactly what segment 0 holds goes through, and only segment 0 pays.
-        let victims = p.reclaim_in(0, 4 * BUF as usize).unwrap();
+        let victims = p.reclaim_in(0, 4 * BUF as usize, by_lfu()).unwrap();
         assert_eq!(oids(&victims), vec![0, 1, 2, 3]);
         assert!((100..104).all(|i| p.contains_object(&ObjectId(i))));
         drop(victims);
@@ -676,8 +724,26 @@ mod tests {
         for i in 0..n as u16 {
             p.insert_object(ObjectId(9_200 + i as u64), ctx(0, i));
         }
-        let victims = p.reclaim_in(0, n * BUF as usize).unwrap();
+        let victims = p.reclaim_in(0, n * BUF as usize, by_lfu()).unwrap();
         assert_eq!(victims.len(), n);
+        for (oid, _) in &victims {
+            super::super::reclaim::RECLAIM_LIST.remove(oid);
+        }
+    }
+
+    #[test]
+    fn volatile_eviction_takes_only_objects_with_a_ttl() {
+        let p = dram_pool();
+        for i in 0..4u16 {
+            let ctx = ctx(0, i);
+            ctx.set_ttl_present(i % 2 == 1);
+            p.insert_object(ObjectId(9_300 + i as u64), ctx);
+        }
+        let volatile = by_policy(MaxmemoryPolicy { volatile: true });
+        // Only 2 BUF of segment 0 has a TTL.
+        assert!(p.reclaim_in(0, 3 * BUF as usize, volatile).is_none());
+        let victims = p.reclaim_in(0, 2 * BUF as usize, volatile).unwrap();
+        assert_eq!(oids(&victims), vec![9_301, 9_303]);
         for (oid, _) in &victims {
             super::super::reclaim::RECLAIM_LIST.remove(oid);
         }

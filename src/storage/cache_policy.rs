@@ -236,6 +236,35 @@ pub struct TieredCache {
     pub stats: CacheStats,
 }
 
+// ─── MaxmemoryPolicy ─────────────────────────────────────────────────────────
+
+/// The server's `maxmemory-policy`, as module eviction uses it. Read it on every
+/// eviction: `CONFIG SET` can change it at any time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxmemoryPolicy {
+    /// `volatile-*`: only keys with a TTL may be evicted.
+    pub volatile: bool,
+}
+
+impl MaxmemoryPolicy {
+    fn parse(name: &str) -> Self {
+        Self {
+            volatile: name.starts_with("volatile-"),
+        }
+    }
+
+    /// Call under the server lock.
+    pub fn read(ctx: &valkey_module::Context) -> Self {
+        let info = ctx.server_info("memory");
+        Self::parse(
+            &info
+                .field("maxmemory_policy")
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        )
+    }
+}
+
 // ─── Sampled victim selection ────────────────────────────────────────────────
 
 /// A dense collection that `sample_victim` can read by index.
@@ -382,6 +411,29 @@ mod tests {
         assert_eq!(f.track(ObjectId(4)), 2);
         assert_eq!(f.track(ObjectId(1)), 1);
         assert_eq!(len(&f), (3, 3));
+    }
+
+    // ─── MaxmemoryPolicy ───
+
+    #[test]
+    fn parse_policies() {
+        for name in [
+            "volatile-lru",
+            "volatile-lfu",
+            "volatile-random",
+            "volatile-ttl",
+        ] {
+            assert!(MaxmemoryPolicy::parse(name).volatile, "{name}");
+        }
+        for name in [
+            "allkeys-lru",
+            "allkeys-lfu",
+            "allkeys-random",
+            "noeviction",
+            "",
+        ] {
+            assert!(!MaxmemoryPolicy::parse(name).volatile, "{name}");
+        }
     }
 
     // ─── sample_victim ───

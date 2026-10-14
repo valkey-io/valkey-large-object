@@ -20,8 +20,8 @@ use super::get_dram_pool;
 /// 3. Proactive expand: if pool utilization exceeds the expand watermark,
 ///    add a segment before the hot path stalls on segment creation.
 /// 4. Proactive shrink: if server memory pressure exceeds the shrink watermark,
-///    evict the least-used segment. Tiered: data stays on NVMe. Dram: its keys
-///    go on the reclaim list for step 2.
+///    evict the least-used segment. Tiered: data stays on NVMe. Dram, only under
+///    `allkeys-*`: its keys go on the reclaim list for step 2.
 pub fn scaling_cron(ctx: &Context) {
     let expand_watermark = crate::scaling_expand_watermark();
     let shrink_watermark = crate::scaling_shrink_watermark();
@@ -85,9 +85,12 @@ pub fn scaling_cron(ctx: &Context) {
     }
     let ratio = used as f64 / maxmemory as f64;
     // Tiered shrink only drops cached copies, so it always runs. Dram shrink
-    // deletes keys, so it follows `maxmemory-policy`: none under `noeviction`.
-    let may_shrink =
-        crate::operating_mode() == crate::OperatingMode::Tiered || crate::eviction_allowed(ctx);
+    // deletes a segment's keys whatever their TTL, so it runs only under
+    // `allkeys-*`: none under `noeviction`, and none under `volatile-*`, where
+    // evicted objects just leave holes for later writes.
+    let may_shrink = crate::operating_mode() == crate::OperatingMode::Tiered
+        || (crate::eviction_allowed(ctx)
+            && !super::cache_policy::MaxmemoryPolicy::read(ctx).volatile);
     if ratio > shrink_watermark && may_shrink && pool.try_shrink() {
         ctx.log_notice(&format!(
             "largeobj: scaling — memory pressure {:.1}% > {:.0}%, evicted one DRAM segment",

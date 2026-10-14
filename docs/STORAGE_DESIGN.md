@@ -1015,16 +1015,19 @@ with the fewest allocated bytes, drops every object on it, and releases it (§8.
 | Mode | Condition | Effect on the victim's objects |
 |---|---|---|
 | Tiered | ratio > watermark | Cached copies dropped; objects stay on NVMe, next GET reads NVMe. |
-| Dram | ratio > watermark **and** `maxmemory-policy` is not `noeviction` | The objects *are* the data. Their oids go on the reclaim list; the keys read as missing and the cron deletes them (§8.5). |
+| Dram | ratio > watermark **and** `maxmemory-policy` is `allkeys-*` | The objects *are* the data. Their oids go on the reclaim list; the keys read as missing and the cron deletes them (§8.5). |
 
 **Why the policy decides Dram shrink** (`eviction_allowed`). Dram shrink
 deletes keys, so it runs only when the operator allowed eviction (the module context
 flag `EVICT`: `maxmemory` set and the policy is not `noeviction`); under `noeviction`
 writes fail with OOM instead. A replica that ignores maxmemory (the default) never has
-the flag, so it leaves eviction to its primary. Under any evicting policy shrink is required, not
+the flag, so it leaves eviction to its primary. It also does not run under `volatile-*`:
+it deletes every key on the segment, TTL or not, which that policy forbids. There,
+evicted objects leave holes that later writes reuse. Under `allkeys-*` shrink is required, not
 optional: core evicting an LO key frees almost no `used_memory` (fact 2), so without a
 segment release core's eviction loop would keep deleting keys without ever getting
-under `maxmemory`. Tiered shrink drops only cached copies, so it runs under every
+under `maxmemory`. Under `volatile-*` that gap stays open until segments can be
+emptied by migrating their objects instead of deleting them. Tiered shrink drops only cached copies, so it runs under every
 policy: it is what makes room for new keys, client query buffers (a TCP `BLOB.TCP_SET`
 buffers its whole payload) and output buffers, even in an LO-only keyspace.
 

@@ -97,7 +97,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
         return false;
     }
     let Some(policy) = with_server_lock(|ctx| {
-        crate::tiered_eviction_allowed(ctx).then(|| super::live::Policy::read(ctx))
+        crate::tiered_eviction_allowed(ctx).then(|| super::cache_policy::MaxmemoryPolicy::read(ctx))
     }) else {
         return false;
     };
@@ -110,7 +110,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
     // Claim, then stat: a claimed file cannot change under us.
     let mut victims = Vec::new();
     let mut covered = 0;
-    for oid in super::live::sample(policy, EVICT_BATCH) {
+    for oid in super::live::candidates(policy, EVICT_BATCH) {
         if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
             break;
         }

@@ -18,7 +18,7 @@
 //! chunks arrive (`let mut crc: u32 = 0`) and compares against the client-provided
 //! value on completion. Neither ObjectContext nor StreamingContext needs CRC state.
 
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use super::cache_policy::{now_minutes, AccessStats};
 
@@ -76,6 +76,9 @@ pub struct ObjectContext {
     chunks_ready: AtomicU32,
     /// LFU access score for the cache policy.
     pub stats: AccessStats,
+    /// Dram: whether the key has a TTL, so `volatile-*` eviction may take it. Set by
+    /// the keyspace-event handler (`live::on_keyspace_event`).
+    ttl_present: AtomicBool,
 }
 
 impl ObjectContext {
@@ -86,6 +89,7 @@ impl ObjectContext {
             state: AtomicU8::new(ObjectState::Ready as u8),
             chunks_ready: AtomicU32::new(0),
             stats: AccessStats::new(now_minutes()),
+            ttl_present: AtomicBool::new(false),
         }
     }
 
@@ -96,6 +100,7 @@ impl ObjectContext {
             state: AtomicU8::new(ObjectState::Filling as u8),
             chunks_ready: AtomicU32::new(0),
             stats: AccessStats::new(now_minutes()),
+            ttl_present: AtomicBool::new(false),
         }
     }
 
@@ -117,6 +122,14 @@ impl ObjectContext {
         );
         self.state
             .store(ObjectState::Ready as u8, Ordering::Release);
+    }
+
+    pub fn ttl_present(&self) -> bool {
+        self.ttl_present.load(Ordering::Relaxed)
+    }
+
+    pub fn set_ttl_present(&self, present: bool) {
+        self.ttl_present.store(present, Ordering::Relaxed);
     }
 
     /// Get the number of chunks ready (contiguous from offset 0).

@@ -1,5 +1,6 @@
 //! Live object index (Tiered): which oids have a file, and which of those have a TTL.
-//! Eviction samples it instead of reading `disk-dir`.
+//! Eviction picks from it instead of reading `disk-dir`. Also home of the keyspace-event
+//! handler that records TTL changes for both modes (Dram keeps them on `ObjectContext`).
 //!
 //! The oid is a dense integer, so it is the bit position in both bitmaps.
 //! `select(k)` on a bitmap returns its k-th set bit, a uniformly random live oid.
@@ -10,6 +11,7 @@ use rand::RngExt;
 use roaring::RoaringTreemap;
 use valkey_module::{Context, NotifyEvent, ValkeyValue};
 
+use super::cache_policy::MaxmemoryPolicy;
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 
 #[derive(Default)]
@@ -54,53 +56,25 @@ fn set_ttl(oid: ObjectId, has_ttl: bool) {
 /// Keyspace events that can change a key's TTL without changing its oid. An overwrite
 /// (BLOB.TCP_SET / BLOB.RDMA_SET) needs none: it mints a new oid, and Valkey drops the key's TTL.
 pub fn on_keyspace_event(ctx: &Context, _: NotifyEvent, event: &str, key: &[u8]) {
-    if !matches!(event, "expire" | "persist" | "copy_to")
-        || crate::operating_mode() != crate::OperatingMode::Tiered
-    {
+    if !matches!(event, "expire" | "persist" | "copy_to") {
         return;
     }
     let key = ctx.create_string(key);
     let oid = match ctx.open_key(&key).get_value::<LoValue>(&LO_TYPE) {
-        Ok(Some(LoValue {
-            file: Some(file), ..
-        })) => file.object_id(),
+        Ok(Some(lo)) => lo.object_id,
         _ => return,
     };
     let has_ttl = matches!(ctx.call("PTTL", &[&key]), Ok(ValkeyValue::Integer(ms)) if ms >= 0);
-    set_ttl(oid, has_ttl);
-}
-
-// ─── Policy ──────────────────────────────────────────────────────────────────
-
-/// `maxmemory-policy`, as eviction uses it: which bitmap to sample.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Policy {
-    volatile: bool,
-}
-
-impl Policy {
-    fn parse(name: &str) -> Self {
-        Self {
-            volatile: name.starts_with("volatile-"),
-        }
-    }
-
-    /// The server's `maxmemory-policy`. Call under the server lock.
-    pub fn read(ctx: &Context) -> Self {
-        let info = ctx.server_info("memory");
-        Self::parse(
-            &info
-                .field("maxmemory_policy")
-                .map(|v| v.to_string())
-                .unwrap_or_default(),
-        )
+    match crate::operating_mode() {
+        crate::OperatingMode::Tiered => set_ttl(oid, has_ttl),
+        crate::OperatingMode::Dram => super::get_dram_pool().set_ttl(&oid, has_ttl),
     }
 }
 
-// ─── Sampling ────────────────────────────────────────────────────────────────
+// ─── Candidates ──────────────────────────────────────────────────────────────
 
-/// Up to `n` distinct random eviction candidates from the policy's bitmap.
-pub fn sample(policy: Policy, n: usize) -> Vec<ObjectId> {
+/// Up to `n` distinct random eviction candidates from the bitmap the policy allows.
+pub fn candidates(policy: MaxmemoryPolicy, n: usize) -> Vec<ObjectId> {
     let live = live();
     let bitmap = if policy.volatile {
         &live.ttl
@@ -139,8 +113,8 @@ mod tests {
         set_ttl(ObjectId(oid), ttl);
     }
 
-    fn pick(policy: &str, range: std::ops::Range<u64>) -> Vec<u64> {
-        sample(Policy::parse(policy), 1000)
+    fn pick(volatile: bool, range: std::ops::Range<u64>) -> Vec<u64> {
+        candidates(MaxmemoryPolicy { volatile }, 1000)
             .into_iter()
             .map(|oid| oid.0)
             .filter(|oid| range.contains(oid))
@@ -148,38 +122,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_policies() {
-        for name in [
-            "volatile-lru",
-            "volatile-lfu",
-            "volatile-random",
-            "volatile-ttl",
-        ] {
-            assert!(Policy::parse(name).volatile, "{name}");
-        }
-        for name in ["allkeys-lru", "allkeys-lfu", "allkeys-random", ""] {
-            assert!(!Policy::parse(name).volatile, "{name}");
-        }
-    }
-
-    #[test]
-    fn volatile_samples_only_ttl_keys() {
+    fn volatile_picks_only_ttl_keys() {
         for oid in 1_000..1_010 {
             add(oid, oid % 2 == 0);
         }
-        let picked = pick("volatile-random", 1_000..1_010);
+        let picked = pick(true, 1_000..1_010);
         assert_eq!(picked.len(), 5);
         assert!(picked.iter().all(|oid| oid % 2 == 0), "{picked:?}");
-        assert_eq!(pick("allkeys-random", 1_000..1_010).len(), 10);
+        assert_eq!(pick(false, 1_000..1_010).len(), 10);
     }
 
     #[test]
     fn remove_clears_both_bitmaps_and_ttl_needs_a_live_file() {
         add(4_000, true);
         remove(ObjectId(4_000));
-        assert!(pick("allkeys-random", 4_000..4_001).is_empty());
-        assert!(pick("volatile-random", 4_000..4_001).is_empty());
+        assert!(pick(false, 4_000..4_001).is_empty());
+        assert!(pick(true, 4_000..4_001).is_empty());
         set_ttl(ObjectId(4_000), true);
-        assert!(pick("volatile-random", 4_000..4_001).is_empty());
+        assert!(pick(true, 4_000..4_001).is_empty());
     }
 }
