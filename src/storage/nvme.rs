@@ -5,87 +5,15 @@
 //! channels, and completion streams; this module handles everything that
 //! knows what an NVMe object file *is*.
 
-use std::ffi::CStr;
 use std::mem::size_of;
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::context::SegmentBuffer;
 use super::uring;
 use super::Crc;
 use super::NVMePool;
 use crate::data_type::ObjectId;
-
-// ─── Object File fd Placement ────────────────────────────────────────────────
-
-/// Valkey's event loop holds `maxclients + CONFIG_FDSET_INCR` fds (server.h: 32 + 96).
-const VALKEY_FDSET_INCR: u64 = 128;
-
-/// Lowest fd number object files are moved to. 0 = not reserved; fds stay where `open` put them.
-static FD_FLOOR: AtomicI32 = AtomicI32::new(0);
-
-/// Keep object-file fds out of the fd numbers Valkey uses for client sockets.
-///
-/// Valkey's event loop is an array indexed by fd number, sized `maxclients + 128`;
-/// a client socket numbered past it is never served. Linux hands out the lowest
-/// free number, so long-lived object fds left low push client sockets past the end.
-/// Raises the soft `RLIMIT_NOFILE` to the hard limit and sets the floor that
-/// `open_object_file` moves fds above. Returns the floor and the room above it
-/// (hard limit − floor), or `None` when the hard limit leaves no room.
-///
-/// Called at load and again on every `CONFIG SET maxclients`. The floor only rises:
-/// Valkey grows its event loop when maxclients grows but does not shrink it.
-pub fn reserve_fd_range(maxclients: u64) -> Option<(i32, u64)> {
-    let floor = maxclients + VALKEY_FDSET_INCR;
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: limit is a valid rlimit out-parameter.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 || limit.rlim_max <= floor {
-        return None;
-    }
-    limit.rlim_cur = limit.rlim_max;
-    // SAFETY: limit is a valid rlimit; raising soft up to hard needs no privilege.
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
-        return None;
-    }
-    let floor = i32::try_from(floor).ok()?;
-    let floor = FD_FLOOR.fetch_max(floor, Ordering::Relaxed).max(floor);
-    Some((floor, limit.rlim_max - floor as u64))
-}
-
-/// Whether `fd` sits where Valkey could need it for a client socket: below the
-/// floor, or anywhere when no floor was reserved.
-pub fn in_client_range(fd: RawFd) -> bool {
-    let floor = FD_FLOOR.load(Ordering::Relaxed);
-    floor == 0 || fd < floor
-}
-
-/// `open(2)` an object file, then move the fd above the floor from
-/// `reserve_fd_range`. Same contract as `open`: an fd, or -1 with errno set.
-/// Panics when no fd is free above the floor: keeping the low fd would take a
-/// client's fd number, and that client would never be served.
-pub fn open_object_file(path: &CStr, flags: libc::c_int, mode: libc::mode_t) -> RawFd {
-    // SAFETY: path is NUL-terminated; open returns an fd or -1.
-    let fd = unsafe { libc::open(path.as_ptr(), flags, mode as libc::c_uint) };
-    let floor = FD_FLOOR.load(Ordering::Relaxed);
-    if fd < 0 || floor == 0 {
-        return fd;
-    }
-    // SAFETY: fd is a valid fd we own; F_DUPFD_CLOEXEC returns a new fd >= floor or -1.
-    let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor) };
-    if high < 0 {
-        panic!(
-            "largeobj: no free fd above Valkey's client range ({floor}): {}; \
-             raise LimitNOFILE (soft and hard)",
-            std::io::Error::last_os_error()
-        );
-    }
-    // SAFETY: fd is ours and no longer used; high refers to the same open file.
-    unsafe { libc::close(fd) };
-    high
-}
 
 // ─── NVMe Disk Usage Tracking ────────────────────────────────────────────────
 
@@ -347,7 +275,7 @@ pub fn open_nvme_file_for_write(file_path: &str) -> Result<OwnedFd, super::Stora
     if crate::direct_io() {
         flags |= libc::O_DIRECT;
     }
-    let fd = open_object_file(&c_path, flags, 0o644);
+    let fd = super::fd_placement::open_object_file(&c_path, flags, 0o644);
     if fd < 0 {
         Err(super::StorageError::IoError {
             code: std::io::Error::last_os_error()
@@ -537,24 +465,5 @@ mod tests {
         // align_up(5000)=8192, align_up(3193)=4096. Data total = 12288.
         let mut iter = super::super::ChunkIterator::new(8193, 5000, 2, None);
         assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 4096);
-    }
-
-    // ─── Object File fd Placement ───
-
-    #[test]
-    fn test_open_object_file_places_fd_above_client_range() {
-        let (floor, _) = reserve_fd_range(100).expect("hard limit has room above 228");
-        assert_eq!(floor, 228);
-        let path = std::ffi::CString::new("/dev/null").unwrap();
-        let fd = open_object_file(&path, libc::O_RDONLY, 0);
-        assert!(
-            fd >= floor,
-            "fd {fd} is inside the client range below {floor}"
-        );
-        assert!(!in_client_range(fd));
-        assert!(in_client_range(floor - 1));
-        // SAFETY: fd was just opened by this test.
-        unsafe { libc::close(fd) };
-        FD_FLOOR.store(0, Ordering::Relaxed);
     }
 }

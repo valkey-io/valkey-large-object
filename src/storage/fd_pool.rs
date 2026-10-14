@@ -112,7 +112,7 @@ impl FdPool {
         if crate::direct_io() {
             flags |= libc::O_DIRECT;
         }
-        let raw = super::nvme::open_object_file(&c_path, flags, 0);
+        let raw = super::fd_placement::open_object_file(&c_path, flags, 0);
         if raw < 0 {
             return None;
         }
@@ -148,7 +148,7 @@ impl FdPool {
             let mut fds = self.fds.write().expect("FdPool.fds lock unavailable");
             let stale: Vec<ObjectId> = fds
                 .iter()
-                .filter(|(_, e)| super::nvme::in_client_range(e.fd.as_raw_fd()))
+                .filter(|(_, e)| super::fd_placement::in_client_range(e.fd.as_raw_fd()))
                 .map(|(oid, _)| *oid)
                 .collect();
             stale
