@@ -756,7 +756,7 @@ pub(crate) async fn efa_transfer_addrs(
     let mut indexed_futures = FuturesUnordered::new();
     let mut buf_offset = 0usize;
     let mut failed = false;
-    let fail_partial = crate::test_efa_fail_partial();
+    let fail_partial = crate::test_rdma_fail_partial();
     for (i, &(addr, len, rkey)) in addrs.iter().enumerate() {
         // Hidden test hook: after the first successful post, inject a failure
         // so the await loop exercises the inline drain path. Only takes effect

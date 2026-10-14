@@ -37,13 +37,14 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         """
         return (
             f"operating-mode Tiered"
-            f" nvme-dir {data_dir}"
-            f" nvme-staging-size 1048576"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 1048576"
             f" segment-size 1048576"
             f" max-promote-size 520192"
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
+            f" fabric-provider Emulated"
         )
 
     def get_server_args(self):
@@ -53,7 +54,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     @pytest.fixture(autouse=True)
     def setup_test(self, setup):
         module_path = os.getenv('MODULE_PATH')
-        # Give the module a DEDICATED nvme-dir under testdir (not testdir itself).
+        # Give the module a DEDICATED disk-dir under testdir (not testdir itself).
         # The module owns this directory outright and wipes it wholesale on startup
         # and teardown, so it must not be shared with the server's own files
         # (logfile, rdb) which live directly in testdir. Absolute path so file
@@ -78,7 +79,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         logging.info("startup args are: %s", args)
 
     def _object_files(self):
-        """Every file currently in nvme-dir (name-agnostic)."""
+        """Every file currently in disk-dir (name-agnostic)."""
         return sorted(glob.glob(os.path.join(self.data_dir, "*")))
 
     def subscribe_keyspace_events(self, client):

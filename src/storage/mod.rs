@@ -157,7 +157,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
     let dram_segment_count = 1;
     // NVMe staging is split into uniform `segment_size` segments (based on startup configs).
     // Ceiling division so total staging capacity is never below the requested
-    // nvme-staging-size (floor would under-provision: 100MB / 64MB = 1 seg = 64MB).
+    // disk-staging-size (floor would under-provision: 100MB / 64MB = 1 seg = 64MB).
     let nvme_segments: usize = if mode == crate::OperatingMode::Tiered {
         (nvme_staging.div_ceil(dram_seg_size)).max(1)
     } else {
@@ -167,7 +167,7 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
         return Err(format!(
             "too many segments (DRAM {}, NVMe {}). \
              Max {} per pool. \
-             Increase segment-size or decrease nvme-staging-size",
+             Increase segment-size or decrease disk-staging-size",
             dram_segment_count, nvme_segments, MAX_SEGMENTS,
         ));
     }

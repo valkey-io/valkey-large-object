@@ -8,7 +8,7 @@ PEER_ADDRESS = binascii.hexlify(
     b'\x02\x00' + (1).to_bytes(2, 'big') + bytes([127, 0, 0, 1]) + bytes(8)
 ).decode()
 
-# Sentinel for BLOB.HELLO, whose reply is host-specific and checked by shape.
+# Sentinel for BLOB.RDMA_HELLO, whose reply is host-specific and checked by shape.
 HELLO_ADDRESSES = object()
 
 class TestLargeObjACLCategory(ValkeyLargeObjTestCaseBase):
@@ -26,17 +26,25 @@ class TestLargeObjACLCategory(ValkeyLargeObjTestCaseBase):
     def test_large_obj_acl_category(self):
         # (args, expected reply for the permitted user). HELLO returns host-specific
         # fabric addresses, so it gets a sentinel and a shape check instead.
+        # TCP commands are exercised with inline data; RDMA commands are only checked
+        # for ACL membership (no fabric target in this test).
         large_obj_commands = [
-            (['BLOB.SET', 'aclkey', 'val'], b'OK'),
-            (['BLOB.GET', 'aclkey'], b'val'),
+            (['BLOB.TCP_SET', 'aclkey', 'val'], b'OK'),
+            (['BLOB.TCP_GET', 'aclkey'], b'val'),
             (['BLOB.INFO', 'aclkey', 'LEN'], 3),
-            (['BLOB.HELLO', PEER_ADDRESS], HELLO_ADDRESSES),
+            (['BLOB.RDMA_HELLO', PEER_ADDRESS], HELLO_ADDRESSES),
         ]
+        # RDMA_GET and RDMA_SET are registered but cannot be exercised without a
+        # fabric target, so they are only checked for category membership below.
+        all_largeobj_commands = {
+            b'BLOB.TCP_GET', b'BLOB.TCP_SET',
+            b'BLOB.RDMA_HELLO', b'BLOB.RDMA_GET', b'BLOB.RDMA_SET',
+            b'BLOB.INFO',
+        }
         client = self.server.get_new_client()
         listed = set(client.execute_command("COMMAND LIST FILTERBY ACLCAT largeobj"))
-        # Every largeobj command is covered, and nothing else is in the category.
-        assert listed == {args[0].lower().encode() for args, _ in large_obj_commands} or \
-            listed == {args[0].encode() for args, _ in large_obj_commands}, listed
+        assert listed == all_largeobj_commands or \
+            listed == {c.lower() for c in all_largeobj_commands}, listed
 
         client.execute_command("ACL SETUSER nonlargeobjuser on >blob_pass +@all -@largeobj ~*")
         client.execute_command("ACL SETUSER largeobjuser on >blob_pass +@largeobj ~*")
@@ -69,10 +77,12 @@ class TestLargeObjACLCategory(ValkeyLargeObjTestCaseBase):
     def test_large_obj_command_acl_categories(self):
         # List of large object commands and their acl categories
         large_object_commands = [
-            ('BLOB.HELLO', [b'module', b'fast'], [b'@connection', b'@largeobj', b'@fast']),
+            ('BLOB.TCP_GET', [b'readonly', b'module', b'fast'], [b'@read', b'@fast', b'@largeobj']),
+            ('BLOB.TCP_SET', [b'write', b'denyoom', b'module', b'fast'], [b'@write', b'@fast', b'@largeobj']),
+            ('BLOB.RDMA_HELLO', [b'module', b'fast'], [b'@connection', b'@largeobj', b'@fast']),
+            ('BLOB.RDMA_GET', [b'readonly', b'module', b'fast'], [b'@read', b'@fast', b'@largeobj']),
+            ('BLOB.RDMA_SET', [b'write', b'denyoom', b'module', b'fast'], [b'@write', b'@fast', b'@largeobj']),
             ('BLOB.INFO', [b'readonly', b'module', b'fast'], [b'@read', b'@fast', b'@largeobj']),
-            ('BLOB.SET', [b'write', b'denyoom', b'module', b'fast'], [b'@write', b'@fast', b'@largeobj']),
-            ('BLOB.GET', [b'readonly', b'module', b'fast'], [b'@read', b'@fast', b'@largeobj']),
         ]
         for cmd in large_object_commands:
             # Get the info of the commands and compare the acl categories

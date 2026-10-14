@@ -8,7 +8,7 @@
 
 The module stores large objects (15KB to multi-GB (TBD)) and must serve them via two transports:
 - **TCP:** standard RESP reply
-- **EFA:** RDMA fi_write directly to client GPU memory (requires EFA NIC; detected at startup — if fabric init fails, `BLOB.HELLO` returns an EFA-unavailable error, no EFA session can be established, and the module operates TCP-only for its lifetime)
+- **EFA:** RDMA fi_write directly to client GPU memory (requires EFA NIC; detected at startup — if fabric init fails, `BLOB.RDMA_HELLO` returns an EFA-unavailable error, no EFA session can be established, and the module operates TCP-only for its lifetime)
 
 Two operating modes:
 - **DRAM-only:** All objects live in DRAM. No NVMe. Fastest reads. Limited by DRAM capacity.
@@ -219,9 +219,9 @@ In Dram mode, there is no io_uring engine — NVMe I/O does not exist — so nei
 - NVMePool: fi_write to client during serve-and-discard GET
 - DRAMPool: fi_write to client from cached objects (the hot serving path)
 
-If EFA init fails at startup, `fi_mr_reg` is skipped for all segments. EFA-transport
-command paths are unusable for the module's lifetime: `BLOB.HELLO` fails, and
-`BLOB.SET`/`BLOB.GET` with addresses require a HELLO session. The fabric is opened once
+If EFA init fails at startup, `fi_mr_reg` is skipped for all segments. RDMA
+command paths are unusable for the module's lifetime: `BLOB.RDMA_HELLO` fails, and
+`BLOB.RDMA_GET`/`BLOB.RDMA_SET` require a HELLO session. The fabric is opened once
 at load; there is no runtime re-detection. TCP-transport paths continue normally.
 
 **Why separate segments per layer:**
@@ -244,10 +244,10 @@ EFA `fi_write` has no alignment constraint — sends exact `len`.
 Without O_DIRECT (DRAM-only mode, or `direct-io no`), neither constraint applies.
 
 **Max object size enforcement:**
-- **`max-object-size` (all modes):** Objects whose length exceeds this configurable limit are rejected at `BLOB.SET`, regardless of transport (TCP or EFA) or operating mode (Dram or Tiered). This is a single global cap on object size.
+- **`max-object-size` (all modes):** Objects whose length exceeds this configurable limit are rejected at `BLOB.TCP_SET` / `BLOB.RDMA_SET`, regardless of transport or operating mode (Dram or Tiered). This is a single global cap on object size.
 - **TCP additionally:** Valkey's querybuf accumulates the whole payload before dispatch and cannot stream, so TCP is bounded by `max-object-size` in the same way (§7.7).
 - **EFA:** Objects larger than a single buffer are chunked internally via multi-buffer parallel I/O (§7.3) using `chunk-size`, still subject to `max-object-size`.
-- **NVMe capacity:** Objects exceeding available NVMe space are also rejected at `BLOB.SET` today. Module-driven eviction of NVMe objects to make room is planned (§8.1).
+- **NVMe capacity:** Objects exceeding available NVMe space are also rejected at `BLOB.TCP_SET` / `BLOB.RDMA_SET` today. Module-driven eviction of NVMe objects to make room is planned (§8.1).
 
 ---
 
@@ -262,16 +262,18 @@ Both approaches follow the same command-level flow. "Alloc" and "free" refer to 
 All objects live exclusively in DRAM. No NVMe storage. Fastest possible reads. Capacity limited by available DRAM.
 
 ```
-BLOB.SET key len <payload> [rkey remote_addr]:
+BLOB.TCP_SET key <payload>
+BLOB.RDMA_SET key total_len rkey1 addr1 len1 [...]:
   1. Alloc buffer (registered memory)
   2a. TCP: copy payload into buffer
-  2b. EFA: fi_read from client GPU into buffer (zero-copy)
+  2b. RDMA: fi_read from client GPU into buffer (zero-copy)
   3. Track buffer: key → buffer location + len
 
-BLOB.GET key [rkey remote_addr len]:
+BLOB.TCP_GET key
+BLOB.RDMA_GET key rkey1 addr1 len1 [...]:
   4. Lookup in HashMap → buffer pointer
   5a. TCP: reply from buffer
-  5b. EFA: fi_write from buffer to client GPU (zero-copy)
+  5b. RDMA: fi_write from buffer to client GPU (zero-copy)
 
 DEL key:
   6. Free buffer (return to pool / arena)
@@ -285,33 +287,37 @@ DEL key:
 All objects persist on NVMe (write-through). DRAM is a read cache — hot objects promoted on GET only.
 
 ```
-BLOB.SET key len <payload> [rkey remote_addr]:
+BLOB.TCP_SET key <payload>
+BLOB.RDMA_SET key total_len rkey1 addr1 len1 [...]:
   1. If key has existing DRAMPool entry: free that buffer (invalidate stale data)
   2. Alloc buffer (registered memory)
   3a. TCP: copy payload into buffer
-  3b. EFA: fi_read from client GPU into buffer (zero-copy)
+  3b. RDMA: fi_read from client GPU into buffer (zero-copy)
   4. io_uring WriteFixed to NVMe (O_DIRECT, 4KB-aligned length via object_disk_len)
   5. Free buffer (no DRAMPool caching on write path)
   6. Track file in key/object: key → NVMe location only
 
-BLOB.GET key [rkey remote_addr len] — DRAMPool hit:
+BLOB.TCP_GET key
+BLOB.RDMA_GET key rkey1 addr1 len1 [...] — DRAMPool hit:
   7. Lookup in HashMap → buffer is cached in DRAMPool
   8a. TCP: reply from buffer
-  8b. EFA: fi_write from buffer (zero-copy)
+  8b. RDMA: fi_write from buffer (zero-copy)
 
-BLOB.GET key [rkey remote_addr len] — DRAMPool miss (serve-and-discard, no promotion):
+BLOB.TCP_GET key
+BLOB.RDMA_GET key rkey1 addr1 len1 [...] — DRAMPool miss (serve-and-discard, no promotion):
   9. Alloc buffer from NVMePool (registered memory)
   10. io_uring ReadFixed from NVMe into NVMePool buffer (O_DIRECT)
   11a. TCP: reply from NVMePool buffer
-  11b. EFA: fi_write from NVMePool buffer (zero-copy)
+  11b. RDMA: fi_write from NVMePool buffer (zero-copy)
   12. Free NVMePool buffer
 
-BLOB.GET key [rkey remote_addr len] — DRAMPool miss + promotion (promotion policy says YES):
+BLOB.TCP_GET key
+BLOB.RDMA_GET key rkey1 addr1 len1 [...] — DRAMPool miss + promotion (promotion policy says YES):
   9. Alloc ObjectContext with N buffers directly in a DRAMPool segment, insert as Filling
   10. io_uring ReadFixed from NVMe directly into the DRAMPool buffers (no memcpy, no NVMePool involvement)
   11. Mark ObjectContext Ready when complete; serve the client from it:
       11a. TCP: reply from DRAMPool buffers
-      11b. EFA: fi_write from DRAMPool buffers (zero-copy)
+      11b. RDMA: fi_write from DRAMPool buffers (zero-copy)
   12. Buffers stay — they ARE the cached object (served directly on subsequent hits)
       Concurrent GETs coalesce on this Filling ObjectContext (§7.3.5)
 
@@ -515,10 +521,10 @@ read finishes — exactly as for DEL.
 ObjectContext exists in two layers with different lifetimes. Same struct, same SegmentBuffer type, but allocated from **separate talc instances in separate segments** (§4.5).
 
 **DRAMPool (long-lived):**
-- ObjectContext created on cache promotion (BLOB.GET hit policy admits it)
+- ObjectContext created on cache promotion (BLOB.TCP_GET / BLOB.RDMA_GET hit policy admits it)
 - Buffers allocated from a DRAMPool segment via `dram_pool.alloc()` (picks a segment, mallocs from that segment's own talc)
 - Held in `HashMap<ObjectId, ObjectContext>` for the object's entire cached lifetime
-- Buffers remain allocated and serve repeated BLOB.GET hits directly
+- Buffers remain allocated and serve repeated BLOB.TCP_GET / BLOB.RDMA_GET hits directly
 - On DRAMPool eviction (policy-based — LRU/LFU/memory pressure): ObjectContext dropped → `dram_pool.free()` for each buffer (frees into the owning segment's talc)
 - Object survives on NVMe. Next GET is a cache miss (NVMePool serves it).
 
@@ -598,18 +604,18 @@ The server decides chunk size — the client never specifies or sees it.
 
 **Server config:** `chunk-size` (e.g., 8MB). This determines the allocation unit for all I/O operations.
 
-**BLOB.SET translation:**
+**BLOB.TCP_SET / BLOB.RDMA_SET translation:**
 ```
-Client sends:  BLOB.SET key 50MB <payload or rkey+addr+len>
+Client sends:  BLOB.TCP_SET key <payload>   (or BLOB.RDMA_SET key 50MB rkey addr len)
 Server sees:   total_len=50MB, chunk_size=8MB → N=7 chunks
 Server does:   alloc 7 buffers from shared segments
                partition incoming data into 8MB pieces
                submit 7 parallel WriteFixed SQEs to NVMe
 ```
 
-**BLOB.GET translation:**
+**BLOB.TCP_GET / BLOB.RDMA_GET translation:**
 ```
-Client sends:  BLOB.GET key [rkey addr 50MB]
+Client sends:  BLOB.TCP_GET key   (or BLOB.RDMA_GET key rkey addr 50MB)
 Server sees:   LoValue.len=50MB, chunk_size=8MB → N=7 chunks
 Server does:   alloc 4-8 buffers (pipeline depth)
                submit ReadFixed SQEs at file offsets 0, 8MB, 16MB, ...
@@ -664,7 +670,7 @@ See §6.2 for full struct definitions. Summary:
 - **StreamingContext** (NVMePool): rotating window of X buffers, used for SET writes and GET serve-and-discard. Short-lived.
 - **ObjectContext** (DRAMPool): complete allocation of ALL N buffers, with `ObjectState` (`Ready` or `Filling{chunks_ready, total}`). Long-lived. Coalescing point for concurrent GETs during promotion.
 
-#### 7.3.3 BLOB.SET Flows
+#### 7.3.3 BLOB.TCP_SET / BLOB.RDMA_SET Flows
 
 **SET + EFA + NVMe mode:**
 ```
@@ -732,7 +738,7 @@ Main thread (synchronous — no tokio task needed):
   Verify CRC → create LoValue + ObjectContext{buffers, state=Ready}, reply OK.
 ```
 
-#### 7.3.4 BLOB.GET Flows
+#### 7.3.4 BLOB.TCP_GET / BLOB.RDMA_GET Flows
 
 **GET + DRAMPool hit (both transports):**
 ```
@@ -876,8 +882,8 @@ Two cases for how EFA handles large objects:
 The command includes multiple client addresses:
 
 ```
-BLOB.SET key <total_len> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
-BLOB.GET key <rkey1 addr1 len1> <rkey2 addr2 len2> ...
+BLOB.RDMA_SET key <total_len> <rkey1 addr1 len1> <rkey2 addr2 len2> ...
+BLOB.RDMA_GET key <rkey1 addr1 len1> <rkey2 addr2 len2> ...
 ```
 
 - The server treats the addresses as **one logical contiguous destination** (address1
@@ -921,11 +927,11 @@ Server internally:
 
 Valkey's RESP command dispatch accumulates the full payload in `client->querybuf` before calling the module handler. Replies use single-allocation `VM_ReplyWithStringBuffer`. There is no incremental streaming API for either direction.
 
-**Consequence:** A 10GB BLOB.SET over TCP requires 10GB in querybuf before the module even runs. This is untenable.
+**Consequence:** A 10GB BLOB.TCP_SET over TCP requires 10GB in querybuf before the module even runs. This is untenable.
 
 **v1 behavior:**
-- `BLOB.SET`: reject with `ERR max object size exceeded` if payload > `max-object-size` (configurable, applies to all modes and transports)
-- `BLOB.GET`: no size check — a stored object is served even if `max-object-size` was later lowered
+- `BLOB.TCP_SET` / `BLOB.RDMA_SET`: reject with `ERR max object size exceeded` if payload > `max-object-size` (configurable, applies to all modes and transports)
+- `BLOB.TCP_GET` / `BLOB.RDMA_GET`: no size check — a stored object is served even if `max-object-size` was later lowered
 - Over TCP this is the only size bound (querybuf cannot stream); EFA clients are additionally chunked via multi-buffer parallel I/O (Cases 1/2 above) but remain subject to `max-object-size`
 
 **Future (v2+):** If Valkey adds a streaming/incremental module API for reading from client socket and writing chunked replies, TCP could support larger objects. Until then, large objects require EFA.
@@ -954,7 +960,7 @@ shrink, which releases segments, gives memory back to core.
 
 | Actor | What it does | Data loss? | Modes |
 |---|---|---|---|
-| **Core maxmemory eviction** | Valkey's `maxmemory-policy` deletes a victim key (LO keys included) and calls the module free callback. `noeviction` → `BLOB.SET` fails (OOM). Frees space inside a segment, not `used_memory` (fact 2). | **Yes** | Both |
+| **Core maxmemory eviction** | Valkey's `maxmemory-policy` deletes a victim key (LO keys included) and calls the module free callback. `noeviction` → `BLOB.TCP_SET` / `BLOB.RDMA_SET` fails (OOM). Frees space inside a segment, not `used_memory` (fact 2). | **Yes** | Both |
 | **Module cache eviction** (`make_room_for`) | Demotes cached DRAM copies to make room for a promotion; the object stays on NVMe. | No | Tiered |
 | **Module segment shrink** (`try_shrink`) | Under server memory pressure, releases the least-loaded DRAM segment. | Tiered: no (data on NVMe). Dram: **yes** — the segment's keys are deleted | Both |
 | **Module DRAM object eviction** *(planned)* | Evicts individual objects from the DRAMPool object map; their keys are deleted. | **Yes** | Dram |
@@ -974,7 +980,7 @@ for them.
 **Startup allocation.** The DRAMPool starts with **one** segment and grows on demand
 (`storage::init`). A deployment that loads the module but never stores a LargeObject
 still pays one `segment-size` segment. The alternative — start with zero segments and
-allocate (plus EFA-register, ~333µs) on the first `BLOB.SET` — is a pre-ship decision.
+allocate (plus EFA-register, ~333µs) on the first `BLOB.TCP_SET` / `BLOB.RDMA_SET` — is a pre-ship decision.
 
 ### 8.2 When to Expand
 
@@ -989,7 +995,7 @@ Both are gated by the server ceiling: an expand that would push `used_memory` pa
 `scaling-shrink-watermark` × `maxmemory` is refused (`would_cross_memory_watermark`),
 so the pool never grows into memory the shrink would immediately take back. With
 `maxmemory = 0` growth is unbounded, as in core Valkey. In Dram mode a refused
-reactive expand rejects the `BLOB.SET` (OOM); in Tiered mode the cache stops growing,
+reactive expand rejects the `BLOB.TCP_SET` / `BLOB.RDMA_SET` (OOM); in Tiered mode the cache stops growing,
 and a promotion that finds no room is skipped (the GET reads NVMe).
 
 **Why Dram is reactive-primary.** The alloc-fail row grows *because* a request just
@@ -1019,7 +1025,7 @@ the flag, so it leaves eviction to its primary. Under any evicting policy shrink
 optional: core evicting an LO key frees almost no `used_memory` (fact 2), so without a
 segment release core's eviction loop would keep deleting keys without ever getting
 under `maxmemory`. Tiered shrink drops only cached copies, so it runs under every
-policy: it is what makes room for new keys, client query buffers (a TCP `BLOB.SET`
+policy: it is what makes room for new keys, client query buffers (a TCP `BLOB.TCP_SET`
 buffers its whole payload) and output buffers, even in an LO-only keyspace.
 
 **Why proactive only.** Nothing "fails" to prompt a shrink: the trigger is external
@@ -1064,7 +1070,7 @@ registered, its I/O goes non-fixed (plain Read/Write).
    Dropping the map's `Arc` frees an object's buffers as soon as no in-flight reader
    holds a clone.
 3. **Dram only: list the oids.** The removed oids go on `RECLAIM_LIST`, under the
-   list lock held across step 2 (§9.3). From now on BLOB.GET, BLOB.INFO and COPY treat
+   list lock held across step 2 (§9.3). From now on BLOB.TCP_GET / BLOB.RDMA_GET, BLOB.INFO and COPY treat
    those keys as missing (`LoValue::reclaim_in_progress`).
 4. **Release.** The segment's `refcount` counts live allocations (+1 per alloc, −1
    per free). The cron releases every `draining && refcount == 0` segment
@@ -1321,7 +1327,7 @@ Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a 
 | FdPool | `OIDIndexedMap<FdEntry>` (entry = `Arc<OwnedFd>` + LFU `AccessStats`) | `RwLock` | Main (remove via ObjectFile::Drop on DEL/free), tokio (get_or_open lazily on first GET; LFU eviction takes the write lock to remove a cold entry). SET does NOT use FdPool — it opens a private fd. |
 | NVMe disk-usage counter | `AtomicU64` (NVME_DISK_USAGE) | lock-free atomic | Tokio (reserve on SET/COPY), any thread (decrement on ObjectFile::Drop / error rollback) |
 | Segment registry | `Mutex<SegmentState { slots: Vec<Option<Segment>> }>` (per pool) | Mutex | All threads take it briefly to reach a segment (alloc picker, free, buffer_ptr, iovec lookup). Slots are mutated only by expand/release on the main thread; the Tiered DRAM ring's poller rewrites `iovecs` and each segment's `iovec_index` during a rebuild (§8.6). Each segment's `refcount`/`allocated_bytes`/`draining` are atomics; its talc is a separate per-segment Mutex. |
-| Reclaim list | `RECLAIM_LIST: LazyLock<ReclaimList>` (`HashSet<ObjectId>` behind a `Mutex`) | Mutex | Main (add on Dram shrink; `contains` on BLOB.GET/INFO/COPY; cron scan + remove; INFO), BIO (`lo_free` → `remove_object` removes), tokio (refused EFA commit → `remove_object`). Lock order: reclaim list before `DRAMPool.objects`. All readers run on the main thread, so a RwLock would buy nothing. |
+| Reclaim list | `RECLAIM_LIST: LazyLock<ReclaimList>` (`HashSet<ObjectId>` behind a `Mutex`) | Mutex | Main (add on Dram shrink; `contains` on BLOB.TCP_GET/BLOB.RDMA_GET/INFO/COPY; cron scan + remove; INFO), BIO (`lo_free` → `remove_object` removes), tokio (refused EFA commit → `remove_object`). Lock order: reclaim list before `DRAMPool.objects`. All readers run on the main thread, so a RwLock would buy nothing. |
 | Reclaim scan cursor | `thread_local! RECLAIM_SCAN` (db + `KeysCursor`) | none (main thread only) | Scaling cron |
 
 **Why RwLock for DRAMPool HashMap and FdPool:** GET hit is the hot path — main thread reads frequently. RwLock allows parallel reads. Writes (promotion insert from tokio, remove from main on free callback) are infrequent and take exclusive lock briefly.
@@ -1462,7 +1468,7 @@ bound is physical RAM, as in core Valkey.
 
 | Mode | At the ceiling |
 |---|---|
-| Dram | A `BLOB.SET` that needs a new segment is rejected (OOM). Under an evicting `maxmemory-policy` the cron shrinks a segment and deletes its keys; under `noeviction` writes keep failing (§8.3). |
+| Dram | A `BLOB.TCP_SET` / `BLOB.RDMA_SET` that needs a new segment is rejected (OOM). Under an evicting `maxmemory-policy` the cron shrinks a segment and deletes its keys; under `noeviction` writes keep failing (§8.3). |
 | Tiered | The cache stops growing; the cron shrinks segments (cached copies dropped, data stays on NVMe). |
 
 Segment **count** is always derived from demand, never a knob. Every segment is

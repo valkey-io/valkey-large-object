@@ -191,7 +191,7 @@ fn commit_lo_value(
     Ok(CommitOutcome::ValueSet)
 }
 
-/// Keyspace event names published after a successful BLOB.SET.
+/// Keyspace event names published after a successful BLOB.TCP_SET / BLOB.RDMA_SET.
 pub(crate) const EVENT_CREATE: &str = "largeobj.create";
 pub(crate) const EVENT_UPDATE: &str = "largeobj.update";
 
@@ -199,7 +199,7 @@ pub(crate) const EVENT_UPDATE: &str = "largeobj.update";
 // GET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute BLOB.GET with mode + transport routing.
+/// Execute BLOB.TCP_GET / BLOB.RDMA_GET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_get(
     ctx: &valkey_module::Context,
@@ -554,7 +554,7 @@ async fn cmd_get_tiered_run(
 // SET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute BLOB.SET with mode + transport routing.
+/// Execute BLOB.TCP_SET / BLOB.RDMA_SET with mode + transport routing.
 /// Engine owns all routing decisions. Command handler just matches EngineResult.
 pub fn execute_set(
     ctx: &valkey_module::Context,

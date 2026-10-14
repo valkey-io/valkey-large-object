@@ -145,7 +145,7 @@ impl LoValue {
 
     /// Deep-copy for the COPY command callback.
     /// Dram mode: clone ObjectContext via try_clone. Tiered mode: copy NVMe file.
-    /// Returns None on capacity exhaustion (pool full or nvme-maxmemory exceeded).
+    /// Returns None on capacity exhaustion (pool full or disk-maxmemory exceeded).
     pub fn create_copy(&self) -> Option<LoValue> {
         if self.reclaim_in_progress() {
             return None;
@@ -171,7 +171,7 @@ impl LoValue {
 
     /// Tiered mode: copy NVMe file with a fresh OID.
     /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
-    /// Returns None if nvme-maxmemory would be exceeded or the copy fails.
+    /// Returns None if disk-maxmemory would be exceeded or the copy fails.
     fn create_copy_tiered(&self) -> Option<LoValue> {
         let file = self.file.as_ref()?.copy(self.len, self.crc32c)?;
         Some(LoValue::new(

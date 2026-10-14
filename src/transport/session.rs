@@ -1,4 +1,4 @@
-//! `BLOB.HELLO` creates a session keyed by Valkey client id, dropped on disconnect.
+//! `BLOB.RDMA_HELLO` creates a session keyed by Valkey client id, dropped on disconnect.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -13,11 +13,11 @@ use crate::transport::operand::PoolOperand;
 
 // ─── Session ─────────────────────────────────────────────────────────────────
 
-/// Per-client DMA session created during BLOB.HELLO
+/// Per-client DMA session created during BLOB.RDMA_HELLO
 pub struct Session {
     /// The Valkey client id: the fabric keys address-vector entries and in-flight accounting by it.
     client_id: u64,
-    /// The client's fabric address from BLOB.HELLO.
+    /// The client's fabric address from BLOB.RDMA_HELLO.
     peer_address: Vec<u8>,
 }
 
@@ -101,7 +101,7 @@ fn sessions() -> MutexGuard<'static, HashMap<u64, Arc<Session>>> {
     SESSIONS.lock().expect("SESSIONS lock unavailable")
 }
 
-/// Bind a fresh session to the client that ran BLOB.HELLO, replacing on collision.
+/// Bind a fresh session to the client that ran BLOB.RDMA_HELLO, replacing on collision.
 pub fn insert(client_id: u64, session: Session) {
     if sessions().insert(client_id, Arc::new(session)).is_some() {
         valkey_module::logging::log_debug(format!("replaced session for client_id: {client_id}"));

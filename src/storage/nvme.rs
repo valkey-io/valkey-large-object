@@ -112,10 +112,10 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
     }
 }
 
-/// Atomically reserve `bytes` of NVMe disk budget if it fits within nvme-maxmemory.
+/// Atomically reserve `bytes` of NVMe disk budget if it fits within disk-maxmemory.
 /// Returns true and increments the counter on success; returns false and leaves the
 /// counter unchanged if the reservation would exceed the cap (or overflow).
-/// Returns true if nvme-maxmemory is 0 (unlimited).
+/// Returns true if disk-maxmemory is 0 (unlimited).
 pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
     let max = crate::nvme_maxmemory();
     NVME_DISK_USAGE
@@ -410,13 +410,13 @@ pub(crate) fn warn_failed_unlink(during: &str, path: &str, err: &std::io::Error)
 }
 
 /// Reset the NVMe object directory (Tiered mode only): delete it and everything
-/// under it, then recreate it empty. `nvme-dir` is a dedicated, module-owned
-/// directory (see the `nvme-dir` config docs), so wiping it is safe. A no-op
+/// under it, then recreate it empty. `disk-dir` is a dedicated, module-owned
+/// directory (see the `disk-dir` config docs), so wiping it is safe. A no-op
 /// in Dram mode, which never touches disk.
 ///
 /// Called both to reclaim a previous run's leftovers at startup and to clear
-/// this instance's files at shutdown. Returns `Ok(())` once nvme-dir exists and
-/// is empty (or immediately, in Dram mode); `Err` if nvme-dir is unset in Tiered
+/// this instance's files at shutdown. Returns `Ok(())` once disk-dir exists and
+/// is empty (or immediately, in Dram mode); `Err` if disk-dir is unset in Tiered
 /// mode, or the directory could not be removed or recreated.
 pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
     if mode != crate::OperatingMode::Tiered {
@@ -425,7 +425,7 @@ pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std
     if dir.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "nvme-dir is required in Tiered operating mode",
+            "disk-dir is required in Tiered operating mode",
         ));
     }
     // remove_dir_all errors if `dir` is absent — but "absent" is already the

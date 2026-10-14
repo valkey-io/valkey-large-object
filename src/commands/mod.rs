@@ -1,11 +1,11 @@
 //! Command Handlers — thin layer that parses args and dispatches to engine.
 //!
-//! BLOB.HELLO: EFA session establishment
-//! BLOB.GET key                                            (TCP): engine::execute_get
-//! BLOB.GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]   (EFA): engine::execute_get
-//! BLOB.SET key <data>                                     (TCP): engine::execute_set
-//! BLOB.SET key total_len rkey1 addr1 len1 [...]           (EFA): engine::execute_set
-//! BLOB.INFO key [LEN|CRC|TIER]: metadata from LoValue, no engine call
+//! BLOB.RDMA_HELLO: RDMA session establishment
+//! BLOB.TCP_GET key
+//! BLOB.RDMA_GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
+//! BLOB.TCP_SET key <data>
+//! BLOB.RDMA_SET key total_len rkey1 addr1 len1 [...]
+//! BLOB.INFO key [LEN|CRC|TIER]
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use crate::transport::{self, session, Session};
 /// Upper bound on client memory addresses in one EFA command.
 const MAX_EFA_ADDRESSES: usize = 256;
 
-/// The EFA session the client previously established with BLOB.HELLO.
+/// The RDMA session the client previously established with BLOB.RDMA_HELLO.
 fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
     session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))
 }
@@ -72,14 +72,14 @@ fn parse_efa_addresses(
     Ok(addrs)
 }
 
-// ─── BLOB.HELLO ────────────────────────────────────────────────────────────────
+// ─── BLOB.RDMA_HELLO ───────────────────────────────────────────────────────────
 //
 // Establishes a fabric session with the client.
 // Client sends its fabric address as hex, opaque to us and in the provider's own format. The
 // server inserts it into each domain's address vector and returns an address per server,
 // so both sides hold each other before the first transfer.
 
-pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if args.len() < 2 {
         return Err(ValkeyError::WrongArity);
     }
@@ -120,21 +120,14 @@ pub fn lo_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     Ok(ValkeyValue::Array(reply))
 }
 
-// ─── BLOB.GET ──────────────────────────────────────────────────────────────────
+// ─── BLOB.TCP_GET ──────────────────────────────────────────────────────────────
 //
-// Parse args → resolve key → determine transport → dispatch to engine.
+// BLOB.TCP_GET key — returns object bytes inline via RESP.
 
-pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    // Strict arity, decided before the key lookup so a malformed EFA call cannot be
-    // answered as if it were a TCP GET (or as a missing key).
-    //   2 args: TCP — BLOB.GET key
-    //  ≥5 args: EFA — BLOB.GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
-    let efa = match args.len() {
-        2 => false,
-        len if len >= 5 => true,
-        _ => return Err(ValkeyError::WrongArity),
-    };
-
+pub fn lo_tcp_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    if args.len() != 2 {
+        return Err(ValkeyError::WrongArity);
+    }
     // Lookup LoValue in keyspace.
     let key = ctx.open_key(&args[1]);
     let lo_value: &LoValue = match key
@@ -144,24 +137,48 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         Some(v) if !v.reclaim_in_progress() => v,
         _ => return Ok(ValkeyValue::Null),
     };
-
     let object_id = lo_value.object_id;
     let obj_len = lo_value.len;
     let crc32c = lo_value.crc32c;
-
     // Pin the file to protect it from asynchronous deletion in tiered mode.
     let file = lo_value.file.clone();
+    // Dispatch to engine — it decides sync vs async internally.
+    match engine::execute_get(ctx, object_id, obj_len, crc32c, file, Transport::Tcp) {
+        engine::EngineResult::Sync(result) => result,
+        engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
+    }
+}
 
-    // EFA: BLOB.GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
-    // Address count is inferred from the triplet args.
-    let transport = if efa {
-        let addrs = parse_efa_addresses(&args, 2, obj_len)?;
-        let session = efa_session(ctx)?;
-        Transport::Efa { session, addrs }
-    } else {
-        Transport::Tcp
+// ─── BLOB.RDMA_GET ─────────────────────────────────────────────────────────────
+//
+// BLOB.RDMA_GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
+// Writes object data directly to client-registered memory via RDMA.
+
+pub fn lo_rdma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    // At least: cmd + key + one (rkey, addr, len) triple = 5 args.
+    // Incomplete triples are caught by parse_efa_addresses with a clearer error.
+    if args.len() < 5 {
+        return Err(ValkeyError::WrongArity);
+    }
+    // Lookup LoValue in keyspace.
+    let key = ctx.open_key(&args[1]);
+    let lo_value: &LoValue = match key
+        .get_value::<LoValue>(&LO_TYPE)
+        .map_err(|_| ValkeyError::WrongType)?
+    {
+        Some(v) if !v.reclaim_in_progress() => v,
+        _ => return Ok(ValkeyValue::Null),
     };
-
+    let object_id = lo_value.object_id;
+    let obj_len = lo_value.len;
+    let crc32c = lo_value.crc32c;
+    // Pin the file to protect it from asynchronous deletion in tiered mode.
+    let file = lo_value.file.clone();
+    // BLOB.RDMA_GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
+    // Address count is inferred from the triplet args.
+    let addrs = parse_efa_addresses(&args, 2, obj_len)?;
+    let session = efa_session(ctx)?;
+    let transport = Transport::Efa { session, addrs };
     // Dispatch to engine — it decides sync vs async internally.
     match engine::execute_get(ctx, object_id, obj_len, crc32c, file, transport) {
         engine::EngineResult::Sync(result) => result,
@@ -169,22 +186,14 @@ pub fn lo_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 }
 
-// ─── BLOB.SET ──────────────────────────────────────────────────────────────────
+// ─── BLOB.TCP_SET ──────────────────────────────────────────────────────────────
 //
-// Parse args → determine data source → dispatch to engine.
+// BLOB.TCP_SET key <data> — stores inline bytes from the RESP payload.
 
-pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
-    // Strict arity.
-    //   3 args: TCP — BLOB.SET key <data>
-    //  ≥6 args: EFA — BLOB.SET key total_len rkey1 addr1 len1 [rkey2 addr2 len2 ...]
-    // 4 and 5 args are rejected: neither a valid TCP call (exactly 3) nor a valid EFA
-    // call (needs total_len + at least one triplet).
-    let efa = match args.len() {
-        3 => false,
-        len if len >= 6 => true,
-        _ => return Err(ValkeyError::WrongArity),
-    };
-
+pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    if args.len() != 3 {
+        return Err(ValkeyError::WrongArity);
+    }
     // Reject a key of another type before any transfer, matching valkey-bloom.
     if ctx
         .open_key(&args[1])
@@ -193,32 +202,13 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     {
         return Err(ValkeyError::WrongType);
     }
-
-    // Determine data source and obj_len based on transport.
-    let (obj_len, data_source) = if efa {
-        // EFA: BLOB.SET key total_len rkey1 addr1 len1 [rkey2 addr2 len2 ...]
-        // total_len is required — server needs to know how many bytes to fi_read
-        // from the client.
-        let obj_len: u64 = args[2]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_LEN))?;
-        let addrs = parse_efa_addresses(&args, 3, obj_len)?;
-        let session = efa_session(ctx)?;
-        (obj_len, DataSource::Efa { session, addrs })
-    } else {
-        // TCP path: BLOB.SET key <data>
-        // data.len() IS the authoritative length. No user-provided len needed.
-        let data = args[2].as_slice().to_vec();
-        let obj_len = data.len() as u64;
-        (obj_len, DataSource::Tcp(data))
-    };
-
-    // Reject zero-length values / 0-byte cases.
+    // TCP path: data.len() IS the authoritative length. No user-provided len needed.
+    let data = args[2].as_slice().to_vec();
+    let obj_len = data.len() as u64;
+    // Reject zero-length values.
     if obj_len == 0 {
         return Err(ValkeyError::Str(errors::ERR_ZERO_LENGTH_OBJECT));
     }
-
     // Reject objects exceeding the configured max object size. The config
     // constraint enforces max-object-size <= segment-size, so this also
     // covers objects that would not fit in a single segment.
@@ -226,7 +216,52 @@ pub fn lo_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if obj_len > max_obj_size {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
+    // Dispatch to engine — it decides sync vs async internally.
+    match engine::execute_set(ctx, &args[1], obj_len, DataSource::Tcp(data)) {
+        engine::EngineResult::Sync(result) => result,
+        engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
+    }
+}
 
+// ─── BLOB.RDMA_SET ─────────────────────────────────────────────────────────────
+//
+// BLOB.RDMA_SET key total_len rkey1 addr1 len1 [rkey2 addr2 len2 ...]
+// Reads object data from client-registered memory via RDMA.
+
+pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
+    // At least: cmd + key + total_len + one (rkey, addr, len) triple = 6 args.
+    // Incomplete triples are caught by parse_efa_addresses with a clearer error.
+    if args.len() < 6 {
+        return Err(ValkeyError::WrongArity);
+    }
+    // Reject a key of another type before any transfer, matching valkey-bloom.
+    if ctx
+        .open_key(&args[1])
+        .get_value::<LoValue>(&LO_TYPE)
+        .is_err()
+    {
+        return Err(ValkeyError::WrongType);
+    }
+    // total_len is required — server needs to know how many bytes to fi_read
+    // from the client.
+    let obj_len: u64 = args[2]
+        .to_string_lossy()
+        .parse()
+        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_LEN))?;
+    // Reject zero-length values.
+    if obj_len == 0 {
+        return Err(ValkeyError::Str(errors::ERR_ZERO_LENGTH_OBJECT));
+    }
+    // Reject objects exceeding the configured max object size. The config
+    // constraint enforces max-object-size <= segment-size, so this also
+    // covers objects that would not fit in a single segment.
+    let max_obj_size = crate::max_object_size();
+    if obj_len > max_obj_size {
+        return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
+    }
+    let addrs = parse_efa_addresses(&args, 3, obj_len)?;
+    let session = efa_session(ctx)?;
+    let data_source = DataSource::Efa { session, addrs };
     // Dispatch to engine — it decides sync vs async internally.
     match engine::execute_set(ctx, &args[1], obj_len, data_source) {
         engine::EngineResult::Sync(result) => result,
@@ -325,8 +360,8 @@ mod tests {
 
     #[test]
     fn start_idx_skips_leading_args() {
-        // Simulates BLOB.GET key rkey addr len — start_idx=2 skips "BLOB.GET" and "key".
-        let args = vs(&["BLOB.GET", "key", "7", "64", "4096"]);
+        // Simulates BLOB.RDMA_GET key rkey addr len — start_idx=2 skips "BLOB.RDMA_GET" and "key".
+        let args = vs(&["BLOB.RDMA_GET", "key", "7", "64", "4096"]);
         assert_eq!(
             parse_efa_addresses(&args, 2, 4096).unwrap(),
             vec![(64, 4096, 7)]

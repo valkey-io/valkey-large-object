@@ -82,7 +82,7 @@ impl ObjectFile {
     /// payload past the header byte-for-byte. `fsync`s before returning so the file is
     /// durable before it is exposed to O_DIRECT reads via io_uring.
     ///
-    /// Reserves `disk_len` against nvme-maxmemory up front; the returned handle's `Drop`
+    /// Reserves `disk_len` against disk-maxmemory up front; the returned handle's `Drop`
     /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
     /// the command rather than aborting the node), leaving no partial file behind.
     pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
