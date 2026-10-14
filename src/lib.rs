@@ -18,7 +18,7 @@
 //   1. Fabric::start()         — one libfabric service per domain. On missing
 //                                fabric, the EFA path is unavailable and BLOB.RDMA_HELLO
 //                                gives an error.
-//   2. storage::init(mode, nvme_dir)
+//   2. storage::init(ctx, mode, nvme_dir)
 //                              — validate config, allocate pool segments, create
 //                                the per-pool io_uring engines and start the
 //                                smartlog poller (Tiered only). All resources are
@@ -160,15 +160,6 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
-    // Tiered mode keeps object files open (fd cache + in-flight SETs). Move those
-    // fds above Valkey's client range, or they stop new clients being served.
-    if mode == OperatingMode::Tiered {
-        if let Err(msg) = storage::fd_placement::place(ctx) {
-            ctx.log_warning(&format!("{msg}; aborting module load"));
-            return Status::Err;
-        }
-    }
-
     // Step 0: Create tokio runtime as a local. Set in OnceLock only after all init succeeds.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads())
@@ -191,7 +182,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Step 2: Initialize storage layer (pools, io_uring engine, validation).
     // All pool/engine OnceLocks are set inside init() only after everything succeeds.
     // On failure, locals drop naturally — no cleanup needed.
-    let storage_summary = match storage::init(mode, &dir) {
+    let storage_summary = match storage::init(ctx, mode, &dir) {
         Ok(summary) => summary,
         Err(e) => {
             ctx.log_warning(&format!("largeobj: storage init failed: {}", e));
@@ -254,7 +245,7 @@ fn on_config_changed(ctx: &Context, changed: &[&str]) {
         if changed.contains(&"maxclients") {
             if let Err(msg) = storage::fd_placement::place(ctx) {
                 // The panic hook logs the message and aborts the server.
-                panic!("{msg}");
+                panic!("CONFIG SET maxclients: cannot keep object-file fds out of Valkey's client range: {msg}");
             }
             pool.evict_in_client_range();
         }

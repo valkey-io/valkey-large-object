@@ -148,7 +148,11 @@ pub fn get_fd_pool() -> &'static FdPool {
 /// All OnceLock statics are set at the very end after everything succeeds.
 /// On failure, local variables drop naturally — no cleanup needed, module load retryable.
 /// Returns Ok(summary string) on success, Err(message) on validation/environment failure.
-pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String> {
+pub fn init(
+    ctx: &valkey_module::Context,
+    mode: crate::OperatingMode,
+    nvme_dir: &str,
+) -> Result<String, String> {
     let dram_seg_size = crate::dram_segment_size();
     let nvme_staging = crate::nvme_staging_size();
     // DRAMPool always starts with 1 segment and grows on demand — reactively
@@ -171,6 +175,14 @@ pub fn init(mode: crate::OperatingMode, nvme_dir: &str) -> Result<String, String
              Increase segment-size or decrease disk-staging-size",
             dram_segment_count, nvme_segments, MAX_SEGMENTS,
         ));
+    }
+    // Tiered keeps object files open (fd cache + in-flight SETs). Place those fds
+    // above Valkey's client range before any is opened, or they stop new clients
+    // being served.
+    if mode == crate::OperatingMode::Tiered {
+        fd_placement::place(ctx).map_err(|e| {
+            format!("cannot keep object-file fds out of Valkey's client range: {e}")
+        })?;
     }
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.
