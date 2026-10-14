@@ -986,15 +986,19 @@ subset whose key has a TTL). An oid leaves both when it is evicted, so it is nev
 twice. TTL membership comes from the `expire`, `persist` and `copy_to` keyspace events
 (`live::on_keyspace_event`, both modes); `expire` covers EXPIRE, PEXPIRE, EXPIREAT and
 PEXPIREAT. RENAME and MOVE carry the object and its TTL together, and an overwrite mints a
-new oid, so none needs an event. The policy's order is not honored yet: both
-modes evict a random allowed key. Dram picks it inside the segment being filled, so every
-victim makes room there.
+new oid, so none needs an event.
 
 **When eviction runs.** Dram: only when the server may evict, that is `maxmemory` is set,
 the policy is not `noeviction`, and this is not a replica; the expand gate on `maxmemory`
 is what makes a SET miss. Tiered: whenever a write would exceed `disk-maxmemory`, unless
 `maxmemory-policy` is `noeviction` or this is a replica. The server's `maxmemory` is not
 required: it bounds DRAM, not the disk.
+
+**Order among the allowed keys.** Under `*-lru` the least recently used goes first: in
+Dram from a global `LruList`, in any segment, until the write fits; on NVMe from the same
+kind of list. A GET is a use; so is a TTL change, as in core. `*-lfu` and `*-random` keep
+their earlier order: a random allowed key, which Dram picks inside the segment being
+filled.
 
 **Detection:**
 

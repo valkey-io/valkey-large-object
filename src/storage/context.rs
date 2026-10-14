@@ -79,6 +79,8 @@ pub struct ObjectContext {
     /// Dram: whether the key has a TTL, so `volatile-*` eviction may take it. Set by
     /// the keyspace-event handler (`live::on_keyspace_event`).
     ttl_present: AtomicBool,
+    /// Dram: this object's slot in the DRAMPool's `LruList`, set when it is inserted.
+    lru_slot: AtomicU32,
 }
 
 impl ObjectContext {
@@ -90,6 +92,7 @@ impl ObjectContext {
             chunks_ready: AtomicU32::new(0),
             stats: AccessStats::new(now_minutes()),
             ttl_present: AtomicBool::new(false),
+            lru_slot: AtomicU32::new(u32::MAX),
         }
     }
 
@@ -101,6 +104,7 @@ impl ObjectContext {
             chunks_ready: AtomicU32::new(0),
             stats: AccessStats::new(now_minutes()),
             ttl_present: AtomicBool::new(false),
+            lru_slot: AtomicU32::new(u32::MAX),
         }
     }
 
@@ -130,6 +134,14 @@ impl ObjectContext {
 
     pub fn set_ttl_present(&self, present: bool) {
         self.ttl_present.store(present, Ordering::Relaxed);
+    }
+
+    pub fn lru_slot(&self) -> u32 {
+        self.lru_slot.load(Ordering::Relaxed)
+    }
+
+    pub fn set_lru_slot(&self, slot: u32) {
+        self.lru_slot.store(slot, Ordering::Relaxed);
     }
 
     /// Get the number of chunks ready (contiguous from offset 0).

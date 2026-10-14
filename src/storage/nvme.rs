@@ -132,7 +132,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
                     "largeobj: failed to stat object file {} during eviction, will retry: {e}",
                     oid.file_path(&crate::disk_dir())
                 ));
-                super::live::remove(oid);
+                super::live::evicted(oid);
                 crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
                 ORPHANED_FILES.push(unevictable, 0);
             }
@@ -157,7 +157,7 @@ fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
     let mut freed = 0;
     for (unevictable, size) in victims {
         let oid = unevictable.oid();
-        super::live::remove(oid);
+        super::live::evicted(oid);
         if let Some(pool) = super::FD_POOL.get() {
             pool.remove(oid);
         }

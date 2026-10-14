@@ -12,6 +12,8 @@ Tests cover:
   - Eviction, both modes: a SET or COPY past the budget evicts other objects; their keys read as
     misses until the scaling cron deletes them. Tiered stays exact against concurrent GET, SET,
     overwrite, COPY and DEL
+  - Eviction policies, both modes: volatile-* takes only keys with a TTL, *-lru the least
+    recently used first
 """
 
 import os
@@ -626,8 +628,9 @@ class DramBudget(Budget):
 
 class TieredBudget(Budget):
     """`disk-maxmemory` of 8 objects, with pools bigger than any object: only the ledger can refuse
-    a write, and it is exact. Victims are a uniform random sample of the live objects: tests assert
-    counts and the ledger, not names."""
+    a write, and it is exact. Under the default allkeys-lru, eviction takes the least recently used
+    object first: the oldest write, unless read since. Tests assert counts and the ledger, not
+    names, unless they pin one down."""
 
     OBJ = 512 * 1024
     DISK_PER_OBJ = OBJ + 4096  # the ledger also charges the file's one-page header
@@ -650,11 +653,12 @@ class TieredBudget(Budget):
         return client
 
     def object_files(self):
-        """Lowest oid first (file names are zero-padded hex oids)."""
+        """Lowest oid first (file names are zero-padded hex oids): the oldest write first."""
         return sorted(name for name in os.listdir(self.data_dir) if OBJECT_FILE.match(name))
 
     def first_in_line(self, payloads):
-        """The oldest key (lowest oid), read back from its file's payload byte."""
+        """The key LRU eviction takes first when none was read: the oldest write (lowest oid),
+        read back from its file's payload byte."""
         with open(os.path.join(self.data_dir, self.object_files()[0]), 'rb') as f:
             f.seek(4096)
             byte = f.read(1)[0]
@@ -1006,7 +1010,8 @@ class TestTieredEvictionMixed(TieredBudget):
 
 
 class EvictionPolicyTests:
-    """Run against both budgets: `volatile-*` evicts only keys with a TTL."""
+    """Run against both budgets: `volatile-*` evicts only keys with a TTL, `*-lru` the least
+    recently used first."""
 
     @pytest.mark.parametrize('policy', ['volatile-lru', 'volatile-random'])
     def test_volatile_evicts_only_keys_with_a_ttl(self, policy):
@@ -1140,6 +1145,29 @@ class EvictionPolicyTests:
         assert client.execute_command('BLOB.TCP_SET', 'fill', b'F' * self.OBJ) == b'OK'
         self.assert_refused(client, 'refused', b'R' * self.OBJ)
         assert self.evictions(client) == 0
+
+
+    def test_lru_evicts_exactly_the_least_recently_used(self):
+        client = self.new_client('allkeys-lru')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        keys = list(payloads)
+        # Read in reverse write order: the last key written is now the least recently used.
+        for key in reversed(keys):
+            assert client.execute_command('BLOB.TCP_GET', key) == payloads[key]
+        for i in range(2):
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+        assert sorted(surviving(client, payloads)) == sorted(keys[:-2])
+
+    def test_volatile_lru_evicts_the_least_recently_used_key_with_a_ttl(self):
+        """The oldest key has no TTL, and of the rest the oldest was read since."""
+        client = self.new_client('volatile-lru')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        keys = list(payloads)
+        for key in keys[1:]:
+            assert client.execute_command('EXPIRE', key, 1000) == 1
+        assert client.execute_command('BLOB.TCP_GET', keys[1]) == payloads[keys[1]]
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        assert sorted(surviving(client, payloads)) == sorted(k for k in keys if k != keys[2])
 
 
 class TestDramEvictionPolicy(EvictionPolicyTests, DramBudget):
