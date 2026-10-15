@@ -642,10 +642,10 @@ class TieredBudget(Budget):
                 f" scaling-poll-ms {self.POLL_MS} bench-mode no direct-io no")
 
     def new_client(self, policy='allkeys-lru'):
-        """maxmemory far above usage: core never evicts, so every eviction seen is the module's."""
+        """No server maxmemory: Tiered eviction does not need one, and core never evicts, so
+        every eviction seen is the module's."""
         client = self.server.get_new_client()
-        used = int(client.info('memory')['used_memory'])
-        client.config_set('maxmemory', used + 256 * 1024 * 1024)
+        assert client.config_get('maxmemory')['maxmemory'] == '0'
         client.config_set('maxmemory-policy', policy)
         return client
 
@@ -785,18 +785,30 @@ class TestDramEvictionCron(EvictionCronTests, DramBudget):
 
 class TestTieredEviction(EvictionTests, TieredBudget):
 
-    def test_more_than_the_budget_or_no_maxmemory_is_refused(self):
-        """No eviction makes room for more than the cap, and without a server maxmemory the node
-        never evicts, disk-maxmemory or not."""
+    def test_more_than_the_budget_is_refused(self):
+        """No eviction makes room for more than the cap."""
         client = self.new_client()
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
         self.assert_refused(client, 'huge', b'H' * self.BUDGET)
-        client.config_set('maxmemory', 0)
-        self.assert_refused(client, 'overflow', b'O' * self.OBJ)
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 0
-        assert info['largeobj_nvme_capacity_exceeded'] == 2
+        assert info['largeobj_nvme_capacity_exceeded'] == 1
         assert surviving(client, payloads) == payloads
+
+    def test_the_server_maxmemory_does_not_gate_eviction(self):
+        """Only disk-maxmemory and the policy decide: with or without a server maxmemory, a
+        full disk evicts, and noeviction refuses."""
+        client = self.new_client()
+        set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        assert client.execute_command('BLOB.TCP_SET', 'no_maxmemory', b'N' * self.OBJ) == b'OK'
+        used = int(client.info('memory')['used_memory'])
+        client.config_set('maxmemory', used + 256 * 1024 * 1024)
+        assert client.execute_command('BLOB.TCP_SET', 'with_maxmemory', b'W' * self.OBJ) == b'OK'
+        assert self.evictions(client) == 2
+        client.config_set('maxmemory', 0)
+        client.config_set('maxmemory-policy', 'noeviction')
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        assert self.evictions(client) == 2
 
     def test_a_write_that_needs_more_than_16_victims_is_refused_but_they_stay_evicted(self):
         """A claim is never undone."""

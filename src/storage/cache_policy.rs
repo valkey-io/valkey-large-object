@@ -246,32 +246,34 @@ pub struct TieredCache {
 pub struct MaxmemoryPolicy {
     /// `volatile-*`: only keys with a TTL may be evicted.
     pub volatile: bool,
+    /// `noeviction`: nothing may be evicted.
+    pub noeviction: bool,
 }
 
 /// The cached policy, as `MaxmemoryPolicy::bits`: one value, so a reader never sees half
 /// of a change.
 static POLICY: AtomicU8 = AtomicU8::new(0);
 const VOLATILE: u8 = 1;
+const NOEVICTION: u8 = 2;
 
 impl MaxmemoryPolicy {
     fn parse(name: &str) -> Self {
         Self {
             volatile: name.starts_with("volatile-"),
+            noeviction: name == "noeviction",
         }
     }
 
     fn bits(self) -> u8 {
-        if self.volatile {
-            VOLATILE
-        } else {
-            0
-        }
+        (if self.volatile { VOLATILE } else { 0 }) | (if self.noeviction { NOEVICTION } else { 0 })
     }
 
     /// The policy now in force: one atomic load.
     pub fn current() -> Self {
+        let bits = POLICY.load(Ordering::Relaxed);
         Self {
-            volatile: POLICY.load(Ordering::Relaxed) & VOLATILE != 0,
+            volatile: bits & VOLATILE != 0,
+            noeviction: bits & NOEVICTION != 0,
         }
     }
 
@@ -453,17 +455,15 @@ mod tests {
             "volatile-random",
             "volatile-ttl",
         ] {
-            assert!(MaxmemoryPolicy::parse(name).volatile, "{name}");
+            let p = MaxmemoryPolicy::parse(name);
+            assert!(p.volatile && !p.noeviction, "{name}");
         }
-        for name in [
-            "allkeys-lru",
-            "allkeys-lfu",
-            "allkeys-random",
-            "noeviction",
-            "",
-        ] {
-            assert!(!MaxmemoryPolicy::parse(name).volatile, "{name}");
+        for name in ["allkeys-lru", "allkeys-lfu", "allkeys-random", ""] {
+            let p = MaxmemoryPolicy::parse(name);
+            assert!(!p.volatile && !p.noeviction, "{name}");
         }
+        let p = MaxmemoryPolicy::parse("noeviction");
+        assert!(!p.volatile && p.noeviction);
     }
 
     // ─── sample_victim ───

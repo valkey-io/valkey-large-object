@@ -731,7 +731,10 @@ mod tests {
                 .reclaim_in(
                     0,
                     BUF as usize,
-                    by_policy(MaxmemoryPolicy { volatile: false }),
+                    by_policy(MaxmemoryPolicy {
+                        volatile: false,
+                        noeviction: false,
+                    }),
                 )
                 .unwrap();
             seen.extend(victims.iter().map(|(oid, _)| oid.0));
@@ -750,7 +753,10 @@ mod tests {
             ctx.set_ttl_present(i % 2 == 1);
             p.insert_object(ObjectId(9_300 + i as u64), ctx);
         }
-        let volatile = by_policy(MaxmemoryPolicy { volatile: true });
+        let volatile = by_policy(MaxmemoryPolicy {
+            volatile: true,
+            noeviction: false,
+        });
         // Only 2 BUF of segment 0 has a TTL.
         assert!(p.reclaim_in(0, 3 * BUF as usize, volatile).is_none());
         let victims = p.reclaim_in(0, 2 * BUF as usize, volatile).unwrap();

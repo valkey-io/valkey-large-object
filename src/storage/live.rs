@@ -116,11 +116,17 @@ mod tests {
     }
 
     fn pick(volatile: bool, range: std::ops::Range<u64>) -> Vec<u64> {
-        candidates(MaxmemoryPolicy { volatile }, 1000)
-            .into_iter()
-            .map(|oid| oid.0)
-            .filter(|oid| range.contains(oid))
-            .collect()
+        candidates(
+            MaxmemoryPolicy {
+                volatile,
+                noeviction: false,
+            },
+            1000,
+        )
+        .into_iter()
+        .map(|oid| oid.0)
+        .filter(|oid| range.contains(oid))
+        .collect()
     }
 
     #[test]
