@@ -1146,6 +1146,77 @@ class EvictionPolicyTests:
         assert len(survivors) == self.PER_BUDGET - 2
         self.assert_refused(client, 'refused', b'R' * self.OBJ)
 
+    def free_a_slot(self, client, key):
+        """DEL `key` and wait until its object is freed, leaving room for exactly one write."""
+        client.execute_command('DEL', key)
+        wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
+        self.settle(client, self.PER_BUDGET - 1)
+
+    def test_every_expire_variant_marks_the_key_evictable(self):
+        """Each way to set a TTL fires the `expire` event: the key becomes volatile-evictable."""
+        client = self.new_client('volatile-random')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        far = int(time.time()) + 1000
+        variants = [('PEXPIREAT', far * 1000), ('EXPIREAT', far), ('PEXPIRE', 1000000), ('EXPIRE', 1000)]
+        volatile = list(payloads)[:min(len(variants), self.PER_BUDGET)]
+        for key, (command, when) in zip(volatile, variants):
+            assert client.execute_command(command, key, when) == 1
+        for i in range(len(volatile)):
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+        assert not set(surviving(client, payloads)) & set(volatile)
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        assert self.evictions(client) == len(volatile)
+
+    def test_rename_keeps_the_ttl_with_the_object(self):
+        """RENAME moves the key, its object and its TTL; no event fires, none is needed."""
+        client = self.new_client('volatile-lru')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        assert client.execute_command('EXPIRE', 'obj_0', 1000) == 1
+        client.execute_command('RENAME', 'obj_0', 'moved_0')
+        assert client.execute_command('BLOB.TCP_SET', 'new_0', b'N' * self.OBJ) == b'OK'
+        survivors = surviving(client, {**payloads, 'moved_0': payloads['obj_0']})
+        assert 'moved_0' not in survivors, "the renamed key lost its TTL"
+        assert len(survivors) == self.PER_BUDGET - 1
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        assert self.evictions(client) == 1
+
+    def test_rename_over_a_ttl_key_leaves_nothing_volatile(self):
+        """The replaced key's object goes with its TTL; the key that replaced it has none."""
+        client = self.new_client('volatile-lru')
+        set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        assert client.execute_command('EXPIRE', 'obj_0', 1000) == 1
+        client.execute_command('RENAME', 'obj_1', 'obj_0')
+        wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
+        self.settle(client, self.PER_BUDGET - 1)
+        assert client.execute_command('BLOB.TCP_SET', 'fill', b'F' * self.OBJ) == b'OK'
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        assert self.evictions(client) == 0
+
+    def test_move_to_another_db_keeps_the_ttl(self):
+        """MOVE carries the object and its TTL to the other db; the key stays evictable there."""
+        client = self.new_client('volatile-lru')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        assert client.execute_command('EXPIRE', 'obj_0', 1000) == 1
+        assert client.execute_command('MOVE', 'obj_0', 1) == 1
+        assert client.execute_command('BLOB.TCP_SET', 'new_0', b'N' * self.OBJ) == b'OK'
+        others = {key: value for key, value in payloads.items() if key != 'obj_0'}
+        assert surviving(client, others) == others, "a key without a TTL was evicted"
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        assert self.evictions(client) == 1
+
+    def test_overwrite_drops_the_ttl(self):
+        """An overwrite mints a new object, and Valkey drops the key's TTL with the old one."""
+        client = self.new_client('volatile-lru')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        assert client.execute_command('EXPIRE', 'obj_0', 1000) == 1
+        self.free_a_slot(client, f'obj_{self.PER_BUDGET - 1}')
+        assert client.execute_command('BLOB.TCP_SET', 'obj_0', b'O' * self.OBJ) == b'OK'
+        wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
+        self.settle(client, self.PER_BUDGET - 1)
+        assert client.execute_command('BLOB.TCP_SET', 'fill', b'F' * self.OBJ) == b'OK'
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        assert self.evictions(client) == 0
+
 
 class TestDramEvictionPolicy(EvictionPolicyTests, DramBudget):
     pass

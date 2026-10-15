@@ -55,6 +55,8 @@ fn set_ttl(oid: ObjectId, has_ttl: bool) {
 
 /// Keyspace events that can change a key's TTL without changing its oid. An overwrite
 /// (BLOB.TCP_SET / BLOB.RDMA_SET) needs none: it mints a new oid, and Valkey drops the key's TTL.
+/// RENAME and MOVE need none either: the object and its TTL move together. `expire` covers
+/// EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT.
 pub fn on_keyspace_event(ctx: &Context, _: NotifyEvent, event: &str, key: &[u8]) {
     if !matches!(event, "expire" | "persist" | "copy_to") {
         return;
