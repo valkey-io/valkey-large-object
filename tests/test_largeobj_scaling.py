@@ -1008,9 +1008,10 @@ class TestTieredEvictionMixed(TieredBudget):
 class EvictionPolicyTests:
     """Run against both budgets: `volatile-*` evicts only keys with a TTL."""
 
-    def test_volatile_evicts_only_keys_with_a_ttl(self):
+    @pytest.mark.parametrize('policy', ['volatile-lru', 'volatile-random'])
+    def test_volatile_evicts_only_keys_with_a_ttl(self, policy):
         """With no TTL key left, a volatile policy refuses the write, as in core."""
-        client = self.new_client('volatile-lru')
+        client = self.new_client(policy)
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
         keys = list(payloads)
         persistent, volatile = keys[:self.PER_BUDGET // 2], keys[self.PER_BUDGET // 2:]
@@ -1054,6 +1055,20 @@ class EvictionPolicyTests:
         client.config_set('maxmemory-policy', 'volatile-lru')
         self.assert_refused(client, 'refused_2', b'R' * self.OBJ)
         assert self.evictions(client) == 1
+
+    @pytest.mark.parametrize('policy', ['allkeys-random', 'volatile-random'])
+    def test_random_evicts_just_enough_keys(self, policy):
+        """Room for one more object costs one victim, and any of the old keys may be it."""
+        client = self.new_client(policy)
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        if policy.startswith('volatile-'):
+            for key in payloads:
+                assert client.execute_command('EXPIRE', key, 1000) == 1
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        assert self.evictions(client) == 1
+        survivors = surviving(client, payloads)
+        assert len(survivors) == self.PER_BUDGET - 1
+        assert all(payloads[key] == value for key, value in survivors.items())
 
     def free_a_slot(self, client, key):
         """DEL `key` and wait until its object is freed, leaving room for exactly one write."""
