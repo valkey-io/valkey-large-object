@@ -119,7 +119,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
         match stat(oid) {
             Ok(Some(len)) => {
                 covered += len;
-                victims.push((oid, len, unevictable));
+                victims.push((unevictable, len));
             }
             // We collect our victim candidates via a readdir snapshot. Between the
             // readdir and the victim claim (adding the oid to the RECLAIM_LIST), the
@@ -134,7 +134,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
                     oid.file_path(&crate::nvme_dir())
                 ));
                 crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
-                ORPHANED_FILES.push(oid, 0, unevictable);
+                ORPHANED_FILES.push(unevictable, 0);
             }
         }
     }
@@ -159,19 +159,20 @@ fn victim_batch(n: usize) -> Vec<ObjectId> {
         .collect()
 }
 
-/// Unlink claimed `victims` (oid, size, guard) and remove them from the unevictable list,
+/// Unlink claimed `victims` and remove them from the unevictable list,
 /// except orphans, which stay in it until the retry. Returns the bytes freed, not counting
 /// orphans. Victims stay in the reclaim list: their keys read as missing until the cron
 /// deletes them, and their teardown then only removes them from it.
-fn evict(victims: Vec<(ObjectId, u64, Arc<super::UnevictableOid>)>) -> u64 {
+fn evict(victims: Vec<(Arc<super::UnevictableOid>, u64)>) -> u64 {
     let mut freed = 0;
-    for (oid, size, unevictable) in victims {
+    for (unevictable, size) in victims {
+        let oid = unevictable.oid();
         if let Some(pool) = super::FD_POOL.get() {
             pool.remove(oid);
         }
         super::get_dram_pool().remove_object(&oid);
         crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
-        if try_unlink(oid, size, unevictable, "eviction") {
+        if try_unlink(unevictable, size, "eviction") {
             freed += size;
         }
     }
@@ -184,7 +185,7 @@ fn evict(victims: Vec<(ObjectId, u64, Arc<super::UnevictableOid>)>) -> u64 {
 /// so no eviction takes them. The cron's retry unlinks them and credits their bytes.
 /// Size 0: an eviction could not stat the file, so the retry does first.
 pub struct OrphanedFiles {
-    files: Mutex<Vec<(ObjectId, u64, Arc<super::UnevictableOid>)>>,
+    files: Mutex<Vec<(Arc<super::UnevictableOid>, u64)>>,
     pub count: AtomicU64,
     pub bytes: AtomicU64,
     retrying: AtomicBool,
@@ -198,13 +199,13 @@ pub static ORPHANED_FILES: OrphanedFiles = OrphanedFiles {
 };
 
 impl OrphanedFiles {
-    fn push(&self, oid: ObjectId, size: u64, unevictable: Arc<super::UnevictableOid>) {
+    fn push(&self, unevictable: Arc<super::UnevictableOid>, size: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(size, Ordering::Relaxed);
         self.files
             .lock()
             .expect("ORPHANED_FILES lock unavailable")
-            .push((oid, size, unevictable));
+            .push((unevictable, size));
     }
 
     /// Scaling cron: retry the unlinks on tokio, one retry at a time.
@@ -215,7 +216,8 @@ impl OrphanedFiles {
         crate::runtime_handle().spawn(async {
             let files =
                 std::mem::take(&mut *self.files.lock().expect("ORPHANED_FILES lock unavailable"));
-            for (oid, mut size, unevictable) in files {
+            for (unevictable, mut size) in files {
+                let oid = unevictable.oid();
                 let sized = size > 0
                     || stat(oid).is_ok_and(|len| {
                         size = len.unwrap_or(0);
@@ -228,7 +230,7 @@ impl OrphanedFiles {
                     self.bytes.fetch_sub(size, Ordering::Relaxed);
                 } else {
                     let mut files = self.files.lock().expect("ORPHANED_FILES lock unavailable");
-                    files.push((oid, size, unevictable));
+                    files.push((unevictable, size));
                 }
             }
             self.retrying.store(false, Ordering::Release);
@@ -286,14 +288,10 @@ fn transient(e: &std::io::Error) -> bool {
     )
 }
 
-/// Unlink `oid`'s file of `size` charged bytes. True if it is gone: the caller credits
+/// Unlink the file of `size` charged bytes. True if it is gone: the caller credits
 /// them. False if it is orphaned: the bytes stay charged until the retry credits them.
-pub(crate) fn try_unlink(
-    oid: ObjectId,
-    size: u64,
-    unevictable: Arc<super::UnevictableOid>,
-    during: &str,
-) -> bool {
+pub(crate) fn try_unlink(unevictable: Arc<super::UnevictableOid>, size: u64, during: &str) -> bool {
+    let oid = unevictable.oid();
     let unlinked = if crate::test_fail_unlink() {
         Err(std::io::Error::from_raw_os_error(libc::EBUSY))
     } else {
@@ -306,7 +304,7 @@ pub(crate) fn try_unlink(
         "largeobj: failed to unlink object file {} during {during}, will retry: {e}",
         oid.file_path(&crate::nvme_dir())
     ));
-    ORPHANED_FILES.push(oid, size, unevictable);
+    ORPHANED_FILES.push(unevictable, size);
     false
 }
 

@@ -58,6 +58,10 @@ impl UnevictableOid {
         }
     }
 
+    pub fn oid(&self) -> ObjectId {
+        self.0
+    }
+
     fn insert(unevictable: &mut HashMap<ObjectId, Weak<Self>>, oid: ObjectId) -> Arc<Self> {
         let shared = Arc::new(Self(oid));
         unevictable.insert(oid, Arc::downgrade(&shared));
@@ -167,7 +171,7 @@ impl ObjectFile {
         match self.copy_file(&dst_path, new_oid, len, crc32c) {
             Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
             Err(e) => {
-                if super::nvme::try_unlink(new_oid, disk_len, copy, "copy") {
+                if super::nvme::try_unlink(copy, disk_len, "copy") {
                     super::nvme::decrease_nvme_disk_usage(disk_len);
                 }
                 valkey_module::logging::log_warning(format!(
@@ -224,7 +228,7 @@ impl Drop for ObjectFile {
             let claimed_by_eviction = super::reclaim::RECLAIM_LIST.remove(&object_id);
             if claimed_by_eviction {
                 // The eviction unlinks the file and credits its bytes.
-            } else if super::nvme::try_unlink(object_id, disk_len, unevictable, "teardown") {
+            } else if super::nvme::try_unlink(unevictable, disk_len, "teardown") {
                 // Release exactly what create added — no stat, so it can't drift.
                 crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
             }
