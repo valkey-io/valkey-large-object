@@ -54,7 +54,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
     def _wait_free_settled(self, client):
         """Wait for Valkey lazyfree to drain AND teardown to unlink the file."""
         wait_for_equal(
-            lambda: client.info("stats").get("lazyfree_pending_objects", 0), 0
+            lambda: client.info("memory").get("lazyfree_pending_objects", 0), 0
         )
 
     def test_get_after_set_roundtrip(self):
@@ -96,7 +96,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client.execute_command('BLOB.TCP_SET', 'promo_key', payload)
 
         # Freshly SET: on NVMe only, nothing cached yet.
-        assert client.execute_command('BLOB.INFO', 'promo_key', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'promo_key', 'TIER') == b'disk'
 
         # First GET: DRAMPool miss -> NVMe read -> promote to DRAMPool.
         result1 = client.execute_command('BLOB.TCP_GET', 'promo_key')
@@ -116,7 +116,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         dat_files_before = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_before) >= 1
         client.execute_command('DEL', 'del_key')
-        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
         dat_files_after = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_after) < len(dat_files_before)
 
@@ -143,19 +143,19 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert src_digest != dst_digest
         # Deleting source does not affect the copy
         client.execute_command('DEL', 'srckey')
-        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
         assert client.execute_command('BLOB.TCP_GET', 'dstkey') == payload
         # Deleting copy does not affect the source
         client.execute_command('BLOB.TCP_SET', 'srckey2', payload)
         client.execute_command('COPY', 'srckey2', 'dstkey2')
         client.execute_command('DEL', 'dstkey2')
-        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
         assert client.execute_command('BLOB.TCP_GET', 'srckey2') == payload
         #  The copy starts un-promoted even if the source is cached
         client.execute_command('BLOB.TCP_GET', 'srckey2')  # promote source
         assert client.execute_command('BLOB.INFO', 'srckey2', 'TIER') == b'dram'
         client.execute_command('COPY', 'srckey2', 'dstkey3')
-        assert client.execute_command('BLOB.INFO', 'dstkey3', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'dstkey3', 'TIER') == b'disk'
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 
@@ -212,7 +212,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
             client.execute_command('BLOB.TCP_SET', 'nvme_cap_3', payload)
             assert False, "Expected capacity exceeded error from disk-maxmemory"
         except ResponseError as e:
-            assert 'nvme disk capacity exceeded' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'used disk space' in str(e).lower(), f"Unexpected error: {e}"
 
     # ─── DEL semantics ────────────────────────────────────────────────────
 
@@ -336,7 +336,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         except ResponseError as e:
             err = str(e).lower()
             assert 'max object size' in err, f"Unexpected error: {e}"
-            assert 'nvme' not in err, f"Should not hit NVMe error: {e}"
+            assert 'used disk space' not in err, f"Should not hit disk OOM error: {e}"
         # Rejected SET must not leave a .dat file or phantom key.
         assert self._dat_count() == 0
         assert client.execute_command('DBSIZE') == 0
@@ -427,7 +427,7 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         # The paused SET's set_finalize sees no existing key (DEL removed v1)
         # and commits payload2 as a fresh key.
         wait_for_equal(
-            lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0
+            lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0
         )
         assert client.execute_command('BLOB.TCP_GET', 'delset_key') == payload2
 
@@ -464,7 +464,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
         for _ in range(5):
             result = client.execute_command('BLOB.TCP_GET', 'repeat_key')
             assert result == payload
-            assert client.execute_command('BLOB.INFO', 'repeat_key', 'TIER') == b'nvme'
+            assert client.execute_command('BLOB.INFO', 'repeat_key', 'TIER') == b'disk'
 
     def test_reject_invalid_buffer_configs(self):
         """CONFIG SET rejects min-buffers-per-op > max-buffers-per-op and
@@ -540,7 +540,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
     def _wait_free_settled(self, client):
         """Wait for Valkey lazyfree to drain AND teardown to unlink the file."""
         wait_for_equal(
-            lambda: client.info("stats").get("lazyfree_pending_objects", 0), 0
+            lambda: client.info("memory").get("lazyfree_pending_objects", 0), 0
         )
 
     def _set_ok(self, client, key, payload):
@@ -563,12 +563,12 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
                 assert client.execute_command("BLOB.TCP_SET", key, payload) == b"OK"
                 return
             except ResponseError as e:
-                if "pool exhausted" not in str(e).lower():
+                if "used disk space" not in str(e).lower():
                     raise
                 last = e
                 time.sleep(delay)
         assert False, (
-            f"SET '{key}' still pool-exhausted after {tries} tries "
+            f"SET '{key}' still OOM-disk after {tries} tries "
             f"({tries * delay:.1f}s) -- capacity not reclaimed on overwrite (leak): {last}"
         )
 
@@ -578,7 +578,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
             assert False, f"Expected '{key}' SET to be rejected (capacity exceeded)"
         except ResponseError as e:
             err = str(e).lower()
-            assert "pool exhausted" in err or "capacity exceeded" in err, \
+            assert "used disk space" in err, \
                 f"Unexpected error: {e}"
 
 
@@ -869,7 +869,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
 
         # GET 1: rejected by admission, served transiently.
         assert client.execute_command('BLOB.TCP_GET', 'basic_key') == payload
-        assert client.execute_command('BLOB.INFO', 'basic_key', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'basic_key', 'TIER') == b'disk'
         after1 = dram()
         assert after1['largeobj_cache_misses'] == 1
         assert after1['largeobj_cache_admission_rejects'] == 1
@@ -922,7 +922,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         client.execute_command('BLOB.TCP_SET', 'three_key', payload)
         for _ in range(2):
             assert client.execute_command('BLOB.TCP_GET', 'three_key') == payload
-            assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'nvme'
+            assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'disk'
         assert client.execute_command('BLOB.TCP_GET', 'three_key') == payload
         assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'dram'
 
@@ -935,7 +935,7 @@ class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
     segment of headroom, see _block_expansion), so a promotion into a full pool
     must reclaim. promote-min-hits 1 so every GET
     promotes; decay off so scores are stable across a minute boundary. The
-    default reclaim-sample-size (5) exceeds the 3-entry map, so victim selection
+    default victim-sample-size (5) exceeds the 3-entry map, so victim selection
     scans every entry and is exact. 256 KiB objects: three fill 768 KiB; a
     fourth needs the remaining 256 KiB exactly, which any allocator overhead
     denies."""
@@ -951,7 +951,7 @@ class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" max-promote-size 262144"
             f" promote-min-hits 1"
-            f" tiered-decay-time 0"
+            f" blob-decay-time 0"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
@@ -999,10 +999,10 @@ class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.INFO', hot, 'TIER') == b'dram'
         assert client.execute_command('BLOB.INFO', 'ev_new', 'TIER') == b'dram'
         tiers = [client.execute_command('BLOB.INFO', k, 'TIER') for k in self.KEYS[1:]]
-        assert tiers.count(b'nvme') == 1, tiers
+        assert tiers.count(b'disk') == 1, tiers
 
         # The reclaimed copy is still on NVMe and reads back intact.
-        reclaimed = self.KEYS[1:][tiers.index(b'nvme')]
+        reclaimed = self.KEYS[1:][tiers.index(b'disk')]
         idx = self.KEYS.index(reclaimed)
         assert client.execute_command('BLOB.TCP_GET', reclaimed) == bytes([65 + idx]) * self.OBJ
 
@@ -1013,7 +1013,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
     expands once for the fourth. Segment 1 then gets the coldest objects, so a
     reclaim that looked across the whole pool would take one of those. The
     target is segment 0 (768 KiB vs 832 KiB) and its 3 entries are fewer than
-    the default reclaim-sample-size (5), so the victim choice there is exact.
+    the default victim-sample-size (5), so the victim choice there is exact.
     The expand watermark is raised so the scaling cron never adds a third
     segment (2 MiB, at most 78% full)."""
 
@@ -1028,7 +1028,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" max-promote-size 262144"
             f" promote-min-hits 1"
-            f" tiered-decay-time 0"
+            f" blob-decay-time 0"
             f" scaling-expand-watermark 95"
             f" chunk-size 65536"
             f" bench-mode no"
@@ -1074,7 +1074,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_dram_objects'] == 7
         assert info['largeobj_dram_segments'] == 2
         assert info['largeobj_dram_scaling_expands'] == 1
-        assert client.execute_command('BLOB.INFO', 'C', 'TIER') == b'nvme'
+        assert client.execute_command('BLOB.INFO', 'C', 'TIER') == b'disk'
         for k in ('A', 'B', 'D', 'E', 'H', 'F'):
             assert client.execute_command('BLOB.INFO', k, 'TIER') == b'dram', k
         # The reclaimed copy still reads back from NVMe.
@@ -1084,7 +1084,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
 class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
     """max-cached-fds 2 with promotion effectively off (promote-min-hits 255), so
     every GET reads through the fd pool. Decay off so scores are stable across
-    a minute boundary. The default reclaim-sample-size (5) exceeds the 2-entry
+    a minute boundary. The default victim-sample-size (5) exceeds the 2-entry
     map, so victim selection scans both entries and is exact."""
 
     OBJ = 64 * 1024
@@ -1098,7 +1098,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" max-promote-size 983040"
             f" promote-min-hits 255"
-            f" tiered-decay-time 0"
+            f" blob-decay-time 0"
             f" max-cached-fds 2"
             f" chunk-size 65536"
             f" bench-mode no"
@@ -1123,7 +1123,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
 
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_reclaims'] == 3
+        assert info['largeobj_fd_evictions'] == 3
         # Nothing was promoted, so these were all NVMe reads.
         dram = client.info('largeobj_dram')
         assert dram['largeobj_dram_objects'] == 0
@@ -1133,7 +1133,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('BLOB.TCP_GET', k) == self._payload(i)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        reclaims = info['largeobj_fd_reclaims']
+        evictions = info['largeobj_fd_evictions']
 
         # DEL drops the pool's fd through ObjectFile::Drop, so the next open
         # takes the free slot instead of reclaiming. KEYS[4] was read last, so
@@ -1144,7 +1144,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_reclaims'] == reclaims
+        assert info['largeobj_fd_evictions'] == evictions
 
     def test_reclaims_coldest_keeps_hot(self):
         """A full pool reclaims the lowest-scoring fd. KEYS[0] is read three
@@ -1161,18 +1161,18 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[1]) == self._payload(1)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_reclaims'] == 0
+        assert info['largeobj_fd_evictions'] == 0
 
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_reclaims'] == 1
+        assert info['largeobj_fd_evictions'] == 1
 
         # KEYS[0] survived, so reading it again needs no open and no reclaim.
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 2
-        assert info['largeobj_fd_reclaims'] == 1
+        assert info['largeobj_fd_evictions'] == 1
 
     def test_lower_cap_at_runtime(self):
         """CONFIG SET to a smaller cap takes effect on the next open."""
@@ -1187,4 +1187,4 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 1
-        assert info['largeobj_fd_reclaims'] == 2
+        assert info['largeobj_fd_evictions'] == 2

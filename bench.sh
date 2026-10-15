@@ -23,7 +23,7 @@ set -e
 # ─── Defaults ─────────────────────────────────────────────────────────────────
 
 PORT=""
-NVME_DIR=""
+DISK_DIR=""
 RUN_FIO=0
 CLIENTS=200
 DURATION=10
@@ -45,7 +45,7 @@ SIZES_STR="4KB 1MB 50MB"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)          PORT="$2"; shift 2 ;;
-        --disk-dir)      NVME_DIR="$2"; shift 2 ;;
+        --disk-dir)      DISK_DIR="$2"; shift 2 ;;
         --modes)         MODES_STR="$2"; shift 2 ;;
         --sizes)         SIZES_STR="$2"; shift 2 ;;
         --clients)       CLIENTS="$2"; shift 2 ;;
@@ -60,7 +60,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --port <PORT>              Valkey server port (required)"
-            echo "  --disk-dir <DIR>           NVMe directory (required for Tiered/NVMe modes)"
+            echo "  --disk-dir <DIR>           Object file directory (required for Tiered/NVMe modes)"
             echo "  --modes <\"fio Dram ...\"> Modes to run (default: Dram; with disk-dir: fio Dram Tiered NVMe)"
             echo "  --sizes <\"4KB 1MB ...\">   Object sizes (default: \"4KB 1MB 50MB\")"
             echo "  --clients <N>              Benchmark clients (default: 200)"
@@ -68,7 +68,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --keys <N>                 Number of keys to populate (default: 500)"
             echo "  --maxmemory <BYTES>        Server maxmemory; DRAM pool scales toward it (default: 34359738368 = 32GB)"
             echo "  --segment-size <BYTES>     Segment size in bytes (default: 67108864 = 64MB)"
-            echo "  --disk-maxmemory <BYTES>   NVMe budget in bytes (default: 107374182400 = 100GB)"
+            echo "  --disk-maxmemory <BYTES>   Disk budget in bytes (default: 107374182400 = 100GB)"
             echo "  --worker-threads <N>       Tokio threads (default: 2)"
             echo ""
             echo "Modes:"
@@ -94,7 +94,7 @@ fi
 
 # Auto-detect modes if not specified
 if [ -z "$MODES_STR" ]; then
-    if [ -n "$NVME_DIR" ]; then
+    if [ -n "$DISK_DIR" ]; then
         MODES_STR="fio Dram Tiered NVMe"
     else
         MODES_STR="Dram"
@@ -112,7 +112,7 @@ done
 # Validate: Tiered/NVMe modes need disk-dir
 for m in $MODES_STR; do
     if [ "$m" = "Tiered" ] || [ "$m" = "NVMe" ]; then
-        if [ -z "$NVME_DIR" ]; then
+        if [ -z "$DISK_DIR" ]; then
             echo "ERROR: --disk-dir is required for $m mode"
             exit 1
         fi
@@ -122,12 +122,12 @@ done
 MODULE_SO="${MODULE_SO:-$(dirname "$0")/target/release/libvalkey_large_object.so}"
 
 # Verify disk-dir is NOT on the root disk (common mistake: /data falls through to /)
-if [ -n "$NVME_DIR" ]; then
-    mkdir -p "$NVME_DIR"
-    NVME_DEV=$(df "$NVME_DIR" 2>/dev/null | tail -1 | awk '{print $1}')
+if [ -n "$DISK_DIR" ]; then
+    mkdir -p "$DISK_DIR"
+    NVME_DEV=$(df "$DISK_DIR" 2>/dev/null | tail -1 | awk '{print $1}')
     ROOT_DEV=$(df / 2>/dev/null | tail -1 | awk '{print $1}')
     if [ "$NVME_DEV" = "$ROOT_DEV" ]; then
-        echo "WARNING: --disk-dir ($NVME_DIR) is on the ROOT disk ($ROOT_DEV)!"
+        echo "WARNING: --disk-dir ($DISK_DIR) is on the ROOT disk ($ROOT_DEV)!"
         echo "         NVMe benchmark results will be wrong. Use a path on the NVMe stripe."
         echo "         Example: --disk-dir /mnt/bigobj-data/bench-test"
         echo ""
@@ -136,7 +136,7 @@ if [ -n "$NVME_DIR" ]; then
             exit 1
         fi
     else
-        echo "NVMe device:    $NVME_DEV ($(df -h "$NVME_DIR" | tail -1 | awk '{print $2}'))"
+        echo "NVMe device:    $NVME_DEV ($(df -h "$DISK_DIR" | tail -1 | awk '{print $2}'))"
     fi
 fi
 VALKEY_SERVER="${VALKEY_SERVER:-valkey-server}"
@@ -188,22 +188,22 @@ print_scaling() {
     local label="$1"
     local info
     info=$($VALKEY_CLI -p $PORT INFO largeobj 2>/dev/null | tr -d '\r')
-    local live nvme_live util expands shrinks dram_uring nvme_uring efa
+    local live nvme_live util expands shrinks dram_uring nvme_uring rdma
     live=$(echo       "$info" | grep -E "dram_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
-    nvme_live=$(echo  "$info" | grep -E "nvme_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
+    nvme_live=$(echo  "$info" | grep -E "disk_staging_segments"           | awk -F: '{print $2}' | tr -d '[:space:]')
     util=$(echo       "$info" | grep -E "utilization_pct"                 | awk -F: '{print $2}' | tr -d '[:space:]')
     expands=$(echo    "$info" | grep -E "scaling_expands"            | awk -F: '{print $2}' | tr -d '[:space:]')
     shrinks=$(echo    "$info" | grep -E "scaling_shrinks"            | awk -F: '{print $2}' | tr -d '[:space:]')
     dram_uring=$(echo "$info" | grep -E "dram_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
-    nvme_uring=$(echo "$info" | grep -E "nvme_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
-    efa=$(echo        "$info" | grep -E "efa_registered_segments"         | awk -F: '{print $2}' | tr -d '[:space:]')
+    nvme_uring=$(echo "$info" | grep -E "disk_staging_uring_registered_segments" | awk -F: '{print $2}' | tr -d '[:space:]')
+    rdma=$(echo       "$info" | grep -E "rdma_registered_segments"         | awk -F: '{print $2}' | tr -d '[:space:]')
     local total_live=$(( ${live:-0} + ${nvme_live:-0} ))
     echo "     [scaling: $label] dram_live=${live:-?} nvme_live=${nvme_live:-0} total_live=${total_live} util_pct=${util:-?} expand=${expands:-?} shrink=${shrinks:-?}"
     # io_uring registration coverage, per pool: each should equal that pool's live
     # count once the post-expand re-register has completed. Dram mode shows dram=0 (no
-    # io_uring engine). EFA is fabric-global (one MR per segment, not per-pool), so
+    # io_uring engine). RDMA is fabric-global (one MR per segment, not per-pool), so
     # it is reported once against total_live.
-    echo "     [registered: $label] io_uring dram=${dram_uring:-0}/${live:-?} nvme=${nvme_uring:-0}/${nvme_live:-0}  efa=${efa:-?}/${total_live}"
+    echo "     [registered: $label] io_uring dram=${dram_uring:-0}/${live:-?} nvme=${nvme_uring:-0}/${nvme_live:-0}  rdma=${rdma:-?}/${total_live}"
 }
 
 # Run one BLOB.TCP_GET benchmark pass and print throughput + latency. Arg: label.
@@ -233,7 +233,7 @@ echo "Clients:        $CLIENTS"
 echo "Duration:       ${DURATION}s"
 echo "Keys:           $NUM_KEYS"
 echo "Module:         $MODULE_SO"
-[ -n "$NVME_DIR" ] && echo "NVMe dir:       $NVME_DIR"
+[ -n "$DISK_DIR" ] && echo "Disk dir:       $DISK_DIR"
 echo "Server maxmem:  $MAXMEMORY ($((MAXMEMORY / 1048576))MB) — DRAM pool scales toward this"
 echo "Segment size:   $SEGMENT_SIZE ($((SEGMENT_SIZE / 1048576))MB)"
 echo "Worker threads: $WORKER_THREADS"
@@ -245,17 +245,17 @@ echo ""
 
 # ─── fio baseline ─────────────────────────────────────────────────────────────
 
-if [ $RUN_FIO -eq 1 ] && [ -n "$NVME_DIR" ]; then
+if [ $RUN_FIO -eq 1 ] && [ -n "$DISK_DIR" ]; then
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "  Mode: fio baseline (O_DIRECT random read, io_uring)"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     # Detect block device for disk read assertion
-    FIO_BLOCK_DEV=$(basename "$(readlink -f "$(df "$NVME_DIR" | tail -1 | awk '{print $1}')")" 2>/dev/null)
+    FIO_BLOCK_DEV=$(basename "$(readlink -f "$(df "$DISK_DIR" | tail -1 | awk '{print $1}')")" 2>/dev/null)
     FIO_STAT_FILE="/sys/block/${FIO_BLOCK_DEV}/stat"
 
-    FIO_FILE="$NVME_DIR/fio_testfile"
+    FIO_FILE="$DISK_DIR/fio_testfile"
     for i in "${!SIZES_LABEL[@]}"; do
         LABEL="${SIZES_LABEL[$i]}"
         BYTES="${SIZES_BYTES[$i]}"
@@ -287,8 +287,8 @@ if [ $RUN_FIO -eq 1 ] && [ -n "$NVME_DIR" ]; then
             FIO_READS_DELTA=$(( FIO_READS_AFTER - FIO_READS_BEFORE ))
             echo "  Disk reads: $FIO_READS_DELTA"
             if [ $FIO_READS_DELTA -eq 0 ]; then
-                echo "  FATAL: fio produced zero disk reads — disk-dir ($NVME_DIR) is likely on the wrong device."
-                echo "         Verify with: df $NVME_DIR"
+                echo "  FATAL: fio produced zero disk reads — disk-dir ($DISK_DIR) is likely on the wrong device."
+                echo "         Verify with: df $DISK_DIR"
                 rm -f "$FIO_FILE"
                 exit 1
             fi
@@ -364,7 +364,7 @@ for BENCH_MODE in $MODES_STR; do
                 ;;
             Tiered)
                 MODULE_ARGS="operating-mode Tiered"
-                MODULE_ARGS="$MODULE_ARGS disk-dir $NVME_DIR"
+                MODULE_ARGS="$MODULE_ARGS disk-dir $DISK_DIR"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS disk-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS disk-staging-size $STAGING_NEEDED"
@@ -373,7 +373,7 @@ for BENCH_MODE in $MODES_STR; do
                 ;;
             NVMe)
                 MODULE_ARGS="operating-mode Tiered"
-                MODULE_ARGS="$MODULE_ARGS disk-dir $NVME_DIR"
+                MODULE_ARGS="$MODULE_ARGS disk-dir $DISK_DIR"
                 MODULE_ARGS="$MODULE_ARGS segment-size $SEGMENT_SIZE"
                 MODULE_ARGS="$MODULE_ARGS disk-maxmemory $NVME_MAXMEMORY"
                 MODULE_ARGS="$MODULE_ARGS disk-staging-size $STAGING_NEEDED"
@@ -388,8 +388,8 @@ for BENCH_MODE in $MODES_STR; do
 
         # Clean disk-dir for Tiered/NVMe modes
         if [ "$BENCH_MODE" = "Tiered" ] || [ "$BENCH_MODE" = "NVMe" ]; then
-            mkdir -p "$NVME_DIR"
-            find "$NVME_DIR" -name "*.dat" -delete 2>/dev/null || true
+            mkdir -p "$DISK_DIR"
+            find "$DISK_DIR" -name "*.dat" -delete 2>/dev/null || true
         fi
 
         # Kill any stale server on this port from a previous run
@@ -497,19 +497,19 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
 
         # Detect the block device for the disk-read assertion (e.g. dm-0 for LVM).
         DISK_READS_BEFORE=""
-        if [ -n "$NVME_DIR" ] && [ "$BENCH_MODE" != "Dram" ]; then
-            BLOCK_DEV=$(df "$NVME_DIR" 2>/dev/null | tail -1 | awk '{print $1}' | sed 's|/dev/||; s|/|-|g')
+        if [ -n "$DISK_DIR" ] && [ "$BENCH_MODE" != "Dram" ]; then
+            BLOCK_DEV=$(df "$DISK_DIR" 2>/dev/null | tail -1 | awk '{print $1}' | sed 's|/dev/||; s|/|-|g')
             STAT_FILE="/sys/block/${BLOCK_DEV}/stat"
             if [ ! -f "$STAT_FILE" ]; then
                 # LVM: /dev/mapper/vg-lv -> dm-X
-                BLOCK_DEV=$(basename "$(readlink -f "$(df "$NVME_DIR" | tail -1 | awk '{print $1}')")" 2>/dev/null)
+                BLOCK_DEV=$(basename "$(readlink -f "$(df "$DISK_DIR" | tail -1 | awk '{print $1}')")" 2>/dev/null)
                 STAT_FILE="/sys/block/${BLOCK_DEV}/stat"
             fi
             if [ -f "$STAT_FILE" ]; then
                 DISK_READS_BEFORE=$(awk '{print $1}' "$STAT_FILE")
             else
-                echo "  FATAL: Cannot find block device stat file for $NVME_DIR (tried $STAT_FILE)."
-                echo "         Cannot verify NVMe I/O. Check mount point with: df $NVME_DIR"
+                echo "  FATAL: Cannot find block device stat file for $DISK_DIR (tried $STAT_FILE)."
+                echo "         Cannot verify NVMe I/O. Check mount point with: df $DISK_DIR"
                 $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
                 exit 1
             fi

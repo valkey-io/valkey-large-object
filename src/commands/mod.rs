@@ -24,7 +24,7 @@ const MAX_EFA_ADDRESSES: usize = 256;
 
 /// The RDMA session the client previously established with BLOB.RDMA_HELLO.
 fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
-    session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))
+    session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_RDMA_SESSION))
 }
 
 /// Parse the client's memory addresses from `args[start_idx..]`, which must be
@@ -37,11 +37,11 @@ fn parse_efa_addresses(
 ) -> Result<Vec<ClientEFAAddress>, ValkeyError> {
     let tail = &args[start_idx..];
     if tail.is_empty() || !tail.len().is_multiple_of(3) {
-        return Err(ValkeyError::Str(errors::ERR_MALFORMED_ADDR_ARGS));
+        return Err(ValkeyError::Str(errors::ERR_MALFORMED_MEMORY_ADDR_ARGS));
     }
     let n_addrs = tail.len() / 3;
     if n_addrs > MAX_EFA_ADDRESSES {
-        return Err(ValkeyError::Str(errors::ERR_TOO_MANY_ADDRESSES));
+        return Err(ValkeyError::Str(errors::ERR_TOO_MANY_MEMORY_ADDRESSES));
     }
     let mut addrs = Vec::with_capacity(n_addrs);
     let mut total_addr_len: u64 = 0;
@@ -54,20 +54,23 @@ fn parse_efa_addresses(
         let addr: u64 = tail[base + 1]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR))?;
         let len: u64 = tail[base + 2]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_ADDR_LEN))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR_LEN))?;
         // A zero-length address can never absorb bytes
         if 0 == len {
-            return Err(ValkeyError::Str(errors::ERR_INVALID_ADDR_LEN));
+            return Err(ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR_LEN));
         }
         addrs.push((addr, len as usize, rkey));
         total_addr_len = total_addr_len.saturating_add(len);
     }
     if total_addr_len < required_len {
-        return Err(ValkeyError::Str(errors::ERR_INSUFFICIENT_ADDR_SPACE));
+        return Err(ValkeyError::String(format!(
+            "ERR client memory address length {} smaller than object length {}",
+            total_addr_len, required_len
+        )));
     }
     Ok(addrs)
 }
@@ -85,18 +88,18 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let Some(fabric) = transport::fabric() else {
-        return Err(ValkeyError::Str(errors::ERR_EFA_UNAVAILABLE));
+        return Err(ValkeyError::Str(errors::ERR_RDMA_UNAVAILABLE));
     };
 
-    let peer_address = decode_hex(args[1].as_slice())
-        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_PEER_ADDR_HEX))?;
+    let rdma_address = decode_hex(args[1].as_slice())
+        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RDMA_ADDR_HEX))?;
     // An EFA address is exactly 32 bytes; a tcp one is a sockaddr, opaque beyond being non-empty.
     match crate::fabric_provider() {
-        FabricProvider::EfaDirect if peer_address.len() != 32 => {
-            return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_LEN));
+        FabricProvider::EfaDirect if rdma_address.len() != 32 => {
+            return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_LEN));
         }
-        FabricProvider::Emulated if peer_address.is_empty() => {
-            return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_EMPTY));
+        FabricProvider::Emulated if rdma_address.is_empty() => {
+            return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_EMPTY));
         }
         FabricProvider::EfaDirect | FabricProvider::Emulated => {}
     }
@@ -106,12 +109,12 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // inserting the new one; when the client's old endpoint has died and the new one reuses its
     // QPN, efa-direct cannot represent both (vdma/.claude/open_issue.md). Reconnect instead.
     if session::lookup(client_id).is_some() {
-        return Err(ValkeyError::Str(errors::ERR_DMA_SESSION_EXISTS));
+        return Err(ValkeyError::Str(errors::ERR_RDMA_SESSION_EXISTS));
     }
     fabric
-        .add_peer(client_id, &peer_address)
-        .map_err(|e| ValkeyError::String(format!("{}: {}", errors::ERR_SESSION_CREATE, e)))?;
-    session::insert(client_id, Session::new(client_id, peer_address));
+        .add_peer(client_id, &rdma_address)
+        .map_err(|_| ValkeyError::Str(errors::ERR_SESSION_CREATE))?;
+    session::insert(client_id, Session::new(client_id, rdma_address));
 
     let reply: Vec<ValkeyValue> = fabric
         .local_addresses()
@@ -195,13 +198,11 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::WrongArity);
     }
     // Reject a key of another type before any transfer, matching valkey-bloom.
-    if ctx
+    let old_oid = ctx
         .open_key(&args[1])
         .get_value::<LoValue>(&LO_TYPE)
-        .is_err()
-    {
-        return Err(ValkeyError::WrongType);
-    }
+        .map_err(|_| ValkeyError::WrongType)?
+        .map(|v| v.object_id);
     // TCP path: data.len() IS the authoritative length. No user-provided len needed.
     let data = args[2].as_slice().to_vec();
     let obj_len = data.len() as u64;
@@ -217,7 +218,7 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set(ctx, &args[1], obj_len, DataSource::Tcp(data)) {
+    match engine::execute_set(ctx, &args[1], obj_len, DataSource::Tcp(data), old_oid) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }
@@ -235,13 +236,11 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::WrongArity);
     }
     // Reject a key of another type before any transfer, matching valkey-bloom.
-    if ctx
+    let old_oid = ctx
         .open_key(&args[1])
         .get_value::<LoValue>(&LO_TYPE)
-        .is_err()
-    {
-        return Err(ValkeyError::WrongType);
-    }
+        .map_err(|_| ValkeyError::WrongType)?
+        .map(|v| v.object_id);
     // total_len is required — server needs to know how many bytes to fi_read
     // from the client.
     let obj_len: u64 = args[2]
@@ -263,7 +262,7 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let session = efa_session(ctx)?;
     let data_source = DataSource::Efa { session, addrs };
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set(ctx, &args[1], obj_len, data_source) {
+    match engine::execute_set(ctx, &args[1], obj_len, data_source, old_oid) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }
@@ -286,7 +285,7 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         .map_err(|_| ValkeyError::WrongType)?
     {
         Some(v) if !v.reclaim_in_progress() => v,
-        _ => return Err(ValkeyError::Str(errors::ERR_NOT_FOUND)),
+        _ => return Ok(ValkeyValue::Null),
     };
 
     let len = ValkeyValue::Integer(value.len as i64);
@@ -329,6 +328,7 @@ mod tests {
         match parse_efa_addresses(&vs, 0, required_len) {
             Ok(addrs) => panic!("expected rejection, parsed {addrs:?}"),
             Err(ValkeyError::Str(message)) => message.to_string(),
+            Err(ValkeyError::String(message)) => message,
             Err(ValkeyError::WrongArity) => "WrongArity".to_string(),
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
@@ -381,12 +381,12 @@ mod tests {
         // Shortfall is rejected.
         assert_eq!(
             reject(&["7", "64", "4095"], 4096),
-            errors::ERR_INSUFFICIENT_ADDR_SPACE
+            "ERR client memory address length 4095 smaller than object length 4096"
         );
         // Summed across addresses, still one byte short.
         assert_eq!(
             reject(&["7", "64", "2048", "8", "9000", "2047"], 4096),
-            errors::ERR_INSUFFICIENT_ADDR_SPACE
+            "ERR client memory address length 4095 smaller than object length 4096"
         );
     }
 
@@ -394,14 +394,17 @@ mod tests {
     fn incomplete_triples_are_rejected() {
         assert_eq!(
             reject(&[] as &[&str], 4096),
-            errors::ERR_MALFORMED_ADDR_ARGS
+            errors::ERR_MALFORMED_MEMORY_ADDR_ARGS
         );
-        assert_eq!(reject(&["7"], 4096), errors::ERR_MALFORMED_ADDR_ARGS);
-        assert_eq!(reject(&["7", "64"], 4096), errors::ERR_MALFORMED_ADDR_ARGS);
+        assert_eq!(reject(&["7"], 4096), errors::ERR_MALFORMED_MEMORY_ADDR_ARGS);
+        assert_eq!(
+            reject(&["7", "64"], 4096),
+            errors::ERR_MALFORMED_MEMORY_ADDR_ARGS
+        );
         // One complete triple + one leftover.
         assert_eq!(
             reject(&["7", "64", "4096", "extra"], 4096),
-            errors::ERR_MALFORMED_ADDR_ARGS
+            errors::ERR_MALFORMED_MEMORY_ADDR_ARGS
         );
     }
 
@@ -411,7 +414,7 @@ mod tests {
             .flat_map(|i| ["7".to_string(), (i * 4096).to_string(), "4096".to_string()])
             .collect();
         let refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
-        assert_eq!(reject(&refs, 4096), errors::ERR_TOO_MANY_ADDRESSES);
+        assert_eq!(reject(&refs, 4096), errors::ERR_TOO_MANY_MEMORY_ADDRESSES);
     }
 
     #[test]
@@ -422,15 +425,15 @@ mod tests {
         );
         assert_eq!(
             reject(&["7", "notanaddr", "4096"], 4096),
-            errors::ERR_INVALID_REMOTE_ADDR
+            errors::ERR_INVALID_MEMORY_ADDR
         );
         assert_eq!(
             reject(&["7", "64", "notalen"], 4096),
-            errors::ERR_INVALID_ADDR_LEN
+            errors::ERR_INVALID_MEMORY_ADDR_LEN
         );
         assert_eq!(
             reject(&["7", "64", "0"], 4096),
-            errors::ERR_INVALID_ADDR_LEN
+            errors::ERR_INVALID_MEMORY_ADDR_LEN
         );
     }
 }

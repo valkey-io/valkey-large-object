@@ -7,7 +7,7 @@ A Valkey module for storing large objects (KV cache tensors, embeddings, blobs) 
 Two operating modes:
 
 - **Dram** (default) — All objects live in a DRAMPool backed by pre-allocated segments with a talc arena allocator. Fastest reads. No NVMe.
-- **Tiered** — Objects persist on NVMe files. DRAMPool acts as a read cache: objects are promoted on repeat access (`promote-min-hits`) and cold copies are reclaimed by an LFU score when the pool is full. io_uring ReadFixed/WriteFixed with O_DIRECT for zero-copy NVMe I/O.
+- **Tiered** — Objects persist on NVMe files. DRAMPool acts as a read cache: objects are promoted on repeat access (`promote-min-hits`) and cold copies are dropped by LFU score when the pool is full. io_uring ReadFixed/WriteFixed with O_DIRECT for zero-copy NVMe I/O.
 
 Storage is organized as segments (contiguous memory regions) managed by pool allocators:
 - **DRAMPool** — Long-lived object cache. Segment memory registered with both io_uring and EFA.
@@ -56,6 +56,19 @@ valkey-server --port 7380 \
         disk-staging-size 64mb
 ```
 
+## Naming conventions
+
+The codebase uses implementation-specific names internally and hardware-neutral names on all client-facing surfaces (error messages, INFO fields, config parameters, command names).
+
+| Internal (code) | Client-facing | Notes |
+|---|---|---|
+| **EFA** (Elastic Fabric Adapter) | **RDMA** | Commands use `BLOB.RDMA_*`. Error strings say "rdma address". Code uses EFA in type/function names and comments. |
+| **NVMe** | **disk** | Config uses `disk-dir`, `disk-maxmemory`. Code uses NVMe in module names (`nvme.rs`) and internal functions. |
+| **NVMe staging pool** | **disk_staging** | INFO fields prefixed `disk_staging_*`, config `disk-staging-size`. Refers to the DRAM buffers used for disk I/O, not the disk itself. |
+| **address** (unqualified) | **rdma address** or **memory address** | "rdma address" = the client's RDMA fabric endpoint (from `BLOB.RDMA_HELLO`). "memory address" = a client-side buffer described by an `(rkey, addr, len)` triple. Never use bare "address" in client-facing strings. |
+
+When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and server log messages. Any string returned to a client must use the client-facing term.
+
 ## Configuration
 
 | Parameter | Default | Mutable | Description |
@@ -73,11 +86,11 @@ valkey-server --port 7380 \
 | `scaling-poll-ms` | 2500 | Yes | Scaling cron poll interval in milliseconds. Min 1000, max 60000. |
 | `scaling-expand-watermark` | 80 | Yes | Percent utilization to trigger proactive segment expansion. Min 50, max 95. |
 | `scaling-shrink-watermark` | 90 | Yes | Percent used_memory/maxmemory to trigger DRAM segment eviction. Min 50, max 95. |
-| `reclaim-poll-ms` | 100 | Yes | Reclaim cron poll interval in milliseconds. Min 10, max 60000. |
-| `reclaim-scan-budget-us` | 1000 | Yes | Microseconds per tick for reclaim-list key deletion. Min 100, max 100000. |
-| `reclaim-sample-size` | 5 | Yes | Tiered: cached entries sampled per reclaim; the lowest LFU score goes. Min 1, max 64. |
+| `reaper-poll-ms` | 100 | Yes | Scaling cron poll interval in milliseconds while evicted keys wait to be deleted. Min 10, max 60000. |
+| `reaper-scan-budget-us` | 1000 | Yes | Microseconds per tick for deleting evicted keys. Min 100, max 100000. |
+| `victim-sample-size` | 5 | Yes | Entries sampled per victim search (eviction, DRAM cache drop, fd close); the lowest LFU score goes. Min 1, max 64. |
 | `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Min 1, max 255. |
-| `tiered-decay-time` | 1 | Yes | Tiered: minutes per one-point decay of the LFU score used for DRAM and fd reclaim. 0 = no decay. Max 65535. |
+| `blob-decay-time` | 1 | Yes | Minutes per one-point decay of the LFU score used to rank DRAM objects and fds for eviction. 0 = no decay. Max 65535. |
 | `max-cached-fds` | 1024 | Yes | Tiered: cap on cached read fds. 0 = unlimited. Max 1048576. |
 | `smartlog-poll-secs` | 60 | Immutable | NVMe SMART poll interval in seconds. 0 = disabled. Max 86400. |
 | `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. Min 1, max 32. |

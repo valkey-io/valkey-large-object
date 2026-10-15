@@ -54,30 +54,30 @@ pub const MAX_MAX_PROMOTE_SIZE: i64 = i64::MAX;
 pub const DEFAULT_SCALING_POLL_MS: i64 = 2500;
 pub const MIN_SCALING_POLL_MS: i64 = 1_000;
 pub const MAX_SCALING_POLL_MS: i64 = 60_000;
-// reclaim-scan-budget-us
-pub const DEFAULT_RECLAIM_SCAN_BUDGET_US: i64 = 1000;
-pub const MIN_RECLAIM_SCAN_BUDGET_US: i64 = 100;
-pub const MAX_RECLAIM_SCAN_BUDGET_US: i64 = 100_000;
-// reclaim-poll-ms
-pub const DEFAULT_RECLAIM_POLL_MS: i64 = 100;
-pub const MIN_RECLAIM_POLL_MS: i64 = 10;
-pub const MAX_RECLAIM_POLL_MS: i64 = 60_000;
+// reaper-scan-budget-us
+pub const DEFAULT_REAPER_SCAN_BUDGET_US: i64 = 1000;
+pub const MIN_REAPER_SCAN_BUDGET_US: i64 = 100;
+pub const MAX_REAPER_SCAN_BUDGET_US: i64 = 100_000;
+// reaper-poll-ms
+pub const DEFAULT_REAPER_POLL_MS: i64 = 100;
+pub const MIN_REAPER_POLL_MS: i64 = 10;
+pub const MAX_REAPER_POLL_MS: i64 = 60_000;
 // smartlog-poll-secs
 pub const DEFAULT_SMARTLOG_POLL_SECS: i64 = 60;
 pub const MIN_SMARTLOG_POLL_SECS: i64 = 0;
 pub const MAX_SMARTLOG_POLL_SECS: i64 = 86_400;
-// tiered-decay-time
-pub const DEFAULT_TIERED_DECAY_TIME: i64 = 1;
-pub const MIN_TIERED_DECAY_TIME: i64 = 0;
-pub const MAX_TIERED_DECAY_TIME: i64 = 65_535;
+// blob-decay-time
+pub const DEFAULT_BLOB_DECAY_TIME: i64 = 1;
+pub const MIN_BLOB_DECAY_TIME: i64 = 0;
+pub const MAX_BLOB_DECAY_TIME: i64 = 65_535;
 // promote-min-hits
 pub const DEFAULT_PROMOTE_MIN_HITS: i64 = 2;
 pub const MIN_PROMOTE_MIN_HITS: i64 = 1;
 pub const MAX_PROMOTE_MIN_HITS: i64 = 255;
-// reclaim-sample-size
-pub const DEFAULT_RECLAIM_SAMPLE_SIZE: i64 = 5;
-pub const MIN_RECLAIM_SAMPLE_SIZE: i64 = 1;
-pub const MAX_RECLAIM_SAMPLE_SIZE: i64 = 64;
+// victim-sample-size
+pub const DEFAULT_VICTIM_SAMPLE_SIZE: i64 = 5;
+pub const MIN_VICTIM_SAMPLE_SIZE: i64 = 1;
+pub const MAX_VICTIM_SAMPLE_SIZE: i64 = 64;
 // max-cached-fds
 pub const DEFAULT_MAX_CACHED_FDS: i64 = 1024;
 pub const MIN_MAX_CACHED_FDS: i64 = 0;
@@ -155,9 +155,12 @@ lazy_static::lazy_static! {
     pub static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(DEFAULT_SCALING_POLL_MS);
 
     /// Main-thread time, in microseconds, one scaling-cron tick may spend
-    /// scanning for and deleting reclaim-list keys. Default: 1000us.
-    pub static ref CFG_RECLAIM_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(DEFAULT_RECLAIM_SCAN_BUDGET_US);
-    pub static ref CFG_RECLAIM_POLL_MS: AtomicI64 = AtomicI64::new(DEFAULT_RECLAIM_POLL_MS);
+    /// scanning for and deleting evicted keys. Default: 1000us.
+    pub static ref CFG_REAPER_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(DEFAULT_REAPER_SCAN_BUDGET_US);
+
+    /// Scaling cron poll interval, in milliseconds, while evicted keys wait to be
+    /// deleted. Default: 100ms.
+    pub static ref CFG_REAPER_POLL_MS: AtomicI64 = AtomicI64::new(DEFAULT_REAPER_POLL_MS);
 
     /// NVMe SMART poll interval in seconds (Tiered mode). 0 disables polling
     /// entirely: no background reads, and the INFO section never appears.
@@ -165,16 +168,16 @@ lazy_static::lazy_static! {
     pub static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(DEFAULT_SMARTLOG_POLL_SECS);
 
     /// LFU counter decay: minutes per one-point decrement. 0 disables decay.
-    pub static ref CFG_TIERED_DECAY_TIME: AtomicI64 = AtomicI64::new(DEFAULT_TIERED_DECAY_TIME);
+    pub static ref CFG_BLOB_DECAY_TIME: AtomicI64 = AtomicI64::new(DEFAULT_BLOB_DECAY_TIME);
 
     /// How many misses an object must accumulate in the admission filter before a GET
     /// promotes it into DRAMPool. Default: 2.
     pub static ref CFG_PROMOTE_MIN_HITS: AtomicI64 = AtomicI64::new(DEFAULT_PROMOTE_MIN_HITS);
 
-    /// Entries sampled per reclaim round; the lowest LFU score is reclaimed.
-    pub static ref CFG_RECLAIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_RECLAIM_SAMPLE_SIZE);
+    /// Entries sampled per victim search; the lowest LFU score goes.
+    pub static ref CFG_VICTIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_VICTIM_SAMPLE_SIZE);
 
-    /// Cap on read fds cached by the FdPool. When full, opening a new fd reclaims
+    /// Cap on read fds cached by the FdPool. When full, opening a new fd evicts
     /// the lowest LFU score among samples. 0 means unlimited.
     pub static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(DEFAULT_MAX_CACHED_FDS);
 
@@ -234,6 +237,9 @@ lazy_static::lazy_static! {
     /// drain path. Default: false. Hidden test hook.
     pub static ref CFG_TEST_RDMA_FAIL_PARTIAL: AtomicBool = AtomicBool::new(false);
 
+    /// Test-only: fail every NVMe unlink but the orphan retry's. false = disabled.
+    pub static ref CFG_TEST_FAIL_UNLINK: AtomicBool = AtomicBool::new(false);
+
     // ─── Streaming Configs ───────────────────────────────────────────────
 
     /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
@@ -261,7 +267,7 @@ pub static MODULE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
-pub fn nvme_dir() -> String {
+pub fn disk_dir() -> String {
     CFG_DISK_DIR
         .lock()
         .expect("CFG_DISK_DIR lock unavailable")
@@ -301,28 +307,28 @@ pub fn scaling_poll_ms() -> u64 {
     CFG_SCALING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn reclaim_scan_budget_us() -> u64 {
-    CFG_RECLAIM_SCAN_BUDGET_US.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn reaper_scan_budget_us() -> u64 {
+    CFG_REAPER_SCAN_BUDGET_US.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn reclaim_poll_ms() -> u64 {
-    CFG_RECLAIM_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn reaper_poll_ms() -> u64 {
+    CFG_REAPER_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn smartlog_poll_secs() -> u64 {
     CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn tiered_decay_time() -> u64 {
-    CFG_TIERED_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn blob_decay_time() -> u64 {
+    CFG_BLOB_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn promote_min_hits() -> u8 {
     CFG_PROMOTE_MIN_HITS.load(std::sync::atomic::Ordering::Relaxed) as u8
 }
 
-pub fn reclaim_sample_size() -> usize {
-    CFG_RECLAIM_SAMPLE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn victim_sample_size() -> usize {
+    CFG_VICTIM_SAMPLE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn max_cached_fds() -> usize {
@@ -353,10 +359,19 @@ pub fn server_memory(ctx: &Context) -> (u64, u64) {
 
 /// Whether the server may evict keys: `maxmemory` is set and `maxmemory-policy`
 /// is not `noeviction`. Not set on a replica that ignores maxmemory (the default),
-/// which leaves eviction to its primary. Dram shrink deletes keys, so it runs only
-/// when this holds.
+/// which leaves eviction to its primary. Dram shrink and Dram SET eviction delete
+/// keys, so they run only when this holds.
 pub fn eviction_allowed(ctx: &Context) -> bool {
     ctx.get_flags().contains(ContextFlags::EVICTED)
+}
+
+/// Whether Tiered eviction may evict object files: `disk-maxmemory` is set and
+/// `eviction_allowed` holds (`maxmemory` is set and `maxmemory-policy` is not `noeviction`).
+pub fn tiered_eviction_allowed(ctx: &Context) -> bool {
+    if nvme_maxmemory() == 0 {
+        return false;
+    }
+    eviction_allowed(ctx)
 }
 
 /// Whether allocating `extra_bytes` more would push server memory to/over the
@@ -397,6 +412,10 @@ pub fn min_buffers_per_op() -> usize {
 
 pub fn test_pause_before_finalize_set_ms() -> u64 {
     CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_fail_unlink() -> bool {
+    CFG_TEST_FAIL_UNLINK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn test_rdma_fail_partial() -> bool {
@@ -674,7 +693,7 @@ mod tests {
                     (&CFG_DISK_STAGING_SIZE, chunk - 1),
                     (&CFG_MAX_OBJECT_SIZE, chunk - 1),
                 ],
-                Some("segment-size must be >= chunk-size"),
+                Some("largeobj.segment-size must be >= largeobj.chunk-size"),
             ),
             (
                 "segment_lt_max_obj_rejected",
@@ -683,31 +702,31 @@ mod tests {
                     (&CFG_SEGMENT_SIZE, max_obj - 1),
                     (&CFG_DISK_STAGING_SIZE, max_obj - 1),
                 ],
-                Some("segment-size is insufficient for max-object-size"),
+                Some("largeobj.segment-size is insufficient for largeobj.max-object-size"),
             ),
             (
                 "segment_lt_promote_rejected",
                 OperatingMode::Tiered,
                 vec![(&CFG_MAX_PROMOTE_SIZE, segment + 1)],
-                Some("segment-size is insufficient for max-promote-size"),
+                Some("largeobj.segment-size is insufficient for largeobj.max-promote-size"),
             ),
             (
                 "staging_lt_segment_rejected",
                 OperatingMode::Tiered,
                 vec![(&CFG_DISK_STAGING_SIZE, segment - 1)],
-                Some("disk-staging-size must be >= segment-size"),
+                Some("largeobj.disk-staging-size must be >= largeobj.segment-size"),
             ),
             (
                 "buffers_max_lt_min_rejected",
                 OperatingMode::Dram,
                 vec![(&CFG_MAX_BUFFERS_PER_OP, min_buf - 1)],
-                Some("max-buffers-per-op must be >= min-buffers-per-op"),
+                Some("largeobj.max-buffers-per-op must be >= largeobj.min-buffers-per-op"),
             ),
             (
                 "tiered_mode_nvme_lt_max_obj_rejected",
                 OperatingMode::Tiered,
                 vec![(&CFG_DISK_MAXMEMORY, max_obj - 1)],
-                Some("disk-maxmemory must be >= max-object-size in Tiered mode"),
+                Some("largeobj.disk-maxmemory must be >= largeobj.max-object-size in Tiered mode"),
             ),
         ]
     }

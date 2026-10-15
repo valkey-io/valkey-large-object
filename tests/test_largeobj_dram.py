@@ -245,9 +245,9 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def test_info_errors(self):
         """BLOB.INFO errors are correct"""
         client = self.server.get_new_client()
-        # Nonexistant key
-        self.verify_error_response(client, 'BLOB.INFO nokey', 'not found')
-        self.verify_error_response(client, 'BLOB.INFO nokey LEN', 'not found')
+        # Nonexistent key returns nil
+        assert client.execute_command('BLOB.INFO', 'nokey') is None
+        assert client.execute_command('BLOB.INFO', 'nokey', 'LEN') is None
         # Wrong type error
         client.execute_command('SET', 'strkey', 'plain')
         try:
@@ -267,7 +267,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             client.execute_command('BLOB.INFO', 'badkey', 'NOTREAL')
             assert False, "Expected wrong information field error"
         except ResponseError as e:
-            assert 'invalid information value' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'invalid information field' in str(e).lower(), f"Unexpected error: {e}"
 
 
 class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):

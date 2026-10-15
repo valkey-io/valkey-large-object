@@ -1,9 +1,13 @@
-//! Reclaim list: objects whose memory a background job (e.g. Dram-mode shrink)
-//! already freed while their keys still exist.
+//! Reclaim list: oids of ghost keys, whose payload is gone or going (a Tiered
+//! eviction unlinks the file after claiming it) while the key still exists. In
+//! Tiered mode, in the list means the eviction owns the file's unlink and credit.
 //!
-//! Commands check it upfront and treat a listed key as missing; the scaling
-//! cron deletes the keys. An oid leaves the list when its object is removed
-//! (`DRAMPool::remove_object`, reached from `lo_free` once the key is deleted).
+//! Commands check it upfront and treat a key in the list as missing; the scaling
+//! cron deletes the keys. An oid leaves the list:
+//! - Dram: when its object is removed (`DRAMPool::remove_object`, reached from
+//!   `lo_free` once the key is deleted), or when the cron deletes its key.
+//! - Tiered: when its file is torn down (`ObjectFile::drop`), or when an NVMe
+//!   eviction finds its file already gone (a stale directory entry).
 //!
 //! Lock order: `RECLAIM_LIST` before `DRAMPool.objects` when both are held.
 
@@ -22,12 +26,12 @@ pub static RECLAIM_LIST: LazyLock<ReclaimList> = LazyLock::new(ReclaimList::defa
 #[derive(Default)]
 pub struct ReclaimList {
     oids: Mutex<HashSet<ObjectId>>,
-    /// `oids.len()`, written under the lock: readers skip it when empty.
+    /// `oids.len()`. Store only under the `oids` lock, or it can read 0 for a non-empty set.
     len: AtomicUsize,
 }
 
 impl ReclaimList {
-    /// Private so every change goes through `add_with` / `remove`, which update `len`.
+    /// Private so every change goes through `add_with` / `insert` / `remove`, which update `len`.
     fn lock(&self) -> MutexGuard<'_, HashSet<ObjectId>> {
         self.oids.lock().expect("RECLAIM_LIST lock unavailable")
     }
@@ -39,6 +43,14 @@ impl ReclaimList {
         let mut oids = self.lock();
         oids.extend(f());
         self.len.store(oids.len(), Ordering::Release);
+    }
+
+    /// Add `oid` to the reclaim list. False if it was already there.
+    pub fn insert(&self, oid: ObjectId) -> bool {
+        let mut oids = self.lock();
+        let inserted = oids.insert(oid);
+        self.len.store(oids.len(), Ordering::Release);
+        inserted
     }
 
     pub fn contains(&self, oid: &ObjectId) -> bool {
@@ -53,13 +65,15 @@ impl ReclaimList {
         self.len() == 0
     }
 
-    /// Take `oid` off the list. Always locks: `remove_object` must wait for a
-    /// shrink that is listing this oid.
-    pub fn remove(&self, oid: &ObjectId) {
+    /// Remove `oid` from the list; false if it was not there. Always locks:
+    /// `remove_object` must wait for a shrink that is adding this oid.
+    pub fn remove(&self, oid: &ObjectId) -> bool {
         let mut oids = self.lock();
-        if oids.remove(oid) {
+        let removed = oids.remove(oid);
+        if removed {
             self.len.store(oids.len(), Ordering::Release);
         }
+        removed
     }
 }
 
@@ -80,12 +94,10 @@ thread_local! {
 }
 
 /// Delete keys whose oids are on the reclaim list, spending at most
-/// `reclaim-scan-budget-us` of main-thread time per tick. Scans db by db,
-/// resuming across ticks, until the reclaim list is empty. An oid leaves the
-/// list when its key is deleted, here or by any other path (`lo_free` ->
-/// `remove_object`), so the scan cannot outlive its keys. Only a delete made
-/// here counts as a reclaim; a normal delete (user DEL, overwrite, expiry ->
-/// `lo_free`) just takes the oid off the list.
+/// `reaper-scan-budget-us` of main-thread time per tick. Scans db by db,
+/// resuming across ticks, until the reclaim list is empty. Dram: an oid leaves the
+/// list when its key is deleted, here or via `lo_free`. Tiered: when its `ObjectFile`
+/// drops. Either way the scan cannot outlive its keys.
 ///
 /// Cross-slot deletion is safe here: a timer callback runs outside command
 /// execution (`server.current_client` is NULL), so key lookups hash each key's
@@ -94,7 +106,7 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
     if RECLAIM_LIST.is_empty() {
         return;
     }
-    let deadline = Instant::now() + Duration::from_micros(crate::reclaim_scan_budget_us());
+    let deadline = Instant::now() + Duration::from_micros(crate::reaper_scan_budget_us());
     RECLAIM_SCAN_CURSOR.with_borrow_mut(|scan| {
         while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
             // Past the last db: one full pass done. At most one pass per tick
@@ -106,14 +118,18 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
             let (listed_keys, more) = listed_keys_in_next_bucket(ctx, &scan.cursor);
             for (name, oid) in listed_keys {
                 let _ = ctx.open_key_writable(&name).unlink();
-                // Same keyspace event and count core makes for its own evictions.
+                // Same keyspace event core fires for its own evictions.
                 ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
-                super::get_dram_pool()
-                    .reclaims
-                    .fetch_add(1, Ordering::Relaxed);
-                // lo_free runs later on the BIO thread; clear now so the scan
-                // stops once every listed key is gone.
-                RECLAIM_LIST.remove(&oid);
+                // Tiered Mode: Do not touch the RECLAIM_LIST. ObjectFile's drop uses
+                // presence in the list to determine if the file was claimed by eviction.
+                // This is necessary in order to not double-free evicted items.
+                // DRAM Mode: Calls to remove the oid from the RECLAIM_LIST happen both
+                // here and in lo_free (initiated by the unlink call above). This removal
+                // is redundant, but removing it here allows the main thread to exit the
+                // reclaim loop instead of waiting for the bio thread or deadline timeout.
+                if crate::operating_mode() == crate::OperatingMode::Dram {
+                    RECLAIM_LIST.remove(&oid);
+                }
             }
             if !more {
                 scan.cursor.restart();

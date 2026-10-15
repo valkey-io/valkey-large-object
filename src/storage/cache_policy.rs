@@ -42,6 +42,9 @@ pub const ADMISSION_FILTER_CAPACITY: usize = 65_536;
 /// Bounds the reclaim loop under the objects write lock.
 pub const RECLAIM_MAX_VICTIMS: usize = 16;
 
+/// Most segments one reclaim may try, the least-loaded ones.
+pub const RECLAIM_MAX_SEGMENTS: usize = 3;
+
 const COUNTER_MASK: u32 = 0xFF;
 const MINUTES_SHIFT: u32 = 8;
 const MINUTES_MASK: u32 = 0xFFFF;
@@ -207,7 +210,7 @@ pub struct CacheStats {
     /// Successful `try_promote_object` calls.
     pub promotions: AtomicU64,
     /// Cached copies demoted (dropped from DRAM, NVMe copy kept) by
-    /// `make_room_for` to free space.
+    /// `make_room_for` to free space, or by a shrink.
     pub demotions: AtomicU64,
 }
 
@@ -215,7 +218,7 @@ impl CacheStats {
     /// Record a GET served from the cache: touch the object's LFU score and
     /// count the hit. Atomic only; no lock needed.
     pub fn record_hit(&self, stats: &AccessStats) {
-        stats.touch(now_minutes(), crate::tiered_decay_time());
+        stats.touch(now_minutes(), crate::blob_decay_time());
         self.hits.fetch_add(1, Ordering::Relaxed);
     }
 

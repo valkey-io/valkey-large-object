@@ -18,19 +18,19 @@ pub struct Session {
     /// The Valkey client id: the fabric keys address-vector entries and in-flight accounting by it.
     client_id: u64,
     /// The client's fabric address from BLOB.RDMA_HELLO.
-    peer_address: Vec<u8>,
+    rdma_address: Vec<u8>,
 }
 
 impl Session {
-    pub fn new(client_id: u64, peer_address: Vec<u8>) -> Self {
+    pub fn new(client_id: u64, rdma_address: Vec<u8>) -> Self {
         Self {
             client_id,
-            peer_address,
+            rdma_address,
         }
     }
 
-    pub fn peer_address(&self) -> &[u8] {
-        &self.peer_address
+    pub fn rdma_address(&self) -> &[u8] {
+        &self.rdma_address
     }
 
     /// DMA write: push `len` bytes at `buf_ptr` into client memory at (rkey, remote_addr).
@@ -80,7 +80,7 @@ impl Session {
             fabric::fabric().ok_or_else(|| DmaError::Fabric("fabric is shut down".into()))?;
         fabric.transfer(TransferRequest {
             client_id: self.client_id,
-            peer_address: self.peer_address.clone(),
+            peer_address: self.rdma_address.clone(),
             remote_key: rkey,
             remote_address: remote_addr,
             direction,
