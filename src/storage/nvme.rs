@@ -96,7 +96,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
     if bytes > max {
         return false;
     }
-    if !with_server_lock(crate::eviction_allowed) {
+    if !with_server_lock(crate::tiered_eviction_allowed) {
         return false;
     }
     // Take the headroom first, so no other write can use it while we evict.
