@@ -97,10 +97,10 @@ pub fn on_keyspace_event(ctx: &Context, _: NotifyEvent, event: &str, key: &[u8])
 // ─── Candidates ──────────────────────────────────────────────────────────────
 
 /// Up to `n` distinct eviction candidates among the objects the policy allows: the
-/// least recently used under `*-lru`, else random.
+/// least recently used, or uniformly random under `*-random`.
 pub fn candidates(policy: MaxmemoryPolicy, n: usize) -> Vec<ObjectId> {
     let mut live = live();
-    if policy.lru {
+    if !policy.random {
         let Live { all, lru, .. } = &mut *live;
         return lru
             .oldest(policy.volatile, n, |oid| {
@@ -152,12 +152,12 @@ mod tests {
         slot
     }
 
-    fn pick(volatile: bool, lru: bool, range: std::ops::Range<u64>) -> Vec<u64> {
+    fn pick(volatile: bool, random: bool, range: std::ops::Range<u64>) -> Vec<u64> {
         candidates(
             MaxmemoryPolicy {
                 volatile,
                 noeviction: false,
-                lru,
+                random,
             },
             usize::MAX,
         )
@@ -172,11 +172,11 @@ mod tests {
         for oid in 1_000..1_010 {
             add(oid, oid % 2 == 0);
         }
-        for lru in [false, true] {
-            let picked = pick(true, lru, 1_000..1_010);
+        for random in [false, true] {
+            let picked = pick(true, random, 1_000..1_010);
             assert_eq!(picked.len(), 5);
             assert!(picked.iter().all(|oid| oid % 2 == 0), "{picked:?}");
-            assert_eq!(pick(false, lru, 1_000..1_010).len(), 10);
+            assert_eq!(pick(false, random, 1_000..1_010).len(), 10);
         }
     }
 
@@ -184,21 +184,21 @@ mod tests {
     fn lru_picks_the_least_recently_used_first() {
         let slots: Vec<u32> = (2_000..2_003).map(|oid| add(oid, false)).collect();
         touch(slots[0], ObjectId(2_000));
-        assert_eq!(pick(false, true, 2_000..2_003), vec![2_001, 2_002, 2_000]);
+        assert_eq!(pick(false, false, 2_000..2_003), vec![2_001, 2_002, 2_000]);
         // An evicted oid is never picked again, even before its file drops.
         evicted(ObjectId(2_001));
-        assert_eq!(pick(false, true, 2_000..2_003), vec![2_002, 2_000]);
+        assert_eq!(pick(false, false, 2_000..2_003), vec![2_002, 2_000]);
         remove(ObjectId(2_001), slots[1]);
-        assert_eq!(pick(false, true, 2_000..2_003), vec![2_002, 2_000]);
+        assert_eq!(pick(false, false, 2_000..2_003), vec![2_002, 2_000]);
     }
 
     #[test]
     fn remove_clears_both_bitmaps_and_ttl_needs_a_live_file() {
         let slot = add(4_000, true);
         remove(ObjectId(4_000), slot);
-        for lru in [false, true] {
-            assert!(pick(false, lru, 4_000..4_001).is_empty());
-            assert!(pick(true, lru, 4_000..4_001).is_empty());
+        for random in [false, true] {
+            assert!(pick(false, random, 4_000..4_001).is_empty());
+            assert!(pick(true, random, 4_000..4_001).is_empty());
         }
         set_ttl(ObjectId(4_000), slot, true);
         assert!(pick(true, false, 4_000..4_001).is_empty());

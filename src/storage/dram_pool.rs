@@ -229,7 +229,7 @@ impl DRAMPool {
             return None;
         }
         let policy = MaxmemoryPolicy::current();
-        if policy.lru {
+        if !policy.random {
             self.evict_lru_for(obj_len as usize, policy.volatile)
         } else {
             self.make_room_for(obj_len as usize, by_policy(policy))
@@ -830,7 +830,7 @@ mod tests {
                     by_policy(MaxmemoryPolicy {
                         volatile: false,
                         noeviction: false,
-                        lru: false,
+                        random: false,
                     }),
                 )
                 .unwrap();
@@ -853,7 +853,7 @@ mod tests {
         let volatile = by_policy(MaxmemoryPolicy {
             volatile: true,
             noeviction: false,
-            lru: false,
+            random: false,
         });
         // Only 2 BUF of segment 0 has a TTL.
         assert!(p.reclaim_in(0, 3 * BUF as usize, volatile).is_none());

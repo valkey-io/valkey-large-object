@@ -242,36 +242,45 @@ pub struct TieredCache {
 /// The server's `maxmemory-policy`, as module eviction uses it. The module API has no
 /// getter for it (`GetContextFlags` says only whether some evicting policy is set), so it
 /// is read once at load and again whenever a `CONFIG SET` changes it, and cached.
+///
+/// Only two things of the policy matter. `volatile-*` limits eviction to keys with a TTL.
+/// `*-random` picks a victim at random; every other order runs as LRU (`*-lfu` and
+/// `volatile-ttl` have no order of their own here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaxmemoryPolicy {
     /// `volatile-*`: only keys with a TTL may be evicted.
     pub volatile: bool,
     /// `noeviction`: nothing may be evicted.
     pub noeviction: bool,
-    /// `*-lru`: evict in exact least-recently-used order (`LruList`).
-    pub lru: bool,
+    /// `*-random`: a random victim instead of the least recently used.
+    pub random: bool,
 }
 
 /// The cached policy, as `MaxmemoryPolicy::bits`: one value, so a reader never sees half
 /// of a change.
 static POLICY: AtomicU8 = AtomicU8::new(0);
 const VOLATILE: u8 = 1;
-const NOEVICTION: u8 = 2;
-const LRU: u8 = 4;
+const RANDOM: u8 = 2;
+const NOEVICTION: u8 = 4;
 
 impl MaxmemoryPolicy {
     fn parse(name: &str) -> Self {
         Self {
             volatile: name.starts_with("volatile-"),
             noeviction: name == "noeviction",
-            lru: name.ends_with("-lru"),
+            random: name.ends_with("-random"),
         }
+    }
+
+    /// Whether `name` is served as LRU though it names another order.
+    fn runs_as_lru(name: &str) -> bool {
+        name.ends_with("-lfu") || name == "volatile-ttl"
     }
 
     fn bits(self) -> u8 {
         (if self.volatile { VOLATILE } else { 0 })
             | (if self.noeviction { NOEVICTION } else { 0 })
-            | (if self.lru { LRU } else { 0 })
+            | (if self.random { RANDOM } else { 0 })
     }
 
     /// The policy now in force: one atomic load.
@@ -280,18 +289,30 @@ impl MaxmemoryPolicy {
         Self {
             volatile: bits & VOLATILE != 0,
             noeviction: bits & NOEVICTION != 0,
-            lru: bits & LRU != 0,
+            random: bits & RANDOM != 0,
         }
     }
 
-    /// Read the policy from the server and cache it. Call at load, and on a change of
-    /// `maxmemory-policy` (`on_config_change`).
+    /// Read the policy from the server and cache it, warning if it is served in another
+    /// order than its own. Call at load, and on a change of `maxmemory-policy`
+    /// (`on_config_change`).
     pub fn refresh(ctx: &valkey_module::Context) {
         let info = ctx.server_info("memory");
         let name = info
             .field("maxmemory_policy")
             .map(|v| v.to_string())
             .unwrap_or_default();
+        if Self::runs_as_lru(&name) {
+            let served = if name.starts_with("volatile-") {
+                "volatile-lru"
+            } else {
+                "allkeys-lru"
+            };
+            valkey_module::logging::log_warning(format!(
+                "largeobj: maxmemory-policy {name} evicts in {served} order: module \
+                 eviction has no LFU or TTL-ordered eviction"
+            ));
+        }
         POLICY.store(Self::parse(&name).bits(), Ordering::Relaxed);
     }
 }
@@ -682,34 +703,56 @@ mod tests {
 
     #[test]
     fn parse_policies() {
-        let p = |volatile, noeviction, lru| MaxmemoryPolicy {
+        let p = |volatile, noeviction, random| MaxmemoryPolicy {
             volatile,
             noeviction,
-            lru,
+            random,
         };
-        assert_eq!(MaxmemoryPolicy::parse("volatile-lru"), p(true, false, true));
         assert_eq!(
-            MaxmemoryPolicy::parse("volatile-lfu"),
+            MaxmemoryPolicy::parse("volatile-lru"),
             p(true, false, false)
         );
         assert_eq!(
-            MaxmemoryPolicy::parse("volatile-random"),
+            MaxmemoryPolicy::parse("volatile-lfu"),
             p(true, false, false)
         );
         assert_eq!(
             MaxmemoryPolicy::parse("volatile-ttl"),
             p(true, false, false)
         );
-        assert_eq!(MaxmemoryPolicy::parse("allkeys-lru"), p(false, false, true));
+        assert_eq!(
+            MaxmemoryPolicy::parse("volatile-random"),
+            p(true, false, true)
+        );
+        assert_eq!(
+            MaxmemoryPolicy::parse("allkeys-lru"),
+            p(false, false, false)
+        );
         assert_eq!(
             MaxmemoryPolicy::parse("allkeys-lfu"),
             p(false, false, false)
         );
         assert_eq!(
             MaxmemoryPolicy::parse("allkeys-random"),
-            p(false, false, false)
+            p(false, false, true)
         );
         assert_eq!(MaxmemoryPolicy::parse("noeviction"), p(false, true, false));
+    }
+
+    #[test]
+    fn policies_that_run_as_lru() {
+        for name in ["allkeys-lfu", "volatile-lfu", "volatile-ttl"] {
+            assert!(MaxmemoryPolicy::runs_as_lru(name), "{name}");
+        }
+        for name in [
+            "allkeys-lru",
+            "volatile-lru",
+            "allkeys-random",
+            "volatile-random",
+            "noeviction",
+        ] {
+            assert!(!MaxmemoryPolicy::runs_as_lru(name), "{name}");
+        }
     }
 
     // ─── LruList ───

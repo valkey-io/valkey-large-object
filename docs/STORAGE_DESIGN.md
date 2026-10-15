@@ -978,8 +978,10 @@ eviction reads the cached value with one atomic load:
 
 | Policy | Dram object eviction | NVMe object eviction |
 |---|---|---|
-| `volatile-*` | Only objects whose key has a TTL (`ObjectContext::ttl_present`) | Only oids in the `ttl` bitmap; with none left the write is refused, as in core |
-| `allkeys-*` | Any object | Any oid in the `all` bitmap |
+| `volatile-*` | Only objects whose key has a TTL (`ObjectContext::ttl_present`; the TTL list of the `LruList` for LRU) | Only oids on the TTL list (and in the `ttl` bitmap, for `*-random`); with none left the write is refused, as in core |
+| `allkeys-*` | Any object | Any oid |
+| Order, `*-lru`, `*-lfu`, `volatile-ttl` | The least recently used, in any segment, until the write fits | The least recently used |
+| Order, `*-random` | A random object in the segment being filled, so every victim makes room there | A uniform random pick from the `all` or `ttl` bitmap |
 
 Two roaring bitmaps of oids back the NVMe side: `all` (every live object) and `ttl` (the
 subset whose key has a TTL). An oid leaves both when it is evicted, so it is never picked
@@ -994,11 +996,19 @@ is what makes a SET miss. Tiered: whenever a write would exceed `disk-maxmemory`
 `maxmemory-policy` is `noeviction` or this is a replica. The server's `maxmemory` is not
 required: it bounds DRAM, not the disk.
 
-**Order among the allowed keys.** Under `*-lru` the least recently used goes first: in
-Dram from a global `LruList`, in any segment, until the write fits; on NVMe from the same
-kind of list. A GET is a use; so is a TTL change, as in core. `*-lfu` and `*-random` keep
-their earlier order: a random allowed key, which Dram picks inside the segment being
-filled.
+**Order among the allowed keys.** Every order but random runs as LRU (`*-lfu` and
+`volatile-ttl` too), and the module logs a warning each time the policy is set, at load or
+by `CONFIG SET`, to one it serves in another order. A GET is a use; so is a TTL change, as
+in core. Dram LRU evicts from a global list, not one segment: the freed bytes of a victim
+may sit in a segment that cannot take the write, so they stay as holes, and one write
+evicts at most `RECLAIM_MAX_SEGMENTS` segments' worth of bytes. If the write still does not
+fit, the victims stay evicted and the write fails. Dram random has no order to honor, so it
+works one segment at a time (the `RECLAIM_MAX_SEGMENTS` least-loaded): it evicts random
+objects from that segment until the write fits, or puts them all back and tries the next,
+so it never leaves a hole behind that cannot take the write.
+
+Tiered cache demotion is not a policy eviction: it drops a cached copy, deletes no key,
+and ranks by decayed LFU score, not by `maxmemory-policy`.
 
 **Detection:**
 

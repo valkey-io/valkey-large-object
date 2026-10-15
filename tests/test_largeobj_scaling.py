@@ -1146,7 +1146,6 @@ class EvictionPolicyTests:
         self.assert_refused(client, 'refused', b'R' * self.OBJ)
         assert self.evictions(client) == 0
 
-
     def test_lru_evicts_exactly_the_least_recently_used(self):
         client = self.new_client('allkeys-lru')
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
@@ -1168,6 +1167,35 @@ class EvictionPolicyTests:
         assert client.execute_command('BLOB.TCP_GET', keys[1]) == payloads[keys[1]]
         assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
         assert sorted(surviving(client, payloads)) == sorted(k for k in keys if k != keys[2])
+
+
+    def assert_runs_as_lru(self, policy):
+        """Reads put the last key written first in line; two writes evict it and its neighbor.
+        Under `volatile-*` the oldest key has no TTL and is spared whatever its age."""
+        client = self.new_client(policy)
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        keys = list(payloads)
+        if policy.startswith('volatile-'):
+            for key in keys[1:]:
+                assert client.execute_command('EXPIRE', key, 1000) == 1
+        for key in reversed(keys):
+            assert client.execute_command('BLOB.TCP_GET', key) == payloads[key]
+        for i in range(2):
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+        assert sorted(surviving(client, payloads)) == sorted(keys[:-2])
+        return client
+
+    @pytest.mark.parametrize('policy', ['allkeys-lfu', 'volatile-lfu', 'volatile-ttl'])
+    def test_lfu_and_ttl_policies_run_as_lru(self, policy):
+        self.assert_runs_as_lru(policy)
+
+    def test_a_policy_served_as_lru_is_warned_about_once(self):
+        client = self.assert_runs_as_lru('allkeys-lfu')
+        for i in range(2):
+            assert client.execute_command('BLOB.TCP_SET', f'more_{i}', b'M' * self.OBJ) == b'OK'
+        with open(os.path.join(self.server.cwd, self.server.args['logfile'])) as f:
+            warnings = [line for line in f if 'allkeys-lfu evicts in allkeys-lru order' in line]
+        assert len(warnings) == 1
 
 
 class TestDramEvictionPolicy(EvictionPolicyTests, DramBudget):
