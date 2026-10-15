@@ -986,8 +986,9 @@ subset whose key has a TTL). An oid leaves both when it is evicted, so it is nev
 twice. TTL membership comes from the `expire`, `persist` and `copy_to` keyspace events
 (`live::on_keyspace_event`, both modes); `expire` covers EXPIRE, PEXPIRE, EXPIREAT and
 PEXPIREAT. RENAME and MOVE carry the object and its TTL together, and an overwrite mints a
-new oid, so none needs an event. The order among allowed keys is not set by the policy yet:
-Dram ranks by sampled LFU score inside one segment, NVMe picks at random.
+new oid, so none needs an event. The policy's order is not honored yet: both
+modes evict a random allowed key. Dram picks it inside the segment being filled, so every
+victim makes room there.
 
 **Detection:**
 

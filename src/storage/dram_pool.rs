@@ -16,6 +16,7 @@
 //! way (`alloc_exact_expand_evict`), where the server allows eviction, taking
 //! only keys the `maxmemory-policy` allows.
 
+use rand::RngExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -96,15 +97,11 @@ fn by_lfu() -> impl Fn(&ObjectContext) -> Option<u8> + Copy {
     move |ctx| Some(ctx.stats.decayed_counter(now_min, decay_time))
 }
 
-/// Dram eviction's ranking: LFU, over the objects `policy` allows to go.
+/// Dram eviction's ranking: random, over the objects `policy` allows to go (under
+/// `volatile-*`, those whose key has a TTL). No order of the policy is honored yet.
 fn by_policy(policy: MaxmemoryPolicy) -> impl Fn(&ObjectContext) -> Option<u8> + Copy {
-    let lfu = by_lfu();
     move |ctx| {
-        if policy.volatile && !ctx.ttl_present() {
-            None
-        } else {
-            lfu(ctx)
-        }
+        (!policy.volatile || ctx.ttl_present()).then(|| rand::rng().random_range(0..=u8::MAX))
     }
 }
 
@@ -168,10 +165,10 @@ impl DRAMPool {
         self.pool.alloc_exact(obj_len as usize)
     }
 
-    /// `alloc_exact_or_expand`. If that fails and `eviction_allowed`, evict in the
-    /// least-loaded segments and retry the alloc in each (`make_room_for`). Only
-    /// keys the `maxmemory-policy` allows are evicted: under `volatile-*`, keys
-    /// with a TTL. Dram mode, main thread only. `ctx` may be a dummy.
+    /// `alloc_exact_or_expand`. If that fails and `eviction_allowed`, evict random
+    /// objects in the least-loaded segments and retry the alloc in each
+    /// (`make_room_for`). Only keys the `maxmemory-policy` allows are evicted: under
+    /// `volatile-*`, keys with a TTL. Dram mode, main thread only. `ctx` may be a dummy.
     pub fn alloc_exact_expand_evict(
         &self,
         ctx: &valkey_module::Context,
@@ -720,6 +717,29 @@ mod tests {
         for (oid, _) in &victims {
             super::super::reclaim::RECLAIM_LIST.remove(oid);
         }
+    }
+
+    #[test]
+    fn dram_eviction_does_not_always_take_the_same_object() {
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..40 {
+            let p = dram_pool();
+            for i in 0..4u16 {
+                p.insert_object(ObjectId(9_600 + i as u64), ctx(0, i));
+            }
+            let victims = p
+                .reclaim_in(
+                    0,
+                    BUF as usize,
+                    by_policy(MaxmemoryPolicy { volatile: false }),
+                )
+                .unwrap();
+            seen.extend(victims.iter().map(|(oid, _)| oid.0));
+            for (oid, _) in &victims {
+                super::super::reclaim::RECLAIM_LIST.remove(oid);
+            }
+        }
+        assert!(seen.len() > 1, "always evicted {seen:?}");
     }
 
     #[test]
