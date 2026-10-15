@@ -38,48 +38,44 @@ use super::Crc;
 use crate::data_type::ObjectId;
 
 /// Unevictable list (Tiered): oids whose files are in use by a GET, SET, COPY,
-/// teardown or eviction, as oid -> the `Arc` its live `UnevictableGuard`s share.
+/// teardown or eviction, as oid -> the `Arc<UnevictableOid>` its holders share.
 /// Eviction never claims an oid whose `Weak` is live.
-static UNEVICTABLE: LazyLock<Mutex<HashMap<ObjectId, Weak<Unevictable>>>> =
+static UNEVICTABLE: LazyLock<Mutex<HashMap<ObjectId, Weak<UnevictableOid>>>> =
     LazyLock::new(Mutex::default);
 
-/// Shared by every guard for one oid. Dropping the last guard removes the oid from
-/// the unevictable list.
-struct Unevictable(ObjectId);
+/// Keeps its oid in the unevictable list while any `Arc` of it is alive. Every holder
+/// of one oid shares the same `Arc`. Never call `new` or drop an `Arc` under the
+/// `UNEVICTABLE` or `RECLAIM_LIST` lock.
+pub struct UnevictableOid(ObjectId);
 
-impl Drop for Unevictable {
+impl UnevictableOid {
+    #[must_use]
+    pub fn new(oid: ObjectId) -> Arc<Self> {
+        let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
+        match unevictable.get(&oid).and_then(Weak::upgrade) {
+            Some(shared) => shared,
+            None => Self::insert(&mut unevictable, oid),
+        }
+    }
+
+    fn insert(unevictable: &mut HashMap<ObjectId, Weak<Self>>, oid: ObjectId) -> Arc<Self> {
+        let shared = Arc::new(Self(oid));
+        unevictable.insert(oid, Arc::downgrade(&shared));
+        shared
+    }
+}
+
+/// The last `Arc` dropped: remove the oid from the unevictable list.
+impl Drop for UnevictableOid {
     fn drop(&mut self) {
         let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
-        // A new guard may have replaced the entry before this took the lock.
+        // A new holder may have replaced the entry before this took the lock.
         if unevictable
             .get(&self.0)
             .is_some_and(|w| w.strong_count() == 0)
         {
             unevictable.remove(&self.0);
         }
-    }
-}
-
-/// Keeps `oid` in the unevictable list until every guard for it drops.
-/// Never call `new` or drop one under the `UNEVICTABLE` or `RECLAIM_LIST` lock.
-#[must_use]
-pub struct UnevictableGuard {
-    _shared: Arc<Unevictable>,
-}
-
-impl UnevictableGuard {
-    pub fn new(oid: ObjectId) -> Self {
-        let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
-        match unevictable.get(&oid).and_then(Weak::upgrade) {
-            Some(shared) => Self { _shared: shared },
-            None => Self::insert(&mut unevictable, oid),
-        }
-    }
-
-    fn insert(unevictable: &mut HashMap<ObjectId, Weak<Unevictable>>, oid: ObjectId) -> Self {
-        let shared = Arc::new(Unevictable(oid));
-        unevictable.insert(oid, Arc::downgrade(&shared));
-        Self { _shared: shared }
     }
 }
 
@@ -97,14 +93,15 @@ pub fn unevictable_count() -> usize {
 /// unless it is in either already. One `UNEVICTABLE` critical section, so a
 /// teardown either adds `oid` to the unevictable list first (the claim fails) or
 /// finds it in the reclaim list. Call under the server lock.
-pub fn claim_victim(oid: ObjectId) -> Option<UnevictableGuard> {
+#[must_use]
+pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOid>> {
     let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
     if unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0)
         || !super::reclaim::RECLAIM_LIST.insert(oid)
     {
         return None;
     }
-    Some(UnevictableGuard::insert(&mut unevictable, oid))
+    Some(UnevictableOid::insert(&mut unevictable, oid))
 }
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
@@ -160,12 +157,12 @@ impl ObjectFile {
         let dir = crate::nvme_dir();
         let disk_len = self.disk_len;
         // We do not allow the eviction of the source or the new file mid-copy.
-        let _source = UnevictableGuard::new(self.object_id);
+        let _source = UnevictableOid::new(self.object_id);
         if !super::nvme::try_reserve_nvme_disk_usage(disk_len) {
             return None;
         }
         let new_oid = ObjectId::next();
-        let copy = UnevictableGuard::new(new_oid);
+        let copy = UnevictableOid::new(new_oid);
         let dst_path = new_oid.file_path(&dir);
         match self.copy_file(&dst_path, new_oid, len, crc32c) {
             Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
@@ -212,7 +209,7 @@ impl Drop for ObjectFile {
         let object_id = self.object_id;
         let disk_len = self.disk_len;
         // We do not allow the eviction of a file that is being torn down.
-        let unevictable = UnevictableGuard::new(object_id);
+        let unevictable = UnevictableOid::new(object_id);
 
         // Deregistering drops the pool's Arc<OwnedFd>; if no in-flight reader
         // holds a clone, the fd's OwnedFd closes at this time.

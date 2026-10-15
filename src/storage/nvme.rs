@@ -8,7 +8,7 @@
 use std::mem::size_of;
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use super::context::SegmentBuffer;
 use super::uring;
@@ -163,7 +163,7 @@ fn victim_batch(n: usize) -> Vec<ObjectId> {
 /// except orphans, which stay in it until the retry. Returns the bytes freed, not counting
 /// orphans. Victims stay in the reclaim list: their keys read as missing until the cron
 /// deletes them, and their teardown then only removes them from it.
-fn evict(victims: Vec<(ObjectId, u64, super::UnevictableGuard)>) -> u64 {
+fn evict(victims: Vec<(ObjectId, u64, Arc<super::UnevictableOid>)>) -> u64 {
     let mut freed = 0;
     for (oid, size, unevictable) in victims {
         if let Some(pool) = super::FD_POOL.get() {
@@ -184,7 +184,7 @@ fn evict(victims: Vec<(ObjectId, u64, super::UnevictableGuard)>) -> u64 {
 /// so no eviction takes them. The cron's retry unlinks them and credits their bytes.
 /// Size 0: an eviction could not stat the file, so the retry does first.
 pub struct OrphanedFiles {
-    files: Mutex<Vec<(ObjectId, u64, super::UnevictableGuard)>>,
+    files: Mutex<Vec<(ObjectId, u64, Arc<super::UnevictableOid>)>>,
     pub count: AtomicU64,
     pub bytes: AtomicU64,
     retrying: AtomicBool,
@@ -198,7 +198,7 @@ pub static ORPHANED_FILES: OrphanedFiles = OrphanedFiles {
 };
 
 impl OrphanedFiles {
-    fn push(&self, oid: ObjectId, size: u64, unevictable: super::UnevictableGuard) {
+    fn push(&self, oid: ObjectId, size: u64, unevictable: Arc<super::UnevictableOid>) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(size, Ordering::Relaxed);
         self.files
@@ -291,7 +291,7 @@ fn transient(e: &std::io::Error) -> bool {
 pub(crate) fn try_unlink(
     oid: ObjectId,
     size: u64,
-    unevictable: super::UnevictableGuard,
+    unevictable: Arc<super::UnevictableOid>,
     during: &str,
 ) -> bool {
     let unlinked = if crate::test_fail_unlink() {
