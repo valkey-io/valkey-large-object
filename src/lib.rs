@@ -241,8 +241,8 @@ fn deinitialize(_ctx: &Context) -> Status {
 /// means clients would be stranded behind object fds again, so that is fatal.
 #[config_changed_event_handler]
 fn on_config_changed(ctx: &Context, changed: &[&str]) {
-    if let Some(pool) = storage::FD_POOL.get() {
-        if changed.contains(&"maxclients") {
+    if changed.contains(&"maxclients") {
+        if let Some(pool) = storage::FD_POOL.get() {
             if let Err(msg) = storage::fd_placement::place(ctx) {
                 // The panic hook logs the message and aborts the server.
                 panic!("CONFIG SET maxclients: cannot keep object-file fds out of Valkey's client range: {msg}");

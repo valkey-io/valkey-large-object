@@ -1198,7 +1198,8 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
 class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
     """Cached object-file fds must not take the fd numbers Valkey serves clients on.
 
-    Valkey's event loop only covers fds below maxclients + 128, and Linux hands out
+    Valkey's event loop only covers fds below maxclients + CONFIG_FDSET_INCR (128),
+    and Linux hands out
     the lowest free fd. With maxclients 100 and 300 cached fds left low, every new
     client socket lands past the event loop: it is accepted and counted, but its
     commands are never read. The module moves its fds above that range instead."""
@@ -1251,7 +1252,10 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
     def test_config_set_maxclients_moves_cached_fds_above_grown_range(self):
         """CONFIG SET maxclients grows the event loop over the fds placed at load
         (228+). The module evicts those from the cache, so none stays in the client
-        range, and the next GETs reopen them above the new range (500 + 128 = 628)."""
+        range, and the next GETs reopen them above the new range
+        (500 + CONFIG_FDSET_INCR 128 = 628). Lowering maxclients again keeps the
+        floor: clients above the lower value stay connected, so nothing is evicted
+        and new opens still land at 628+."""
         client = self.server.get_new_client()
         for i in range(self.OBJECTS):
             client.execute_command('BLOB.TCP_SET', f'obj_{i}', b'x' * 4096)
@@ -1268,6 +1272,29 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
         object_fds = self.object_fds(client)
         assert len(object_fds) == self.OBJECTS
         assert min(object_fds) >= 628
+
+        client.execute_command('CONFIG', 'SET', 'maxclients', '100')
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == self.OBJECTS
+        client.execute_command('BLOB.TCP_SET', 'obj_new', b'x' * 4096)
+        assert client.execute_command('BLOB.TCP_GET', 'obj_new') == b'x' * 4096
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == self.OBJECTS + 1
+        assert min(self.object_fds(client)) >= 628
+
+    def test_config_set_maxclients_evicts_only_fds_below_new_floor(self):
+        """Growing maxclients from 100 to 250 moves the floor from 228 to 378. Only
+        the cached fds in 228..377 are evicted; those already at 378+ stay cached."""
+        client = self.server.get_new_client()
+        for i in range(self.OBJECTS):
+            client.execute_command('BLOB.TCP_SET', f'obj_{i}', b'x' * 4096)
+            client.execute_command('BLOB.TCP_GET', f'obj_{i}')
+        before = self.object_fds(client)
+        kept = sorted(fd for fd in before if fd >= 378)
+        assert len(before) == self.OBJECTS
+        assert kept and len(kept) < self.OBJECTS
+
+        client.execute_command('CONFIG', 'SET', 'maxclients', '250')
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == len(kept)
+        assert sorted(self.object_fds(client)) == kept
 
     def test_raise_max_cached_fds_rejected_without_room(self):
         """The room above the client range (hard - 228) must hold the cache plus one

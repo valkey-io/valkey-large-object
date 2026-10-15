@@ -1,7 +1,8 @@
 //! Object-file fd placement — keep the module's long-lived fds out of the fd
 //! numbers Valkey serves clients on.
 //!
-//! Valkey's event loop is an array indexed by fd number, sized `maxclients + 128`;
+//! Valkey's event loop is an array indexed by fd number, sized
+//! `maxclients + CONFIG_FDSET_INCR` (128);
 //! a client socket numbered past it is never served. Linux hands out the lowest
 //! free number, so object fds left low (the fd cache, in-flight SET files) push
 //! client sockets past the end. Every object-file open goes through
@@ -33,8 +34,8 @@ pub fn place(ctx: &Context) -> Result<(), String> {
         .parse()
         .expect("maxclients is numeric");
     let floor = reserve_fd_range(maxclients)?;
-    outside_event_loop(floor)?;
     check_room(crate::max_cached_fds() as u64)?;
+    outside_event_loop(floor)?;
     ctx.log_notice(&format!("largeobj: object-file fds placed at {floor}+"));
     Ok(())
 }
@@ -105,7 +106,7 @@ fn reserve_fd_range(maxclients: u64) -> Result<i32, String> {
 }
 
 /// One-shot check that `floor` is past the end of Valkey's event loop, so the
-/// copied `maxclients + 128` really marks where client fds end. `EventLoopAdd`
+/// copied `maxclients + CONFIG_FDSET_INCR` really marks where client fds end. `EventLoopAdd`
 /// answers ERANGE exactly when `fd >= setsize`. The probe is an eventfd we own
 /// (epoll rejects regular files), placed at `floor`, so no client's event is
 /// touched; if it registers, it is removed at once. Main thread only.

@@ -50,7 +50,7 @@ Four runtime-mutable configs:
 | `tiered-decay-time` | 1 | 0..=65535 | Minutes per one-point counter decay. 0 disables decay (pure LFU). Same semantics as core `lfu-decay-time`. |
 | `promote-min-hits` | 2 | 1..=255 | Misses an object must accumulate before a GET promotes it. 1 promotes on the first GET. |
 | `reclaim-sample-size` | 5 | 1..=64 | Entries sampled per reclaim round. Same idea as core's `maxmemory-samples`. |
-| `max-cached-fds` | 16384 | 1..=1048576 | Cap on cached read fds. The fds sit above Valkey's client range (`maxclients + 128`), so they never take client fd numbers; load fails, and a runtime raise is rejected, when the cap does not fit between there and the open-file hard limit. |
+| `max-cached-fds` | 16384 | 1..=1048576 | Cap on cached read fds. The fds sit above Valkey's client range (`maxclients + CONFIG_FDSET_INCR`, 128 in core), so they never take client fd numbers; load fails, and a runtime raise is rejected, when the cap does not fit between there and the open-file hard limit (the module raises the soft limit to the hard limit at load). |
 
 Three tuning values are constants in `src/storage/cache_policy.rs`, because no operator has a reason to change them:
 
