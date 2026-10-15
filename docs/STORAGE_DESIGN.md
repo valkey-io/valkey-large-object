@@ -1033,7 +1033,7 @@ with the fewest allocated bytes, drops every object on it, and releases it (§8.
 | Mode | Condition | Effect on the victim's objects |
 |---|---|---|
 | Tiered | ratio > watermark | Cached copies dropped; objects stay on NVMe, next GET reads NVMe. |
-| Dram | ratio > watermark **and** `maxmemory-policy` is `allkeys-*` | The objects *are* the data. Their oids go on the reclaim list; the keys read as missing and the cron deletes them (§8.5). |
+| Dram | never | The objects *are* the data; releasing a segment would delete them. See below. |
 
 **Why Dram does not shrink.** Releasing a segment deletes every key on it, TTL or not,
 hot or cold, which no `maxmemory-policy` allows. So Dram never shrinks: evicted objects
@@ -1485,7 +1485,7 @@ bound is physical RAM, as in core Valkey.
 
 | Mode | At the ceiling |
 |---|---|
-| Dram | A `BLOB.TCP_SET` / `BLOB.RDMA_SET` that needs a new segment is rejected (OOM). Under an evicting `maxmemory-policy` the cron shrinks a segment and deletes its keys; under `noeviction` writes keep failing (§8.3). |
+| Dram | A `BLOB.TCP_SET` / `BLOB.RDMA_SET` that needs a new segment is rejected (OOM). An evicting `maxmemory-policy` makes room by evicting objects into holes (§8.1); under `noeviction` writes keep failing. Dram never shrinks (§8.3). |
 | Tiered | The cache stops growing; the cron shrinks segments (cached copies dropped, data stays on NVMe). |
 
 Segment **count** is always derived from demand, never a knob. Every segment is
@@ -1495,10 +1495,9 @@ exactly `segment-size`.
 
 - **Tiered mode:** DRAMPool is a cache, reclaimable under pressure without data loss.
   NVMe capacity is a hard SET bound today; module-driven NVMe eviction is planned (§8.1).
-- **Dram mode:** DRAMPool is the data. Under server memory pressure and an evicting
-  `maxmemory-policy`, the cron deletes the keys on the least-loaded segment (§8.5); core's
-  `maxmemory-policy` evicts whole keys independently but cannot lower `used_memory`
-  by itself (§8.1 fact 2). Module-driven per-object eviction is planned (§8.1).
+- **Dram mode:** DRAMPool is the data. It never shrinks (§8.3), so memory comes back only by
+  evicting objects into holes; core's `maxmemory-policy` evicts whole keys independently but
+  cannot lower `used_memory` by itself (§8.1 fact 2). Module-driven per-object eviction is planned (§8.1).
 
 **NVMe staging is not a scalable budget.** It sizes transient I/O buffers for
 concurrency, is fixed at startup and never shrinks.
