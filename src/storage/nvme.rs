@@ -163,7 +163,7 @@ fn victim_batch(n: usize) -> Vec<ObjectId> {
 /// except orphans, which stay in it until the retry. Returns the bytes freed, not counting
 /// orphans. Victims stay in the reclaim list: their keys read as missing until the cron
 /// deletes them, and their teardown then only removes them from it.
-fn evict(victims: Vec<(Arc<super::UnevictableOid>, u64)>) -> u64 {
+fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
     let mut freed = 0;
     for (unevictable, size) in victims {
         let oid = unevictable.oid();
@@ -185,7 +185,7 @@ fn evict(victims: Vec<(Arc<super::UnevictableOid>, u64)>) -> u64 {
 /// so no eviction takes them. The cron's retry unlinks them and credits their bytes.
 /// Size 0: an eviction could not stat the file, so the retry does first.
 pub struct OrphanedFiles {
-    files: Mutex<Vec<(Arc<super::UnevictableOid>, u64)>>,
+    files: Mutex<Vec<(Arc<super::UnevictableOID>, u64)>>,
     pub count: AtomicU64,
     pub bytes: AtomicU64,
     retrying: AtomicBool,
@@ -199,7 +199,7 @@ pub static ORPHANED_FILES: OrphanedFiles = OrphanedFiles {
 };
 
 impl OrphanedFiles {
-    fn push(&self, unevictable: Arc<super::UnevictableOid>, size: u64) {
+    fn push(&self, unevictable: Arc<super::UnevictableOID>, size: u64) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(size, Ordering::Relaxed);
         self.files
@@ -290,7 +290,7 @@ fn transient(e: &std::io::Error) -> bool {
 
 /// Unlink the file of `size` charged bytes. True if it is gone: the caller credits
 /// them. False if it is orphaned: the bytes stay charged until the retry credits them.
-pub(crate) fn try_unlink(unevictable: Arc<super::UnevictableOid>, size: u64, during: &str) -> bool {
+pub(crate) fn try_unlink(unevictable: Arc<super::UnevictableOID>, size: u64, during: &str) -> bool {
     let oid = unevictable.oid();
     let unlinked = if crate::test_fail_unlink() {
         Err(std::io::Error::from_raw_os_error(libc::EBUSY))

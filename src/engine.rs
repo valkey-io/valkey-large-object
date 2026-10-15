@@ -312,7 +312,7 @@ fn cmd_get_tiered(
     blocked_client: valkey_module::BlockedClient,
 ) {
     // We do not allow the eviction of files that are inflight.
-    let unevictable = storage::UnevictableOid::new(object_id);
+    let unevictable = storage::UnevictableOID::new(object_id);
     let dram_pool = storage::get_dram_pool();
     let cache = dram_pool.tiered_cache();
     // ─── DRAMPool hit ────────────────────────────────────────────────────
@@ -808,8 +808,8 @@ fn cmd_set_tiered(
     // We do not allow the eviction of the new file until it is committed, nor of
     // the one it replaces.
     let unevictable = (
-        storage::UnevictableOid::new(object_id),
-        old_oid.map(storage::UnevictableOid::new),
+        storage::UnevictableOID::new(object_id),
+        old_oid.map(storage::UnevictableOID::new),
     );
     match data_source {
         DataSource::Tcp(data) => {
@@ -1008,7 +1008,7 @@ fn cmd_get_from_dram(
     crc32c: Crc,
     transport: Transport,
     thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
-    file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOid>)>,
+    file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOID>)>,
 ) {
     match transport {
         Transport::Tcp => {
