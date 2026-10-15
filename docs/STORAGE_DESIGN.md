@@ -971,6 +971,22 @@ object's storage first and put its oid on the reclaim list (§8.5), and both fee
 `reclaims` counter. `reclaim-sample-size` and the reclaim-named internals are reserved
 for them.
 
+**Which keys eviction may take follows `maxmemory-policy`**, read on every eviction
+(`CONFIG SET` can change it at any time):
+
+| Policy | Dram object eviction | NVMe object eviction |
+|---|---|---|
+| `volatile-*` | Only objects whose key has a TTL (`ObjectContext::ttl_present`) | Only oids in the `ttl` bitmap; with none left the write is refused, as in core |
+| `allkeys-*` | Any object | Any oid in the `all` bitmap |
+
+Two roaring bitmaps of oids back the NVMe side: `all` (every live object) and `ttl` (the
+subset whose key has a TTL). An oid leaves both when it is evicted, so it is never picked
+twice. TTL membership comes from the `expire`, `persist` and `copy_to` keyspace events
+(`live::on_keyspace_event`, both modes); `expire` covers EXPIRE, PEXPIRE, EXPIREAT and
+PEXPIREAT. RENAME and MOVE carry the object and its TTL together, and an overwrite mints a
+new oid, so none needs an event. The order among allowed keys is not set by the policy yet:
+Dram ranks by sampled LFU score inside one segment, NVMe picks at random.
+
 **Detection:**
 
 - **Dram expand:** reactive (SET alloc-miss → expand + retry inline) and proactive (cron, utilization > watermark).
