@@ -158,11 +158,8 @@ impl Fabric {
 
 /// `None` before `commit` and after `shutdown`. `None` at commit means this instance has no
 /// fabric: the module runs TCP-only and `BLOB.RDMA_HELLO` reports RDMA unavailable.
+/// RwLock: every EFA transfer reads it from tokio workers; only commit and shutdown write.
 static FABRIC: RwLock<Option<Arc<Fabric>>> = RwLock::new(None);
-
-fn slot() -> MutexGuard<'static, Option<Arc<Fabric>>> {
-    FABRIC.lock().expect("FABRIC lock unavailable")
-}
 
 /// Store the fabric from `initialize`, once it has been set up.
 pub fn commit(fabric: Option<Fabric>) {

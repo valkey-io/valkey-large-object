@@ -122,7 +122,7 @@ impl SegmentPool {
     /// first. 0 means the bytes fit and only talc overhead could block the alloc.
     pub(super) fn segment_shortfalls(&self, size: usize, n: usize) -> Vec<(usize, usize)> {
         let total: usize = Self::chunk_sizes(size).iter().sum();
-        let st = self.state.lock().expect("state lock unavailable");
+        let st = self.state.read().expect("state lock unavailable");
         Self::least_loaded(&st, n)
             .into_iter()
             .map(|(i, cur)| (i, (cur + total).saturating_sub(self.segment_size)))
@@ -818,7 +818,7 @@ mod tests {
         freed.iter().for_each(|(_, b)| pool.free_n(b));
         // Seg 1: fuller than seg 0, but with one contiguous free tail.
         let big: Vec<_> = (0..2).map(|_| alloc_in(1, 12288).unwrap()).collect();
-        let least = SegmentPool::least_loaded(&pool.state.lock().unwrap(), 1)[0].0;
+        let least = SegmentPool::least_loaded(&pool.state.read().unwrap(), 1)[0].0;
         assert_eq!(least, 0, "seg 0 is least loaded");
         assert!(alloc_in(0, 16384).is_none(), "seg 0 is fragmented");
 
