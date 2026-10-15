@@ -18,24 +18,28 @@
 
 use rand::RngExt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::cache_policy::{
-    now_minutes, sample_victim, MaxmemoryPolicy, OIDIndexedMap, OIDIndexedSet, TieredCache,
-    RECLAIM_MAX_SEGMENTS, RECLAIM_MAX_VICTIMS,
+    now_minutes, sample_victim, LruList, MaxmemoryPolicy, OIDIndexedMap, OIDIndexedSet, Pick,
+    TieredCache, RECLAIM_MAX_SEGMENTS, RECLAIM_MAX_VICTIMS,
 };
 use super::context::{ObjectContext, SegmentBuffer};
 use super::segment_pool::SegmentPool;
 use crate::data_type::ObjectId;
 
 /// Cached objects plus a per-segment index of the same OIDs, so reclaim can
-/// sample one segment. Both change together, only through `insert`/`remove`.
+/// sample one segment, plus (Dram) their LRU order. All change together, only
+/// through `insert`/`remove`.
 #[derive(Default)]
 struct ObjectMaps {
     all: OIDIndexedMap<Arc<ObjectContext>>,
     /// `by_segment[s]`: OIDs of the objects in segment `s`. An object never
     /// spans segments, so its first buffer names its segment.
     by_segment: Vec<OIDIndexedSet>,
+    /// Dram only: every object, least recently used first, for `*-lru` eviction.
+    /// Its own lock, under `objects` (read is enough), so a GET can record a use.
+    lru: Option<Mutex<LruList>>,
 }
 
 impl ObjectMaps {
@@ -45,6 +49,9 @@ impl ObjectMaps {
             self.by_segment.resize_with(s + 1, OIDIndexedSet::new);
         }
         self.by_segment[s].insert(oid);
+        if let Some(lru) = &mut self.lru {
+            ctx.set_lru_slot(lru_list(lru).insert(oid));
+        }
         let old = self.all.insert(oid, ctx);
         debug_assert!(old.is_none(), "OIDs are never reused");
     }
@@ -52,7 +59,27 @@ impl ObjectMaps {
     fn remove(&mut self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
         let ctx = self.all.swap_remove(oid)?;
         self.by_segment[ctx.buffers[0].segment_idx as usize].swap_remove(oid);
+        self.forget_lru(oid, &ctx);
         Some(ctx)
+    }
+
+    fn forget_lru(&mut self, oid: &ObjectId, ctx: &ObjectContext) {
+        if let Some(lru) = &mut self.lru {
+            lru_list(lru).remove(ctx.lru_slot(), *oid);
+        }
+    }
+
+    /// Remove and return the least recently used object no reader holds, among
+    /// those with a TTL if `volatile`. Dram only.
+    fn take_oldest(&mut self, volatile: bool) -> Option<(ObjectId, Arc<ObjectContext>)> {
+        let all = &self.all;
+        let (_, oid) = *lru_list(self.lru.as_mut()?)
+            .oldest(volatile, 1, |oid| match all.get(&oid) {
+                Some(ctx) if Arc::strong_count(ctx) == 1 => Pick::Take,
+                _ => Pick::Pass,
+            })
+            .first()?;
+        Some((oid, self.remove(&oid)?))
     }
 
     /// Remove every object in segment `seg` (shrink) and return their OIDs.
@@ -62,7 +89,9 @@ impl ObjectMaps {
         };
         let ids = std::mem::take(ids);
         for oid in &ids {
-            self.all.swap_remove(oid);
+            if let Some(ctx) = self.all.swap_remove(oid) {
+                self.forget_lru(oid, &ctx);
+            }
         }
         ids
     }
@@ -85,9 +114,15 @@ impl ObjectMaps {
                 None
             }
         })?;
-        let oid = ids.swap_remove_index(victim)?;
-        Some((oid, self.all.swap_remove(&oid)?))
+        let oid = *ids.get_index(victim)?;
+        Some((oid, self.remove(&oid)?))
     }
+}
+
+/// The list behind `lru`, from `&mut ObjectMaps`: under the `objects` write lock,
+/// no other thread can hold its mutex.
+fn lru_list(lru: &mut Mutex<LruList>) -> &mut LruList {
+    lru.get_mut().expect("DRAMPool lru lock unavailable")
 }
 
 /// Rank objects by LFU score, read at one time for the whole search.
@@ -124,7 +159,10 @@ impl DRAMPool {
     pub fn new(segment_count: usize, segment_size: usize, cache: Option<TieredCache>) -> Self {
         Self {
             pool: SegmentPool::new(segment_count, segment_size, super::uring::PoolType::Dram),
-            objects: RwLock::new(ObjectMaps::default()),
+            objects: RwLock::new(ObjectMaps {
+                lru: cache.is_none().then(Mutex::default),
+                ..ObjectMaps::default()
+            }),
             expand_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
             cache,
@@ -165,10 +203,12 @@ impl DRAMPool {
         self.pool.alloc_exact(obj_len as usize)
     }
 
-    /// `alloc_exact_or_expand`. If that fails and `eviction_allowed`, evict random
-    /// objects in the least-loaded segments and retry the alloc in each
-    /// (`make_room_for`). Only keys the `maxmemory-policy` allows are evicted: under
-    /// `volatile-*`, keys with a TTL. Dram mode, main thread only. `ctx` may be a dummy.
+    /// `alloc_exact_or_expand`. If that fails and `eviction_allowed`, evict and
+    /// retry: under `*-lru` the least recently used objects wherever they live
+    /// (`evict_lru_for`), else random objects in the least-loaded segments
+    /// (`make_room_for`). Only keys the `maxmemory-policy` allows are evicted:
+    /// under `volatile-*`, keys with a TTL. Dram mode, main thread only. `ctx` may
+    /// be a dummy.
     pub fn alloc_exact_expand_evict(
         &self,
         ctx: &valkey_module::Context,
@@ -188,7 +228,44 @@ impl DRAMPool {
         if !crate::eviction_allowed(ctx) {
             return None;
         }
-        self.make_room_for(obj_len as usize, by_policy(MaxmemoryPolicy::current()))
+        let policy = MaxmemoryPolicy::current();
+        if !policy.random {
+            self.evict_lru_for(obj_len as usize, policy.volatile)
+        } else {
+            self.make_room_for(obj_len as usize, by_policy(policy))
+        }
+    }
+
+    /// Evict the least recently used objects the policy allows, one at a time,
+    /// until `obj_len` fits in some segment. A victim's freed bytes may sit in a
+    /// segment that cannot take the write: they stay as a hole for later writes.
+    /// Stops after `RECLAIM_MAX_SEGMENTS` segments' worth of bytes. Victims stay
+    /// evicted when the write still does not fit. Dram mode only.
+    fn evict_lru_for(&self, obj_len: usize, volatile: bool) -> Option<Vec<SegmentBuffer>> {
+        let budget = RECLAIM_MAX_SEGMENTS * self.pool.segment_size;
+        let mut freed = 0;
+        while freed < budget {
+            let mut victim = None;
+            // List before `objects`, as in `try_shrink`.
+            super::reclaim::RECLAIM_LIST.add_with(|| {
+                victim = self
+                    .objects
+                    .write()
+                    .expect("DRAMPool.objects lock unavailable")
+                    .take_oldest(volatile);
+                victim.as_ref().map(|(oid, _)| *oid)
+            });
+            let (_, ctx) = victim?;
+            crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
+            freed += ctx.buffers.iter().map(|b| b.len as usize).sum::<usize>();
+            // No reader holds it, and it left the map: this is the last Arc, so its
+            // buffers return to their segment now.
+            drop(ctx);
+            if let Some(bufs) = self.pool.alloc_exact(obj_len) {
+                return Some(bufs);
+            }
+        }
+        None
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {
@@ -289,14 +366,33 @@ impl DRAMPool {
     /// Dram: record whether `oid`'s key has a TTL. Ignored for an object already
     /// reclaimed, whose key is going.
     pub fn set_ttl(&self, oid: &ObjectId, has_ttl: bool) {
-        if let Some(ctx) = self
+        let objects = self
             .objects
             .read()
-            .expect("DRAMPool.objects lock unavailable")
-            .all
-            .get(oid)
-        {
+            .expect("DRAMPool.objects lock unavailable");
+        if let Some(ctx) = objects.all.get(oid) {
             ctx.set_ttl_present(has_ttl);
+            if let Some(lru) = &objects.lru {
+                lru.lock().expect("DRAMPool lru lock unavailable").set_ttl(
+                    ctx.lru_slot(),
+                    *oid,
+                    has_ttl,
+                );
+            }
+        }
+    }
+
+    /// Dram: record a GET of `oid`, for LRU and LFU eviction.
+    pub fn record_access(&self, oid: &ObjectId, ctx: &ObjectContext) {
+        ctx.stats.touch(now_minutes(), crate::blob_decay_time());
+        let objects = self
+            .objects
+            .read()
+            .expect("DRAMPool.objects lock unavailable");
+        if let Some(lru) = &objects.lru {
+            lru.lock()
+                .expect("DRAMPool lru lock unavailable")
+                .touch(ctx.lru_slot(), *oid);
         }
     }
 
@@ -734,6 +830,7 @@ mod tests {
                     by_policy(MaxmemoryPolicy {
                         volatile: false,
                         noeviction: false,
+                        random: false,
                     }),
                 )
                 .unwrap();
@@ -756,6 +853,7 @@ mod tests {
         let volatile = by_policy(MaxmemoryPolicy {
             volatile: true,
             noeviction: false,
+            random: false,
         });
         // Only 2 BUF of segment 0 has a TTL.
         assert!(p.reclaim_in(0, 3 * BUF as usize, volatile).is_none());
@@ -764,6 +862,36 @@ mod tests {
         for (oid, _) in &victims {
             super::super::reclaim::RECLAIM_LIST.remove(oid);
         }
+    }
+
+    #[test]
+    fn lru_takes_the_least_recently_used_unpinned_object_in_any_segment() {
+        let p = dram_pool();
+        for i in 0..4u16 {
+            p.insert_object(ObjectId(9_400 + i as u64), ctx(i % 2, i));
+        }
+        let read = p.get_object(&ObjectId(9_400)).unwrap();
+        p.record_access(&ObjectId(9_400), &read);
+        drop(read);
+        let pinned = p.get_object(&ObjectId(9_401)).unwrap();
+        let take = |volatile| {
+            p.objects
+                .write()
+                .unwrap()
+                .take_oldest(volatile)
+                .map(|(oid, _)| oid.0)
+        };
+        // 9_400 was read and 9_401 is held by a reader: 9_402 is the oldest takeable.
+        assert_eq!(take(false), Some(9_402));
+        assert_eq!(take(false), Some(9_403));
+        assert_eq!(take(false), Some(9_400));
+        assert_eq!(take(false), None, "only the pinned object is left");
+        drop(pinned);
+        assert_eq!(take(true), None, "no object has a TTL");
+        p.set_ttl(&ObjectId(9_401), true);
+        assert_eq!(take(true), Some(9_401));
+        assert_eq!(p.object_count(), 0);
+        assert_index_consistent(&p);
     }
 
     #[test]

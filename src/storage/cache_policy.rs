@@ -242,30 +242,45 @@ pub struct TieredCache {
 /// The server's `maxmemory-policy`, as module eviction uses it. The module API has no
 /// getter for it (`GetContextFlags` says only whether some evicting policy is set), so it
 /// is read once at load and again whenever a `CONFIG SET` changes it, and cached.
+///
+/// Only two things of the policy matter. `volatile-*` limits eviction to keys with a TTL.
+/// `*-random` picks a victim at random; every other order runs as LRU (`*-lfu` and
+/// `volatile-ttl` have no order of their own here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MaxmemoryPolicy {
     /// `volatile-*`: only keys with a TTL may be evicted.
     pub volatile: bool,
     /// `noeviction`: nothing may be evicted.
     pub noeviction: bool,
+    /// `*-random`: a random victim instead of the least recently used.
+    pub random: bool,
 }
 
 /// The cached policy, as `MaxmemoryPolicy::bits`: one value, so a reader never sees half
 /// of a change.
 static POLICY: AtomicU8 = AtomicU8::new(0);
 const VOLATILE: u8 = 1;
-const NOEVICTION: u8 = 2;
+const RANDOM: u8 = 2;
+const NOEVICTION: u8 = 4;
 
 impl MaxmemoryPolicy {
     fn parse(name: &str) -> Self {
         Self {
             volatile: name.starts_with("volatile-"),
             noeviction: name == "noeviction",
+            random: name.ends_with("-random"),
         }
     }
 
+    /// Whether `name` is served as LRU though it names another order.
+    fn runs_as_lru(name: &str) -> bool {
+        name.ends_with("-lfu") || name == "volatile-ttl"
+    }
+
     fn bits(self) -> u8 {
-        (if self.volatile { VOLATILE } else { 0 }) | (if self.noeviction { NOEVICTION } else { 0 })
+        (if self.volatile { VOLATILE } else { 0 })
+            | (if self.noeviction { NOEVICTION } else { 0 })
+            | (if self.random { RANDOM } else { 0 })
     }
 
     /// The policy now in force: one atomic load.
@@ -274,17 +289,30 @@ impl MaxmemoryPolicy {
         Self {
             volatile: bits & VOLATILE != 0,
             noeviction: bits & NOEVICTION != 0,
+            random: bits & RANDOM != 0,
         }
     }
 
-    /// Read the policy from the server and cache it. Call at load, and on a change of
-    /// `maxmemory-policy` (`on_config_change`).
+    /// Read the policy from the server and cache it, warning if it is served in another
+    /// order than its own. Call at load, and on a change of `maxmemory-policy`
+    /// (`on_config_change`).
     pub fn refresh(ctx: &valkey_module::Context) {
         let info = ctx.server_info("memory");
         let name = info
             .field("maxmemory_policy")
             .map(|v| v.to_string())
             .unwrap_or_default();
+        if Self::runs_as_lru(&name) {
+            let served = if name.starts_with("volatile-") {
+                "volatile-lru"
+            } else {
+                "allkeys-lru"
+            };
+            valkey_module::logging::log_warning(format!(
+                "largeobj: maxmemory-policy {name} evicts in {served} order: module \
+                 eviction has no LFU or TTL-ordered eviction"
+            ));
+        }
         POLICY.store(Self::parse(&name).bits(), Ordering::Relaxed);
     }
 }
@@ -294,6 +322,232 @@ impl MaxmemoryPolicy {
 fn on_config_change(ctx: &valkey_module::Context, changed: &[&str]) {
     if changed.contains(&"maxmemory-policy") {
         MaxmemoryPolicy::refresh(ctx);
+    }
+}
+
+// ─── LruList ─────────────────────────────────────────────────────────────────
+
+/// End of a list.
+const NIL: u32 = u32::MAX;
+/// `prev` of a node that is not in that list.
+const OFF: u32 = u32::MAX - 1;
+/// The oid of a free slot. Real oids start at 1.
+const FREE: ObjectId = ObjectId(0);
+
+#[derive(Debug, Clone, Copy)]
+struct Links {
+    prev: u32,
+    next: u32,
+}
+
+const UNLINKED: Links = Links {
+    prev: OFF,
+    next: NIL,
+};
+
+/// `oldest` and `newest` of one list.
+#[derive(Debug, Clone, Copy)]
+struct Ends {
+    oldest: u32,
+    newest: u32,
+}
+
+/// Index into a node's `links` and the list's `ends`.
+#[derive(Debug, Clone, Copy)]
+enum List {
+    All = 0,
+    Ttl = 1,
+}
+
+#[derive(Debug)]
+struct Node {
+    oid: ObjectId,
+    links: [Links; 2],
+}
+
+/// What `LruList::oldest` does with a node it walks past.
+pub enum Pick {
+    /// A candidate.
+    Take,
+    /// Not now (in use); it keeps its place.
+    Pass,
+    /// No longer evictable (already evicted). Unlinked, so no later walk meets it; its
+    /// owner still `remove`s it.
+    Unlink,
+}
+
+/// Exact least-recently-used order of objects, for `*-lru` eviction. Two doubly linked
+/// lists over one slab: every object, and the objects whose key has a TTL. A node's slot
+/// is its handle, kept by its owner, so a touch or remove needs no lookup. Each call also
+/// names the oid, and is ignored when the slot no longer holds it (freed, maybe reused).
+///
+/// A TTL change is a use, as in core (EXPIRE and PERSIST touch the key), so every move
+/// into the TTL list also moves the node to the newest end of the full list: the TTL list
+/// stays the full list's order restricted to keys with a TTL.
+///
+/// 24 bytes a node; freed slots are reused, and the slab never shrinks. Not locked: its
+/// owner calls it under its own lock.
+#[derive(Debug)]
+pub struct LruList {
+    nodes: Vec<Node>,
+    /// Free slots, chained through `links[All].next`.
+    free: u32,
+    ends: [Ends; 2],
+}
+
+impl Default for LruList {
+    fn default() -> Self {
+        let empty = Ends {
+            oldest: NIL,
+            newest: NIL,
+        };
+        Self {
+            nodes: Vec::new(),
+            free: NIL,
+            ends: [empty; 2],
+        }
+    }
+}
+
+impl LruList {
+    /// Add `oid` as the most recently used object. Returns its slot.
+    pub fn insert(&mut self, oid: ObjectId) -> u32 {
+        let node = Node {
+            oid,
+            links: [UNLINKED; 2],
+        };
+        let slot = if self.free == NIL {
+            self.nodes.push(node);
+            u32::try_from(self.nodes.len() - 1).expect("LruList slots fit in u32")
+        } else {
+            let slot = self.free;
+            self.free = self.links(List::All, slot).next;
+            self.nodes[slot as usize] = node;
+            slot
+        };
+        self.push_newest(List::All, slot);
+        slot
+    }
+
+    /// Record a use: `oid` becomes the most recently used object.
+    pub fn touch(&mut self, slot: u32, oid: ObjectId) {
+        if !self.listed(slot, oid) {
+            return;
+        }
+        for list in [List::All, List::Ttl] {
+            if self.linked(list, slot) {
+                self.unlink(list, slot);
+                self.push_newest(list, slot);
+            }
+        }
+    }
+
+    /// Record whether `oid`'s key has a TTL. Also a use.
+    pub fn set_ttl(&mut self, slot: u32, oid: ObjectId, has_ttl: bool) {
+        if !self.listed(slot, oid) {
+            return;
+        }
+        self.touch(slot, oid);
+        match (has_ttl, self.linked(List::Ttl, slot)) {
+            (true, false) => self.push_newest(List::Ttl, slot),
+            (false, true) => self.unlink(List::Ttl, slot),
+            _ => {}
+        }
+    }
+
+    /// The object is gone: drop its node and free its slot.
+    pub fn remove(&mut self, slot: u32, oid: ObjectId) {
+        if !self.holds(slot, oid) {
+            return;
+        }
+        self.unlink_both(slot);
+        let free = self.free;
+        let node = &mut self.nodes[slot as usize];
+        node.oid = FREE;
+        node.links[List::All as usize].next = free;
+        self.free = slot;
+    }
+
+    /// Up to `n` `(slot, oid)` candidates, least recently used first, from the TTL list if
+    /// `volatile`, else from every object. `pick` decides each node walked past.
+    pub fn oldest(
+        &mut self,
+        volatile: bool,
+        n: usize,
+        mut pick: impl FnMut(ObjectId) -> Pick,
+    ) -> Vec<(u32, ObjectId)> {
+        let list = if volatile { List::Ttl } else { List::All };
+        let mut taken = Vec::new();
+        let mut slot = self.ends[list as usize].oldest;
+        while slot != NIL && taken.len() < n {
+            let oid = self.nodes[slot as usize].oid;
+            let next = self.links(list, slot).next;
+            match pick(oid) {
+                Pick::Take => taken.push((slot, oid)),
+                Pick::Pass => {}
+                Pick::Unlink => self.unlink_both(slot),
+            }
+            slot = next;
+        }
+        taken
+    }
+
+    fn holds(&self, slot: u32, oid: ObjectId) -> bool {
+        oid != FREE && self.nodes.get(slot as usize).is_some_and(|n| n.oid == oid)
+    }
+
+    /// `slot` holds `oid` and is still in the full list (not evicted).
+    fn listed(&self, slot: u32, oid: ObjectId) -> bool {
+        self.holds(slot, oid) && self.linked(List::All, slot)
+    }
+
+    fn linked(&self, list: List, slot: u32) -> bool {
+        self.links(list, slot).prev != OFF
+    }
+
+    fn links(&self, list: List, slot: u32) -> Links {
+        self.nodes[slot as usize].links[list as usize]
+    }
+
+    fn links_mut(&mut self, list: List, slot: u32) -> &mut Links {
+        &mut self.nodes[slot as usize].links[list as usize]
+    }
+
+    fn push_newest(&mut self, list: List, slot: u32) {
+        let newest = self.ends[list as usize].newest;
+        *self.links_mut(list, slot) = Links {
+            prev: newest,
+            next: NIL,
+        };
+        if newest == NIL {
+            self.ends[list as usize].oldest = slot;
+        } else {
+            self.links_mut(list, newest).next = slot;
+        }
+        self.ends[list as usize].newest = slot;
+    }
+
+    fn unlink(&mut self, list: List, slot: u32) {
+        let Links { prev, next } = self.links(list, slot);
+        if prev == NIL {
+            self.ends[list as usize].oldest = next;
+        } else {
+            self.links_mut(list, prev).next = next;
+        }
+        if next == NIL {
+            self.ends[list as usize].newest = prev;
+        } else {
+            self.links_mut(list, next).prev = prev;
+        }
+        *self.links_mut(list, slot) = UNLINKED;
+    }
+
+    fn unlink_both(&mut self, slot: u32) {
+        for list in [List::All, List::Ttl] {
+            if self.linked(list, slot) {
+                self.unlink(list, slot);
+            }
+        }
     }
 }
 
@@ -449,21 +703,136 @@ mod tests {
 
     #[test]
     fn parse_policies() {
+        let p = |volatile, noeviction, random| MaxmemoryPolicy {
+            volatile,
+            noeviction,
+            random,
+        };
+        assert_eq!(
+            MaxmemoryPolicy::parse("volatile-lru"),
+            p(true, false, false)
+        );
+        assert_eq!(
+            MaxmemoryPolicy::parse("volatile-lfu"),
+            p(true, false, false)
+        );
+        assert_eq!(
+            MaxmemoryPolicy::parse("volatile-ttl"),
+            p(true, false, false)
+        );
+        assert_eq!(
+            MaxmemoryPolicy::parse("volatile-random"),
+            p(true, false, true)
+        );
+        assert_eq!(
+            MaxmemoryPolicy::parse("allkeys-lru"),
+            p(false, false, false)
+        );
+        assert_eq!(
+            MaxmemoryPolicy::parse("allkeys-lfu"),
+            p(false, false, false)
+        );
+        assert_eq!(
+            MaxmemoryPolicy::parse("allkeys-random"),
+            p(false, false, true)
+        );
+        assert_eq!(MaxmemoryPolicy::parse("noeviction"), p(false, true, false));
+    }
+
+    #[test]
+    fn policies_that_run_as_lru() {
+        for name in ["allkeys-lfu", "volatile-lfu", "volatile-ttl"] {
+            assert!(MaxmemoryPolicy::runs_as_lru(name), "{name}");
+        }
         for name in [
+            "allkeys-lru",
             "volatile-lru",
-            "volatile-lfu",
+            "allkeys-random",
             "volatile-random",
-            "volatile-ttl",
+            "noeviction",
         ] {
-            let p = MaxmemoryPolicy::parse(name);
-            assert!(p.volatile && !p.noeviction, "{name}");
+            assert!(!MaxmemoryPolicy::runs_as_lru(name), "{name}");
         }
-        for name in ["allkeys-lru", "allkeys-lfu", "allkeys-random", ""] {
-            let p = MaxmemoryPolicy::parse(name);
-            assert!(!p.volatile && !p.noeviction, "{name}");
-        }
-        let p = MaxmemoryPolicy::parse("noeviction");
-        assert!(!p.volatile && p.noeviction);
+    }
+
+    // ─── LruList ───
+
+    /// Every candidate, oldest first: of the TTL list if `volatile`, else of all.
+    fn order(lru: &mut LruList, volatile: bool) -> Vec<u64> {
+        lru.oldest(volatile, usize::MAX, |_| Pick::Take)
+            .into_iter()
+            .map(|(_, oid)| oid.0)
+            .collect()
+    }
+
+    #[test]
+    fn lru_orders_by_last_use() {
+        let mut lru = LruList::default();
+        let slots: Vec<u32> = (1..=4).map(|oid| lru.insert(ObjectId(oid))).collect();
+        assert_eq!(order(&mut lru, false), vec![1, 2, 3, 4]);
+        lru.touch(slots[0], ObjectId(1));
+        lru.touch(slots[2], ObjectId(3));
+        assert_eq!(order(&mut lru, false), vec![2, 4, 1, 3]);
+        // The oldest and the newest end both unlink cleanly.
+        lru.remove(slots[1], ObjectId(2));
+        lru.remove(slots[2], ObjectId(3));
+        assert_eq!(order(&mut lru, false), vec![4, 1]);
+    }
+
+    #[test]
+    fn lru_ttl_list_follows_the_full_order() {
+        let mut lru = LruList::default();
+        let slots: Vec<u32> = (1..=4).map(|oid| lru.insert(ObjectId(oid))).collect();
+        // A TTL change is a use: 4 and then 2 move to the newest end.
+        lru.set_ttl(slots[3], ObjectId(4), true);
+        lru.set_ttl(slots[1], ObjectId(2), true);
+        assert_eq!(order(&mut lru, false), vec![1, 3, 4, 2]);
+        assert_eq!(order(&mut lru, true), vec![4, 2]);
+        lru.touch(slots[3], ObjectId(4));
+        assert_eq!(order(&mut lru, true), vec![2, 4]);
+        // PERSIST: out of the TTL list, still in the full one.
+        lru.set_ttl(slots[1], ObjectId(2), false);
+        assert_eq!(order(&mut lru, true), vec![4]);
+        assert_eq!(order(&mut lru, false), vec![1, 3, 4, 2]);
+        lru.remove(slots[3], ObjectId(4));
+        assert!(order(&mut lru, true).is_empty());
+    }
+
+    #[test]
+    fn lru_ignores_a_stale_slot() {
+        let mut lru = LruList::default();
+        let old = lru.insert(ObjectId(1));
+        lru.insert(ObjectId(2));
+        lru.remove(old, ObjectId(1));
+        // The freed slot is reused by oid 3; calls naming oid 1 must leave it alone.
+        let reused = lru.insert(ObjectId(3));
+        assert_eq!(reused, old);
+        lru.touch(old, ObjectId(1));
+        lru.set_ttl(old, ObjectId(1), true);
+        lru.remove(old, ObjectId(1));
+        assert_eq!(order(&mut lru, false), vec![2, 3]);
+        assert!(order(&mut lru, true).is_empty());
+    }
+
+    #[test]
+    fn lru_walk_passes_or_unlinks() {
+        let mut lru = LruList::default();
+        let slots: Vec<u32> = (1..=4).map(|oid| lru.insert(ObjectId(oid))).collect();
+        let picked = lru.oldest(false, 2, |oid| match oid.0 {
+            1 => Pick::Pass,
+            2 => Pick::Unlink,
+            _ => Pick::Take,
+        });
+        assert_eq!(
+            picked,
+            vec![(slots[2], ObjectId(3)), (slots[3], ObjectId(4))]
+        );
+        // 1 kept its place; 2 left the walk, and a touch does not bring it back.
+        lru.touch(slots[1], ObjectId(2));
+        assert_eq!(order(&mut lru, false), vec![1, 3, 4]);
+        // Its owner still frees the slot.
+        lru.remove(slots[1], ObjectId(2));
+        assert_eq!(lru.insert(ObjectId(5)), slots[1]);
     }
 
     // ─── sample_victim ───
