@@ -7,10 +7,11 @@
 use std::collections::{HashMap, VecDeque};
 
 use indexmap::{IndexMap, IndexSet};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
+use linkme::distributed_slice;
 use rand::RngExt;
 
 use crate::data_type::ObjectId;
@@ -236,6 +237,66 @@ pub struct TieredCache {
     pub stats: CacheStats,
 }
 
+// ─── MaxmemoryPolicy ─────────────────────────────────────────────────────────
+
+/// The server's `maxmemory-policy`, as module eviction uses it. The module API has no
+/// getter for it (`GetContextFlags` says only whether some evicting policy is set), so it
+/// is read once at load and again whenever a `CONFIG SET` changes it, and cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxmemoryPolicy {
+    /// `volatile-*`: only keys with a TTL may be evicted.
+    pub volatile: bool,
+    /// `noeviction`: nothing may be evicted.
+    pub noeviction: bool,
+}
+
+/// The cached policy, as `MaxmemoryPolicy::bits`: one value, so a reader never sees half
+/// of a change.
+static POLICY: AtomicU8 = AtomicU8::new(0);
+const VOLATILE: u8 = 1;
+const NOEVICTION: u8 = 2;
+
+impl MaxmemoryPolicy {
+    fn parse(name: &str) -> Self {
+        Self {
+            volatile: name.starts_with("volatile-"),
+            noeviction: name == "noeviction",
+        }
+    }
+
+    fn bits(self) -> u8 {
+        (if self.volatile { VOLATILE } else { 0 }) | (if self.noeviction { NOEVICTION } else { 0 })
+    }
+
+    /// The policy now in force: one atomic load.
+    pub fn current() -> Self {
+        let bits = POLICY.load(Ordering::Relaxed);
+        Self {
+            volatile: bits & VOLATILE != 0,
+            noeviction: bits & NOEVICTION != 0,
+        }
+    }
+
+    /// Read the policy from the server and cache it. Call at load, and on a change of
+    /// `maxmemory-policy` (`on_config_change`).
+    pub fn refresh(ctx: &valkey_module::Context) {
+        let info = ctx.server_info("memory");
+        let name = info
+            .field("maxmemory_policy")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        POLICY.store(Self::parse(&name).bits(), Ordering::Relaxed);
+    }
+}
+
+/// `CONFIG SET` fired this after applying the change, so `refresh` reads the new value.
+#[distributed_slice(valkey_module::server_events::CONFIG_CHANGED_SERVER_EVENTS_LIST)]
+fn on_config_change(ctx: &valkey_module::Context, changed: &[&str]) {
+    if changed.contains(&"maxmemory-policy") {
+        MaxmemoryPolicy::refresh(ctx);
+    }
+}
+
 // ─── Sampled victim selection ────────────────────────────────────────────────
 
 /// A dense collection that `sample_victim` can read by index.
@@ -382,6 +443,27 @@ mod tests {
         assert_eq!(f.track(ObjectId(4)), 2);
         assert_eq!(f.track(ObjectId(1)), 1);
         assert_eq!(len(&f), (3, 3));
+    }
+
+    // ─── MaxmemoryPolicy ───
+
+    #[test]
+    fn parse_policies() {
+        for name in [
+            "volatile-lru",
+            "volatile-lfu",
+            "volatile-random",
+            "volatile-ttl",
+        ] {
+            let p = MaxmemoryPolicy::parse(name);
+            assert!(p.volatile && !p.noeviction, "{name}");
+        }
+        for name in ["allkeys-lru", "allkeys-lfu", "allkeys-random", ""] {
+            let p = MaxmemoryPolicy::parse(name);
+            assert!(!p.volatile && !p.noeviction, "{name}");
+        }
+        let p = MaxmemoryPolicy::parse("noeviction");
+        assert!(!p.volatile && p.noeviction);
     }
 
     // ─── sample_victim ───

@@ -14,6 +14,7 @@ pub mod cache_policy;
 pub mod context;
 pub mod dram_pool;
 pub mod fd_pool;
+pub mod live;
 pub mod nvme;
 pub mod nvme_pool;
 pub mod object_file;

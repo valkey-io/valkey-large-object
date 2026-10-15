@@ -365,13 +365,14 @@ pub fn eviction_allowed(ctx: &Context) -> bool {
     ctx.get_flags().contains(ContextFlags::EVICTED)
 }
 
-/// Whether Tiered eviction may evict object files: `disk-maxmemory` is set and
-/// `eviction_allowed` holds (`maxmemory` is set and `maxmemory-policy` is not `noeviction`).
+/// Whether Tiered eviction may evict object files: `disk-maxmemory` is set,
+/// `maxmemory-policy` is not `noeviction`, and this is not a replica, which leaves
+/// eviction to its primary. The server's `maxmemory` is not involved: it bounds DRAM,
+/// not the disk.
 pub fn tiered_eviction_allowed(ctx: &Context) -> bool {
-    if nvme_maxmemory() == 0 {
-        return false;
-    }
-    eviction_allowed(ctx)
+    nvme_maxmemory() != 0
+        && !storage::cache_policy::MaxmemoryPolicy::current().noeviction
+        && !ctx.get_flags().contains(ContextFlags::SLAVE)
 }
 
 /// Whether allocating `extra_bytes` more would push server memory to/over the
