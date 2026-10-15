@@ -971,8 +971,10 @@ object's storage first and put its oid on the reclaim list (§8.5), and both fee
 `reclaims` counter. `reclaim-sample-size` and the reclaim-named internals are reserved
 for them.
 
-**Which keys eviction may take follows `maxmemory-policy`**, read on every eviction
-(`CONFIG SET` can change it at any time):
+**Which keys eviction may take follows `maxmemory-policy`.** The module API has no getter
+for the policy, so it is read once at load and again on the server's config-change event
+(`cache_policy::on_config_change`), which `CONFIG SET` fires after applying the change; an
+eviction reads the cached value with one atomic load:
 
 | Policy | Dram object eviction | NVMe object eviction |
 |---|---|---|

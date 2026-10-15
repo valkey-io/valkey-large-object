@@ -90,7 +90,7 @@ pub fn scaling_cron(ctx: &Context) {
     // evicted objects just leave holes for later writes.
     let may_shrink = crate::operating_mode() == crate::OperatingMode::Tiered
         || (crate::eviction_allowed(ctx)
-            && !super::cache_policy::MaxmemoryPolicy::read(ctx).volatile);
+            && !super::cache_policy::MaxmemoryPolicy::current().volatile);
     if ratio > shrink_watermark && may_shrink && pool.try_shrink() {
         ctx.log_notice(&format!(
             "largeobj: scaling — memory pressure {:.1}% > {:.0}%, evicted one DRAM segment",

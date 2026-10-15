@@ -191,7 +191,7 @@ impl DRAMPool {
         if !crate::eviction_allowed(ctx) {
             return None;
         }
-        self.make_room_for(obj_len as usize, by_policy(MaxmemoryPolicy::read(ctx)))
+        self.make_room_for(obj_len as usize, by_policy(MaxmemoryPolicy::current()))
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {

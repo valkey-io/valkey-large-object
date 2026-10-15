@@ -212,6 +212,9 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         panic!("Runtime already initialized");
     }
 
+    // Cache maxmemory-policy; `CONFIG SET` keeps it current (cache_policy::on_config_change).
+    storage::cache_policy::MaxmemoryPolicy::refresh(ctx);
+
     // Mark module as initialized so runtime CONFIG SET validation is enabled.
     MODULE_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
 

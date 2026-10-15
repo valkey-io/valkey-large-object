@@ -96,11 +96,10 @@ fn evict_and_reserve(bytes: u64) -> bool {
     if bytes > max {
         return false;
     }
-    let Some(policy) = with_server_lock(|ctx| {
-        crate::tiered_eviction_allowed(ctx).then(|| super::cache_policy::MaxmemoryPolicy::read(ctx))
-    }) else {
+    if !with_server_lock(crate::tiered_eviction_allowed) {
         return false;
-    };
+    }
+    let policy = super::cache_policy::MaxmemoryPolicy::current();
     // Take the headroom first, so no other write can use it while we evict.
     let prev = NVME_DISK_USAGE.update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
         cur + bytes.min(max.saturating_sub(cur))

@@ -1146,6 +1146,19 @@ class EvictionPolicyTests:
         assert len(survivors) == self.PER_BUDGET - 2
         self.assert_refused(client, 'refused', b'R' * self.OBJ)
 
+    def test_a_policy_change_takes_effect_at_once(self):
+        """Nothing has a TTL: volatile-* refuses the write, allkeys-* evicts to take it, and
+        switching back refuses again, so each CONFIG SET reached the cached policy."""
+        client = self.new_client('volatile-lru')
+        set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        self.assert_refused(client, 'refused_1', b'R' * self.OBJ)
+        client.config_set('maxmemory-policy', 'allkeys-lru')
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        assert self.evictions(client) == 1
+        client.config_set('maxmemory-policy', 'volatile-lru')
+        self.assert_refused(client, 'refused_2', b'R' * self.OBJ)
+        assert self.evictions(client) == 1
+
     def free_a_slot(self, client, key):
         """DEL `key` and wait until its object is freed, leaving room for exactly one write."""
         client.execute_command('DEL', key)
