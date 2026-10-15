@@ -54,30 +54,30 @@ pub const MAX_MAX_PROMOTE_SIZE: i64 = i64::MAX;
 pub const DEFAULT_SCALING_POLL_MS: i64 = 2500;
 pub const MIN_SCALING_POLL_MS: i64 = 1_000;
 pub const MAX_SCALING_POLL_MS: i64 = 60_000;
-// reclaim-scan-budget-us
-pub const DEFAULT_RECLAIM_SCAN_BUDGET_US: i64 = 1000;
-pub const MIN_RECLAIM_SCAN_BUDGET_US: i64 = 100;
-pub const MAX_RECLAIM_SCAN_BUDGET_US: i64 = 100_000;
-// reclaim-poll-ms
-pub const DEFAULT_RECLAIM_POLL_MS: i64 = 100;
-pub const MIN_RECLAIM_POLL_MS: i64 = 10;
-pub const MAX_RECLAIM_POLL_MS: i64 = 60_000;
+// reaper-scan-budget-us
+pub const DEFAULT_REAPER_SCAN_BUDGET_US: i64 = 1000;
+pub const MIN_REAPER_SCAN_BUDGET_US: i64 = 100;
+pub const MAX_REAPER_SCAN_BUDGET_US: i64 = 100_000;
+// reaper-poll-ms
+pub const DEFAULT_REAPER_POLL_MS: i64 = 100;
+pub const MIN_REAPER_POLL_MS: i64 = 10;
+pub const MAX_REAPER_POLL_MS: i64 = 60_000;
 // smartlog-poll-secs
 pub const DEFAULT_SMARTLOG_POLL_SECS: i64 = 60;
 pub const MIN_SMARTLOG_POLL_SECS: i64 = 0;
 pub const MAX_SMARTLOG_POLL_SECS: i64 = 86_400;
-// lfu-decay-time
-pub const DEFAULT_LFU_DECAY_TIME: i64 = 1;
-pub const MIN_LFU_DECAY_TIME: i64 = 0;
-pub const MAX_LFU_DECAY_TIME: i64 = 65_535;
+// blob-decay-time
+pub const DEFAULT_BLOB_DECAY_TIME: i64 = 1;
+pub const MIN_BLOB_DECAY_TIME: i64 = 0;
+pub const MAX_BLOB_DECAY_TIME: i64 = 65_535;
 // promote-min-hits
 pub const DEFAULT_PROMOTE_MIN_HITS: i64 = 2;
 pub const MIN_PROMOTE_MIN_HITS: i64 = 1;
 pub const MAX_PROMOTE_MIN_HITS: i64 = 255;
-// reclaim-sample-size
-pub const DEFAULT_RECLAIM_SAMPLE_SIZE: i64 = 5;
-pub const MIN_RECLAIM_SAMPLE_SIZE: i64 = 1;
-pub const MAX_RECLAIM_SAMPLE_SIZE: i64 = 64;
+// victim-sample-size
+pub const DEFAULT_VICTIM_SAMPLE_SIZE: i64 = 5;
+pub const MIN_VICTIM_SAMPLE_SIZE: i64 = 1;
+pub const MAX_VICTIM_SAMPLE_SIZE: i64 = 64;
 // max-cached-fds
 pub const DEFAULT_MAX_CACHED_FDS: i64 = 1024;
 pub const MIN_MAX_CACHED_FDS: i64 = 0;
@@ -155,9 +155,12 @@ lazy_static::lazy_static! {
     pub static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(DEFAULT_SCALING_POLL_MS);
 
     /// Main-thread time, in microseconds, one scaling-cron tick may spend
-    /// scanning for and deleting reclaim-list keys. Default: 1000us.
-    pub static ref CFG_RECLAIM_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(DEFAULT_RECLAIM_SCAN_BUDGET_US);
-    pub static ref CFG_RECLAIM_POLL_MS: AtomicI64 = AtomicI64::new(DEFAULT_RECLAIM_POLL_MS);
+    /// scanning for and deleting evicted keys. Default: 1000us.
+    pub static ref CFG_REAPER_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(DEFAULT_REAPER_SCAN_BUDGET_US);
+
+    /// Scaling cron poll interval, in milliseconds, while evicted keys wait to be
+    /// deleted. Default: 100ms.
+    pub static ref CFG_REAPER_POLL_MS: AtomicI64 = AtomicI64::new(DEFAULT_REAPER_POLL_MS);
 
     /// NVMe SMART poll interval in seconds (Tiered mode). 0 disables polling
     /// entirely: no background reads, and the INFO section never appears.
@@ -165,16 +168,16 @@ lazy_static::lazy_static! {
     pub static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(DEFAULT_SMARTLOG_POLL_SECS);
 
     /// LFU counter decay: minutes per one-point decrement. 0 disables decay.
-    pub static ref CFG_LFU_DECAY_TIME: AtomicI64 = AtomicI64::new(DEFAULT_LFU_DECAY_TIME);
+    pub static ref CFG_BLOB_DECAY_TIME: AtomicI64 = AtomicI64::new(DEFAULT_BLOB_DECAY_TIME);
 
     /// How many misses an object must accumulate in the admission filter before a GET
     /// promotes it into DRAMPool. Default: 2.
     pub static ref CFG_PROMOTE_MIN_HITS: AtomicI64 = AtomicI64::new(DEFAULT_PROMOTE_MIN_HITS);
 
-    /// Entries sampled per reclaim round; the lowest LFU score is reclaimed.
-    pub static ref CFG_RECLAIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_RECLAIM_SAMPLE_SIZE);
+    /// Entries sampled per victim search; the lowest LFU score goes.
+    pub static ref CFG_VICTIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_VICTIM_SAMPLE_SIZE);
 
-    /// Cap on read fds cached by the FdPool. When full, opening a new fd reclaims
+    /// Cap on read fds cached by the FdPool. When full, opening a new fd evicts
     /// the lowest LFU score among samples. 0 means unlimited.
     pub static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(DEFAULT_MAX_CACHED_FDS);
 
@@ -304,28 +307,28 @@ pub fn scaling_poll_ms() -> u64 {
     CFG_SCALING_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn reclaim_scan_budget_us() -> u64 {
-    CFG_RECLAIM_SCAN_BUDGET_US.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn reaper_scan_budget_us() -> u64 {
+    CFG_REAPER_SCAN_BUDGET_US.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn reclaim_poll_ms() -> u64 {
-    CFG_RECLAIM_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn reaper_poll_ms() -> u64 {
+    CFG_REAPER_POLL_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn smartlog_poll_secs() -> u64 {
     CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn lfu_decay_time() -> u64 {
-    CFG_LFU_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn blob_decay_time() -> u64 {
+    CFG_BLOB_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn promote_min_hits() -> u8 {
     CFG_PROMOTE_MIN_HITS.load(std::sync::atomic::Ordering::Relaxed) as u8
 }
 
-pub fn reclaim_sample_size() -> usize {
-    CFG_RECLAIM_SAMPLE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
+pub fn victim_sample_size() -> usize {
+    CFG_VICTIM_SAMPLE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
 pub fn max_cached_fds() -> usize {

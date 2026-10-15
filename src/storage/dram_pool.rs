@@ -341,7 +341,7 @@ impl DRAMPool {
     /// buffers while holding `objects`, so today the order is objects -> state).
     fn make_room_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
         // Tiered only drops cached copies, so only Dram needs eviction allowed.
-        debug_assert!(
+        assert!(
             crate::operating_mode() != crate::OperatingMode::Dram
                 || crate::eviction_allowed(&valkey_module::Context::dummy()),
             "Dram eviction without eviction_allowed"
@@ -408,9 +408,9 @@ impl DRAMPool {
         need: usize,
         max_victims: usize,
     ) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
-        let samples = crate::reclaim_sample_size();
+        let samples = crate::victim_sample_size();
         let now_min = now_minutes();
-        let decay_time = crate::lfu_decay_time();
+        let decay_time = crate::blob_decay_time();
         let mut objects = self
             .objects
             .write()

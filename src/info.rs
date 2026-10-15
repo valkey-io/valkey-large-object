@@ -60,18 +60,18 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             LARGE_OBJECT_COUNT.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "pending_reclaims",
+            "pending_evictions",
             storage::reclaim::RECLAIM_LIST.len() as i64,
         )?
         .field("evictions", EVICTIONS.load(Ordering::Relaxed) as i64)?
         .field("disk_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
         .field(
             "disk_orphaned_files",
-            storage::nvme::ORPHANS.count.load(Ordering::Relaxed) as i64,
+            storage::nvme::ORPHANED_FILES.count.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "disk_orphaned_bytes",
-            storage::nvme::ORPHANS.bytes.load(Ordering::Relaxed) as i64,
+            storage::nvme::ORPHANED_FILES.bytes.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "disk_unevictable_objects",
@@ -91,8 +91,8 @@ fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .add_section("fd")
         .field("open_fds", fds.len() as i64)?
         .field(
-            "fd_reclaims",
-            fds.reclaims.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            "fd_evictions",
+            fds.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .build_section()?
         .build_info()

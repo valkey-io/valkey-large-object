@@ -60,7 +60,7 @@ def apply_full_shrink_pressure(client, policy='noeviction'):
 def shrink_completed(client):
     """No segment draining and every reclaimed key deleted."""
     info = info_largeobj(client)
-    return info['largeobj_dram_draining_segments'] == 0 and info['largeobj_pending_reclaims'] == 0
+    return info['largeobj_dram_draining_segments'] == 0 and info['largeobj_pending_evictions'] == 0
 
 
 def promote(client, keys):
@@ -97,8 +97,8 @@ def surviving(client, payloads):
     return {key: value for key, value in got.items() if value is not None}
 
 
-def pending_reclaims(client):
-    return info_largeobj(client)['largeobj_pending_reclaims']
+def pending_evictions(client):
+    return info_largeobj(client)['largeobj_pending_evictions']
 
 
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
@@ -406,11 +406,11 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         takes it off the reclaim list."""
         client = self.server.get_new_client()
         # The shrink tick re-arms the cron 60s out, holding the window open.
-        client.config_set('largeobj.reclaim-poll-ms', 60000)
+        client.config_set('largeobj.reaper-poll-ms', 60000)
         self._write_payloads(client)
 
         apply_shrink_pressure(client, 'volatile-lru')
-        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_reclaims'] == 1,
+        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_evictions'] == 1,
                       timeout=self.TIMEOUT_S)
         client.config_set('maxmemory', 0)  # let COPY (denyoom) reach the module
 
@@ -424,7 +424,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
             client.execute_command('COPY', victim, 'copy_dst')
 
         client.delete(victim)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_reclaims'] == 0)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_evictions'] == 0)
 
     def test_no_shrink_under_noeviction(self):
         """Dram shrink deletes keys, so noeviction disables it."""
@@ -789,7 +789,7 @@ class EvictionTests:
         assert len(survivors) == self.PER_BUDGET
         assert f'obj_{len(payloads) - 1}' in survivors, "the last write is nobody's victim"
         assert all(value == payloads[key] for key, value in survivors.items())
-        assert self.evictions(client) == pending_reclaims(client) == len(payloads) - self.PER_BUDGET
+        assert self.evictions(client) == pending_evictions(client) == len(payloads) - self.PER_BUDGET
         assert client.execute_command('EXISTS', *payloads) == len(payloads)
         self.settle(client, self.PER_BUDGET)
 
@@ -834,9 +834,9 @@ class EvictionTests:
         assert client.execute_command('BLOB.TCP_SET', overwritten, b'fresh' * 1000) == b'OK'
         assert client.execute_command('BLOB.TCP_GET', overwritten) == b'fresh' * 1000
         assert client.execute_command('DEL', deleted) == 1
-        wait_for_true(lambda: pending_reclaims(client) == self.evictions(client) - 2)
+        wait_for_true(lambda: pending_evictions(client) == self.evictions(client) - 2)
         client.execute_command('FLUSHALL', 'ASYNC')
-        wait_for_true(lambda: pending_reclaims(client) == 0)
+        wait_for_true(lambda: pending_evictions(client) == 0)
         self.settle(client, 0)
 
 
@@ -853,7 +853,7 @@ class EvictionCronTests:
         client.execute_command('MOVE', 'first_1', 2)
         payloads = set_objects(client, 'obj_', 3 * self.PER_BUDGET, self.OBJ)
         client.config_set('maxmemory', 1 << 40)  # Dram: else the tick after the sweep shrinks
-        wait_for_true(lambda: pending_reclaims(client) == 0, timeout=15)
+        wait_for_true(lambda: pending_evictions(client) == 0, timeout=15)
 
         evictions = self.evictions(client)
         assert evictions > 0
@@ -971,7 +971,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         promote(client, set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ))
         assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
         info = info_largeobj(client)
-        assert info['largeobj_evictions'] == info['largeobj_pending_reclaims'] == 1
+        assert info['largeobj_evictions'] == info['largeobj_pending_evictions'] == 1
         assert info['largeobj_dram_objects'] == self.PER_BUDGET - 1
 
 
@@ -1087,7 +1087,7 @@ class TestTieredEvictionMixed(TieredBudget):
         assert self.evictions(client) > 0
 
         # The cron deletes the ghosts, then ledger == directory == live keys.
-        wait_for_true(lambda: pending_reclaims(client) == 0, timeout=20)
+        wait_for_true(lambda: pending_evictions(client) == 0, timeout=20)
         wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
         self.settle(client, None, timeout=15)
         assert len(self.object_files()) == client.dbsize()

@@ -37,7 +37,7 @@ struct FdEntry {
 pub struct FdPool {
     fds: RwLock<OIDIndexedMap<FdEntry>>,
     /// Cached fds dropped to stay under `max-cached-fds`.
-    pub reclaims: AtomicU64,
+    pub evictions: AtomicU64,
 }
 
 impl Default for FdPool {
@@ -50,7 +50,7 @@ impl FdPool {
     pub fn new() -> Self {
         Self {
             fds: RwLock::new(OIDIndexedMap::new()),
-            reclaims: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }
     }
 
@@ -71,7 +71,7 @@ impl FdPool {
         cap: usize,
     ) -> Option<Arc<OwnedFd>> {
         let now_min = now_minutes();
-        let decay_time = crate::lfu_decay_time();
+        let decay_time = crate::blob_decay_time();
         let hit = |entry: &FdEntry| {
             entry.stats.touch(now_min, decay_time);
             Arc::clone(&entry.fd)
@@ -96,13 +96,13 @@ impl FdPool {
         // entry only drops the map's ref: a reader still holding a clone keeps the
         // fd open until its read finishes, then it closes.
         if cap > 0 {
-            let samples = crate::reclaim_sample_size();
+            let samples = crate::victim_sample_size();
             while fds.len() >= cap {
                 reclaim_one(&mut fds, samples, |e| {
                     Some(e.stats.decayed_counter(now_min, decay_time))
                 })
                 .expect("a non-empty map always yields a victim");
-                self.reclaims.fetch_add(1, Ordering::Relaxed);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -261,7 +261,7 @@ mod tests {
             assert_eq!(pool.len(), 1, "cap holds");
             assert!(!pool.contains(oids[0]));
             assert!(pool.contains(oids[1]));
-            assert_eq!(pool.reclaims.load(Ordering::Relaxed), 1);
+            assert_eq!(pool.evictions.load(Ordering::Relaxed), 1);
             assert!(
                 weak.upgrade().is_some(),
                 "reader keeps the reclaimed fd open"

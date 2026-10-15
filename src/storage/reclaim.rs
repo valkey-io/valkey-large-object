@@ -94,10 +94,10 @@ thread_local! {
 }
 
 /// Delete keys whose oids are on the reclaim list, spending at most
-/// `reclaim-scan-budget-us` of main-thread time per tick. Scans db by db,
-/// resuming across ticks, until the reclaim list is empty. An oid leaves the
-/// list when its key is deleted, here or by any other path (`lo_free` ->
-/// `remove_object`), so the scan cannot outlive its keys.
+/// `reaper-scan-budget-us` of main-thread time per tick. Scans db by db,
+/// resuming across ticks, until the reclaim list is empty. Dram: an oid leaves the
+/// list when its key is deleted, here or via `lo_free`. Tiered: when its `ObjectFile`
+/// drops. Either way the scan cannot outlive its keys.
 ///
 /// Cross-slot deletion is safe here: a timer callback runs outside command
 /// execution (`server.current_client` is NULL), so key lookups hash each key's
@@ -106,7 +106,7 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
     if RECLAIM_LIST.is_empty() {
         return;
     }
-    let deadline = Instant::now() + Duration::from_micros(crate::reclaim_scan_budget_us());
+    let deadline = Instant::now() + Duration::from_micros(crate::reaper_scan_budget_us());
     RECLAIM_SCAN_CURSOR.with_borrow_mut(|scan| {
         while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
             // Past the last db: one full pass done. At most one pass per tick
@@ -120,9 +120,13 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
                 let _ = ctx.open_key_writable(&name).unlink();
                 // Same keyspace event core fires for its own evictions.
                 ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
-                // lo_free runs later on the BIO thread; clear now so the scan
-                // stops once every listed key is gone. Tiered: the file's
-                // teardown clears it.
+                // Tiered Mode: Do not touch the RECLAIM_LIST. ObjectFile's drop uses
+                // presence in the list to determine if the file was claimed by eviction.
+                // This is necessary in order to not double-free evicted items.
+                // DRAM Mode: Calls to remove the oid from the RECLAIM_LIST happen both
+                // here and in lo_free (initiated by the unlink call above). This removal
+                // is redundant, but removing it here allows the main thread to exit the
+                // reclaim loop instead of waiting for the bio thread or deadline timeout.
                 if crate::operating_mode() == crate::OperatingMode::Dram {
                     RECLAIM_LIST.remove(&oid);
                 }

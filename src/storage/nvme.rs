@@ -91,20 +91,18 @@ fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
 /// Evict objects to make room for `bytes`, then reserve them. True if reserved.
 /// A refused write keeps its victims evicted: a claim is never undone.
 fn evict_and_reserve(bytes: u64) -> bool {
+    let max = crate::nvme_maxmemory();
     // Eviction cannot make room for more than the cap.
-    if bytes > crate::nvme_maxmemory() {
+    if bytes > max {
         return false;
     }
     if !with_server_lock(crate::eviction_allowed) {
         return false;
     }
-    let max = crate::nvme_maxmemory();
     // Take the headroom first, so no other write can use it while we evict.
-    let prev = NVME_DISK_USAGE
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            Some(cur + bytes.min(max.saturating_sub(cur)))
-        })
-        .unwrap_or_else(|cur| cur);
+    let prev = NVME_DISK_USAGE.update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        cur + bytes.min(max.saturating_sub(cur))
+    });
     let taken = bytes.min(max.saturating_sub(prev));
     let need = bytes - taken;
     // Claim, then stat: a claimed file cannot change under us.
@@ -123,7 +121,9 @@ fn evict_and_reserve(bytes: u64) -> bool {
                 covered += len;
                 victims.push((oid, len, unevictable));
             }
-            // Stale readdir entry: torn down before the claim, so its key is gone.
+            // We collect our victim candidates via a readdir snapshot. Between the
+            // readdir and the victim claim (adding the oid to the RECLAIM_LIST), the
+            // file may be deleted by an ObjectFile's drop.
             Ok(None) => {
                 super::reclaim::RECLAIM_LIST.remove(&oid);
             }
@@ -134,7 +134,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
                     oid.file_path(&crate::nvme_dir())
                 ));
                 crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
-                ORPHANS.push(oid, 0, unevictable);
+                ORPHANED_FILES.push(oid, 0, unevictable);
             }
         }
     }
@@ -178,42 +178,43 @@ fn evict(victims: Vec<(ObjectId, u64, super::UnevictableGuard)>) -> u64 {
     freed
 }
 
-// ─── Orphans ─────────────────────────────────────────────────────────────────
+// ─── Orphaned Files ──────────────────────────────────────────────────────────
 
 /// Files whose unlink failed transiently: still charged, and in the unevictable list
 /// so no eviction takes them. The cron's retry unlinks them and credits their bytes.
 /// Size 0: an eviction could not stat the file, so the retry does first.
-pub struct Orphans {
+pub struct OrphanedFiles {
     files: Mutex<Vec<(ObjectId, u64, super::UnevictableGuard)>>,
     pub count: AtomicU64,
     pub bytes: AtomicU64,
     retrying: AtomicBool,
 }
 
-pub static ORPHANS: Orphans = Orphans {
+pub static ORPHANED_FILES: OrphanedFiles = OrphanedFiles {
     files: Mutex::new(Vec::new()),
     count: AtomicU64::new(0),
     bytes: AtomicU64::new(0),
     retrying: AtomicBool::new(false),
 };
 
-impl Orphans {
+impl OrphanedFiles {
     fn push(&self, oid: ObjectId, size: u64, unevictable: super::UnevictableGuard) {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.bytes.fetch_add(size, Ordering::Relaxed);
         self.files
             .lock()
-            .expect("ORPHANS lock unavailable")
+            .expect("ORPHANED_FILES lock unavailable")
             .push((oid, size, unevictable));
     }
 
     /// Scaling cron: retry the unlinks on tokio, one retry at a time.
-    pub fn retry(&'static self) {
+    pub fn retry_deletion(&'static self) {
         if self.count.load(Ordering::Relaxed) == 0 || self.retrying.swap(true, Ordering::Acquire) {
             return;
         }
         crate::runtime_handle().spawn(async {
-            let files = std::mem::take(&mut *self.files.lock().expect("ORPHANS lock unavailable"));
+            let files =
+                std::mem::take(&mut *self.files.lock().expect("ORPHANED_FILES lock unavailable"));
             for (oid, mut size, unevictable) in files {
                 let sized = size > 0
                     || stat(oid).is_ok_and(|len| {
@@ -226,7 +227,7 @@ impl Orphans {
                     self.count.fetch_sub(1, Ordering::Relaxed);
                     self.bytes.fetch_sub(size, Ordering::Relaxed);
                 } else {
-                    let mut files = self.files.lock().expect("ORPHANS lock unavailable");
+                    let mut files = self.files.lock().expect("ORPHANED_FILES lock unavailable");
                     files.push((oid, size, unevictable));
                 }
             }
@@ -237,9 +238,8 @@ impl Orphans {
 
 /// Unlink `oid`'s file.
 /// - Ok: unlinked, or already gone (`ENOENT`).
-/// - Err, transient: `EINTR`, `EAGAIN`, `EBUSY`, `ENOMEM`. A retry may succeed.
-/// - Fatal, aborts the server: anything else, e.g. `EIO` (hardware), `EROFS` (the
-///   filesystem went read-only), `EACCES`/`EPERM` (permissions changed), path errors (a bug).
+/// - Err: a `transient` error. A retry may succeed.
+/// - Any other error aborts the server.
 fn unlink(oid: ObjectId) -> std::io::Result<()> {
     let path = oid.file_path(&crate::nvme_dir());
     let Err(e) = std::fs::remove_file(&path) else {
@@ -252,8 +252,8 @@ fn unlink(oid: ObjectId) -> std::io::Result<()> {
     }
 }
 
-/// Size of `oid`'s file; `None` if it is gone (`ENOENT`). Errors as for `unlink`:
-/// transient ones are returned, anything else aborts the server.
+/// Size of `oid`'s file; `None` if it is gone (`ENOENT`). A `transient` error is
+/// returned; any other error aborts the server.
 fn stat(oid: ObjectId) -> std::io::Result<Option<u64>> {
     let path = oid.file_path(&crate::nvme_dir());
     match std::fs::metadata(&path) {
@@ -264,6 +264,21 @@ fn stat(oid: ObjectId) -> std::io::Result<Option<u64>> {
     }
 }
 
+/// Transient errors, retried:
+/// - `EINTR`: a signal interrupted the call.
+/// - `EAGAIN`: the filesystem asked us to try again (network and FUSE filesystems).
+/// - `EBUSY`: the file is in use by the system, e.g. an NFS client's stand-in for an
+///   open, deleted file.
+/// - `ENOMEM`: the kernel was briefly out of memory.
+///
+/// Critical errors abort the server. They include:
+/// - `EIO`: the disk failed.
+/// - `EROFS`: the filesystem went read-only.
+/// - `EACCES`, `EPERM`: `disk-dir`'s permissions changed.
+/// - `ENOTDIR`, `ELOOP`, `ENAMETOOLONG`: `disk-dir`'s path no longer resolves (part of it
+///   was replaced, loops, or is too long).
+/// - `EISDIR`: a directory sits where an object file should be.
+/// - `EFAULT`: a bad pointer passed to the kernel, a bug.
 fn transient(e: &std::io::Error) -> bool {
     matches!(
         e.raw_os_error(),
@@ -291,7 +306,7 @@ pub(crate) fn try_unlink(
         "largeobj: failed to unlink object file {} during {during}, will retry: {e}",
         oid.file_path(&crate::nvme_dir())
     ));
-    ORPHANS.push(oid, size, unevictable);
+    ORPHANED_FILES.push(oid, size, unevictable);
     false
 }
 

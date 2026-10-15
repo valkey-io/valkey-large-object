@@ -218,7 +218,7 @@ impl CacheStats {
     /// Record a GET served from the cache: touch the object's LFU score and
     /// count the hit. Atomic only; no lock needed.
     pub fn record_hit(&self, stats: &AccessStats) {
-        stats.touch(now_minutes(), crate::lfu_decay_time());
+        stats.touch(now_minutes(), crate::blob_decay_time());
         self.hits.fetch_add(1, Ordering::Relaxed);
     }
 

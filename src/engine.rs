@@ -244,7 +244,7 @@ fn cmd_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, Va
             // Eviction ranks by use, as for a Tiered cache hit.
             obj_ctx.stats.touch(
                 storage::cache_policy::now_minutes(),
-                crate::lfu_decay_time(),
+                crate::blob_decay_time(),
             );
             if crate::bench_mode() {
                 Ok(ValkeyValue::Integer(obj_len as i64))
@@ -284,7 +284,7 @@ fn cmd_get_dram_efa(
             // Eviction ranks by use, as for a Tiered cache hit.
             obj_ctx.stats.touch(
                 storage::cache_policy::now_minutes(),
-                crate::lfu_decay_time(),
+                crate::blob_decay_time(),
             );
             // Serve from DRAMPool.
             cmd_get_from_dram(
