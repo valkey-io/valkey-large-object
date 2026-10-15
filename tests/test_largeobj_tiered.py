@@ -54,7 +54,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
     def _wait_free_settled(self, client):
         """Wait for Valkey lazyfree to drain AND teardown to unlink the file."""
         wait_for_equal(
-            lambda: client.info("stats").get("lazyfree_pending_objects", 0), 0
+            lambda: client.info("memory").get("lazyfree_pending_objects", 0), 0
         )
 
     def test_get_after_set_roundtrip(self):
@@ -116,7 +116,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         dat_files_before = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_before) >= 1
         client.execute_command('DEL', 'del_key')
-        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
         dat_files_after = glob.glob(os.path.join(self.data_dir, '*.dat'))
         assert len(dat_files_after) < len(dat_files_before)
 
@@ -143,13 +143,13 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert src_digest != dst_digest
         # Deleting source does not affect the copy
         client.execute_command('DEL', 'srckey')
-        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
         assert client.execute_command('BLOB.TCP_GET', 'dstkey') == payload
         # Deleting copy does not affect the source
         client.execute_command('BLOB.TCP_SET', 'srckey2', payload)
         client.execute_command('COPY', 'srckey2', 'dstkey2')
         client.execute_command('DEL', 'dstkey2')
-        wait_for_equal(lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0)
+        wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
         assert client.execute_command('BLOB.TCP_GET', 'srckey2') == payload
         #  The copy starts un-promoted even if the source is cached
         client.execute_command('BLOB.TCP_GET', 'srckey2')  # promote source
@@ -427,7 +427,7 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         # The paused SET's set_finalize sees no existing key (DEL removed v1)
         # and commits payload2 as a fresh key.
         wait_for_equal(
-            lambda: client.info('stats').get('lazyfree_pending_objects', 0), 0
+            lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0
         )
         assert client.execute_command('BLOB.TCP_GET', 'delset_key') == payload2
 
@@ -540,7 +540,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
     def _wait_free_settled(self, client):
         """Wait for Valkey lazyfree to drain AND teardown to unlink the file."""
         wait_for_equal(
-            lambda: client.info("stats").get("lazyfree_pending_objects", 0), 0
+            lambda: client.info("memory").get("lazyfree_pending_objects", 0), 0
         )
 
     def _set_ok(self, client, key, payload):

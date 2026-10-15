@@ -863,7 +863,9 @@ class EvictionCronTests:
             keys += client.dbsize()
         client.execute_command('SELECT', 0)
         assert keys == 2 + len(payloads) - evictions, "only victims' keys were deleted"
-        assert len(surviving(client, payloads)) == client.dbsize(), "and all of them"
+        # 'renamed' is in db 0 too, and Tiered readdir order may leave it alive.
+        live = surviving(client, {**payloads, 'renamed': None})
+        assert len(live) == client.dbsize(), "and all of them"
         self.settle(client, keys)
 
 
@@ -1088,7 +1090,7 @@ class TestTieredEvictionMixed(TieredBudget):
 
         # The cron deletes the ghosts, then ledger == directory == live keys.
         wait_for_true(lambda: pending_evictions(client) == 0, timeout=20)
-        wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
+        wait_for_true(lambda: client.info('memory').get('lazyfree_pending_objects', 0) == 0)
         self.settle(client, None, timeout=15)
         assert len(self.object_files()) == client.dbsize()
         assert info_largeobj(client)['largeobj_disk_used_bytes'] == client.dbsize() * self.DISK_PER_OBJ
