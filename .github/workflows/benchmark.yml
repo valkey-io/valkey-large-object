@@ -78,7 +78,7 @@ jobs:
           pkill -9 -f valkey-server 2>/dev/null || true
           sleep 2
           mkdir -p /mnt/bigobj-data/bench-test
-          ./bench.sh --port 7399 --nvme-dir /mnt/bigobj-data/bench-test 2>&1 | tee bench-results.txt
+          ./bench.sh --port 7399 --disk-dir /mnt/bigobj-data/bench-test 2>&1 | tee bench-results.txt
 
       - name: React with rocket (done)
         if: always()

@@ -18,7 +18,7 @@
 //   1. Fabric::start()         — one libfabric service per domain. On missing
 //                                fabric, the EFA path is unavailable and BLOB.RDMA_HELLO
 //                                gives an error.
-//   2. storage::init(mode, nvme_dir)
+//   2. storage::init(mode, disk_dir)
 //                              — validate config, allocate pool segments, create
 //                                the per-pool io_uring engines and start the
 //                                smartlog poller (Tiered only). All resources are
@@ -137,7 +137,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
-    let dir = nvme_dir();
+    let dir = disk_dir();
 
     // Validate cross-config constraints now that all configs are finalized.
     // Per-config callbacks skip validation at load time (non-deterministic processing
@@ -152,7 +152,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // unclean exit — a hard crash / SIGKILL never reaches our shutdown handler.
     // If the reset fails we can't guarantee a clean slate, so refuse to load
     // rather than start dirty.
-    if let Err(e) = storage::validate_and_clean_nvme_dir(mode, &dir) {
+    if let Err(e) = storage::validate_and_clean_disk_dir(mode, &dir) {
         ctx.log_warning(&format!(
             "largeobj: startup failed to reset disk-dir {}: {}; aborting module load",
             dir, e
@@ -246,8 +246,8 @@ fn deinitialize(_ctx: &Context) -> Status {
 fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     smartlog::signal_shutdown();
     transport::shutdown();
-    let dir = nvme_dir();
-    if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
+    let dir = disk_dir();
+    if let Err(e) = storage::validate_and_clean_disk_dir(operating_mode(), &dir) {
         ctx.log_warning(&format!(
             "largeobj: shutdown cleanup failed to reset disk-dir {}: {}",
             dir, e

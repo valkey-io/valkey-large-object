@@ -158,7 +158,7 @@ impl ObjectFile {
     /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
     /// the command rather than aborting the node), leaving no partial file behind.
     pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
-        let dir = crate::nvme_dir();
+        let dir = crate::disk_dir();
         let disk_len = self.disk_len;
         // We do not allow the eviction of the source or the new file mid-copy.
         let _source = UnevictableOID::new(self.object_id);
@@ -193,7 +193,7 @@ impl ObjectFile {
         crc32c: Crc,
     ) -> std::io::Result<()> {
         use std::io::{Seek, SeekFrom, Write};
-        let mut src = std::fs::File::open(self.object_id.file_path(&crate::nvme_dir()))?;
+        let mut src = std::fs::File::open(self.object_id.file_path(&crate::disk_dir()))?;
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)

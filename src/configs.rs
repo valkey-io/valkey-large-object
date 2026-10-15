@@ -267,7 +267,7 @@ pub static MODULE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
-pub fn nvme_dir() -> String {
+pub fn disk_dir() -> String {
     CFG_DISK_DIR
         .lock()
         .expect("CFG_DISK_DIR lock unavailable")

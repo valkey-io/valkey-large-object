@@ -131,7 +131,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
             Err(e) => {
                 valkey_module::logging::log_warning(format!(
                     "largeobj: failed to stat object file {} during eviction, will retry: {e}",
-                    oid.file_path(&crate::nvme_dir())
+                    oid.file_path(&crate::disk_dir())
                 ));
                 crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
                 ORPHANED_FILES.push(unevictable, 0);
@@ -149,9 +149,9 @@ fn evict_and_reserve(bytes: u64) -> bool {
     reserved
 }
 
-/// The first `n` object files in `nvme_dir`.
+/// The first `n` object files in `disk_dir`.
 fn victim_batch(n: usize) -> Vec<ObjectId> {
-    let Ok(dir) = std::fs::read_dir(crate::nvme_dir()) else {
+    let Ok(dir) = std::fs::read_dir(crate::disk_dir()) else {
         return Vec::new();
     };
     dir.filter_map(|entry| ObjectId::from_filename(entry.ok()?.file_name().to_str()?))
@@ -243,7 +243,7 @@ impl OrphanedFiles {
 /// - Err: a `transient` error. A retry may succeed.
 /// - Any other error aborts the server.
 fn unlink(oid: ObjectId) -> std::io::Result<()> {
-    let path = oid.file_path(&crate::nvme_dir());
+    let path = oid.file_path(&crate::disk_dir());
     let Err(e) = std::fs::remove_file(&path) else {
         return Ok(());
     };
@@ -257,7 +257,7 @@ fn unlink(oid: ObjectId) -> std::io::Result<()> {
 /// Size of `oid`'s file; `None` if it is gone (`ENOENT`). A `transient` error is
 /// returned; any other error aborts the server.
 fn stat(oid: ObjectId) -> std::io::Result<Option<u64>> {
-    let path = oid.file_path(&crate::nvme_dir());
+    let path = oid.file_path(&crate::disk_dir());
     match std::fs::metadata(&path) {
         Ok(meta) => Ok(Some(meta.len())),
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
@@ -302,7 +302,7 @@ pub(crate) fn try_unlink(unevictable: Arc<super::UnevictableOID>, size: u64, dur
     };
     valkey_module::logging::log_warning(format!(
         "largeobj: failed to unlink object file {} during {during}, will retry: {e}",
-        oid.file_path(&crate::nvme_dir())
+        oid.file_path(&crate::disk_dir())
     ));
     ORPHANED_FILES.push(unevictable, size);
     false
@@ -583,7 +583,7 @@ pub async fn write_file_header(
 /// this instance's files at shutdown. Returns `Ok(())` once disk-dir exists and
 /// is empty (or immediately, in Dram mode); `Err` if disk-dir is unset in Tiered
 /// mode, or the directory could not be removed or recreated.
-pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
+pub fn validate_and_clean_disk_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
     if mode != crate::OperatingMode::Tiered {
         return Ok(());
     }

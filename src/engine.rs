@@ -349,7 +349,7 @@ fn cmd_get_tiered(
     };
     if let Some(obj_ctx) = promoted {
         let fd_pool = storage::get_fd_pool();
-        let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
+        let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
             Some(fd) => fd,
             None => {
                 // remove_object drops the map's Arc; obj_ctx drops at end of scope
@@ -424,7 +424,7 @@ fn cmd_get_tiered(
     };
     let stream_ctx = storage::StreamingContext::new(buffers);
     let fd_pool = storage::get_fd_pool();
-    let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
+    let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
         Some(fd) => fd,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -899,7 +899,7 @@ async fn cmd_set_tiered_run(
     }
     // FdPool not used on SET: this write fd is short-lived and never cached.
     // FdPool caches read fds lazily on first GET via ensure_open.
-    let file_path = object_id.file_path(&crate::nvme_dir());
+    let file_path = object_id.file_path(&crate::disk_dir());
     let fd = match storage::open_nvme_file_for_write(&file_path) {
         Ok(fd) => fd,
         Err(_e) => {
@@ -963,7 +963,7 @@ async fn cmd_set_tiered_run(
     // NVMe disk accounting stays with the NVMe caller (no file on the DRAM path).
     let object_id = object_file.object_id();
     let disk_len = object_file.disk_len();
-    let file_path = object_id.file_path(&crate::nvme_dir());
+    let file_path = object_id.file_path(&crate::disk_dir());
     let on_disk = std::fs::metadata(&file_path)
         .unwrap_or_else(|e| {
             panic!(

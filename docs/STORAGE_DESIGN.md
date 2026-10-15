@@ -422,8 +422,8 @@ struct StreamingContext {
 ### 6.3 NVMe File Reference
 
 Each object version is one file, named directly from its `ObjectId` under the
-configured `nvme-dir`: `{nvme-dir}/{oid:016x}.dat` (via `ObjectId::file_path`).
-There is no extra subdirectory — `nvme-dir` is the module-owned directory. The
+configured `disk-dir`: `{disk-dir}/{oid:016x}.dat` (via `ObjectId::file_path`).
+There is no extra subdirectory — `disk-dir` is the module-owned directory. The
 runtime handle is `ObjectFile { object_id, disk_len }` (held behind
 `Arc<ObjectFile>`); it stores no path and no fd — the path is derived from the OID
 and the fd is managed separately by the FdPool (§6.4).
@@ -467,7 +467,7 @@ carries all metadata needed to serve).
 
 **Runtime references:**
 - The read fd is opened lazily on the first GET and cached in FdPool as `Arc<OwnedFd>` (SET opens its own private fd, not via FdPool — §6.4)
-- Lookup: `fd_pool.get_or_open(object_id, nvme_dir)` → `Arc<OwnedFd>` for io_uring submission
+- Lookup: `fd_pool.get_or_open(object_id, disk_dir)` → `Arc<OwnedFd>` for io_uring submission
 - File size = `4096 + ceil(len / 4096) * 4096` (header page + O_DIRECT-padded data)
 - Actual object length stored in `LoValue.len` (hot path) and `FileHeader.len` (recovery path)
 - On DEL/free: `ObjectFile::Drop` removes the fd from FdPool (closes on last ref) and unlinks the file
@@ -498,7 +498,7 @@ reader finishes, and `OwnedFd` closes it via RAII on the final drop. **Everythin
 else is policy built on this primitive; none of it can cause a use-after-close.**
 
 **Operations:**
-- **GET:** `fd_pool.get_or_open(oid, nvme_dir)` — read-lock fast path returns a clone
+- **GET:** `fd_pool.get_or_open(oid, disk_dir)` — read-lock fast path returns a clone
   of the cached `Arc<OwnedFd>` and bumps its `AccessStats`; on a miss it
   takes the write lock, re-checks (double-checked locking), `libc::open`s the file
   (`O_RDONLY`, plus `O_DIRECT` when `direct-io` is on), wraps it in `Arc<OwnedFd>`,
@@ -542,7 +542,7 @@ Example: 50MB object cached in DRAMPool (long-lived). NVMePool would look the sa
 Valkey keyspace                Module internals
 ──────────────                 ────────────────
 key "obj-A"
-  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<OwnedFd> → {nvme-dir}/000000000000002a.dat (50MB)
+  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<OwnedFd> → {disk-dir}/000000000000002a.dat (50MB)
        len=50MB,                                                ▲
        crc32c=0xAB12}                                           │  N buffers : 1 file
                                                                 │  (parallel ReadFixed/WriteFixed
@@ -587,7 +587,7 @@ Each object is one contiguous file on NVMe regardless of size:
 
 ```
 Object "key123" (10GB):
-  NVMe: {nvme-dir}/000000000000002a.dat   (10GB file, XFS extent-allocated)
+  NVMe: {disk-dir}/000000000000002a.dat   (10GB file, XFS extent-allocated)
   LoValue: {oid=42, len=10GB, crc32c=0xAB12}
 ```
 
@@ -964,7 +964,7 @@ shrink, which releases segments, gives memory back to core.
 | **Module cache eviction** (`make_room_for`) | Demotes cached DRAM copies to make room for a promotion; the object stays on NVMe. | No | Tiered |
 | **Module segment shrink** (`try_shrink`) | Under server memory pressure, releases the least-loaded DRAM segment. | Tiered: no (data on NVMe). Dram: **yes** — the segment's keys are deleted | Both |
 | **Module DRAM object eviction** *(planned)* | Evicts individual objects from the DRAMPool object map; their keys are deleted. | **Yes** | Dram |
-| **Module NVMe object eviction** *(planned)* | Evicts objects from the filesystem to free NVMe capacity (`nvme-maxmemory`); their keys are deleted. | **Yes** | Tiered |
+| **Module NVMe object eviction** *(planned)* | Evicts objects from the filesystem to free NVMe capacity (`disk-maxmemory`); their keys are deleted. | **Yes** | Tiered |
 
 The two planned actors complete the reclaim family: like Dram shrink, they free an
 object's storage first and put its oid on the reclaim list (§8.5), and both feed the
@@ -1340,7 +1340,7 @@ only same-segment operations serialize. Hold time ~10-50ns. Negligible contentio
 
 **Consistency with §9.2:** Main thread never allocs from NVMePool (all Tiered I/O goes through tokio). Main thread allocs from DRAMPool only in DRAM-only SET (synchronous path). Main thread frees via Arc Drop in free callback (which may call the owning segment's talc.free if last ref).
 
-**NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `nvme-maxmemory` and fails the SET if it would exceed the cap (`nvme-maxmemory` of 0 = unlimited). Module-driven NVMe eviction (planned, §8.1) will free space instead of failing. This is the only increment path in production (a separate `increase_nvme_disk_usage` exists but is test-only). Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The reserved/written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length.
+**NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `disk-maxmemory` and fails the SET if it would exceed the cap (`disk-maxmemory` of 0 = unlimited). Module-driven NVMe eviction (planned, §8.1) will free space instead of failing. This is the only increment path in production (a separate `increase_nvme_disk_usage` exists but is test-only). Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The reserved/written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length.
 
 ### 9.4 Free Callback Lifecycle
 
@@ -1425,9 +1425,9 @@ this section owns the semantics.
 |---|---|---|---|---|---|
 | `operating-mode` | `Dram` | — | — | Immutable | `Dram` (DRAMPool is the store) vs `Tiered` (NVMe is the store, DRAMPool is a cache) |
 | `segment-size` | `1GiB` | `1MB` | `1GiB` | Immutable | Uniform segment size for both pools. DRAMPool growth unit |
-| `nvme-staging-size` | `1GiB` | `1MB` | `1GiB` | Immutable | NVMePool staging capacity, split into `ceil(nvme-staging-size / segment-size)` segments of `segment-size`. Sized for max concurrent I/O, not object capacity |
-| `nvme-maxmemory` | `0` (unlimited) | `0` | i64::MAX | Live | NVMe **disk** ceiling; SET-admission bound in Tiered (enforcement: §9.3) |
-| `nvme-dir` | `""` | — | — | Immutable | NVMe object directory (Tiered) |
+| `disk-staging-size` | `1GiB` | `1MB` | `1GiB` | Immutable | NVMePool staging capacity, split into `ceil(disk-staging-size / segment-size)` segments of `segment-size`. Sized for max concurrent I/O, not object capacity |
+| `disk-maxmemory` | `0` (unlimited) | `0` | i64::MAX | Live | NVMe **disk** ceiling; SET-admission bound in Tiered (enforcement: §9.3) |
+| `disk-dir` | `""` | — | — | Immutable | NVMe object directory (Tiered) |
 | `direct-io` | `yes` | — | — | Immutable | O_DIRECT on NVMe files (must be `no` on tmpfs) |
 | `max-promote-size` | `256MB` | `0` (disable) | `1TB` | Live | Promotion eligibility; objects above this never enter DRAMPool (detail: §7.5) |
 | `promote-min-hits` | `2` | `1` | `255` | Live | Admission-filter misses before a GET promotes an object |
@@ -1450,7 +1450,7 @@ this section owns the semantics.
 | `fabric-crc-pool-threads` | `1` | `1` | `1024` | Immutable | Threads hashing checksummed transfers off the fabric workers |
 
 **Segment size is capped at 1 GiB** for both `segment-size` and
-`nvme-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):
+`disk-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):
 NVMe staging is always io_uring-registered, and DRAMPool is io_uring-registered in
 Tiered mode (for promotion ReadFixed). Larger capacity comes from *more* segments,
 never bigger ones. (EFA `fi_mr_reg` itself has no such cap — a Dram-mode segment is
