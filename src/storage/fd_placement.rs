@@ -2,15 +2,15 @@
 //! numbers Valkey serves clients on.
 //!
 //! Valkey's event loop is an array indexed by fd number, sized
-//! `maxclients + CONFIG_FDSET_INCR` (128);
-//! a client socket numbered past it is never served. Linux hands out the lowest
-//! free number, so object fds left low (the fd cache, in-flight SET files) push
-//! client sockets past the end. Every object-file open goes through
-//! `open_object_file`, which moves the fd above a floor at the end of that range.
-//! `place` sets the floor at load and on every `CONFIG SET maxclients`.
+//! `maxclients + CONFIG_FDSET_INCR` (128); a client socket numbered past it is
+//! never served. Linux hands out the lowest free number, so object fds left low
+//! (the fd cache, in-flight SET files) push client sockets past the end. Every
+//! object-file open goes through `open_object_file`, which moves the fd above a
+//! floor at the end of that range. `place` sets the floor at load and on every
+//! `CONFIG SET maxclients`.
 
 use std::ffi::{c_int, c_void, CStr};
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use valkey_module::{raw, Context};
@@ -41,10 +41,11 @@ pub fn place(ctx: &Context) -> Result<(), String> {
 }
 
 /// Whether every object fd the module can hold fits between the floor and the
-/// open-file hard limit: `cap` cached read fds, plus one in-flight fd per client
+/// open-file limit: `cap` cached read fds, plus one in-flight fd per client
 /// (a SET's write fd, or a GET's fd evicted mid-read; both block their client, so
 /// a client holds at most one). With this room, failing to move an fd above the
-/// floor means misprovisioning or a bug.
+/// floor means misprovisioning or a bug. Checks the soft limit, which is what
+/// `F_DUPFD` is bounded by; `reserve_fd_range` raised it to the hard limit.
 /// Always Ok before `place` has set a floor (non-Tiered, or still loading).
 pub fn check_room(cap: u64) -> Result<(), String> {
     let floor = FD_FLOOR.load(Ordering::Relaxed);
@@ -54,33 +55,33 @@ pub fn check_room(cap: u64) -> Result<(), String> {
     // The floor tracks the highest maxclients seen; Valkey keeps clients above a
     // lowered maxclients connected, so that is the client bound.
     let maxclients = floor as u64 - VALKEY_FDSET_INCR;
-    let needed = cap + maxclients;
-    let room = nofile_limit()?.rlim_max.saturating_sub(floor as u64);
-    if room >= needed {
+    let required = floor as u64 + cap + maxclients;
+    let limit = nofile_limit().rlim_cur;
+    if limit >= required {
         return Ok(());
     }
     Err(format!(
-        "only {room} fds above Valkey's client range ({floor}) for \
-         max-cached-fds {cap} + maxclients {maxclients}; raise LimitNOFILE \
-         (soft and hard) above {}",
-        floor as u64 + needed
+        "open-file limit {limit} is too low for max-cached-fds {cap} and \
+         maxclients {maxclients}; raise it to at least {required}"
     ))
 }
 
 /// The process's `RLIMIT_NOFILE`.
-fn nofile_limit() -> Result<libc::rlimit, String> {
+fn nofile_limit() -> libc::rlimit {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
     // SAFETY: limit is a valid rlimit out-parameter.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return Err(format!(
-            "getrlimit(RLIMIT_NOFILE): {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(limit)
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    // getrlimit fails only on a bad pointer or resource (EFAULT, EINVAL).
+    assert_eq!(
+        rc,
+        0,
+        "getrlimit(RLIMIT_NOFILE): {}",
+        std::io::Error::last_os_error()
+    );
+    limit
 }
 
 /// Raises the soft `RLIMIT_NOFILE` to the hard limit and sets the floor that
@@ -91,13 +92,13 @@ fn nofile_limit() -> Result<libc::rlimit, String> {
 /// does not shrink it.
 fn reserve_fd_range(maxclients: u64) -> Result<i32, String> {
     let floor = i32::try_from(maxclients + VALKEY_FDSET_INCR)
-        .map_err(|_| format!("maxclients {maxclients} puts the fd floor past i32"))?;
-    let mut limit = nofile_limit()?;
+        .map_err(|_| format!("maxclients {maxclients} is too large for an fd number"))?;
+    let mut limit = nofile_limit();
     limit.rlim_cur = limit.rlim_max;
     // SAFETY: limit is a valid rlimit; raising soft up to hard needs no privilege.
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
         return Err(format!(
-            "setrlimit(RLIMIT_NOFILE soft = hard {}): {}",
+            "cannot raise the open-file soft limit to the hard limit {}: {}",
             limit.rlim_max,
             std::io::Error::last_os_error()
         ));
@@ -112,64 +113,60 @@ fn reserve_fd_range(maxclients: u64) -> Result<i32, String> {
 /// touched; if it registers, it is removed at once. Main thread only.
 fn outside_event_loop(floor: i32) -> Result<(), String> {
     unsafe extern "C" fn noop(_fd: c_int, _data: *mut c_void, _mask: c_int) {}
+    // Reads errno: call it right after the failing call, before the fds drop.
+    let probe_err = |step: &str| {
+        format!(
+            "event-loop probe at fd {floor}: {step}: {}",
+            std::io::Error::last_os_error()
+        )
+    };
     // SAFETY: eventfd returns a new fd or -1.
     let low = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
     if low < 0 {
-        return Err(format!(
-            "event-loop probe: eventfd: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(probe_err("eventfd"));
     }
-    // SAFETY: low is a valid fd we own; returns a new fd >= floor or -1.
-    let probe = unsafe { libc::fcntl(low, libc::F_DUPFD_CLOEXEC, floor) };
-    let dup_err = std::io::Error::last_os_error();
-    // SAFETY: low is ours and no longer needed.
-    unsafe { libc::close(low) };
+    // SAFETY: low is a new fd we own.
+    let low = unsafe { OwnedFd::from_raw_fd(low) };
+    // SAFETY: low is valid; returns a new fd >= floor or -1.
+    let probe = unsafe { libc::fcntl(low.as_raw_fd(), libc::F_DUPFD_CLOEXEC, floor) };
     if probe < 0 {
-        return Err(format!(
-            "event-loop probe: no free fd at {floor}: {dup_err}"
-        ));
+        return Err(probe_err("F_DUPFD_CLOEXEC"));
     }
+    // SAFETY: probe is a new fd we own.
+    let probe = unsafe { OwnedFd::from_raw_fd(probe) };
     let readable = raw::REDISMODULE_EVENTLOOP_READABLE as c_int;
     // SAFETY: the module API is initialized (OnLoad or a server event on the main
     // thread); probe is our own eventfd.
-    let added = unsafe {
+    let rc = unsafe {
         raw::RedisModule_EventLoopAdd.expect("EventLoopAdd API available")(
-            probe,
+            probe.as_raw_fd(),
             readable,
             Some(noop),
             std::ptr::null_mut(),
         )
-    } == raw::REDISMODULE_OK as c_int;
-    let add_err = std::io::Error::last_os_error();
-    if added {
-        // SAFETY: probe was just registered by us.
+    };
+    if rc == raw::REDISMODULE_OK as c_int {
+        // SAFETY: probe was just registered by us, and is still open.
         unsafe {
-            raw::RedisModule_EventLoopDel.expect("EventLoopDel API available")(probe, readable)
+            raw::RedisModule_EventLoopDel.expect("EventLoopDel API available")(
+                probe.as_raw_fd(),
+                readable,
+            )
         };
-    }
-    // SAFETY: probe is ours.
-    unsafe { libc::close(probe) };
-    if added {
         return Err(format!(
-            "fd {floor} (maxclients + {VALKEY_FDSET_INCR}) is inside Valkey's event loop; \
-             this server sizes its client range differently and object-file fds \
-             would take client fd numbers"
+            "Valkey's event loop is larger than maxclients + {VALKEY_FDSET_INCR}: \
+             fd {floor} is inside it"
         ));
     }
-    if add_err.raw_os_error() != Some(libc::ERANGE) {
-        return Err(format!(
-            "event-loop probe: EventLoopAdd({floor}): {add_err}"
-        ));
+    if std::io::Error::last_os_error().raw_os_error() != Some(libc::ERANGE) {
+        return Err(probe_err("EventLoopAdd"));
     }
     Ok(())
 }
 
-/// Whether `fd` sits where Valkey could need it for a client socket: below the
-/// floor, or anywhere when no floor was reserved.
+/// Whether `fd` is below the floor, where Valkey could need it for a client socket.
 pub fn in_client_range(fd: RawFd) -> bool {
-    let floor = FD_FLOOR.load(Ordering::Relaxed);
-    floor == 0 || fd < floor
+    fd < FD_FLOOR.load(Ordering::Relaxed)
 }
 
 /// `open(2)` an object file, then move the fd above the floor set by `place`.
@@ -188,8 +185,7 @@ pub fn open_object_file(path: &CStr, flags: libc::c_int, mode: libc::mode_t) -> 
     let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor) };
     if high < 0 {
         panic!(
-            "largeobj: no free fd above Valkey's client range ({floor}): {}; \
-             raise LimitNOFILE (soft and hard)",
+            "no free fd at or above {floor} for an object file: {}",
             std::io::Error::last_os_error()
         );
     }

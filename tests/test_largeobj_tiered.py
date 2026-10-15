@@ -1199,10 +1199,10 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
     """Cached object-file fds must not take the fd numbers Valkey serves clients on.
 
     Valkey's event loop only covers fds below maxclients + CONFIG_FDSET_INCR (128),
-    and Linux hands out
-    the lowest free fd. With maxclients 100 and 300 cached fds left low, every new
-    client socket lands past the event loop: it is accepted and counted, but its
-    commands are never read. The module moves its fds above that range instead."""
+    and Linux hands out the lowest free fd. With maxclients 100 and 300 cached fds
+    left low, every new client socket lands past the event loop: it is accepted and
+    counted, but its commands are never read. The module moves its fds above that
+    range instead."""
 
     OBJECTS = 300
     NEW_CLIENTS = 90
@@ -1304,7 +1304,7 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
         fits = hard - 228 - 100
         client = self.server.get_new_client()
         client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', str(fits))
-        with pytest.raises(ResponseError, match="raise LimitNOFILE"):
+        with pytest.raises(ResponseError, match="is too low for max-cached-fds"):
             client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds',
                                    str(fits + 1))
         assert client.config_get('largeobj.max-cached-fds') == {
@@ -1319,4 +1319,4 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         with self.server.expect_crash(self):
             client.execute_command('CONFIG', 'SET', 'maxclients', str(maxclients))
-        assert self.server.verify_string_in_logfile("above Valkey's client range")
+        assert self.server.verify_string_in_logfile("is too low for max-cached-fds")
