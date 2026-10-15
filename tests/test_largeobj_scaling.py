@@ -4,8 +4,7 @@ Integration tests for DRAMPool expand/shrink scaling behavior, and eviction.
 Tests cover:
   - Dram mode: reactive expand (TCP and EFA SET) and proactive expand
   - Dram mode: expansion gated by server maxmemory watermark
-  - Dram mode: shrink deletes the victim segment's keys and frees memory
-  - Dram mode: expand, shrink to zero segments, expand again
+  - Dram mode: never shrinks, under any policy
   - Tiered mode: reactive expand on promotion
   - Tiered mode: shrink drops cached copies, NVMe data survives
   - Tiered mode: expand, shrink to zero segments, expand again
@@ -49,18 +48,6 @@ def apply_shrink_pressure(client, policy='noeviction'):
     noeviction."""
     client.config_set('maxmemory-policy', policy)
     client.config_set('maxmemory', int(client.info('memory')['used_memory'] * 0.85))
-
-
-SOFT_SHRINK_WATERMARK = 0.5
-
-
-def apply_soft_shrink_pressure(client, policy='allkeys-lru'):
-    """Set maxmemory so used_memory is 80% of it: above the 50% shrink watermark floor, so
-    the module shrinks, but under maxmemory, so core evicts nothing even under allkeys-*.
-    The margin covers the ~1MB that used_memory sheds just after a large SET."""
-    client.config_set('largeobj.scaling-shrink-watermark', int(SOFT_SHRINK_WATERMARK * 100))
-    client.config_set('maxmemory-policy', policy)
-    client.config_set('maxmemory', int(client.info('memory')['used_memory'] / 0.8))
 
 
 def apply_full_shrink_pressure(client, policy='noeviction'):
@@ -331,20 +318,15 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands']
 
 
-class TestDramShrink(ValkeyLargeObjTestCaseBase):
-    """Dram mode: under server memory pressure and an `allkeys-*` maxmemory-policy,
-    the scaling cron reclaims a segment by deleting the keys whose objects live
-    on it, so used_memory drops.
+class TestDramNoShrink(ValkeyLargeObjTestCaseBase):
+    """Dram mode never shrinks: releasing a segment would delete its keys whatever
+    `maxmemory-policy` says, so memory pressure only evicts objects into holes.
     """
 
-    TIMEOUT_S = 20
-    # One object per segment, so each shrink reclaims exactly one key.
+    # One object per segment.
     PAYLOADS = {f'dshrink_{i}': bytes([i]) * SEGMENT_FILLING_SIZE for i in range(4)}
 
     def get_module_args(self, data_dir, direct_io):
-        # Expand watermark 95 (above one object's ~88% of a segment): no proactive
-        # expand, so the pool holds exactly one segment per object and no empty
-        # segment the shrink could pick instead.
         return (
             f"operating-mode Dram"
             f" segment-size 1048576"
@@ -361,94 +343,22 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         for key, payload in self.PAYLOADS.items():
             assert client.execute_command('BLOB.TCP_SET', key, payload) == b'OK'
 
-    def test_shrink_deletes_victim_keys_and_frees_memory(self):
-        """Under maxmemory pressure with an allkeys policy, a shrink releases a
-        segment and deletes its keys, which brings used_memory back under the
-        shrink watermark. Every deleted key fires an 'evicted' keyspace event,
-        and every surviving key still reads back correctly."""
+    @pytest.mark.parametrize('policy', ['noeviction', 'volatile-lru', 'allkeys-lru'])
+    def test_no_shrink_under_any_policy(self, policy):
+        """Memory pressure above the shrink watermark releases no segment."""
         client = self.server.get_new_client()
         self._write_payloads(client)
         before = info_largeobj(client)
-        # Subscribe before the shrink so no 'evicted' event is missed.
-        client.config_set('notify-keyspace-events', 'Ee')
-        events = client.pubsub()
-        events.subscribe('__keyevent@0__:evicted')
-        assert events.get_message(timeout=1)['type'] == 'subscribe'
-
-        apply_soft_shrink_pressure(client)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_scaling_shrinks']
-                      > before['largeobj_dram_scaling_shrinks'], timeout=self.TIMEOUT_S)
-
-        def under_watermark():
-            memory = client.info('memory')
-            return memory['used_memory'] < SOFT_SHRINK_WATERMARK * memory['maxmemory']
-        wait_for_true(under_watermark, timeout=self.TIMEOUT_S)
-
-        # Lift the pressure so no further shrink starts, then wait for the last
-        # one to finish: segment released and its keys deleted.
-        client.config_set('maxmemory', 0)
-        wait_for_true(lambda: shrink_completed(client), timeout=self.TIMEOUT_S)
-
-        after = info_largeobj(client)
-        # Every shrink releases exactly one segment.
-        num_shrinks = after['largeobj_dram_scaling_shrinks'] - before['largeobj_dram_scaling_shrinks']
-        assert num_shrinks > 0
-        assert after['largeobj_dram_segments'] == before['largeobj_dram_segments'] - num_shrinks
-        # Every key the shrinks deleted is counted as one reclaim: core evicted none.
-        surviving_keys = [k for k in self.PAYLOADS if client.exists(k)]
-        deleted_keys = set(self.PAYLOADS) - set(surviving_keys)
-        assert deleted_keys
-        assert after['largeobj_evictions'] == before['largeobj_evictions'] + len(deleted_keys)
-        # Keys whose segments were not released read back unchanged.
-        for key in surviving_keys:
-            assert client.execute_command('BLOB.TCP_GET', key) == self.PAYLOADS[key]
-        # Each deleted key fires the same 'evicted' event as a core eviction.
-        evicted_keys = []
-        while (msg := events.get_message(timeout=1)) is not None:
-            if msg['type'] == 'message':
-                evicted_keys.append(msg['data'].decode())
-        assert sorted(evicted_keys) == sorted(deleted_keys)
-
-    def test_reclaimed_key_reads_as_missing(self):
-        """Between the shrink and its key deletion, the victim key still exists
-        but every module command treats it as missing. A user DEL in that window
-        takes it off the reclaim list."""
-        client = self.server.get_new_client()
-        # The shrink tick re-arms the cron 60s out, holding the window open.
-        client.config_set('largeobj.reaper-poll-ms', 60000)
-        self._write_payloads(client)
-
-        apply_soft_shrink_pressure(client)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_evictions'] == 1,
-                      timeout=self.TIMEOUT_S)
-        client.config_set('maxmemory', 0)  # let COPY (denyoom) reach the module
-
-        victims = [k for k in self.PAYLOADS if client.execute_command('BLOB.TCP_GET', k) is None]
-        assert len(victims) == 1
-        victim = victims[0]
-        assert client.exists(victim) == 1
-        with pytest.raises(ResponseError, match='not found'):
-            client.execute_command('BLOB.INFO', victim)
-        with pytest.raises(ResponseError, match='module key failed to copy'):
-            client.execute_command('COPY', victim, 'copy_dst')
-
-        client.delete(victim)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_evictions'] == 0)
-
-    @pytest.mark.parametrize('policy', ['noeviction', 'volatile-lru'])
-    def test_no_shrink_unless_allkeys(self, policy):
-        """Dram shrink deletes a segment's keys whatever their TTL, so neither noeviction
-        nor a volatile policy lets it run."""
-        client = self.server.get_new_client()
-        self._write_payloads(client)
-        shrinks = info_largeobj(client)['largeobj_dram_scaling_shrinks']
 
         apply_shrink_pressure(client, policy)
         time.sleep(3)  # three cron ticks at scaling-poll-ms 1000
 
-        assert info_largeobj(client)['largeobj_dram_scaling_shrinks'] == shrinks
-        for key, payload in self.PAYLOADS.items():
-            assert client.execute_command('BLOB.TCP_GET', key) == payload
+        after = info_largeobj(client)
+        assert after['largeobj_dram_scaling_shrinks'] == before['largeobj_dram_scaling_shrinks']
+        assert after['largeobj_dram_segments'] == before['largeobj_dram_segments']
+        if policy != 'allkeys-lru':  # core evicts no key under noeviction or volatile-*
+            for key, payload in self.PAYLOADS.items():
+                assert client.execute_command('BLOB.TCP_GET', key) == payload
 
     def test_no_shrink_without_maxmemory(self):
         """maxmemory 0 gives no pressure signal, so no shrink under any policy."""
@@ -462,32 +372,6 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         assert info_largeobj(client)['largeobj_dram_scaling_shrinks'] == shrinks
         for key, payload in self.PAYLOADS.items():
             assert client.execute_command('BLOB.TCP_GET', key) == payload
-
-    def test_expand_shrink_to_zero_expand(self):
-        """The pool expands, shrinks to zero segments (every key gone), and expands
-        again for the next SET. At maxmemory 1 core evicts keys too, so a shrink may
-        find its segment already empty: count segments, not module evictions."""
-        client = self.server.get_new_client()
-        before = info_largeobj(client)
-        self._write_payloads(client)
-        expanded = info_largeobj(client)
-        assert expanded['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands'] + 3
-        assert expanded['largeobj_dram_segments'] == 4
-
-        apply_full_shrink_pressure(client, 'allkeys-lru')
-        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 0
-                      and shrink_completed(client), timeout=self.TIMEOUT_S)
-        shrunk = info_largeobj(client)
-        assert shrunk['largeobj_dram_scaling_shrinks'] == expanded['largeobj_dram_scaling_shrinks'] + 4
-        assert shrunk['largeobj_num_objects'] == 0
-        assert client.dbsize() == 0
-
-        client.config_set('maxmemory', 0)
-        assert client.execute_command('BLOB.TCP_SET', 'after', b'Z' * SEGMENT_FILLING_SIZE) == b'OK'
-        regrown = info_largeobj(client)
-        assert regrown['largeobj_dram_scaling_expands'] == shrunk['largeobj_dram_scaling_expands'] + 1
-        assert regrown['largeobj_dram_segments'] == 1
-        assert client.execute_command('BLOB.TCP_GET', 'after') == b'Z' * SEGMENT_FILLING_SIZE
 
 
 # ─── Tiered Mode Scaling ──────────────────────────────────────────────────────

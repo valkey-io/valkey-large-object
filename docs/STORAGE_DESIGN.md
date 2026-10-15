@@ -280,7 +280,7 @@ DEL key:
   7. Untrack buffer / delete object
 ```
 
-**Key property:** Data exists ONLY in DRAM. Dropping an object from the DRAMPool = data loss = equivalent to DEL. Today two things do it: Valkey's `maxmemory-policy` (whole-key eviction) and the module's segment shrink under server memory pressure, which deletes the keys on the released segment (§8.3, §8.5). Module-driven eviction of individual objects from the DRAMPool object map is planned (§8.1).
+**Key property:** Data exists ONLY in DRAM. Dropping an object from the DRAMPool = data loss = equivalent to DEL. Today two things do it: Valkey's `maxmemory-policy` (whole-key eviction) and module-driven eviction of individual objects (§8.1). Dram has no segment shrink: releasing a segment would delete its keys whatever the policy says (§8.3). 
 
 ### 5.2 DRAM + NVMe Mode
 
@@ -962,7 +962,7 @@ shrink, which releases segments, gives memory back to core.
 |---|---|---|---|
 | **Core maxmemory eviction** | Valkey's `maxmemory-policy` deletes a victim key (LO keys included) and calls the module free callback. `noeviction` → `BLOB.TCP_SET` / `BLOB.RDMA_SET` fails (OOM). Frees space inside a segment, not `used_memory` (fact 2). | **Yes** | Both |
 | **Module cache eviction** (`make_room_for`) | Demotes cached DRAM copies to make room for a promotion; the object stays on NVMe. | No | Tiered |
-| **Module segment shrink** (`try_shrink`) | Under server memory pressure, releases the least-loaded DRAM segment. | Tiered: no (data on NVMe). Dram: **yes** — the segment's keys are deleted | Both |
+| **Module segment shrink** (`try_shrink`) | Under server memory pressure, releases the least-loaded DRAM segment. | No: data is on NVMe | Tiered only |
 | **Module DRAM object eviction** *(planned)* | Evicts individual objects from the DRAMPool object map; their keys are deleted. | **Yes** | Dram |
 | **Module NVMe object eviction** *(planned)* | Evicts objects from the filesystem to free NVMe capacity (`disk-maxmemory`); their keys are deleted. | **Yes** | Tiered |
 
@@ -1035,19 +1035,15 @@ with the fewest allocated bytes, drops every object on it, and releases it (§8.
 | Tiered | ratio > watermark | Cached copies dropped; objects stay on NVMe, next GET reads NVMe. |
 | Dram | ratio > watermark **and** `maxmemory-policy` is `allkeys-*` | The objects *are* the data. Their oids go on the reclaim list; the keys read as missing and the cron deletes them (§8.5). |
 
-**Why the policy decides Dram shrink** (`eviction_allowed`). Dram shrink
-deletes keys, so it runs only when the operator allowed eviction (the module context
-flag `EVICT`: `maxmemory` set and the policy is not `noeviction`); under `noeviction`
-writes fail with OOM instead. A replica that ignores maxmemory (the default) never has
-the flag, so it leaves eviction to its primary. It also does not run under `volatile-*`:
-it deletes every key on the segment, TTL or not, which that policy forbids. There,
-evicted objects leave holes that later writes reuse. Under `allkeys-*` shrink is required, not
-optional: core evicting an LO key frees almost no `used_memory` (fact 2), so without a
-segment release core's eviction loop would keep deleting keys without ever getting
-under `maxmemory`. Under `volatile-*` that gap stays open until segments can be
-emptied by migrating their objects instead of deleting them. Tiered shrink drops only cached copies, so it runs under every
-policy: it is what makes room for new keys, client query buffers (a TCP `BLOB.TCP_SET`
-buffers its whole payload) and output buffers, even in an LO-only keyspace.
+**Why Dram does not shrink.** Releasing a segment deletes every key on it, TTL or not,
+hot or cold, which no `maxmemory-policy` allows. So Dram never shrinks: evicted objects
+leave holes that later writes reuse. The cost is that core evicting an LO key frees almost
+no `used_memory` (fact 2), so on a server that also holds other data, core's eviction
+loop can keep deleting keys without getting under `maxmemory`. Dram gets memory back only
+once segments can be emptied by migrating their objects instead of deleting them. Tiered
+shrink drops only cached copies, so it runs under every policy: it is what makes room for
+new keys, client query buffers (a TCP `BLOB.TCP_SET` buffers its whole payload) and output
+buffers, even in an LO-only keyspace.
 
 **Why proactive only.** Nothing "fails" to prompt a shrink: the trigger is external
 (the server approaching `maxmemory`), which the module only sees by polling. An alloc

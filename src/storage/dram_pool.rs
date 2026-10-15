@@ -413,7 +413,7 @@ impl DRAMPool {
     /// are returned so they drop after the locks are released. `score` returns
     /// `None` for an object eviction may not take.
     ///
-    /// Dram: the victims' oids go on the reclaim list, as in `try_shrink`.
+    /// Dram: the victims' oids go on the reclaim list.
     fn reclaim_in(
         &self,
         seg: usize,
@@ -431,7 +431,7 @@ impl DRAMPool {
             }
             None => {
                 let mut victims = None;
-                // List before `objects`, as in `try_shrink`.
+                // List before `objects`.
                 super::reclaim::RECLAIM_LIST.add_with(|| {
                     // Dram victims are the data: no cap.
                     victims = self.take_victims(seg, need, usize::MAX, score);
@@ -553,46 +553,37 @@ impl DRAMPool {
         Some(idx)
     }
 
-    /// Mark the segment with the least cached bytes draining and remove its objects.
+    /// Tiered only: mark the segment with the least cached bytes draining and drop
+    /// its cached copies. The data persists on NVMe and GETs fall back to it, so no
+    /// key is touched. Dram has no shrink: it would delete the segment's keys.
     ///
     /// Victim selection: the non-draining segment with the fewest allocated bytes.
     /// Uses the per-segment `allocated_bytes` counter — O(live segments), no HashMap scan.
     ///
     /// Removing the objects drops the map's Arcs, so the segment releases as soon
     /// as in-flight readers drop theirs.
-    /// - **Tiered:** data persists on NVMe; GETs fall back.
-    /// - **Dram:** the oids go on the reclaim list. Their keys read as missing
-    ///   until the scaling cron deletes them.
     ///
     /// Returns true if a victim was selected, false if nothing to shrink.
     pub fn try_shrink(&self) -> bool {
+        assert!(
+            crate::operating_mode() == crate::OperatingMode::Tiered,
+            "try_shrink: Tiered only"
+        );
         let Some((victim_idx, _)) = self.pool.find_shrink_victim() else {
             return false;
         };
         self.pool.mark_segment_draining(victim_idx);
-
-        // Hold the reclaim list across the map scan. A concurrent `remove_object`
-        // either removed the object first (not seen, not listed) or blocks
-        // until we are done and then clears the oid we listed.
-        super::reclaim::RECLAIM_LIST.add_with(|| {
-            let removed = self
-                .objects
-                .write()
-                .expect("DRAMPool.objects lock unavailable")
-                .remove_by_segment_id(victim_idx);
-            let n = removed.len() as u64;
-            // Tiered: the objects live on in NVMe, so their keys stay valid.
-            if crate::operating_mode() == crate::OperatingMode::Dram {
-                crate::info::EVICTIONS.fetch_add(n, Ordering::Relaxed);
-                removed
-            } else {
-                self.tiered_cache()
-                    .stats
-                    .demotions
-                    .fetch_add(n, Ordering::Relaxed);
-                Default::default()
-            }
-        });
+        let removed = self
+            .objects
+            .write()
+            .expect("DRAMPool.objects lock unavailable")
+            .remove_by_segment_id(victim_idx);
+        self.tiered_cache()
+            .stats
+            .demotions
+            .fetch_add(removed.len() as u64, Ordering::Relaxed);
+        // `removed` drops here, after the map lock: the last Arcs free the buffers.
+        drop(removed);
 
         self.shrink_count.fetch_add(1, Ordering::Relaxed);
         true
