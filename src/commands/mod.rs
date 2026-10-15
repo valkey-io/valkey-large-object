@@ -195,13 +195,11 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::WrongArity);
     }
     // Reject a key of another type before any transfer, matching valkey-bloom.
-    if ctx
+    let old_oid = ctx
         .open_key(&args[1])
         .get_value::<LoValue>(&LO_TYPE)
-        .is_err()
-    {
-        return Err(ValkeyError::WrongType);
-    }
+        .map_err(|_| ValkeyError::WrongType)?
+        .map(|v| v.object_id);
     // TCP path: data.len() IS the authoritative length. No user-provided len needed.
     let data = args[2].as_slice().to_vec();
     let obj_len = data.len() as u64;
@@ -217,7 +215,7 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set(ctx, &args[1], obj_len, DataSource::Tcp(data)) {
+    match engine::execute_set(ctx, &args[1], obj_len, DataSource::Tcp(data), old_oid) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }
@@ -235,13 +233,11 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::WrongArity);
     }
     // Reject a key of another type before any transfer, matching valkey-bloom.
-    if ctx
+    let old_oid = ctx
         .open_key(&args[1])
         .get_value::<LoValue>(&LO_TYPE)
-        .is_err()
-    {
-        return Err(ValkeyError::WrongType);
-    }
+        .map_err(|_| ValkeyError::WrongType)?
+        .map(|v| v.object_id);
     // total_len is required — server needs to know how many bytes to fi_read
     // from the client.
     let obj_len: u64 = args[2]
@@ -263,7 +259,7 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let session = efa_session(ctx)?;
     let data_source = DataSource::Efa { session, addrs };
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set(ctx, &args[1], obj_len, data_source) {
+    match engine::execute_set(ctx, &args[1], obj_len, data_source, old_oid) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }

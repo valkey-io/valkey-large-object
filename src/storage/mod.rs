@@ -26,17 +26,14 @@ pub mod uring;
 
 // Re-exports for convenience.
 pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
-pub use object_file::ObjectFile;
+pub use object_file::{ObjectFile, UnevictableOID};
 
 // Re-exports from nvme.rs
 pub use nvme::{
     object_disk_len, open_nvme_file_for_write, read_and_verify_file_header,
-    validate_and_clean_nvme_dir, write_file_header, FileHeader, FILE_HEADER_MAGIC,
+    validate_and_clean_disk_dir, write_file_header, FileHeader, FILE_HEADER_MAGIC,
     FILE_HEADER_SIZE, FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN,
 };
-
-// Re-export for crate-internal use only.
-pub(crate) use nvme::warn_failed_unlink;
 
 pub use dram_pool::DRAMPool;
 pub use fd_pool::FdPool;
@@ -151,7 +148,7 @@ pub fn get_fd_pool() -> &'static FdPool {
 pub fn init(
     ctx: &valkey_module::Context,
     mode: crate::OperatingMode,
-    nvme_dir: &str,
+    disk_dir: &str,
 ) -> Result<String, String> {
     let dram_seg_size = crate::dram_segment_size();
     let nvme_staging = crate::nvme_staging_size();
@@ -259,9 +256,9 @@ pub fn init(
         }
     }
     Ok(format!(
-        "mode={:?} nvme_dir={} dram_segments={}x{}MB nvme_staging={}MB",
+        "mode={:?} disk_dir={} dram_segments={}x{}MB nvme_staging={}MB",
         mode,
-        nvme_dir,
+        disk_dir,
         dram_segment_count,
         dram_seg_size / (1024 * 1024),
         nvme_staging / (1024 * 1024),

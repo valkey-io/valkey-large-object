@@ -18,11 +18,11 @@
 ./bench.sh --port 7380
 
 # All 4 modes on NVMe stripe (default)
-./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test
+./bench.sh --port 7380 --disk-dir /mnt/bigobj-data/bench-test
 
 # Specific modes only
-./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test --modes "NVMe"
-./bench.sh --port 7380 --nvme-dir /mnt/bigobj-data/bench-test --modes "Dram NVMe"
+./bench.sh --port 7380 --disk-dir /mnt/bigobj-data/bench-test --modes "NVMe"
+./bench.sh --port 7380 --disk-dir /mnt/bigobj-data/bench-test --modes "Dram NVMe"
 ```
 
 ## Requirements
@@ -115,7 +115,7 @@ Default: 200. Auto-reduced for large objects when staging cap limits concurrency
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--port` | (required) | Valkey server port |
-| `--nvme-dir` | (optional) | NVMe directory. If set, default modes = `fio Dram Tiered NVMe`. |
+| `--disk-dir` | (optional) | Directory for object files. If set, default modes = `fio Dram Tiered NVMe`. |
 | `--modes` | auto | Space-separated modes. Valid: `fio`, `Dram`, `Tiered`, `NVMe`. |
 | `--sizes` | `"4KB 1MB 50MB"` | Object sizes. Valid: 4KB, 16KB, 50KB, 256KB, 1MB, 4MB, 16MB, 50MB. |
 | `--clients` | 200 | Concurrent benchmark clients. |
@@ -123,7 +123,7 @@ Default: 200. Auto-reduced for large objects when staging cap limits concurrency
 | `--keys` | 500 | Base key count (scaled down for large objects). |
 | `--dram-maxmemory` | 34359738368 (32GB) | DRAM budget in bytes. |
 | `--segment-size` | 67108864 (64MB) | Segment size in bytes. |
-| `--nvme-maxmemory` | 107374182400 (100GB) | NVMe budget in bytes. |
+| `--disk-maxmemory` | 107374182400 (100GB) | NVMe budget in bytes. |
 | `--worker-threads` | 2 | Tokio worker threads. |
 
 Config values in bench.sh use **raw bytes** for module load args. The module also accepts memory notation (e.g., `1gb`) via `CONFIG SET` at runtime.
@@ -140,7 +140,7 @@ Config values in bench.sh use **raw bytes** for module load args. The module als
 ## Common Pitfalls
 
 ### Wrong mount point
-`/data` may not exist as a mount — it falls through to the root disk. Always verify with `df <path>`. The script warns if `--nvme-dir` is on the root disk.
+`/data` may not exist as a mount — it falls through to the root disk. Always verify with `df <path>`. The script warns if `--disk-dir` is on the root disk.
 
 ### Stale server
 The script kills stale servers before each test and checks uptime < 60s after start. If a previous server takes >15s to die (32GB deallocation), it can still race.

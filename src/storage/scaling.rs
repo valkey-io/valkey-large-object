@@ -12,10 +12,10 @@ use super::get_dram_pool;
 ///
 /// Performs these actions in order:
 /// 1. Complete any segments whose drain finished (refcount reached 0).
-/// 2. Delete keys on the reclaim list.
+/// 2. Delete keys on the reclaim list, and retry the orphans' unlinks.
 ///    While a shrink is unfinished (a segment draining or reclaim-list keys
 ///    left), stop here: one shrink at a time, no expand or shrink on top.
-///    While reclaim-list keys remain, the cron re-arms at `reclaim-poll-ms`
+///    While reclaim-list keys remain, the cron re-arms at `reaper-poll-ms`
 ///    instead of `scaling-poll-ms`, so cleanup runs in short, frequent slices.
 /// 3. Proactive expand: if pool utilization exceeds the expand watermark,
 ///    add a segment before the hot path stalls on segment creation.
@@ -33,11 +33,15 @@ pub fn scaling_cron(ctx: &Context) {
 
     // 2. Delete keys left pointing at reclaimed objects.
     super::reclaim::delete_reclaimed_keys(ctx);
+    super::nvme::ORPHANED_FILES.retry_deletion();
 
     // A shrink is still in progress: finish it before any more scaling.
-    // A SET that needs room meanwhile still expands reactively.
+    // A SET that needs room meanwhile still expands reactively. In Tiered mode the
+    // reclaim list holds NVMe evictions, not shrinks.
     let (_, draining, _) = pool.segment_counts();
-    if draining > 0 || !super::reclaim::RECLAIM_LIST.is_empty() {
+    let reclaiming = crate::operating_mode() == crate::OperatingMode::Dram
+        && !super::reclaim::RECLAIM_LIST.is_empty();
+    if draining > 0 || reclaiming {
         rearm_scaling_cron(ctx, next_poll_ms());
         return;
     }
@@ -98,12 +102,12 @@ pub fn scaling_cron(ctx: &Context) {
     rearm_scaling_cron(ctx, next_poll_ms());
 }
 
-/// `reclaim-poll-ms` while reclaim-list keys remain, else `scaling-poll-ms`.
+/// `reaper-poll-ms` while reclaim-list keys remain, else `scaling-poll-ms`.
 fn next_poll_ms() -> u64 {
     if super::reclaim::RECLAIM_LIST.is_empty() {
         crate::scaling_poll_ms()
     } else {
-        crate::reclaim_poll_ms()
+        crate::reaper_poll_ms()
     }
 }
 

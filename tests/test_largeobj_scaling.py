@@ -1,5 +1,5 @@
 """
-Integration tests for DRAMPool expand/shrink scaling behavior.
+Integration tests for DRAMPool expand/shrink scaling behavior, and eviction.
 
 Tests cover:
   - Dram mode: reactive expand (TCP and EFA SET) and proactive expand
@@ -10,11 +10,18 @@ Tests cover:
   - Tiered mode: shrink drops cached copies, NVMe data survives
   - Tiered mode: expand, shrink to zero segments, expand again
   - Tiered mode: shrink releases an EFA-registered segment
+  - Eviction, both modes: a SET or COPY past the budget evicts other objects; their keys read as
+    misses until the scaling cron deletes them. Tiered stays exact against concurrent GET, SET,
+    overwrite, COPY and DEL
 """
 
 import os
+import random
+import re
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 
 import pytest
 from valkey import OutOfMemoryError, ResponseError
@@ -53,7 +60,7 @@ def apply_full_shrink_pressure(client, policy='noeviction'):
 def shrink_completed(client):
     """No segment draining and every reclaimed key deleted."""
     info = info_largeobj(client)
-    return info['largeobj_dram_draining_segments'] == 0 and info['largeobj_pending_reclaims'] == 0
+    return info['largeobj_dram_draining_segments'] == 0 and info['largeobj_pending_evictions'] == 0
 
 
 def promote(client, keys):
@@ -61,6 +68,37 @@ def promote(client, keys):
     for key in keys:
         client.execute_command('BLOB.TCP_GET', key)
     wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == len(keys))
+
+
+def set_policy(client, policy='allkeys-lru'):
+    """Let the module evict: it needs maxmemory > 0 and a policy other than noeviction. Also freezes
+    the pool, so a full segment can only be served by evicting: with the shrink watermark at its 50%
+    floor, a maxmemory about two segments above usage stops `try_expand` (any tighter and core
+    evicts or refuses the command itself)."""
+    used = int(client.info('memory')['used_memory'])
+    segment = info_largeobj(client)['largeobj_dram_segment_size_bytes']
+    client.config_set('largeobj.scaling-shrink-watermark', 50)
+    client.config_set('maxmemory', 2 * (used + segment) - 512 * 1024)
+    client.config_set('maxmemory-policy', policy)
+
+
+def set_objects(client, prefix, count, size):
+    """SET `count` objects of `size` bytes, each filled with its own byte; return them by key."""
+    payloads = {f'{prefix}{i}': bytes([i % 251 + 1]) * size for i in range(count)}
+    for key, payload in payloads.items():
+        assert client.execute_command('BLOB.TCP_SET', key, payload) == b'OK'
+    return payloads
+
+
+def surviving(client, payloads):
+    """The objects that survive, by key, read back. `EXISTS` is no judge: an evicted key outlives
+    its object until the scaling cron deletes it."""
+    got = {key: client.execute_command('BLOB.TCP_GET', key) for key in payloads}
+    return {key: value for key, value in got.items() if value is not None}
+
+
+def pending_evictions(client):
+    return info_largeobj(client)['largeobj_pending_evictions']
 
 
 # ─── Dram Mode Scaling ────────────────────────────────────────────────────────
@@ -351,7 +389,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         surviving_keys = [k for k in self.PAYLOADS if client.exists(k)]
         deleted_keys = set(self.PAYLOADS) - set(surviving_keys)
         assert deleted_keys
-        assert after['largeobj_reclaims'] == before['largeobj_reclaims'] + len(deleted_keys)
+        assert after['largeobj_evictions'] == before['largeobj_evictions'] + len(deleted_keys)
         # Keys whose segments were not released read back unchanged.
         for key in surviving_keys:
             assert client.execute_command('BLOB.TCP_GET', key) == self.PAYLOADS[key]
@@ -365,14 +403,14 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
     def test_reclaimed_key_reads_as_missing(self):
         """Between the shrink and its key deletion, the victim key still exists
         but every module command treats it as missing. A user DEL in that window
-        takes it off the reclaim list but is not counted as a reclaim."""
+        takes it off the reclaim list."""
         client = self.server.get_new_client()
         # The shrink tick re-arms the cron 60s out, holding the window open.
-        client.config_set('largeobj.reclaim-poll-ms', 60000)
+        client.config_set('largeobj.reaper-poll-ms', 60000)
         self._write_payloads(client)
 
         apply_shrink_pressure(client, 'volatile-lru')
-        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_reclaims'] == 1,
+        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_evictions'] == 1,
                       timeout=self.TIMEOUT_S)
         client.config_set('maxmemory', 0)  # let COPY (denyoom) reach the module
 
@@ -385,11 +423,8 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         with pytest.raises(ResponseError, match='module key failed to copy'):
             client.execute_command('COPY', victim, 'copy_dst')
 
-        reclaims = info_largeobj(client)['largeobj_reclaims']
         client.delete(victim)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_reclaims'] == 0)
-        # The user deleted it, not the module, so it isn't counted.
-        assert info_largeobj(client)['largeobj_reclaims'] == reclaims
+        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_evictions'] == 0)
 
     def test_no_shrink_under_noeviction(self):
         """Dram shrink deletes keys, so noeviction disables it."""
@@ -432,7 +467,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
                       and shrink_completed(client), timeout=self.TIMEOUT_S)
         shrunk = info_largeobj(client)
         assert shrunk['largeobj_dram_scaling_shrinks'] == expanded['largeobj_dram_scaling_shrinks'] + 4
-        assert shrunk['largeobj_reclaims'] == expanded['largeobj_reclaims'] + 4
+        assert shrunk['largeobj_evictions'] == expanded['largeobj_evictions'] + 4
         assert shrunk['largeobj_num_objects'] == 0
         assert client.dbsize() == 0
 
@@ -524,7 +559,8 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         shrinks = after['largeobj_dram_scaling_shrinks'] - before['largeobj_dram_scaling_shrinks']
         assert after['largeobj_dram_segments'] == 4 - shrinks
         assert after['largeobj_dram_objects'] == 4 - shrinks
-        assert after['largeobj_reclaims'] == before['largeobj_reclaims']  # no key deleted
+        assert after['largeobj_evictions'] == before['largeobj_evictions']
+        assert after['largeobj_cache_demotions'] == before['largeobj_cache_demotions'] + shrinks
         assert client.dbsize() == 4
         self._assert_reads_from_nvme(client)
         # The released segment left its ring's io_uring table too.
@@ -620,3 +656,439 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
         assert client.execute_command('BLOB.TCP_GET', 'key_a') == b'A' * SEGMENT_FILLING_SIZE
         assert client.execute_command('BLOB.TCP_GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE
+
+
+# ─── Eviction ─────────────────────────────────────────────────────────────────
+
+def hook(client, name, value):
+    """Set a hidden test-only hook: a pause or an injected failure in the production path."""
+    client.config_set(f'largeobj.test-{name}', value)
+
+
+@contextmanager
+def paused_set(server, client, key, payload):
+    """A Tiered SET paused after writing its file and before its key commits. Other commands run
+    meanwhile; the SET commits when the block ends. Yields its outcome."""
+    outcome = {}
+
+    def run():
+        try:
+            outcome['reply'] = server.get_new_client().execute_command('BLOB.TCP_SET', key, payload)
+        except ResponseError as e:
+            outcome['error'] = str(e)
+
+    hook(client, 'pause-before-finalize-set-ms', 3000)
+    thread = threading.Thread(target=run)
+    thread.start()
+    time.sleep(0.5)  # the file is written and the task is paused
+    hook(client, 'pause-before-finalize-set-ms', 0)
+    try:
+        yield outcome
+    finally:
+        thread.join(timeout=15)
+
+
+OBJECT_FILE = re.compile(r'^[0-9a-f]{16}\.dat$')
+
+
+class Budget(ValkeyLargeObjTestCaseBase):
+    """A node whose only room is `BUDGET` bytes: past it, a write succeeds only by evicting.
+    `POLL_MS` keeps the scaling cron away, so victims' keys stay on the reclaim list."""
+
+    POLL_MS = 60_000
+
+    def evictions(self, client):
+        return info_largeobj(client)['largeobj_evictions']
+
+    def assert_refused(self, client, key, payload):
+        with pytest.raises(ResponseError, match=self.FULL):
+            client.execute_command('BLOB.TCP_SET', key, payload)
+
+
+class DramBudget(Budget):
+    """One 1MB segment that `set_policy` freezes."""
+
+    BUDGET = 1024 * 1024
+    OBJ = BUDGET // 4
+    PER_BUDGET = 3  # a fourth would fill the segment exactly, but talc's metadata lives in it
+    FULL = 'pool exhausted'
+
+    def get_module_args(self, data_dir, direct_io):
+        return (f"operating-mode Dram segment-size {self.BUDGET} max-object-size {self.BUDGET - 64 * 1024}"
+                f" chunk-size 65536 scaling-poll-ms {self.POLL_MS} bench-mode no direct-io no")
+
+    def new_client(self, policy='allkeys-lru'):
+        client = self.server.get_new_client()
+        set_policy(client, policy)
+        return client
+
+    def first_in_line(self, payloads):
+        return next(iter(payloads))
+
+    def settle(self, client, live, timeout=10):
+        """A Dram eviction has nothing asynchronous to wait for."""
+
+
+class TieredBudget(Budget):
+    """`disk-maxmemory` of 8 objects, with pools bigger than any object: only the ledger can refuse
+    a write, and it is exact. Victims are the directory's first files in readdir order, the
+    filesystem's choice: tests assert counts and the ledger, not names, unless they pin one down."""
+
+    OBJ = 512 * 1024
+    DISK_PER_OBJ = OBJ + 4096  # the ledger also charges the file's one-page header
+    PER_BUDGET = 8
+    BUDGET = PER_BUDGET * DISK_PER_OBJ
+    FULL = 'capacity exceeded'
+
+    def get_module_args(self, data_dir, direct_io):
+        return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET}"
+                f" disk-staging-size {2 * self.BUDGET} segment-size {2 * self.BUDGET}"
+                f" max-object-size {self.BUDGET} max-promote-size {self.BUDGET}"
+                f" scaling-poll-ms {self.POLL_MS} bench-mode no direct-io no")
+
+    def new_client(self, policy='allkeys-lru'):
+        """maxmemory far above usage: core never evicts, so every eviction seen is the module's."""
+        client = self.server.get_new_client()
+        used = int(client.info('memory')['used_memory'])
+        client.config_set('maxmemory', used + 256 * 1024 * 1024)
+        client.config_set('maxmemory-policy', policy)
+        return client
+
+    def object_files(self):
+        """In readdir order, the order eviction takes them in."""
+        return [name for name in os.listdir(self.data_dir) if OBJECT_FILE.match(name)]
+
+    def first_in_line(self, payloads):
+        """The key eviction takes first, read back from the first file's payload byte."""
+        with open(os.path.join(self.data_dir, self.object_files()[0]), 'rb') as f:
+            f.seek(4096)
+            byte = f.read(1)[0]
+        return next(key for key, payload in payloads.items() if payload[0] == byte)
+
+    def settle(self, client, live, timeout=10):
+        """Every unevictable-list entry removed and every unlink done: the ledger equals the bytes
+        on disk, and the directory holds `live` objects."""
+        def settled():
+            info = info_largeobj(client)
+            files = self.object_files()
+            on_disk = sum(os.path.getsize(os.path.join(self.data_dir, name)) for name in files)
+            return (info['largeobj_disk_unevictable_objects'] == 0
+                    and info['largeobj_disk_used_bytes'] == on_disk
+                    and (live is None or len(files) == live))
+        wait_for_true(settled, timeout=timeout)
+
+
+class EvictionTests:
+    """Run against both budgets."""
+
+    def test_writing_past_the_budget_evicts_and_victims_read_as_misses(self):
+        """A victim's key stays in the keyspace, but reads as missing until the cron deletes it."""
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', 3 * self.PER_BUDGET, self.OBJ)
+        survivors = surviving(client, payloads)
+        assert len(survivors) == self.PER_BUDGET
+        assert f'obj_{len(payloads) - 1}' in survivors, "the last write is nobody's victim"
+        assert all(value == payloads[key] for key, value in survivors.items())
+        assert self.evictions(client) == pending_evictions(client) == len(payloads) - self.PER_BUDGET
+        assert client.execute_command('EXISTS', *payloads) == len(payloads)
+        self.settle(client, self.PER_BUDGET)
+
+    def test_noeviction_refuses_and_destroys_nothing(self):
+        client = self.new_client('noeviction')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        assert self.evictions(client) == 0
+        assert surviving(client, payloads) == payloads
+        self.settle(client, self.PER_BUDGET)
+
+    def test_copy_evicts_other_keys_and_never_its_source(self):
+        """A COPY whose only possible victim is its source fails and destroys nothing. Otherwise each
+        COPY evicts another key, even when the source is first in line."""
+        client = self.new_client()
+        alone = b'A' * int(self.BUDGET * 0.6)
+        assert client.execute_command('BLOB.TCP_SET', 'alone', alone) == b'OK'
+        with pytest.raises(ResponseError):
+            client.execute_command('COPY', 'alone', 'dst')
+        assert client.execute_command('BLOB.TCP_GET', 'alone') == alone
+        assert self.evictions(client) == 0
+        client.execute_command('FLUSHALL')
+        self.settle(client, 0)
+
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        source = self.first_in_line(payloads)
+        for i in range(2 * self.PER_BUDGET):
+            assert client.execute_command('COPY', source, f'dst_{i}') in (1, True)
+            assert client.execute_command('BLOB.TCP_GET', source) == payloads[source]
+        assert self.evictions(client) == 2 * self.PER_BUDGET
+        self.settle(client, self.PER_BUDGET)
+
+    def test_a_victims_key_cannot_be_copied_and_leaves_the_list_when_overwritten_or_deleted(self):
+        """Any policy but noeviction evicts: the policy only decides whether to."""
+        client = self.new_client('volatile-ttl')
+        payloads = set_objects(client, 'obj_', 2 * self.PER_BUDGET, self.OBJ)
+        overwritten, deleted = [key for key in payloads if key not in surviving(client, payloads)][:2]
+        with pytest.raises(ResponseError):
+            client.execute_command('COPY', overwritten, 'copy')
+        assert client.execute_command('EXISTS', 'copy') == 0
+
+        assert client.execute_command('BLOB.TCP_SET', overwritten, b'fresh' * 1000) == b'OK'
+        assert client.execute_command('BLOB.TCP_GET', overwritten) == b'fresh' * 1000
+        assert client.execute_command('DEL', deleted) == 1
+        wait_for_true(lambda: pending_evictions(client) == self.evictions(client) - 2)
+        client.execute_command('FLUSHALL', 'ASYNC')
+        wait_for_true(lambda: pending_evictions(client) == 0)
+        self.settle(client, 0)
+
+
+class EvictionCronTests:
+    """The scaling cron deletes victims' keys, one tick a second here."""
+
+    POLL_MS = 1000
+
+    def test_the_cron_deletes_the_victims_keys_wherever_they_went(self):
+        """Renamed, or moved to another db."""
+        client = self.new_client()
+        set_objects(client, 'first_', 2, self.OBJ)
+        client.execute_command('RENAME', 'first_0', 'renamed')
+        client.execute_command('MOVE', 'first_1', 2)
+        payloads = set_objects(client, 'obj_', 3 * self.PER_BUDGET, self.OBJ)
+        client.config_set('maxmemory', 1 << 40)  # Dram: else the tick after the sweep shrinks
+        wait_for_true(lambda: pending_evictions(client) == 0, timeout=15)
+
+        evictions = self.evictions(client)
+        assert evictions > 0
+        keys = 0
+        for db in range(3):
+            client.execute_command('SELECT', db)
+            keys += client.dbsize()
+        client.execute_command('SELECT', 0)
+        assert keys == 2 + len(payloads) - evictions, "only victims' keys were deleted"
+        assert len(surviving(client, payloads)) == client.dbsize(), "and all of them"
+        self.settle(client, keys)
+
+
+class TestDramEviction(EvictionTests, DramBudget):
+
+    def test_a_read_object_outlives_unread_ones(self):
+        """A GET ranks the object by use, so eviction takes the objects never read first."""
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        read = self.first_in_line(payloads)
+        # Twice: a minute's decay can cost the first GET its gain.
+        for _ in range(2):
+            assert client.execute_command('BLOB.TCP_GET', read) == payloads[read]
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        survivors = surviving(client, payloads)
+        assert read in survivors
+        assert len(survivors) == self.PER_BUDGET - 1
+
+
+class TestDramEvictionCron(EvictionCronTests, DramBudget):
+    pass
+
+
+class TestTieredEviction(EvictionTests, TieredBudget):
+
+    def test_more_than_the_budget_or_no_maxmemory_is_refused(self):
+        """No eviction makes room for more than the cap, and without a server maxmemory the node
+        never evicts, disk-maxmemory or not."""
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        self.assert_refused(client, 'huge', b'H' * self.BUDGET)
+        client.config_set('maxmemory', 0)
+        self.assert_refused(client, 'overflow', b'O' * self.OBJ)
+        info = info_largeobj(client)
+        assert info['largeobj_evictions'] == 0
+        assert info['largeobj_nvme_capacity_exceeded'] == 2
+        assert surviving(client, payloads) == payloads
+
+    def test_a_write_that_needs_more_than_16_victims_is_refused_but_they_stay_evicted(self):
+        """A claim is never undone."""
+        client = self.new_client()
+        set_objects(client, 's_', 64, 60 * 1024)  # 64KB on disk each: they fill the budget
+        self.assert_refused(client, 'big', b'B' * int(self.BUDGET * 0.6))
+        info = info_largeobj(client)
+        assert info['largeobj_evictions'] == 16
+        assert info['largeobj_nvme_capacity_exceeded'] == 1
+        self.settle(client, 64 - 16)
+
+    def test_files_that_are_not_objects_are_never_victims(self):
+        client = self.new_client()
+        strays = ['README', 'ffffffffffffffff.txt', 'abc.dat', 'FFFFFFFFFFFFFFFF.dat']
+        for name in strays:
+            with open(os.path.join(self.data_dir, name), 'wb') as f:
+                f.write(b'x' * 4096)
+        set_objects(client, 'obj_', 3 * self.PER_BUDGET, self.OBJ)
+        assert all(os.path.exists(os.path.join(self.data_dir, name)) for name in strays)
+        self.settle(client, self.PER_BUDGET)
+
+    # Disabled: test-pause-before-finalize-set-ms is immutable, so paused_set cannot toggle it.
+    # @pytest.mark.parametrize('overwrite', [False, True])
+    # def test_a_set_in_flight_is_not_evicted(self, overwrite):
+    #     """A SET's file exists before its key does, and the SET keeps the object it overwrites in the
+    #     unevictable list too. Writes that need room while it is paused before its commit must pass
+    #     over both. The overwritten object is first in line."""
+    #     client = self.new_client()
+    #     payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+    #     key = self.first_in_line(payloads) if overwrite else 'slow'
+    #     with paused_set(self.server, client, key, b'S' * self.OBJ) as outcome:
+    #         set_objects(client, 'other_', 3 * self.PER_BUDGET, self.OBJ)
+    #         if overwrite:
+    #             assert client.execute_command('BLOB.TCP_GET', key) == payloads[key]
+    #     assert outcome.get('reply') == b'OK', outcome
+    #     assert client.execute_command('BLOB.TCP_GET', key) == b'S' * self.OBJ
+    #     self.settle(client, self.PER_BUDGET - (1 if overwrite else 0))
+
+    def test_overlapping_writes_each_evict_only_for_themselves(self):
+        """Each write credits its victims in the same update that reserves its own room, so none
+        evicts for another and none is refused."""
+        client = self.new_client()
+        set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        threads, writes = 8, 20
+        errors = []
+
+        def writer(n):
+            c = self.server.get_new_client()
+            for i in range(writes):
+                try:
+                    c.execute_command('BLOB.TCP_SET', f'w{n}_{i}', b'W' * self.OBJ)
+                except ResponseError as e:
+                    errors.append(e)
+
+        pool = [threading.Thread(target=writer, args=(n,)) for n in range(threads)]
+        for t in pool:
+            t.start()
+        for t in pool:
+            t.join(timeout=120)
+        assert errors == []
+        assert self.evictions(client) == threads * writes, "one victim per write"
+        self.settle(client, self.PER_BUDGET)
+
+    def test_an_evicted_object_releases_its_cached_copy_at_once(self):
+        """The victim's key waits for the cron, but its DRAM copy must not."""
+        client = self.new_client()
+        client.config_set('largeobj.promote-min-hits', 1)
+        promote(client, set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ))
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        info = info_largeobj(client)
+        assert info['largeobj_evictions'] == info['largeobj_pending_evictions'] == 1
+        assert info['largeobj_dram_objects'] == self.PER_BUDGET - 1
+
+
+class TestTieredEvictionCron(EvictionCronTests, TieredBudget):
+    pass
+
+
+class TestTieredUnlinkFailure(TieredBudget):
+    """Every unlink fails transiently except the cron's retry, which runs once a second here. A
+    file left in place stays charged and unevictable until the retry unlinks it."""
+
+    POLL_MS = 1000
+
+    def get_module_args(self, data_dir, direct_io):
+        return super().get_module_args(data_dir, direct_io) + " test-fail-unlink yes"
+
+    def assert_no_orphans(self, client):
+        info = info_largeobj(client)
+        assert info['largeobj_disk_orphaned_files'] == info['largeobj_disk_orphaned_bytes'] == 0
+
+    def test_a_victim_whose_unlink_fails_frees_nothing_until_the_retry(self):
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        assert self.evictions(client) == 1
+        assert len(surviving(client, payloads)) == self.PER_BUDGET - 1
+        self.settle(client, self.PER_BUDGET - 1)
+        self.assert_no_orphans(client)
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        assert self.evictions(client) == 1, "the retry's credit made the room"
+
+    def test_a_deleted_object_whose_unlink_fails_stays_charged_until_the_retry(self):
+        client = self.new_client()
+        set_objects(client, 'obj_', 2, self.OBJ)
+        client.delete('obj_0')
+        self.settle(client, 1)
+        self.assert_no_orphans(client)
+
+
+class TestTieredOrphanHeld(TieredBudget):
+    """Unlinks fail as above, but the cron never ticks during a test, so orphans stay put."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return super().get_module_args(data_dir, direct_io) + " test-fail-unlink yes"
+
+    def test_an_orphan_stays_charged_and_is_never_evicted(self):
+        client = self.new_client()
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        orphan = self.first_in_line(payloads)
+        client.delete(orphan)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_orphaned_files'] == 1)
+        info = info_largeobj(client)
+        assert info['largeobj_disk_orphaned_bytes'] == self.DISK_PER_OBJ
+        assert info['largeobj_disk_used_bytes'] == self.BUDGET
+        assert info['largeobj_disk_unevictable_objects'] == 1
+        assert len(self.object_files()) == self.PER_BUDGET
+        self.assert_refused(client, 'newcomer', b'N' * self.OBJ)
+        assert len(surviving(client, payloads)) == self.PER_BUDGET - 2, "the victim was not the orphan"
+
+
+class TestTieredEvictionMixed(TieredBudget):
+    """GET, SET, overwrite, COPY, DEL and UNLINK from many clients at once, all at the cap, so
+    nearly every write evicts. Each client owns its keys, so it knows what each may read back.
+    Afterwards the ledger, the directory and the keyspace must agree exactly."""
+
+    POLL_MS = 1000
+    SECONDS = 8
+
+    def test_mixed_workload_keeps_every_invariant(self):
+        client = self.new_client()
+        set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        stop = time.time() + self.SECONDS
+        failures = []
+        expected_errors = ('capacity exceeded', 'failed to copy', 'no such key')
+
+        def worker(n):
+            c = self.server.get_new_client()
+            rng = random.Random(n)
+            expected = {}  # key -> the payload it last committed
+            version = 0
+            while time.time() < stop:
+                key = f'c{n}_{rng.randrange(6)}'
+                op = rng.random()
+                try:
+                    if op < 0.45:
+                        version += 1
+                        payload = bytes([n % 200 + 1, version % 256]) * (self.OBJ // 2)
+                        if c.execute_command('BLOB.TCP_SET', key, payload) == b'OK':
+                            expected[key] = payload
+                    elif op < 0.75:
+                        got = c.execute_command('BLOB.TCP_GET', key)
+                        if got is not None and got != expected.get(key):
+                            failures.append(f'{key}: read a payload it never wrote')
+                    elif op < 0.85:
+                        dst = f'c{n}_{rng.randrange(6)}'
+                        if dst != key and c.execute_command('COPY', key, dst, 'REPLACE') == 1:
+                            if key in expected:
+                                expected[dst] = expected[key]
+                    else:
+                        c.execute_command('DEL' if op < 0.925 else 'UNLINK', key)
+                        expected.pop(key, None)
+                except ResponseError as e:
+                    if not any(m in str(e).lower() for m in expected_errors):
+                        failures.append(f'{key}: {e}')
+
+        pool = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+        for t in pool:
+            t.start()
+        for t in pool:
+            t.join(timeout=60)
+        assert failures == []
+        assert client.execute_command('PING')  # no accounting panic took the server down
+        assert self.evictions(client) > 0
+
+        # The cron deletes the ghosts, then ledger == directory == live keys.
+        wait_for_true(lambda: pending_evictions(client) == 0, timeout=20)
+        wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
+        self.settle(client, None, timeout=15)
+        assert len(self.object_files()) == client.dbsize()
+        assert info_largeobj(client)['largeobj_disk_used_bytes'] == client.dbsize() * self.DISK_PER_OBJ

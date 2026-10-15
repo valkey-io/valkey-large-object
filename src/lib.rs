@@ -18,7 +18,7 @@
 //   1. Fabric::start()         — one libfabric service per domain. On missing
 //                                fabric, the EFA path is unavailable and BLOB.RDMA_HELLO
 //                                gives an error.
-//   2. storage::init(ctx, mode, nvme_dir)
+//   2. storage::init(ctx, mode, disk_dir)
 //                              — validate config, allocate pool segments, create
 //                                the per-pool io_uring engines and start the
 //                                smartlog poller (Tiered only). All resources are
@@ -137,7 +137,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
-    let dir = nvme_dir();
+    let dir = disk_dir();
 
     // Validate cross-config constraints now that all configs are finalized.
     // Per-config callbacks skip validation at load time (non-deterministic processing
@@ -152,7 +152,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // unclean exit — a hard crash / SIGKILL never reaches our shutdown handler.
     // If the reset fails we can't guarantee a clean slate, so refuse to load
     // rather than start dirty.
-    if let Err(e) = storage::validate_and_clean_nvme_dir(mode, &dir) {
+    if let Err(e) = storage::validate_and_clean_disk_dir(mode, &dir) {
         ctx.log_warning(&format!(
             "largeobj: startup failed to reset disk-dir {}: {}; aborting module load",
             dir, e
@@ -263,8 +263,8 @@ fn on_config_changed(ctx: &Context, changed: &[&str]) {
 fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     smartlog::signal_shutdown();
     transport::shutdown();
-    let dir = nvme_dir();
-    if let Err(e) = storage::validate_and_clean_nvme_dir(operating_mode(), &dir) {
+    let dir = disk_dir();
+    if let Err(e) = storage::validate_and_clean_disk_dir(operating_mode(), &dir) {
         ctx.log_warning(&format!(
             "largeobj: shutdown cleanup failed to reset disk-dir {}: {}",
             dir, e
@@ -313,9 +313,9 @@ valkey_module! {
              ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, DEFAULT_SCALING_POLL_MS, MIN_SCALING_POLL_MS, MAX_SCALING_POLL_MS,
              ConfigurationFlags::DEFAULT, None, None],
-            ["reclaim-scan-budget-us", &*CFG_RECLAIM_SCAN_BUDGET_US, DEFAULT_RECLAIM_SCAN_BUDGET_US, MIN_RECLAIM_SCAN_BUDGET_US, MAX_RECLAIM_SCAN_BUDGET_US,
+            ["reaper-scan-budget-us", &*CFG_REAPER_SCAN_BUDGET_US, DEFAULT_REAPER_SCAN_BUDGET_US, MIN_REAPER_SCAN_BUDGET_US, MAX_REAPER_SCAN_BUDGET_US,
              ConfigurationFlags::DEFAULT, None, None],
-            ["reclaim-poll-ms", &*CFG_RECLAIM_POLL_MS, DEFAULT_RECLAIM_POLL_MS, MIN_RECLAIM_POLL_MS, MAX_RECLAIM_POLL_MS,
+            ["reaper-poll-ms", &*CFG_REAPER_POLL_MS, DEFAULT_REAPER_POLL_MS, MIN_REAPER_POLL_MS, MAX_REAPER_POLL_MS,
              ConfigurationFlags::DEFAULT, None, None],
             ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, DEFAULT_SMARTLOG_POLL_SECS, MIN_SMARTLOG_POLL_SECS, MAX_SMARTLOG_POLL_SECS,
              ConfigurationFlags::IMMUTABLE, None, None],
@@ -325,11 +325,11 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, DEFAULT_SCALING_SHRINK_WATERMARK, MIN_SCALING_SHRINK_WATERMARK, MAX_SCALING_SHRINK_WATERMARK,
              ConfigurationFlags::DEFAULT, None, None],
-            ["tiered-decay-time", &*CFG_TIERED_DECAY_TIME, DEFAULT_TIERED_DECAY_TIME, MIN_TIERED_DECAY_TIME, MAX_TIERED_DECAY_TIME,
+            ["blob-decay-time", &*CFG_BLOB_DECAY_TIME, DEFAULT_BLOB_DECAY_TIME, MIN_BLOB_DECAY_TIME, MAX_BLOB_DECAY_TIME,
              ConfigurationFlags::DEFAULT, None, None],
             ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, DEFAULT_PROMOTE_MIN_HITS, MIN_PROMOTE_MIN_HITS, MAX_PROMOTE_MIN_HITS,
              ConfigurationFlags::DEFAULT, None, None],
-            ["reclaim-sample-size", &*CFG_RECLAIM_SAMPLE_SIZE, DEFAULT_RECLAIM_SAMPLE_SIZE, MIN_RECLAIM_SAMPLE_SIZE, MAX_RECLAIM_SAMPLE_SIZE,
+            ["victim-sample-size", &*CFG_VICTIM_SAMPLE_SIZE, DEFAULT_VICTIM_SAMPLE_SIZE, MIN_VICTIM_SAMPLE_SIZE, MAX_VICTIM_SAMPLE_SIZE,
              ConfigurationFlags::DEFAULT, None, None],
             ["max-cached-fds", &*CFG_MAX_CACHED_FDS, DEFAULT_MAX_CACHED_FDS, MIN_MAX_CACHED_FDS, MAX_MAX_CACHED_FDS,
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_max_cached_fds))],
@@ -345,6 +345,7 @@ valkey_module! {
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["test-rdma-fail-partial", &*CFG_TEST_RDMA_FAIL_PARTIAL, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
+            ["test-fail-unlink", &*CFG_TEST_FAIL_UNLINK, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
         ],
         enum: [

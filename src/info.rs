@@ -29,6 +29,10 @@ pub static EFA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
 /// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
 pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Objects evicted to make room for a write, or by a Dram shrink: Dram objects or
+/// Tiered files. Cached copies Tiered drops are demotions, not evictions.
+pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
     if let Err(e) = info_sections(ctx) {
@@ -56,12 +60,22 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             LARGE_OBJECT_COUNT.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "pending_reclaims",
+            "pending_evictions",
             storage::reclaim::RECLAIM_LIST.len() as i64,
         )?
+        .field("evictions", EVICTIONS.load(Ordering::Relaxed) as i64)?
+        .field("disk_used_bytes", storage::nvme::nvme_disk_usage() as i64)?
         .field(
-            "reclaims",
-            storage::get_dram_pool().reclaims.load(Ordering::Relaxed) as i64,
+            "disk_orphaned_files",
+            storage::nvme::ORPHANED_FILES.count.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "disk_orphaned_bytes",
+            storage::nvme::ORPHANED_FILES.bytes.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "disk_unevictable_objects",
+            storage::object_file::unevictable_count() as i64,
         )?
         .build_section()?
         .build_info()?;
@@ -77,8 +91,8 @@ fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .add_section("fd")
         .field("open_fds", fds.len() as i64)?
         .field(
-            "fd_reclaims",
-            fds.reclaims.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            "fd_evictions",
+            fds.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .build_section()?
         .build_info()

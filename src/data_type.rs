@@ -18,7 +18,7 @@ use crate::storage::{Crc, ObjectFile};
 
 // ─── ObjectId ────────────────────────────────────────────────────────────────
 
-/// ObjectId IS the file path: deterministic mapping OID → "{nvme_dir}/{oid:016x}.dat"
+/// ObjectId IS the file path: deterministic mapping OID → "{disk_dir}/{oid:016x}.dat"
 /// No lookup table. Compact u64 safe for replication streams, RDB, and LoValue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(pub u64);
@@ -36,8 +36,17 @@ impl ObjectId {
     }
 
     /// Deterministic file path from OID.
-    pub fn file_path(&self, nvme_dir: &str) -> String {
-        format!("{}/{:016x}.dat", nvme_dir, self.0)
+    pub fn file_path(&self, disk_dir: &str) -> String {
+        format!("{}/{:016x}.dat", disk_dir, self.0)
+    }
+
+    /// The OID a `file_path` file name encodes. None for any other name.
+    pub fn from_filename(name: &str) -> Option<Self> {
+        let hex = name.strip_suffix(".dat")?;
+        if hex.len() != 16 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        u64::from_str_radix(hex, 16).ok().map(Self)
     }
 }
 
@@ -302,6 +311,16 @@ mod tests {
             oid2.file_path("/mnt/bigobj"),
             "/mnt/bigobj/0000000000000001.dat"
         );
+
+        assert_eq!(ObjectId::from_filename("00000000000000ff.dat"), Some(oid));
+        for name in [
+            "00000000000000FF.dat",
+            "ff.dat",
+            "00000000000000ff.tmp",
+            "+0000000000000ff.dat",
+        ] {
+            assert_eq!(ObjectId::from_filename(name), None, "{name}");
+        }
     }
 
     // ─── free_effort tests ───────────────────────────────────────────────

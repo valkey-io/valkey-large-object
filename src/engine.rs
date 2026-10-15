@@ -241,6 +241,11 @@ fn cmd_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, Va
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
+            // Eviction ranks by use, as for a Tiered cache hit.
+            obj_ctx.stats.touch(
+                storage::cache_policy::now_minutes(),
+                crate::blob_decay_time(),
+            );
             if crate::bench_mode() {
                 Ok(ValkeyValue::Integer(obj_len as i64))
             } else {
@@ -276,6 +281,11 @@ fn cmd_get_dram_efa(
     let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
     match dram_pool.get_object(&object_id) {
         Some(obj_ctx) if obj_ctx.is_ready() => {
+            // Eviction ranks by use, as for a Tiered cache hit.
+            obj_ctx.stats.touch(
+                storage::cache_policy::now_minutes(),
+                crate::blob_decay_time(),
+            );
             // Serve from DRAMPool.
             cmd_get_from_dram(
                 dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, None,
@@ -301,6 +311,8 @@ fn cmd_get_tiered(
     transport: Transport,
     blocked_client: valkey_module::BlockedClient,
 ) {
+    // We do not allow the eviction of files that are inflight.
+    let unevictable = storage::UnevictableOID::new(object_id);
     let dram_pool = storage::get_dram_pool();
     let cache = dram_pool.tiered_cache();
     // ─── DRAMPool hit ────────────────────────────────────────────────────
@@ -316,7 +328,7 @@ fn cmd_get_tiered(
                 crc32c,
                 transport,
                 thread_ctx,
-                Some(file),
+                Some((file, unevictable)),
             );
             return;
         }
@@ -337,7 +349,7 @@ fn cmd_get_tiered(
     };
     if let Some(obj_ctx) = promoted {
         let fd_pool = storage::get_fd_pool();
-        let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
+        let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
             Some(fd) => fd,
             None => {
                 // remove_object drops the map's Arc; obj_ctx drops at end of scope
@@ -369,7 +381,7 @@ fn cmd_get_tiered(
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
             // Declared after thread_ctx so it drops first: the fd clone is gone
             // before the client unblocks, so its next GET sees the fd unpinned.
-            let _keep_alive = (file, fd);
+            let _keep_alive = (file, fd, unevictable);
             // Promotion: read the NVMe file INTO the DRAM buffers (pool=Dram), and the
             // progress hook marks the cached entry Ready.
             let progress = crate::stream::PromotionProgress {
@@ -412,7 +424,7 @@ fn cmd_get_tiered(
     };
     let stream_ctx = storage::StreamingContext::new(buffers);
     let fd_pool = storage::get_fd_pool();
-    let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
+    let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
         Some(fd) => fd,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -439,7 +451,7 @@ fn cmd_get_tiered(
         // source reads straight from the NVMe pool window.
         let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
         // Declared after thread_ctx so it drops first (see the promotion path).
-        let _keep_alive = (file, fd);
+        let _keep_alive = (file, fd, unevictable);
         cmd_get_tiered_run(
             get_info,
             &stream_ctx.buffers,
@@ -561,6 +573,7 @@ pub fn execute_set(
     key_name: &valkey_module::ValkeyString,
     obj_len: u64,
     data_source: DataSource,
+    old_oid: Option<ObjectId>,
 ) -> EngineResult {
     let mode = crate::operating_mode();
     // Assign object_id at command dispatch time (main thread) — establishes
@@ -593,6 +606,7 @@ pub fn execute_set(
                         data_source,
                         blocked_client,
                         object_id,
+                        old_oid,
                     );
                 }
             }
@@ -613,7 +627,7 @@ fn cmd_set_dram_tcp(
 ) -> Result<ValkeyValue, ValkeyError> {
     let dram_pool = storage::get_dram_pool();
     let chunk_size = crate::chunk_size();
-    let buffers = match dram_pool.alloc_exact_or_expand(ctx, obj_len) {
+    let buffers = match dram_pool.alloc_exact_expand_evict(ctx, obj_len) {
         Some(bufs) => bufs,
         None => {
             info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
@@ -684,8 +698,8 @@ fn cmd_set_dram_efa(
     // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
-    // DRAMPool::alloc_exact_or_expand: all-or-nothing with reactive expansion.
-    let buffers = match dram_pool.alloc_exact_or_expand(ctx, obj_len) {
+    // DRAMPool::alloc_exact_expand_evict: all-or-nothing; expands, then evicts.
+    let buffers = match dram_pool.alloc_exact_expand_evict(ctx, obj_len) {
         Some(bufs) => bufs,
         None => {
             let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
@@ -771,6 +785,7 @@ fn cmd_set_tiered(
     data_source: DataSource,
     blocked_client: valkey_module::BlockedClient,
     object_id: ObjectId,
+    old_oid: Option<ObjectId>,
 ) {
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
@@ -790,10 +805,17 @@ fn cmd_set_tiered(
     let stream_ctx = storage::StreamingContext::new(buffers);
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
+    // We do not allow the eviction of the new file until it is committed, nor of
+    // the one it replaces.
+    let unevictable = (
+        storage::UnevictableOID::new(object_id),
+        old_oid.map(storage::UnevictableOID::new),
+    );
     match data_source {
         DataSource::Tcp(data) => {
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
             crate::runtime_handle().spawn(async move {
+                let _unevictable = unevictable;
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 let set_info = SetObjectInfo {
@@ -814,6 +836,7 @@ fn cmd_set_tiered(
         DataSource::Efa { session, addrs } => {
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs));
             crate::runtime_handle().spawn(async move {
+                let _unevictable = unevictable;
                 let thread_ctx =
                     valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
                 let set_info = SetObjectInfo {
@@ -876,7 +899,7 @@ async fn cmd_set_tiered_run(
     }
     // FdPool not used on SET: this write fd is short-lived and never cached.
     // FdPool caches read fds lazily on first GET via ensure_open.
-    let file_path = object_id.file_path(&crate::nvme_dir());
+    let file_path = object_id.file_path(&crate::disk_dir());
     let fd = match storage::open_nvme_file_for_write(&file_path) {
         Ok(fd) => fd,
         Err(_e) => {
@@ -940,7 +963,7 @@ async fn cmd_set_tiered_run(
     // NVMe disk accounting stays with the NVMe caller (no file on the DRAM path).
     let object_id = object_file.object_id();
     let disk_len = object_file.disk_len();
-    let file_path = object_id.file_path(&crate::nvme_dir());
+    let file_path = object_id.file_path(&crate::disk_dir());
     let on_disk = std::fs::metadata(&file_path)
         .unwrap_or_else(|e| {
             panic!(
@@ -985,7 +1008,7 @@ fn cmd_get_from_dram(
     crc32c: Crc,
     transport: Transport,
     thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
-    file: Option<Arc<ObjectFile>>,
+    file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOID>)>,
 ) {
     match transport {
         Transport::Tcp => {

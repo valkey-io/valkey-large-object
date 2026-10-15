@@ -161,7 +161,7 @@ impl ObjectContext {
         }
         let pool = crate::storage::get_dram_pool();
         let dummy_context = valkey_module::Context::dummy();
-        let new_buffers = pool.alloc_exact_or_expand(&dummy_context, obj_len)?;
+        let new_buffers = pool.alloc_exact_expand_evict(&dummy_context, obj_len)?;
         let copy = Self::new_ready(new_buffers);
         for (src, dst) in self.buffers.iter().zip(&copy.buffers) {
             // SAFETY: src and dst are distinct live allocations of src.len bytes.

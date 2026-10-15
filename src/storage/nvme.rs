@@ -7,7 +7,8 @@
 
 use std::mem::size_of;
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::context::SegmentBuffer;
 use super::uring;
@@ -40,20 +41,29 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
     }
 }
 
-/// Atomically reserve `bytes` of NVMe disk budget if it fits within disk-maxmemory.
-/// Returns true and increments the counter on success; returns false and leaves the
-/// counter unchanged if the reservation would exceed the cap (or overflow).
+/// Reserve `bytes` of NVMe disk budget, evicting other objects to make room if it
+/// does not fit within disk-maxmemory. Returns true and increments the counter on
+/// success; returns false and leaves the counter unchanged otherwise.
 /// Returns true if disk-maxmemory is 0 (unlimited).
 pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
+    reserve(bytes as i64) || evict_and_reserve(bytes)
+}
+
+/// Atomically add `delta` to the usage if the result fits within disk-maxmemory;
+/// false on overflow. Negative when an eviction freed more than it reserves. FATAL
+/// below 0.
+fn reserve(delta: i64) -> bool {
     let max = crate::nvme_maxmemory();
     NVME_DISK_USAGE
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            let next = cur.checked_add(bytes)?;
-            if max == 0 || next <= max {
-                Some(next)
-            } else {
-                None
-            }
+            let Some(next) = cur.checked_add_signed(delta) else {
+                assert!(
+                    delta > 0,
+                    "NVMe disk-usage underflow: {cur} B tracked, delta {delta} B"
+                );
+                return None;
+            };
+            (max == 0 || next <= max).then_some(next)
         })
         .is_ok()
 }
@@ -61,6 +71,241 @@ pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
 /// Current tracked NVMe disk usage in bytes.
 pub fn nvme_disk_usage() -> u64 {
     NVME_DISK_USAGE.load(Ordering::Relaxed)
+}
+
+// ─── NVMe Eviction ───────────────────────────────────────────────────────────
+
+/// Directory entries read per eviction.
+const EVICT_BATCH: usize = 64;
+
+/// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
+/// tokio task) take it. Never call off main while holding it: it would deadlock.
+fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
+    if crate::is_main_thread() {
+        f(&valkey_module::Context::dummy())
+    } else {
+        f(&valkey_module::ThreadSafeContext::new().lock())
+    }
+}
+
+/// Evict objects to make room for `bytes`, then reserve them. True if reserved.
+/// A refused write keeps its victims evicted: a claim is never undone.
+fn evict_and_reserve(bytes: u64) -> bool {
+    let max = crate::nvme_maxmemory();
+    // Eviction cannot make room for more than the cap.
+    if bytes > max {
+        return false;
+    }
+    if !with_server_lock(crate::tiered_eviction_allowed) {
+        return false;
+    }
+    // Take the headroom first, so no other write can use it while we evict.
+    let prev = NVME_DISK_USAGE.update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        cur + bytes.min(max.saturating_sub(cur))
+    });
+    let taken = bytes.min(max.saturating_sub(prev));
+    let need = bytes - taken;
+    // Claim, then stat: a claimed file cannot change under us.
+    let mut victims = Vec::new();
+    let mut covered = 0;
+    for oid in victim_batch(EVICT_BATCH) {
+        if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
+            break;
+        }
+        // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
+        let Some(unevictable) = with_server_lock(|_| super::object_file::claim_victim(oid)) else {
+            continue;
+        };
+        match stat(oid) {
+            Ok(Some(len)) => {
+                covered += len;
+                victims.push((unevictable, len));
+            }
+            // We collect our victim candidates via a readdir snapshot. Between the
+            // readdir and the victim claim (adding the oid to the RECLAIM_LIST), the
+            // file may be deleted by an ObjectFile's drop.
+            Ok(None) => {
+                super::reclaim::RECLAIM_LIST.remove(&oid);
+            }
+            // Evicted, but orphaned with its size unknown: the retry stats and frees it.
+            Err(e) => {
+                valkey_module::logging::log_warning(format!(
+                    "largeobj: failed to stat object file {} during eviction, will retry: {e}",
+                    oid.file_path(&crate::disk_dir())
+                ));
+                crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                ORPHANED_FILES.push(unevictable, 0);
+            }
+        }
+    }
+    // No lock.
+    let freed = evict(victims);
+    // One update, so a competing reservation cannot take the freed bytes.
+    let reserved = reserve(bytes as i64 - taken as i64 - freed as i64);
+    if !reserved {
+        // Release the headroom; the victims stay evicted.
+        decrease_nvme_disk_usage(taken + freed);
+    }
+    reserved
+}
+
+/// The first `n` object files in `disk_dir`.
+fn victim_batch(n: usize) -> Vec<ObjectId> {
+    let Ok(dir) = std::fs::read_dir(crate::disk_dir()) else {
+        return Vec::new();
+    };
+    dir.filter_map(|entry| ObjectId::from_filename(entry.ok()?.file_name().to_str()?))
+        .take(n)
+        .collect()
+}
+
+/// Unlink claimed `victims` and remove them from the unevictable list,
+/// except orphans, which stay in it until the retry. Returns the bytes freed, not counting
+/// orphans. Victims stay in the reclaim list: their keys read as missing until the cron
+/// deletes them, and their teardown then only removes them from it.
+fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
+    let mut freed = 0;
+    for (unevictable, size) in victims {
+        let oid = unevictable.oid();
+        if let Some(pool) = super::FD_POOL.get() {
+            pool.remove(oid);
+        }
+        super::get_dram_pool().remove_object(&oid);
+        crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        if try_unlink(unevictable, size, "eviction") {
+            freed += size;
+        }
+    }
+    freed
+}
+
+// ─── Orphaned Files ──────────────────────────────────────────────────────────
+
+/// Files whose unlink failed transiently: still charged, and in the unevictable list
+/// so no eviction takes them. The cron's retry unlinks them and credits their bytes.
+/// Size 0: an eviction could not stat the file, so the retry does first.
+pub struct OrphanedFiles {
+    files: Mutex<Vec<(Arc<super::UnevictableOID>, u64)>>,
+    pub count: AtomicU64,
+    pub bytes: AtomicU64,
+    retrying: AtomicBool,
+}
+
+pub static ORPHANED_FILES: OrphanedFiles = OrphanedFiles {
+    files: Mutex::new(Vec::new()),
+    count: AtomicU64::new(0),
+    bytes: AtomicU64::new(0),
+    retrying: AtomicBool::new(false),
+};
+
+impl OrphanedFiles {
+    fn push(&self, unevictable: Arc<super::UnevictableOID>, size: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(size, Ordering::Relaxed);
+        self.files
+            .lock()
+            .expect("ORPHANED_FILES lock unavailable")
+            .push((unevictable, size));
+    }
+
+    /// Scaling cron: retry the unlinks on tokio, one retry at a time.
+    pub fn retry_deletion(&'static self) {
+        if self.count.load(Ordering::Relaxed) == 0 || self.retrying.swap(true, Ordering::Acquire) {
+            return;
+        }
+        crate::runtime_handle().spawn(async {
+            let files =
+                std::mem::take(&mut *self.files.lock().expect("ORPHANED_FILES lock unavailable"));
+            for (unevictable, mut size) in files {
+                let oid = unevictable.oid();
+                let sized = size > 0
+                    || stat(oid).is_ok_and(|len| {
+                        size = len.unwrap_or(0);
+                        self.bytes.fetch_add(size, Ordering::Relaxed);
+                        true
+                    });
+                if sized && unlink(oid).is_ok() {
+                    decrease_nvme_disk_usage(size);
+                    self.count.fetch_sub(1, Ordering::Relaxed);
+                    self.bytes.fetch_sub(size, Ordering::Relaxed);
+                } else {
+                    let mut files = self.files.lock().expect("ORPHANED_FILES lock unavailable");
+                    files.push((unevictable, size));
+                }
+            }
+            self.retrying.store(false, Ordering::Release);
+        });
+    }
+}
+
+/// Unlink `oid`'s file.
+/// - Ok: unlinked, or already gone (`ENOENT`).
+/// - Err: a `transient` error. A retry may succeed.
+/// - Any other error aborts the server.
+fn unlink(oid: ObjectId) -> std::io::Result<()> {
+    let path = oid.file_path(&crate::disk_dir());
+    let Err(e) = std::fs::remove_file(&path) else {
+        return Ok(());
+    };
+    match e.raw_os_error() {
+        Some(libc::ENOENT) => Ok(()),
+        _ if transient(&e) => Err(e),
+        _ => panic!("largeobj: failed to unlink object file {path}: {e}"),
+    }
+}
+
+/// Size of `oid`'s file; `None` if it is gone (`ENOENT`). A `transient` error is
+/// returned; any other error aborts the server.
+fn stat(oid: ObjectId) -> std::io::Result<Option<u64>> {
+    let path = oid.file_path(&crate::disk_dir());
+    match std::fs::metadata(&path) {
+        Ok(meta) => Ok(Some(meta.len())),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(e) if transient(&e) => Err(e),
+        Err(e) => panic!("largeobj: failed to stat object file {path}: {e}"),
+    }
+}
+
+/// Transient errors, retried:
+/// - `EINTR`: a signal interrupted the call.
+/// - `EAGAIN`: the filesystem asked us to try again (network and FUSE filesystems).
+/// - `EBUSY`: the file is in use by the system, e.g. an NFS client's stand-in for an
+///   open, deleted file.
+/// - `ENOMEM`: the kernel was briefly out of memory.
+///
+/// Critical errors abort the server. They include:
+/// - `EIO`: the disk failed.
+/// - `EROFS`: the filesystem went read-only.
+/// - `EACCES`, `EPERM`: `disk-dir`'s permissions changed.
+/// - `ENOTDIR`, `ELOOP`, `ENAMETOOLONG`: `disk-dir`'s path no longer resolves (part of it
+///   was replaced, loops, or is too long).
+/// - `EISDIR`: a directory sits where an object file should be.
+/// - `EFAULT`: a bad pointer passed to the kernel, a bug.
+fn transient(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EINTR | libc::EAGAIN | libc::EBUSY | libc::ENOMEM)
+    )
+}
+
+/// Unlink the file of `size` charged bytes. True if it is gone: the caller credits
+/// them. False if it is orphaned: the bytes stay charged until the retry credits them.
+pub(crate) fn try_unlink(unevictable: Arc<super::UnevictableOID>, size: u64, during: &str) -> bool {
+    let oid = unevictable.oid();
+    let unlinked = if crate::test_fail_unlink() {
+        Err(std::io::Error::from_raw_os_error(libc::EBUSY))
+    } else {
+        unlink(oid)
+    };
+    let Err(e) = unlinked else {
+        return true;
+    };
+    valkey_module::logging::log_warning(format!(
+        "largeobj: failed to unlink object file {} during {during}, will retry: {e}",
+        oid.file_path(&crate::disk_dir())
+    ));
+    ORPHANED_FILES.push(unevictable, size);
+    false
 }
 
 // ─── FileHeader ──────────────────────────────────────────────────────────────
@@ -329,14 +574,6 @@ pub async fn write_file_header(
     }
 }
 
-/// Warn that an object file couldn't be unlinked (the next
-/// `validate_and_clean_nvme_dir` reclaims the orphan).
-pub(crate) fn warn_failed_unlink(during: &str, path: &str, err: &std::io::Error) {
-    valkey_module::logging::log_warning(format!(
-        "largeobj: failed to unlink object file {path} during {during}: {err}"
-    ));
-}
-
 /// Reset the NVMe object directory (Tiered mode only): delete it and everything
 /// under it, then recreate it empty. `disk-dir` is a dedicated, module-owned
 /// directory (see the `disk-dir` config docs), so wiping it is safe. A no-op
@@ -346,7 +583,7 @@ pub(crate) fn warn_failed_unlink(during: &str, path: &str, err: &std::io::Error)
 /// this instance's files at shutdown. Returns `Ok(())` once disk-dir exists and
 /// is empty (or immediately, in Dram mode); `Err` if disk-dir is unset in Tiered
 /// mode, or the directory could not be removed or recreated.
-pub fn validate_and_clean_nvme_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
+pub fn validate_and_clean_disk_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
     if mode != crate::OperatingMode::Tiered {
         return Ok(());
     }

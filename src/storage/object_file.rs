@@ -29,12 +29,84 @@
 //! serialized form; on load a handle is reconstructed for the existing file and its
 //! fd opens lazily on the first GET.
 
+use std::collections::HashMap;
 use std::os::unix::io::OwnedFd;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use super::fd_pool::FdPool;
 use super::Crc;
 use crate::data_type::ObjectId;
+
+/// Unevictable list (Tiered): oids whose files are in use by a GET, SET, COPY,
+/// teardown or eviction, as oid -> the `Arc<UnevictableOID>` its holders share.
+/// Eviction never claims an oid whose `Weak` is live.
+static UNEVICTABLE: LazyLock<Mutex<HashMap<ObjectId, Weak<UnevictableOID>>>> =
+    LazyLock::new(Mutex::default);
+
+/// Keeps its oid in the unevictable list while any `Arc` of it is alive. Every holder
+/// of one oid shares the same `Arc`. Never call `new` or drop an `Arc` under the
+/// `UNEVICTABLE` or `RECLAIM_LIST` lock.
+pub struct UnevictableOID(ObjectId);
+
+impl UnevictableOID {
+    #[must_use]
+    pub fn new(oid: ObjectId) -> Arc<Self> {
+        let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
+        match unevictable.get(&oid).and_then(Weak::upgrade) {
+            Some(shared) => shared,
+            None => Self::insert(&mut unevictable, oid),
+        }
+    }
+
+    pub fn oid(&self) -> ObjectId {
+        self.0
+    }
+
+    fn insert(unevictable: &mut HashMap<ObjectId, Weak<Self>>, oid: ObjectId) -> Arc<Self> {
+        let shared = Arc::new(Self(oid));
+        unevictable.insert(oid, Arc::downgrade(&shared));
+        shared
+    }
+}
+
+/// The last `Arc` dropped: remove the oid from the unevictable list.
+impl Drop for UnevictableOID {
+    fn drop(&mut self) {
+        let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
+        // A new holder may have replaced the entry before this took the lock.
+        if unevictable
+            .get(&self.0)
+            .is_some_and(|w| w.strong_count() == 0)
+        {
+            unevictable.remove(&self.0);
+        }
+    }
+}
+
+/// Oids in the unevictable list (INFO).
+pub fn unevictable_count() -> usize {
+    UNEVICTABLE
+        .lock()
+        .expect("UNEVICTABLE lock unavailable")
+        .values()
+        .filter(|w| w.strong_count() > 0)
+        .count()
+}
+
+/// Claim `oid` for eviction: add it to the reclaim list and the unevictable list,
+/// unless it is in either already. One `UNEVICTABLE` critical section, so a
+/// teardown either adds `oid` to the unevictable list first (the claim fails) or
+/// finds it in the reclaim list. Call under the server lock.
+#[must_use]
+pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
+    let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
+    if unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0)
+        || !super::reclaim::RECLAIM_LIST.insert(oid)
+    {
+        return None;
+    }
+    Some(UnevictableOID::insert(&mut unevictable, oid))
+}
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
 
@@ -86,18 +158,22 @@ impl ObjectFile {
     /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
     /// the command rather than aborting the node), leaving no partial file behind.
     pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
-        let dir = crate::nvme_dir();
+        let dir = crate::disk_dir();
         let disk_len = self.disk_len;
+        // We do not allow the eviction of the source or the new file mid-copy.
+        let _source = UnevictableOID::new(self.object_id);
         if !super::nvme::try_reserve_nvme_disk_usage(disk_len) {
             return None;
         }
         let new_oid = ObjectId::next();
+        let copy = UnevictableOID::new(new_oid);
         let dst_path = new_oid.file_path(&dir);
         match self.copy_file(&dst_path, new_oid, len, crc32c) {
             Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
             Err(e) => {
-                let _ = std::fs::remove_file(&dst_path);
-                super::nvme::decrease_nvme_disk_usage(disk_len);
+                if super::nvme::try_unlink(copy, disk_len, "copy") {
+                    super::nvme::decrease_nvme_disk_usage(disk_len);
+                }
                 valkey_module::logging::log_warning(format!(
                     "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
                     self.object_id
@@ -117,7 +193,7 @@ impl ObjectFile {
         crc32c: Crc,
     ) -> std::io::Result<()> {
         use std::io::{Seek, SeekFrom, Write};
-        let mut src = std::fs::File::open(self.object_id.file_path(&crate::nvme_dir()))?;
+        let mut src = std::fs::File::open(self.object_id.file_path(&crate::disk_dir()))?;
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -132,10 +208,12 @@ impl ObjectFile {
 impl Drop for ObjectFile {
     fn drop(&mut self) {
         // Runs once, when the last ref drops: a completed deletion with no
-        // remaining ObjectFile refs. Means "object gone" — deregister the fd and
-        // unlink the file.
+        // remaining ObjectFile refs. Means "object gone" — deregister the fd and,
+        // unless an eviction owns it, unlink the file.
         let object_id = self.object_id;
         let disk_len = self.disk_len;
+        // We do not allow the eviction of a file that is being torn down.
+        let unevictable = UnevictableOID::new(object_id);
 
         // Deregistering drops the pool's Arc<OwnedFd>; if no in-flight reader
         // holds a clone, the fd's OwnedFd closes at this time.
@@ -143,12 +221,17 @@ impl Drop for ObjectFile {
             if let Some(pool) = super::FD_POOL.get() {
                 pool.remove(object_id);
             }
-            let path = object_id.file_path(&crate::nvme_dir());
-            if let Err(e) = std::fs::remove_file(&path) {
-                super::warn_failed_unlink("teardown", &path, &e);
+            // An eviction may have claimed this file. If so, it owns the unlink and the
+            // ledger credit (the ledger can't detect a second one); we only take the oid
+            // off the reclaim list, which only this teardown can do now that the key is
+            // gone. Otherwise we unlink and credit.
+            let claimed_by_eviction = super::reclaim::RECLAIM_LIST.remove(&object_id);
+            if claimed_by_eviction {
+                // The eviction unlinks the file and credits its bytes.
+            } else if super::nvme::try_unlink(unevictable, disk_len, "teardown") {
+                // Release exactly what create added — no stat, so it can't drift.
+                crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
             }
-            // Release exactly what create added — no stat, so it can't drift.
-            crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
         };
 
         // The main event-loop thread must be kept syscall-free. Hand the operation

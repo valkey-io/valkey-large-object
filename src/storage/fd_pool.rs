@@ -39,7 +39,7 @@ struct FdEntry {
 pub struct FdPool {
     fds: RwLock<OIDIndexedMap<FdEntry>>,
     /// Cached fds dropped to stay under `max-cached-fds`.
-    pub reclaims: AtomicU64,
+    pub evictions: AtomicU64,
 }
 
 impl Default for FdPool {
@@ -52,7 +52,7 @@ impl FdPool {
     pub fn new() -> Self {
         Self {
             fds: RwLock::new(OIDIndexedMap::new()),
-            reclaims: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }
     }
 
@@ -73,7 +73,7 @@ impl FdPool {
         cap: usize,
     ) -> Option<Arc<OwnedFd>> {
         let now_min = now_minutes();
-        let decay_time = crate::tiered_decay_time();
+        let decay_time = crate::blob_decay_time();
         let hit = |entry: &FdEntry| {
             entry.stats.touch(now_min, decay_time);
             Arc::clone(&entry.fd)
@@ -100,7 +100,7 @@ impl FdPool {
         // the pool is over it by many entries; reclaiming at most
         // RECLAIM_MAX_VICTIMS per miss shrinks it gradually instead of stalling
         // every GET behind one huge reclaim under the write lock.
-        let samples = crate::reclaim_sample_size();
+        let samples = crate::victim_sample_size();
         for _ in 0..RECLAIM_MAX_VICTIMS {
             if fds.len() < cap {
                 break;
@@ -109,7 +109,7 @@ impl FdPool {
                 Some(e.stats.decayed_counter(now_min, decay_time))
             })
             .expect("a non-empty map always yields a victim");
-            self.reclaims.fetch_add(1, Ordering::Relaxed);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
         }
 
         let path = object_id.file_path(dir);
@@ -286,7 +286,7 @@ mod tests {
             assert_eq!(pool.len(), 1, "cap holds");
             assert!(!pool.contains(oids[0]));
             assert!(pool.contains(oids[1]));
-            assert_eq!(pool.reclaims.load(Ordering::Relaxed), 1);
+            assert_eq!(pool.evictions.load(Ordering::Relaxed), 1);
             assert!(
                 weak.upgrade().is_some(),
                 "reader keeps the reclaimed fd open"
@@ -323,7 +323,7 @@ mod tests {
             pool.get_or_open_with(oids[full], dir, 1).unwrap();
             assert_eq!(pool.len(), full - RECLAIM_MAX_VICTIMS + 1);
             assert_eq!(
-                pool.reclaims.load(Ordering::Relaxed),
+                pool.evictions.load(Ordering::Relaxed),
                 RECLAIM_MAX_VICTIMS as u64
             );
 
