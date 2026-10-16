@@ -1177,7 +1177,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_fd_evictions'] == 1
 
     def test_lower_cap_at_runtime(self):
-        """CONFIG SET to a smaller cap takes effect on the next open."""
+        """CONFIG SET to a smaller cap evicts the cache down to it right away."""
         client = self.server.get_new_client()
         for i, k in enumerate(self.KEYS[:2]):
             client.execute_command('BLOB.TCP_SET', k, self._payload(i))
@@ -1185,6 +1185,10 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.info('largeobj_fd')['largeobj_open_fds'] == 2
 
         client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '1')
+        info = client.info('largeobj_fd')
+        assert info['largeobj_open_fds'] == 1
+        assert info['largeobj_fd_evictions'] == 1
+
         client.execute_command('BLOB.TCP_SET', self.KEYS[2], self._payload(2))
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
@@ -1297,26 +1301,118 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
         assert sorted(self.object_fds(client)) == kept
 
     def test_raise_max_cached_fds_rejected_without_room(self):
-        """The room above the client range (hard - 228) must hold the cache plus one
-        in-flight fd per client (maxclients 100). The largest cap that fits is
-        accepted; one more is rejected, and the old cap stays."""
-        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        fits = hard - 228 - 100
-        client = self.server.get_new_client()
-        client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', str(fits))
+        """Limit 1000 leaves 772 fds above the floor (228), and 100 of them are set
+        aside for commands (maxclients 100), so 672 fit in the cache. The largest cap
+        that fits is accepted; one more is rejected, and the old cap stays."""
+        _, client = self._start_with_nofile_limit('cap-room', 1000)
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '672')
         with pytest.raises(ResponseError, match="is too low for max-cached-fds"):
-            client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds',
-                                   str(fits + 1))
+            client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '673')
         assert client.config_get('largeobj.max-cached-fds') == {
-            'largeobj.max-cached-fds': str(fits)}
+            'largeobj.max-cached-fds': '672'}
 
-    def test_config_set_maxclients_without_room_aborts(self):
-        """Raising maxclients until fewer than max-cached-fds fds fit between
-        the event loop's end and the hard limit would put object fds back on client
-        fd numbers. The module logs why and aborts the server instead."""
-        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        maxclients = hard - 200  # event loop ends at hard - 72: 72 fds of room
+    def test_config_set_maxclients_without_room_empties_cache_and_keeps_serving(self):
+        """Limit 400 holds a cache of 72 fds above the floor (228). Raising maxclients
+        to 200 moves the floor to 328 and sets aside 200 slots for commands, leaving no
+        room for the cache. Valkey has already applied the change and a module cannot
+        veto it, so the module empties the cache. The server keeps running and commands
+        still get fds."""
+        _, client = self._start_with_nofile_limit('maxclients-no-room', 400)
+        for i in range(10):
+            client.execute_command('BLOB.TCP_SET', f'obj_{i}', b'x' * 4096)
+            client.execute_command('BLOB.TCP_GET', f'obj_{i}')
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == 10
+        assert client.info('largeobj_fd')['largeobj_fd_cache_capacity'] == 72
+
+        client.execute_command('CONFIG', 'SET', 'maxclients', '200')
+
+        assert client.ping()
+        fd_info = client.info('largeobj_fd')
+        assert fd_info['largeobj_open_fds'] == 0
+        assert fd_info['largeobj_fd_cache_capacity'] == 0
+        for i in range(10):
+            assert client.execute_command('BLOB.TCP_GET', f'obj_{i}') == b'x' * 4096
+
+    def test_limit_lowered_after_load_fails_the_command_not_the_server(self):
+        """An fd limit lowered after load (here below the floor) leaves no number to
+        move an fd to. The command that needs it gets an error reply, the failure is
+        counted, and the server keeps running."""
         client = self.server.get_new_client()
-        with self.server.expect_crash(self):
-            client.execute_command('CONFIG', 'SET', 'maxclients', str(maxclients))
-        assert self.server.verify_string_in_logfile("is too low for max-cached-fds")
+        pid = client.info('server')['process_id']
+        soft, hard = resource.prlimit(pid, resource.RLIMIT_NOFILE)
+        resource.prlimit(pid, resource.RLIMIT_NOFILE, (200, hard))  # floor is 228
+        try:
+            with pytest.raises(ResponseError):
+                client.execute_command('BLOB.TCP_SET', 'no_room', b'x' * 4096)
+        finally:
+            resource.prlimit(pid, resource.RLIMIT_NOFILE, (soft, hard))
+        assert client.ping()
+        assert client.info('largeobj_fd')['largeobj_fd_placement_failures'] >= 1
+        client.execute_command('BLOB.TCP_SET', 'has_room', b'x' * 4096)
+        assert client.execute_command('BLOB.TCP_GET', 'has_room') == b'x' * 4096
+
+    def test_max_cached_fds_zero_caches_nothing(self):
+        """max-cached-fds 0 empties the cache, and later GETs open, read and close
+        their fd without caching it."""
+        client = self.server.get_new_client()
+        for i in range(10):
+            client.execute_command('BLOB.TCP_SET', f'obj_{i}', b'x' * 4096)
+            client.execute_command('BLOB.TCP_GET', f'obj_{i}')
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == 10
+
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '0')
+        for i in range(10):
+            assert client.execute_command('BLOB.TCP_GET', f'obj_{i}') == b'x' * 4096
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == 0
+        wait_for_true(lambda: self.object_fds(client) == [])
+
+    def _start_with_nofile_limit(self, name, nofile):
+        """Start a server under `ulimit -n <nofile>` (soft = hard, like systemd's
+        LimitNOFILE=<nofile>) with maxclients 100. Returns (server, client)."""
+        testdir = os.path.abspath(os.path.join(self.testdir, name))
+        os.makedirs(testdir, exist_ok=True)
+        wrapper = os.path.join(testdir, 'valkey-server')
+        with open(wrapper, 'w') as f:
+            f.write(f'#!/bin/sh\nulimit -n {nofile}\nexec {self.server_path} "$@"\n')
+        os.chmod(wrapper, 0o755)
+        module_args = self.get_module_args(os.path.join(testdir, 'nvme'), 'no')
+        server, client = self.create_server(
+            testdir=testdir,
+            server_path=wrapper,
+            args={'maxclients': '100',
+                  'loadmodule': f"{os.environ['MODULE_PATH']} {module_args}"},
+        )
+        with open(f"/proc/{client.info('server')['process_id']}/limits") as f:
+            line = next(line for line in f if line.startswith('Max open files'))
+        assert line.split()[3:5] == [str(nofile), str(nofile)]  # soft, hard
+        return server, client
+
+    def test_loads_with_limit_inside_core_range(self):
+        """Valkey's stock open-file limit is maxclients + 32 (132 here), inside the
+        Valkey core range (fd numbers below 228). No fd number past the range exists,
+        so no client can be stranded: Tiered loads, object fds are not moved, and the
+        fd cache is off because a cached fd would hold a client's fd number."""
+        server, client = self._start_with_nofile_limit('stock-limit', 132)
+        assert server.verify_string_in_logfile('object-file fds are not moved')
+        assert server.verify_string_in_logfile('fd cache is off')
+
+        for i in range(10):
+            client.execute_command('BLOB.TCP_SET', f'obj_{i}', b'x' * 4096)
+            assert client.execute_command('BLOB.TCP_GET', f'obj_{i}') == b'x' * 4096
+        fd_info = client.info('largeobj_fd')
+        assert fd_info['largeobj_open_fds'] == 0
+        assert fd_info['largeobj_fd_cache_capacity'] == 0
+
+    def test_loads_with_cap_larger_than_the_limit_allows(self):
+        """Limit 400 leaves 172 fds above the floor (228), and 100 of them are set
+        aside for commands (maxclients 100), so 72 fit in the cache. The default
+        max-cached-fds (16384) asks for more: the server still loads, logs why, and
+        caches 72."""
+        server, client = self._start_with_nofile_limit('small-limit', 400)
+        assert server.verify_string_in_logfile('is too low for max-cached-fds')
+        assert client.info('largeobj_fd')['largeobj_fd_cache_capacity'] == 72
+
+        for i in range(150):
+            client.execute_command('BLOB.TCP_SET', f'obj_{i}', b'x' * 4096)
+            assert client.execute_command('BLOB.TCP_GET', f'obj_{i}') == b'x' * 4096
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == 72

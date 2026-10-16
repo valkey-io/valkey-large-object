@@ -50,7 +50,7 @@ Four runtime-mutable configs:
 | `tiered-decay-time` | 1 | 0..=65535 | Minutes per one-point counter decay. 0 disables decay (pure LFU). Same semantics as core `lfu-decay-time`. |
 | `promote-min-hits` | 2 | 1..=255 | Misses an object must accumulate before a GET promotes it. 1 promotes on the first GET. |
 | `reclaim-sample-size` | 5 | 1..=64 | Entries sampled per reclaim round. Same idea as core's `maxmemory-samples`. |
-| `max-cached-fds` | 16384 | 0..=1048576 | Cap on cached read fds; 0 caches nothing. The fds sit above the Valkey core range (fd numbers below `maxclients + CONFIG_FDSET_INCR`, 128 in core: core's own fds and client sockets), so they never take those fd numbers; load fails, and a runtime raise is rejected, when the cap plus one in-flight fd per client does not fit between there and the open-file limit (the module raises the soft limit to the hard limit at load). When the limit ends inside the Valkey core range (Valkey's stock limit is `maxclients + 32`), no client can be stranded, so the fds are not moved and nothing is checked. |
+| `max-cached-fds` | 16384 | 0..=1048576 | Cap on cached read fds; 0 caches nothing. The cache is also limited to the fd numbers left above the Valkey core range after one slot per client is set aside. At load a larger cap is clamped with a warning; a runtime raise that does not fit is rejected. When the open-file limit ends inside the core range, the cache is off. `INFO largeobj_fd` shows the size in use (`fd_cache_capacity`). See `OBJECT_FD_PLACEMENT_DESIGN.md`. |
 
 Three tuning values are constants in `src/storage/cache_policy.rs`, because no operator has a reason to change them:
 

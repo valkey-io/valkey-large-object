@@ -100,8 +100,8 @@ When fds are moved: `open()` the file, copy the fd to the lowest free number at 
 If no number at or above the floor is free, close the low fd, count the failure, and return the error
 (`EMFILE`) to the caller. The caller turns it into an error reply: a SET reports an I/O error, a GET
 reports an NVMe read error. The low fd is never kept, because keeping it would take a number in the core
-range. This path never panics: an operator can reach it by lowering the limit after load or by raising
-`maxclients`.
+range. This path never panics: it is reachable in normal operation, when more commands run at once than
+there are slots, or after a `maxclients` raise.
 
 For a short moment, between `open()` and the close of the low fd, the file holds a number in the core
 range. The 96 spare numbers are meant to absorb this; the number of opens that can overlap there is not
@@ -152,10 +152,12 @@ If the new floor is at or past the limit (legal: Valkey accepts any `maxclients`
 the floor is 96 higher), fds stop being moved, the cache is emptied, and a notice is logged. The server
 keeps serving. fds stay unmoved until restart, because the floor never falls.
 
-### 5.6 Limit lowered after load (`prlimit`)
+### 5.6 The limit is read when used
 
-Not noticed until an open fails; 5.2 handles it. The cache room is recomputed from the live limit each time
-it is used, so the next cache miss evicts down to the new size.
+The module reads the limit when it sizes the cache or opens a file. It does not watch for changes while
+idle. Valkey itself changes the limit only on `CONFIG SET maxclients`, which 5.5 handles. A limit changed
+from outside the server (for example `prlimit` on the running process) is not acted on; a command that
+then finds no free fd fails as in 5.2.
 
 ### 5.7 Startup probe
 
@@ -198,8 +200,8 @@ for Docker, or `ulimit -n` before `valkey-server`. Then restart.
   chosen: see decision 1.
 - **Refuse to load unless every client has a slot** (`limit >= floor + maxclients`). Commands never fail
   for lack of an fd. Needs `2 x maxclients + 128` before there is any cache, even with the cache off.
-- **Panic when no fd is free.** The condition can be caused by an operator (`prlimit`, a later
-  `maxclients` raise), so it is not an invariant. A panic takes down the whole server, cache included.
+- **Panic when no fd is free.** The condition is reachable in normal operation (more concurrent
+  commands than slots, a later `maxclients` raise), so it is not an invariant. A panic takes down the whole server, cache included.
 - **Evict cached fds when a SET cannot get a slot.** Not reliable: an fd that a GET is still reading stays
   open after eviction, so its number is not freed at the moment it is needed.
 - **A fixed reserve of a few slots for commands.** Nothing bounds how many commands run at once, so a
@@ -253,12 +255,9 @@ about 717 of 750 clients at 1 MB), so A is not pessimistic there.
    ring, EFA/libfabric and any sockets are not counted; what the module holds there has not been checked.
 2. **The short-lived low fd in 5.2** is not bounded. If many opens overlap, they can exhaust the 96 spare
    numbers in the core range.
-3. **A lowered limit with the cache already full.** The limit is recomputed on use. If it drops so that the
-   cache size becomes 0, cached fds already held stay until `CONFIG SET max-cached-fds` or
-   `maxclients` triggers a trim, because the zero-size path does not look at the cache.
-4. **One command per client** is a property of how the module blocks clients, not something it enforces.
+3. **One command per client** is a property of how the module blocks clients, not something it enforces.
    The cache room depends on it.
-5. **A Valkey core change** would remove most of this: a way for a module to reserve fds against the
+4. **A Valkey core change** would remove most of this: a way for a module to reserve fds against the
    `maxclients` budget, or core not lowering the hard limit. Out of scope here.
 
 ## 10. Verification
@@ -281,6 +280,7 @@ Tests:
   evicts down to the cap at once.
 - integration: a limit inside the core range loads with the cache off; a cap larger than the room loads
   with the clamped cache size; `CONFIG SET maxclients` with no room empties the cache and the server keeps
-  serving; a limit lowered after load fails the command, counts it, and the server survives.
+  serving; a command that finds no free fd above the floor fails with an error, is counted in
+  `fd_placement_failures`, and the server survives and serves the next command.
 - Two mutation checks: removing the cache-room clamp fails 3 tests, and making a failed move panic fails
-  the lowered-limit test.
+  the failed-move test.
