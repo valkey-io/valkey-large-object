@@ -91,7 +91,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `victim-sample-size` | 5 | Yes | Entries sampled per victim search (eviction, DRAM cache drop, fd close); the lowest LFU score goes. Min 1, max 64. |
 | `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Min 1, max 255. |
 | `blob-decay-time` | 1 | Yes | Minutes per one-point decay of the LFU score used to rank DRAM objects and fds for eviction. 0 = no decay. Max 65535. |
-| `max-cached-fds` | 1024 | Yes | Tiered: cap on cached read fds. 0 = unlimited. Max 1048576. |
+| `max-cached-fds` | 16384 | Yes | Tiered: cap on cached read fds. 0..1048576; 0 caches nothing. A raise that does not fit above the Valkey core range is rejected. |
 | `smartlog-poll-secs` | 60 | Immutable | NVMe SMART poll interval in seconds. 0 = disabled. Max 86400. |
 | `worker-threads` | 2 | Immutable | Tokio worker threads for async I/O tasks. Min 1, max 32. |
 | `direct-io` | yes | Immutable | Use O_DIRECT for NVMe files. Disable for ASAN builds. |

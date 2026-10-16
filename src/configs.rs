@@ -79,7 +79,7 @@ pub const DEFAULT_VICTIM_SAMPLE_SIZE: i64 = 5;
 pub const MIN_VICTIM_SAMPLE_SIZE: i64 = 1;
 pub const MAX_VICTIM_SAMPLE_SIZE: i64 = 64;
 // max-cached-fds
-pub const DEFAULT_MAX_CACHED_FDS: i64 = 1024;
+pub const DEFAULT_MAX_CACHED_FDS: i64 = 16_384;
 pub const MIN_MAX_CACHED_FDS: i64 = 0;
 pub const MAX_MAX_CACHED_FDS: i64 = 1_048_576;
 // scaling-expand-watermark
@@ -178,7 +178,8 @@ lazy_static::lazy_static! {
     pub static ref CFG_VICTIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_VICTIM_SAMPLE_SIZE);
 
     /// Cap on read fds cached by the FdPool. When full, opening a new fd evicts
-    /// the lowest LFU score among samples. 0 means unlimited.
+    /// the lowest LFU score among samples. Raising it at runtime is rejected
+    /// when the fds do not fit above the Valkey core range.
     pub static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(DEFAULT_MAX_CACHED_FDS);
 
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
@@ -579,6 +580,35 @@ pub fn validate_config_constraint(
         return Ok(());
     }
     validate_all_constraints().map_err(valkey_module::ValkeyError::String)
+}
+
+/// `max-cached-fds` CONFIG SET: the new cap must fit above the Valkey core range
+/// with one slot per client left for commands. At load, `fd_placement::
+/// raise_object_fd_floor` only logs a cap that does not fit. The framework has
+/// already stored the new value; on Err core restores the old one.
+pub fn validate_max_cached_fds(
+    _ctx: &valkey_module::configuration::ConfigurationContext,
+    _name: &str,
+    val: &'static AtomicI64,
+) -> Result<(), valkey_module::ValkeyError> {
+    storage::fd_placement::check_fd_limit(val.load(std::sync::atomic::Ordering::Relaxed) as u64)
+        .map_err(valkey_module::ValkeyError::String)
+}
+
+/// `max-cached-fds` changed (after `validate_max_cached_fds` accepted it): the cache
+/// is trimmed to the new cap right away, or to what fits above the floor when fds
+/// are not moved (nothing). No pool yet at load.
+pub fn on_max_cached_fds_changed(
+    _ctx: &valkey_module::configuration::ConfigurationContext,
+    _name: &str,
+    val: &'static AtomicI64,
+) {
+    if let Some(pool) = storage::FD_POOL.get() {
+        pool.shrink_to(storage::fd_placement::effective_cap());
+        storage::fd_placement::warn_if_cache_limited(
+            val.load(std::sync::atomic::Ordering::Relaxed) as u64,
+        );
+    }
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

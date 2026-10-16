@@ -520,7 +520,7 @@ pub fn open_nvme_file_for_write(file_path: &str) -> Result<OwnedFd, super::Stora
     if crate::direct_io() {
         flags |= libc::O_DIRECT;
     }
-    let fd = unsafe { libc::open(c_path.as_ptr(), flags, 0o644) };
+    let fd = super::fd_placement::open_object_file(&c_path, flags, 0o644);
     if fd < 0 {
         Err(super::StorageError::IoError {
             code: std::io::Error::last_os_error()

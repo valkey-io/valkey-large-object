@@ -50,7 +50,7 @@ Four runtime-mutable configs:
 | `tiered-decay-time` | 1 | 0..=65535 | Minutes per one-point counter decay. 0 disables decay (pure LFU). Same semantics as core `lfu-decay-time`. |
 | `promote-min-hits` | 2 | 1..=255 | Misses an object must accumulate before a GET promotes it. 1 promotes on the first GET. |
 | `reclaim-sample-size` | 5 | 1..=64 | Entries sampled per reclaim round. Same idea as core's `maxmemory-samples`. |
-| `max-cached-fds` | 1024 | 0..=1048576 | Cap on cached read fds. 0 means unlimited. The default stays well under Valkey's fd limit (about `maxclients + 32`), which the module's fds share with client sockets. |
+| `max-cached-fds` | 16384 | 0..=1048576 | Cap on cached read fds; 0 caches nothing. The cache is also limited to the fd numbers left above the Valkey core range after one slot per client is set aside. At load a larger cap is clamped with a warning; a runtime raise that does not fit is rejected. When the open-file limit ends inside the core range, the cache is off. `INFO largeobj_fd` shows the size in use (`fd_cache_capacity`). See `OBJECT_FD_PLACEMENT_DESIGN.md`. |
 
 Three tuning values are constants in `src/storage/cache_policy.rs`, because no operator has a reason to change them:
 
@@ -178,7 +178,7 @@ fds: RwLock<OIDIndexedMap<FdEntry>>
 ```
 
 1. The `get_or_open` fast path touches `stats` under the read lock and hands out a clone. The re-check under the write lock (two concurrent first GETs on a cold object) does the same.
-2. Slow path, under the write lock: if `max-cached-fds` is nonzero and `len >= cap`, remove the lowest-scoring sampled fd until there is room for the new one under the cap (normally one; more after the cap is lowered at runtime, since it is enforced on the next open). Unlike the DRAM pool, an fd held by an in-flight read is not skipped: reclaim only drops the map's `Arc`, the reader's clone keeps the fd open until the read completes, and it closes then. Open fds can briefly exceed the cap by the number of such readers. Victims are chosen before `open()`, so if the open fails they are still reclaimed and counted, costing one reopen each.
+2. Slow path, under the write lock: while `len >= cap`, remove the lowest-scoring sampled fd (one, since the pool never holds more than the cap: lowering `max-cached-fds` at runtime evicts it down to the new cap at once, with the fds closed after the write lock is released). Unlike the DRAM pool, an fd held by an in-flight read is not skipped: reclaim only drops the map's `Arc`, the reader's clone keeps the fd open until the read completes, and it closes then. Open fds can briefly exceed the cap by the number of such readers. Victims are chosen before `open()`, so if the open fails they are still reclaimed and counted, costing one reopen each.
 3. The DRAM pool keeps the held-entry skip because reclaim there must free bytes for an allocation that happens right after; a held entry frees nothing until its reader finishes. The fd cap has no such follow-up, so the skip buys nothing.
 4. The next GET on a reclaimed fd reopens it, which costs one `open()` syscall, so a wrong fd reclaim is far cheaper than a wrong DRAM reclaim.
 5. No admission filter for fds: a miss costs a syscall, not DRAM, so first-touch admission is fine.

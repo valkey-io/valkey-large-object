@@ -18,7 +18,7 @@
 //   1. Fabric::start()         — one libfabric service per domain. On missing
 //                                fabric, the EFA path is unavailable and BLOB.RDMA_HELLO
 //                                gives an error.
-//   2. storage::init(mode, disk_dir)
+//   2. storage::init(ctx, mode, disk_dir)
 //                              — validate config, allocate pool segments, create
 //                                the per-pool io_uring engines and start the
 //                                smartlog poller (Tiered only). All resources are
@@ -35,7 +35,7 @@
 use dma_libfabric_protocol::encode_hex;
 use valkey_module::configuration::ConfigurationFlags;
 use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyResult, ValkeyString};
-use valkey_module_macros::shutdown_event_handler;
+use valkey_module_macros::{config_changed_event_handler, shutdown_event_handler};
 
 use tokio::runtime::Runtime;
 
@@ -182,7 +182,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Step 2: Initialize storage layer (pools, io_uring engine, validation).
     // All pool/engine OnceLocks are set inside init() only after everything succeeds.
     // On failure, locals drop naturally — no cleanup needed.
-    let storage_summary = match storage::init(mode, &dir) {
+    let storage_summary = match storage::init(ctx, mode, &dir) {
         Ok(summary) => summary,
         Err(e) => {
             ctx.log_warning(&format!("largeobj: storage init failed: {}", e));
@@ -233,6 +233,29 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 /// shutdown.
 fn deinitialize(_ctx: &Context) -> Status {
     Status::Ok
+}
+
+/// `CONFIG SET maxclients` grows Valkey's event loop, possibly up into the fds
+/// the module placed at load. Raise the floor, drop the cached fds now below it so
+/// their next GET reopens them above the floor, and trim the cache to what still
+/// fits above the floor with one slot per client left for commands. If the open-file
+/// limit now ends inside the new Valkey core range, fds stop being moved and the
+/// cache is emptied. Valkey has already applied the change and a module cannot veto
+/// it, so a shortfall is logged: commands fail with an error, the server keeps running.
+#[config_changed_event_handler]
+fn on_config_changed(ctx: &Context, changed: &[&str]) {
+    if changed.contains(&"maxclients") {
+        if let Some(pool) = storage::FD_POOL.get() {
+            if let Err(msg) = storage::fd_placement::raise_object_fd_floor(ctx) {
+                ctx.log_warning(&format!(
+                    "largeobj: CONFIG SET maxclients: cannot place object-file fds above the \
+                     Valkey core range: {msg}"
+                ));
+            }
+            pool.drop_fds_below_floor();
+            pool.shrink_to(storage::fd_placement::effective_cap());
+        }
+    }
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
@@ -315,7 +338,7 @@ valkey_module! {
             ["victim-sample-size", &*CFG_VICTIM_SAMPLE_SIZE, DEFAULT_VICTIM_SAMPLE_SIZE, MIN_VICTIM_SAMPLE_SIZE, MAX_VICTIM_SAMPLE_SIZE,
              ConfigurationFlags::DEFAULT, None, None],
             ["max-cached-fds", &*CFG_MAX_CACHED_FDS, DEFAULT_MAX_CACHED_FDS, MIN_MAX_CACHED_FDS, MAX_MAX_CACHED_FDS,
-             ConfigurationFlags::DEFAULT, None, None],
+             ConfigurationFlags::DEFAULT, Some(Box::new(on_max_cached_fds_changed)), Some(Box::new(validate_max_cached_fds))],
             ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, DEFAULT_FABRIC_MAX_IN_FLIGHT, MIN_FABRIC_MAX_IN_FLIGHT, MAX_FABRIC_MAX_IN_FLIGHT,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, MIN_FABRIC_CRC_POOL_THREADS, MAX_FABRIC_CRC_POOL_THREADS,
