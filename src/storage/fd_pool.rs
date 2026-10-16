@@ -60,7 +60,7 @@ impl FdPool {
     /// used to prevent the underlying fd from being closed during inflight read requests.
     /// Returns `None` only on a genuine `open()` failure.
     pub fn get_or_open(&self, object_id: ObjectId, dir: &str) -> Option<Arc<ObjectFd>> {
-        self.get_or_open_with(object_id, dir, super::fd_placement::effective_cap())
+        self.get_or_open_with(object_id, dir, super::fd_placement::cache_size())
     }
 
     /// `get_or_open` with an explicit `max-cached-fds` cap, so
@@ -129,16 +129,16 @@ impl FdPool {
         drop(removed);
     }
 
-    /// Drop the pool's ref to every cached fd below the floor (inside the Valkey
-    /// core range), so the next GET reopens it above. Like `remove`: an in-flight
-    /// reader's clone keeps its fd open until the read finishes. Called when the
-    /// floor rises.
-    pub fn drop_fds_below_floor(&self) {
+    /// Drop the pool's ref to every cached fd below the module start (inside the
+    /// core range), so the next GET reopens it in the module range. Like `remove`: an
+    /// in-flight reader's clone keeps its fd open until the read finishes. Called when
+    /// the module start rises.
+    pub fn drop_fds_below_module_start(&self) {
         let removed: Vec<FdEntry> = {
             let mut fds = self.fds.write().expect("FdPool.fds lock unavailable");
             let stale: Vec<ObjectId> = fds
                 .iter()
-                .filter(|(_, e)| super::fd_placement::below_floor(e.fd.as_raw_fd()))
+                .filter(|(_, e)| super::fd_placement::below_module_start(e.fd.as_raw_fd()))
                 .map(|(oid, _)| *oid)
                 .collect();
             stale

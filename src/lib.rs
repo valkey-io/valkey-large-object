@@ -235,25 +235,25 @@ fn deinitialize(_ctx: &Context) -> Status {
     Status::Ok
 }
 
-/// `CONFIG SET maxclients` grows Valkey's event loop, possibly up into the fds
-/// the module placed at load. Raise the floor, drop the cached fds now below it so
-/// their next GET reopens them above the floor, and trim the cache to what still
-/// fits above the floor with one slot per client left for commands. If the open-file
-/// limit now ends inside the new Valkey core range, fds stop being moved and the
-/// cache is emptied. Valkey has already applied the change and a module cannot veto
-/// it, so a shortfall is logged: commands fail with an error, the server keeps running.
+/// `CONFIG SET maxclients` grows Valkey's event loop, possibly up into the fds the
+/// module placed at load. Raise the module start, drop the cached fds now below it so
+/// their next GET reopens them in the module range, and trim the cache to the new
+/// cache size. If the fd limit now ends inside the core range, placement turns off and
+/// the cache is emptied. Valkey has already applied the change and a module cannot
+/// veto it, so a shortfall is logged: commands fail with an error, the server keeps
+/// running.
 #[config_changed_event_handler]
 fn on_config_changed(ctx: &Context, changed: &[&str]) {
     if changed.contains(&"maxclients") {
         if let Some(pool) = storage::FD_POOL.get() {
-            if let Err(msg) = storage::fd_placement::raise_object_fd_floor(ctx) {
+            if let Err(msg) = storage::fd_placement::raise_module_start(ctx) {
                 ctx.log_warning(&format!(
-                    "largeobj: CONFIG SET maxclients: cannot place object-file fds above the \
-                     Valkey core range: {msg}"
+                    "largeobj: CONFIG SET maxclients: cannot place object-file fds in the \
+                     module range: {msg}"
                 ));
             }
-            pool.drop_fds_below_floor();
-            pool.shrink_to(storage::fd_placement::effective_cap());
+            pool.drop_fds_below_module_start();
+            pool.shrink_to(storage::fd_placement::cache_size());
         }
     }
 }

@@ -173,13 +173,11 @@ pub fn init(
             dram_segment_count, nvme_segments, MAX_SEGMENTS,
         ));
     }
-    // Tiered keeps object files open (fd cache + in-flight SETs). Place those fds
-    // above the Valkey core range before any is opened, or they stop new clients
-    // being served.
+    // Tiered keeps object files open (fd cache + command fds). Place those fds in the
+    // module range before any is opened, or they stop new clients being served.
     if mode == crate::OperatingMode::Tiered {
-        fd_placement::raise_object_fd_floor(ctx).map_err(|e| {
-            format!("cannot keep object-file fds out of the Valkey core range: {e}")
-        })?;
+        fd_placement::raise_module_start(ctx)
+            .map_err(|e| format!("cannot keep object-file fds out of the core range: {e}"))?;
     }
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.

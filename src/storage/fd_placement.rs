@@ -1,26 +1,26 @@
-//! Object-file fd placement — keep the module's long-lived fds out of the fd
-//! numbers Valkey serves clients on.
+//! Object-file fd placement — keep the module's fds out of the fd numbers Valkey
+//! core serves clients on.
 //!
-//! Valkey's event loop is an array indexed by fd number, sized
-//! `maxclients + CONFIG_FDSET_INCR` (128). Those fd numbers are the Valkey core
-//! range: core's own fds and client sockets live there, and a client socket
-//! numbered past it is never served. Linux hands out the lowest free number, so
-//! object fds left inside the range (the fd cache, in-flight SET files) push
-//! client sockets past its end. Cache misses and SET write files are opened
-//! through `open_object_file`, which moves the fd above a floor at the end of the
-//! range. COPY opens its two files directly: it runs on the main thread and closes
-//! them before returning to the event loop, so no client connects while they are
-//! open. `raise_object_fd_floor` sets the floor at load and on every
-//! `CONFIG SET maxclients`.
+//! Valkey core's event loop is an array indexed by fd number, sized
+//! `maxclients + CONFIG_FDSET_INCR` (128). Those fd numbers are the core range:
+//! core's own fds and client sockets live there, and a client socket numbered past
+//! it is never served. Linux hands out the lowest free number, so object fds left
+//! inside the core range (the fd cache, command fds) push client sockets past its
+//! end. Cache misses and SET write files are opened through `open_object_file`,
+//! which moves the fd into the module range: the fd numbers from the module start
+//! (`maxclients + 128`) up to the fd limit. COPY opens its two files directly: it
+//! runs on the main thread and closes them before returning to the event loop, so
+//! no client connects while they are open. `raise_module_start` sets the module
+//! start at load and on every `CONFIG SET maxclients`.
 //!
-//! When the open-file limit ends inside the Valkey core range (Valkey's stock
-//! limit is `maxclients + 32`), no fd number past the range exists, so no client
-//! can be stranded and fds are not moved.
+//! When the fd limit ends inside the core range (Valkey's stock limit is
+//! `maxclients + 32`), the module range is empty: no client can be stranded, and
+//! placement is off.
 //!
-//! The fd cache never takes the slots commands need: it holds at most the fds that
-//! fit above the floor after one slot per client (`effective_cap`). A shortfall is
-//! logged, never fatal: a command that finds no free fd above the floor fails with
-//! an error, and the server keeps running.
+//! The fd cache never takes the numbers commands need. Its size is `max-cached-fds`
+//! limited to what the module range holds after a command reserve of `maxclients`
+//! numbers (`cache_size`). A shortfall is logged, never fatal: a command that finds
+//! no free fd in the module range fails with an error, and the server keeps running.
 
 use std::ffi::{c_int, c_void, CStr};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -31,27 +31,32 @@ use valkey_module::{raw, Context};
 /// Valkey's event loop holds `maxclients + CONFIG_FDSET_INCR` fds (server.h: 32 + 96).
 const VALKEY_FDSET_INCR: u64 = 128;
 
-/// End of the Valkey core range for the highest `maxclients` seen: the lowest fd
-/// number object files are moved to.
-static FD_FLOOR: AtomicI32 = AtomicI32::new(0);
+/// The module start for the highest `maxclients` seen: the first fd number of the
+/// module range, and the lowest number object files are moved to.
+static MODULE_START: AtomicI32 = AtomicI32::new(0);
 
-/// Whether object fds are moved above `FD_FLOOR`. Off when not Tiered, while
-/// loading, and when the open-file limit ends inside the Valkey core range.
-static MOVE_ABOVE_FLOOR: AtomicBool = AtomicBool::new(false);
+/// Whether placement is on: object fds are moved to the module range. Off when not
+/// Tiered, while loading, and when the fd limit ends inside the core range.
+static PLACEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Whether `check_floor_past_event_loop` has passed. The event loop is always
-/// `maxclients + CONFIG_FDSET_INCR` wide, so one check at load covers every later floor.
+/// Whether `check_module_start_past_event_loop` has passed. The event loop is always
+/// `maxclients + CONFIG_FDSET_INCR` wide, so one check at load covers every later module start.
 static PROBED: AtomicBool = AtomicBool::new(false);
 
 /// Object files currently open: the fd cache plus the fds of running GETs and SETs.
 static OPEN_OBJECT_FDS: AtomicU64 = AtomicU64::new(0);
 
-/// Object-file opens that found no free fd at or above the floor.
+/// Object-file opens that found no free fd in the module range.
 static PLACEMENT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
-/// How many object-file opens found no free fd at or above the floor.
+/// How many object-file opens found no free fd in the module range.
 pub fn placement_failures() -> u64 {
     PLACEMENT_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Whether placement is on.
+pub fn placement_enabled() -> bool {
+    PLACEMENT_ENABLED.load(Ordering::Relaxed)
 }
 
 /// How many object files are open now: cached fds, plus the fds of running GETs
@@ -76,21 +81,21 @@ impl Drop for ObjectFd {
     }
 }
 
-/// Raise the floor that object-file fds are moved above to the end of the Valkey
-/// core range for the current `maxclients`. Tiered only, main thread only. Turns
-/// moving off when the open-file limit ends at or before the floor. Logs, and does
-/// not fail, when the limit cannot hold every object fd above the floor. Errs only
-/// when the floor is not actually past the event loop (object fds would then take fd
-/// numbers in the Valkey core range, and clients past them are never served), or
+/// Raise the module start to the end of the core range for the current `maxclients`.
+/// Tiered only, main thread only. Turns placement off when the fd limit ends at or
+/// before the module start. Logs, and does not fail, when the limit cannot hold every
+/// object fd in the module range. Errs only
+/// when the module start is not actually past the event loop (object fds would then take fd
+/// numbers in the core range, and clients past them are never served), or
 /// when the limit cannot be raised.
-pub fn raise_object_fd_floor(ctx: &Context) -> Result<(), String> {
+pub fn raise_module_start(ctx: &Context) -> Result<(), String> {
     let maxclients: u64 = ctx
         .config_get("maxclients".to_string())
         .expect("CONFIG GET maxclients")
         .to_string()
         .parse()
         .expect("maxclients is numeric");
-    let floor = i32::try_from(maxclients + VALKEY_FDSET_INCR)
+    let module_start = i32::try_from(maxclients + VALKEY_FDSET_INCR)
         .map_err(|_| format!("maxclients {maxclients} is too large for an fd number"))?;
     let before = nofile_limit().rlim_cur;
     raise_soft_fd_limit()?;
@@ -103,58 +108,68 @@ pub fn raise_object_fd_floor(ctx: &Context) -> Result<(), String> {
     }
     // Only ever up: Valkey grows its event loop when maxclients grows, but never
     // shrinks it.
-    let floor = FD_FLOOR.fetch_max(floor, Ordering::Relaxed).max(floor);
-    // Every fd number is below the limit, so none is past the Valkey core range.
-    if limit <= floor as u64 {
-        MOVE_ABOVE_FLOOR.store(false, Ordering::Relaxed);
+    let module_start = MODULE_START
+        .fetch_max(module_start, Ordering::Relaxed)
+        .max(module_start);
+    // Every fd number is below the limit, so none is past the core range.
+    if limit <= module_start as u64 {
+        PLACEMENT_ENABLED.store(false, Ordering::Relaxed);
         ctx.log_notice(&format!(
-            "largeobj: open-file limit {limit} ends inside the Valkey core range \
-             (fd {floor}); object-file fds are not moved"
+            "largeobj: open-file limit {limit} ends inside the core range \
+             (fd {module_start}); object-file fd placement is off"
         ));
         warn_if_cache_limited(crate::max_cached_fds() as u64);
         return Ok(());
     }
-    MOVE_ABOVE_FLOOR.store(true, Ordering::Relaxed);
+    PLACEMENT_ENABLED.store(true, Ordering::Relaxed);
     if !PROBED.load(Ordering::Relaxed) {
-        check_floor_past_event_loop(floor)?;
+        check_module_start_past_event_loop(module_start)?;
         PROBED.store(true, Ordering::Relaxed);
     }
-    ctx.log_notice(&format!("largeobj: object-file fds placed at {floor}+"));
-    let maxclients = floor as u64 - VALKEY_FDSET_INCR;
-    if limit < floor as u64 + maxclients {
+    ctx.log_notice(&format!(
+        "largeobj: object-file fd placement is on: module range starts at fd {module_start}"
+    ));
+    let maxclients = module_start as u64 - VALKEY_FDSET_INCR;
+    if limit < module_start as u64 + maxclients {
         ctx.log_warning(&format!(
-            "largeobj: open-file limit {limit} leaves {} fds for object files above the \
-             Valkey core range; commands fail with an error when more than that run at \
+            "largeobj: open-file limit {limit} leaves {} fds in the \
+             module range; commands fail with an error when more than that run at \
              once. Raise it to at least {}",
-            limit - floor as u64,
-            floor as u64 + maxclients
+            limit - module_start as u64,
+            module_start as u64 + maxclients
         ));
     }
     warn_if_cache_limited(crate::max_cached_fds() as u64);
     Ok(())
 }
 
-/// How many cached read fds fit above the floor once one slot per client is set
-/// aside for commands (a SET's write fd, or a GET's fd evicted mid-read; both block
-/// their client, so a client holds at most one). Zero when fds are not moved: a
-/// cached fd would then hold a client's fd number for good.
+/// Cache room: how many cached read fds fit in the module range once the command
+/// reserve (one number per client) is set aside for command fds (a SET's write fd, or
+/// a GET's fd evicted mid-read; both block their client, so a client holds at most
+/// one). Zero when placement is off: a cached fd would then hold a client's fd number
+/// for good.
 fn cache_room() -> u64 {
-    if !MOVE_ABOVE_FLOOR.load(Ordering::Relaxed) {
+    if !PLACEMENT_ENABLED.load(Ordering::Relaxed) {
         return 0;
     }
-    cache_room_for(nofile_limit().rlim_cur, FD_FLOOR.load(Ordering::Relaxed))
+    cache_room_for(
+        nofile_limit().rlim_cur,
+        MODULE_START.load(Ordering::Relaxed),
+    )
 }
 
-fn cache_room_for(limit: u64, floor: i32) -> u64 {
-    let floor = floor as u64;
-    // The floor tracks the highest maxclients seen; Valkey keeps clients above a
+fn cache_room_for(limit: u64, module_start: i32) -> u64 {
+    let module_start = module_start as u64;
+    // The module_start tracks the highest maxclients seen; Valkey keeps clients above a
     // lowered maxclients connected, so that is the client bound.
-    let maxclients = floor.saturating_sub(VALKEY_FDSET_INCR);
-    limit.saturating_sub(floor).saturating_sub(maxclients)
+    let maxclients = module_start.saturating_sub(VALKEY_FDSET_INCR);
+    limit
+        .saturating_sub(module_start)
+        .saturating_sub(maxclients)
 }
 
 /// The number of fds the fd cache may hold: `max-cached-fds`, limited to the room.
-pub fn effective_cap() -> usize {
+pub fn cache_size() -> usize {
     (crate::max_cached_fds() as u64).min(cache_room()) as usize
 }
 
@@ -165,10 +180,10 @@ pub fn warn_if_cache_limited(cap: u64) {
         return;
     }
     let limit = nofile_limit().rlim_cur;
-    let floor = FD_FLOOR.load(Ordering::Relaxed) as u64;
-    let maxclients = floor.saturating_sub(VALKEY_FDSET_INCR);
-    let required = floor + cap + maxclients;
-    let msg = if MOVE_ABOVE_FLOOR.load(Ordering::Relaxed) {
+    let module_start = MODULE_START.load(Ordering::Relaxed) as u64;
+    let maxclients = module_start.saturating_sub(VALKEY_FDSET_INCR);
+    let required = module_start + cap + maxclients;
+    let msg = if PLACEMENT_ENABLED.load(Ordering::Relaxed) {
         format!(
             "largeobj: open-file limit {limit} is too low for max-cached-fds {cap} and \
              maxclients {maxclients}; the fd cache holds {room}. Raise the limit to at \
@@ -176,30 +191,30 @@ pub fn warn_if_cache_limited(cap: u64) {
         )
     } else {
         format!(
-            "largeobj: open-file limit {limit} ends inside the Valkey core range, so the \
+            "largeobj: open-file limit {limit} ends inside the core range, so the \
              fd cache is off (max-cached-fds {cap}). Raise the limit to at least {required}"
         )
     };
     valkey_module::logging::log_warning(msg);
 }
 
-/// Whether `cap` cached fds fit above the floor with one slot per client left for
-/// commands. `CONFIG SET max-cached-fds` rejects a cap that does not. Always Ok
-/// when fds are not moved: the cache is off then, and the cap is only logged.
+/// Whether `cap` cached fds fit in the module range with the command reserve left for
+/// command fds. `CONFIG SET max-cached-fds` rejects a cap that does not. Always Ok
+/// when placement is off: the cache is off then, and the cap is only logged.
 pub fn check_fd_limit(cap: u64) -> Result<(), String> {
-    if !MOVE_ABOVE_FLOOR.load(Ordering::Relaxed) {
+    if !PLACEMENT_ENABLED.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let floor = FD_FLOOR.load(Ordering::Relaxed);
+    let module_start = MODULE_START.load(Ordering::Relaxed);
     let limit = nofile_limit().rlim_cur;
-    if cap <= cache_room_for(limit, floor) {
+    if cap <= cache_room_for(limit, module_start) {
         return Ok(());
     }
-    let maxclients = floor as u64 - VALKEY_FDSET_INCR;
+    let maxclients = module_start as u64 - VALKEY_FDSET_INCR;
     Err(format!(
         "open-file limit {limit} is too low for max-cached-fds {cap} and \
          maxclients {maxclients}; raise it to at least {}",
-        floor as u64 + cap + maxclients
+        module_start as u64 + cap + maxclients
     ))
 }
 
@@ -237,18 +252,18 @@ fn raise_soft_fd_limit() -> Result<(), String> {
     Ok(())
 }
 
-/// One-shot check that `floor` is past the end of Valkey's event loop, so the
+/// One-shot check that `module_start` is past the end of Valkey's event loop, so the
 /// copied `maxclients + CONFIG_FDSET_INCR` really marks the end of the Valkey core
 /// range. `EventLoopAdd` answers ERANGE exactly when `fd >= setsize`. The probe is
-/// an eventfd we own (epoll rejects regular files), placed at `floor`, so no
+/// an eventfd we own (epoll rejects regular files), placed at `module_start`, so no
 /// client's event is touched; if it registers, it is removed at once. Main thread
 /// only.
-fn check_floor_past_event_loop(floor: i32) -> Result<(), String> {
+fn check_module_start_past_event_loop(module_start: i32) -> Result<(), String> {
     unsafe extern "C" fn noop(_fd: c_int, _data: *mut c_void, _mask: c_int) {}
     // Reads errno: call it right after the failing call, before the fds drop.
     let probe_err = |step: &str| {
         format!(
-            "event-loop probe at fd {floor}: {step}: {}",
+            "event-loop probe at fd {module_start}: {step}: {}",
             std::io::Error::last_os_error()
         )
     };
@@ -259,8 +274,8 @@ fn check_floor_past_event_loop(floor: i32) -> Result<(), String> {
     }
     // SAFETY: low is a new fd we own.
     let low = unsafe { OwnedFd::from_raw_fd(low) };
-    // SAFETY: low is valid; returns a new fd >= floor or -1.
-    let probe = unsafe { libc::fcntl(low.as_raw_fd(), libc::F_DUPFD_CLOEXEC, floor) };
+    // SAFETY: low is valid; returns a new fd >= module_start or -1.
+    let probe = unsafe { libc::fcntl(low.as_raw_fd(), libc::F_DUPFD_CLOEXEC, module_start) };
     if probe < 0 {
         return Err(probe_err("F_DUPFD_CLOEXEC"));
     }
@@ -287,7 +302,7 @@ fn check_floor_past_event_loop(floor: i32) -> Result<(), String> {
         };
         return Err(format!(
             "Valkey's event loop is larger than maxclients + {VALKEY_FDSET_INCR}: \
-             fd {floor} is inside it"
+             fd {module_start} is inside it"
         ));
     }
     if std::io::Error::last_os_error().raw_os_error() != Some(libc::ERANGE) {
@@ -296,15 +311,15 @@ fn check_floor_past_event_loop(floor: i32) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `fd` is below the floor, inside the Valkey core range. Always false when
-/// fds are not moved.
-pub fn below_floor(fd: RawFd) -> bool {
-    MOVE_ABOVE_FLOOR.load(Ordering::Relaxed) && fd < FD_FLOOR.load(Ordering::Relaxed)
+/// Whether `fd` is below the module start, inside the core range. Always false when
+/// placement is off.
+pub fn below_module_start(fd: RawFd) -> bool {
+    PLACEMENT_ENABLED.load(Ordering::Relaxed) && fd < MODULE_START.load(Ordering::Relaxed)
 }
 
-/// `open(2)` an object file, then move the fd above the floor set by
-/// `raise_object_fd_floor`. When no fd is free above the floor it closes the low fd
-/// and fails: keeping it would take an fd number in the Valkey core range. The
+/// `open(2)` an object file, then move the fd in the module range set by
+/// `raise_module_start`. When no fd is free in the module range it closes the low fd
+/// and fails: keeping it would take an fd number in the core range. The
 /// caller turns the failure into an error reply.
 pub fn open_object_file(
     path: &CStr,
@@ -316,19 +331,19 @@ pub fn open_object_file(
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    if MOVE_ABOVE_FLOOR.load(Ordering::Relaxed) {
-        fd = move_above(fd, FD_FLOOR.load(Ordering::Relaxed))?;
+    if PLACEMENT_ENABLED.load(Ordering::Relaxed) {
+        fd = move_above(fd, MODULE_START.load(Ordering::Relaxed))?;
     }
     OPEN_OBJECT_FDS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: fd is a newly opened file descriptor owned exclusively by us.
     Ok(ObjectFd(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
-/// Move `fd` to the lowest free number at or above `floor` and close the original.
+/// Move `fd` to the lowest free number at or above `module_start` and close the original.
 /// On failure closes `fd` too.
-fn move_above(fd: RawFd, floor: i32) -> std::io::Result<RawFd> {
-    // SAFETY: fd is a valid fd we own; F_DUPFD_CLOEXEC returns a new fd >= floor or -1.
-    let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor) };
+fn move_above(fd: RawFd, module_start: i32) -> std::io::Result<RawFd> {
+    // SAFETY: fd is a valid fd we own; F_DUPFD_CLOEXEC returns a new fd >= module_start or -1.
+    let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, module_start) };
     let moved = if high < 0 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -337,17 +352,17 @@ fn move_above(fd: RawFd, floor: i32) -> std::io::Result<RawFd> {
     // SAFETY: fd is ours and no longer used; on success high refers to the same open file.
     unsafe { libc::close(fd) };
     if let Err(err) = &moved {
-        note_failure(floor, err);
+        note_failure(module_start, err);
     }
     moved
 }
 
 /// Count a failed move and log the first of each burst of 1024.
-fn note_failure(floor: i32, err: &std::io::Error) {
+fn note_failure(module_start: i32, err: &std::io::Error) {
     let count = PLACEMENT_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
     if count % 1024 == 1 {
         valkey_module::logging::log_warning(format!(
-            "largeobj: no free fd at or above {floor} for an object file: {err}; \
+            "largeobj: no free fd at or above {module_start} for an object file: {err}; \
              {count} failed so far"
         ));
     }
@@ -369,7 +384,7 @@ mod tests {
 
     #[test]
     fn move_above_fails_without_panicking_when_no_fd_is_free() {
-        // F_DUPFD rejects a floor at or above the limit, which is what a full range does.
+        // F_DUPFD rejects the module start at or above the limit, which is what a full range does.
         let failures = placement_failures();
         let err = move_above(open_dev_null(), i32::MAX).expect_err("no fd at i32::MAX");
         assert!(
@@ -390,14 +405,20 @@ mod tests {
     }
 
     #[test]
-    fn cache_room_leaves_one_slot_per_client_for_commands() {
-        let (floor, maxclients) = (10_128, 10_000);
-        // No numbers above the floor, or fewer than one per client: no room.
-        assert_eq!(cache_room_for(10_032, floor), 0);
-        assert_eq!(cache_room_for(10_240, floor), 0);
-        assert_eq!(cache_room_for(floor as u64 + maxclients, floor), 0);
+    fn cache_room_reserves_maxclients_for_commands() {
+        let (module_start, maxclients) = (10_128, 10_000);
+        // No numbers in the module range, or fewer than one per client: no room.
+        assert_eq!(cache_room_for(10_032, module_start), 0);
+        assert_eq!(cache_room_for(10_240, module_start), 0);
+        assert_eq!(
+            cache_room_for(module_start as u64 + maxclients, module_start),
+            0
+        );
         // Each number past that is one cached fd.
-        assert_eq!(cache_room_for(floor as u64 + maxclients + 1, floor), 1);
-        assert_eq!(cache_room_for(65_536, floor), 45_408);
+        assert_eq!(
+            cache_room_for(module_start as u64 + maxclients + 1, module_start),
+            1
+        );
+        assert_eq!(cache_room_for(65_536, module_start), 45_408);
     }
 }

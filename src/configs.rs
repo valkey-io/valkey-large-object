@@ -179,7 +179,7 @@ lazy_static::lazy_static! {
 
     /// Cap on read fds cached by the FdPool. When full, opening a new fd evicts
     /// the lowest LFU score among samples. Raising it at runtime is rejected
-    /// when the fds do not fit above the Valkey core range.
+    /// when the fds do not fit in the module range.
     pub static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(DEFAULT_MAX_CACHED_FDS);
 
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
@@ -582,9 +582,9 @@ pub fn validate_config_constraint(
     validate_all_constraints().map_err(valkey_module::ValkeyError::String)
 }
 
-/// `max-cached-fds` CONFIG SET: the new cap must fit above the Valkey core range
-/// with one slot per client left for commands. At load, `fd_placement::
-/// raise_object_fd_floor` only logs a cap that does not fit. The framework has
+/// `max-cached-fds` CONFIG SET: the new cap must fit in the module range with the
+/// command reserve left for command fds. At load, `fd_placement::
+/// raise_module_start` only logs a cap that does not fit. The framework has
 /// already stored the new value; on Err core restores the old one.
 pub fn validate_max_cached_fds(
     _ctx: &valkey_module::configuration::ConfigurationContext,
@@ -596,15 +596,15 @@ pub fn validate_max_cached_fds(
 }
 
 /// `max-cached-fds` changed (after `validate_max_cached_fds` accepted it): the cache
-/// is trimmed to the new cap right away, or to what fits above the floor when fds
-/// are not moved (nothing). No pool yet at load.
+/// is trimmed to the new cache size right away (nothing when placement is off). No
+/// pool yet at load.
 pub fn on_max_cached_fds_changed(
     _ctx: &valkey_module::configuration::ConfigurationContext,
     _name: &str,
     val: &'static AtomicI64,
 ) {
     if let Some(pool) = storage::FD_POOL.get() {
-        pool.shrink_to(storage::fd_placement::effective_cap());
+        pool.shrink_to(storage::fd_placement::cache_size());
         storage::fd_placement::warn_if_cache_limited(
             val.load(std::sync::atomic::Ordering::Relaxed) as u64,
         );
