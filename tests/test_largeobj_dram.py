@@ -224,6 +224,15 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             assert rdma[f'largeobj_rdma_{field}'] == 0, field
         assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
 
+    def test_info_reports_dram_utilization(self):
+        """INFO reports allocated bytes as a percentage of capacity, to two decimals."""
+        client = self.server.get_new_client()
+        client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
+        dram = client.info('largeobj_dram')
+        used = dram['largeobj_dram_allocated_bytes'] * 100 / dram['largeobj_dram_capacity_bytes']
+        assert 0 < used < 1
+        assert dram['largeobj_dram_utilization_pct'] == round(used, 2)
+
     # ─── BLOB.INFO tests ───────────────────────────────────────────────────
 
     def test_info(self):

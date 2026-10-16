@@ -128,7 +128,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let seg_size = crate::dram_segment_size();
     let capacity = (total - draining) * seg_size;
     let allocated = dram.allocated_bytes();
-    let util_pct = (allocated * 100).checked_div(capacity).unwrap_or(0) as i64;
+    let util_pct = pct(allocated as u64, capacity as u64);
 
     let mut section = ctx
         .builder()
