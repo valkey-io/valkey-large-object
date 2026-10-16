@@ -5,8 +5,9 @@
 //! channels, and completion streams; this module handles everything that
 //! knows what an NVMe object file *is*.
 
+use super::fd_placement::ObjectFd;
 use std::mem::size_of;
-use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -513,24 +514,18 @@ pub async fn read_and_verify_file_header(
 }
 
 /// Open an NVMe file for writing with O_CREAT|O_TRUNC and optionally O_DIRECT.
-/// Returns an `OwnedFd` that closes the file descriptor on drop.
-pub fn open_nvme_file_for_write(file_path: &str) -> Result<OwnedFd, super::StorageError> {
+/// Returns an `ObjectFd` that closes the file descriptor on drop.
+pub fn open_nvme_file_for_write(file_path: &str) -> Result<ObjectFd, super::StorageError> {
     let c_path = std::ffi::CString::new(file_path).expect("file_path null");
     let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
     if crate::direct_io() {
         flags |= libc::O_DIRECT;
     }
-    let fd = super::fd_placement::open_object_file(&c_path, flags, 0o644);
-    if fd < 0 {
-        Err(super::StorageError::IoError {
-            code: std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO),
-        })
-    } else {
-        // SAFETY: fd is a valid, newly opened file descriptor owned exclusively by us.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
+    super::fd_placement::open_object_file(&c_path, flags, 0o644).map_err(|e| {
+        super::StorageError::IoError {
+            code: e.raw_os_error().unwrap_or(libc::EIO),
+        }
+    })
 }
 
 /// Write FileHeader to offset 0 of an NVMe file using the given NVMePool buffer.

@@ -43,12 +43,37 @@ static MOVE_ABOVE_FLOOR: AtomicBool = AtomicBool::new(false);
 /// `maxclients + CONFIG_FDSET_INCR` wide, so one check at load covers every later floor.
 static PROBED: AtomicBool = AtomicBool::new(false);
 
+/// Object files currently open: the fd cache plus the fds of running GETs and SETs.
+static OPEN_OBJECT_FDS: AtomicU64 = AtomicU64::new(0);
+
 /// Object-file opens that found no free fd at or above the floor.
 static PLACEMENT_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// How many object-file opens found no free fd at or above the floor.
 pub fn placement_failures() -> u64 {
     PLACEMENT_FAILURES.load(Ordering::Relaxed)
+}
+
+/// How many object files are open now: cached fds, plus the fds of running GETs
+/// and SETs, including a GET's fd after the cache evicted it.
+pub fn open_object_fds() -> u64 {
+    OPEN_OBJECT_FDS.load(Ordering::Relaxed)
+}
+
+/// An open object file. It closes on drop and counts itself in `open_object_fds`
+/// while open.
+pub struct ObjectFd(OwnedFd);
+
+impl AsRawFd for ObjectFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+impl Drop for ObjectFd {
+    fn drop(&mut self) {
+        OPEN_OBJECT_FDS.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Raise the floor that object-file fds are moved above to the end of the Valkey
@@ -278,36 +303,43 @@ pub fn below_floor(fd: RawFd) -> bool {
 }
 
 /// `open(2)` an object file, then move the fd above the floor set by
-/// `raise_object_fd_floor`. Same contract as `open`: an fd, or -1 with errno set.
-/// When no fd is free above the floor it closes the low fd and fails: keeping it
-/// would take an fd number in the Valkey core range. The caller turns the failure
-/// into an error reply.
-pub fn open_object_file(path: &CStr, flags: libc::c_int, mode: libc::mode_t) -> RawFd {
+/// `raise_object_fd_floor`. When no fd is free above the floor it closes the low fd
+/// and fails: keeping it would take an fd number in the Valkey core range. The
+/// caller turns the failure into an error reply.
+pub fn open_object_file(
+    path: &CStr,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> std::io::Result<ObjectFd> {
     // SAFETY: path is NUL-terminated; open returns an fd or -1.
-    let fd = unsafe { libc::open(path.as_ptr(), flags, mode as libc::c_uint) };
-    if fd < 0 || !MOVE_ABOVE_FLOOR.load(Ordering::Relaxed) {
-        return fd;
+    let mut fd = unsafe { libc::open(path.as_ptr(), flags, mode as libc::c_uint) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    move_above(fd, FD_FLOOR.load(Ordering::Relaxed))
+    if MOVE_ABOVE_FLOOR.load(Ordering::Relaxed) {
+        fd = move_above(fd, FD_FLOOR.load(Ordering::Relaxed))?;
+    }
+    OPEN_OBJECT_FDS.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: fd is a newly opened file descriptor owned exclusively by us.
+    Ok(ObjectFd(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
 /// Move `fd` to the lowest free number at or above `floor` and close the original.
-/// On failure closes `fd` and returns -1 with errno from the failed move.
-fn move_above(fd: RawFd, floor: i32) -> RawFd {
+/// On failure closes `fd` too.
+fn move_above(fd: RawFd, floor: i32) -> std::io::Result<RawFd> {
     // SAFETY: fd is a valid fd we own; F_DUPFD_CLOEXEC returns a new fd >= floor or -1.
     let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor) };
-    if high < 0 {
-        let err = std::io::Error::last_os_error();
-        // SAFETY: fd is ours and no longer used.
-        unsafe { libc::close(fd) };
-        note_failure(floor, &err);
-        // SAFETY: __errno_location is this thread's errno; callers read it after us.
-        unsafe { *libc::__errno_location() = err.raw_os_error().unwrap_or(libc::EMFILE) };
-        return -1;
-    }
-    // SAFETY: fd is ours and no longer used; high refers to the same open file.
+    let moved = if high < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(high)
+    };
+    // SAFETY: fd is ours and no longer used; on success high refers to the same open file.
     unsafe { libc::close(fd) };
-    high
+    if let Err(err) = &moved {
+        note_failure(floor, err);
+    }
+    moved
 }
 
 /// Count a failed move and log the first of each burst of 1024.
@@ -339,14 +371,22 @@ mod tests {
     fn move_above_fails_without_panicking_when_no_fd_is_free() {
         // F_DUPFD rejects a floor at or above the limit, which is what a full range does.
         let failures = placement_failures();
-        let fd = move_above(open_dev_null(), i32::MAX);
-        let errno = std::io::Error::last_os_error().raw_os_error();
-        assert_eq!(fd, -1);
+        let err = move_above(open_dev_null(), i32::MAX).expect_err("no fd at i32::MAX");
         assert!(
-            matches!(errno, Some(libc::EINVAL | libc::EMFILE)),
-            "errno {errno:?}"
+            matches!(err.raw_os_error(), Some(libc::EINVAL | libc::EMFILE)),
+            "{err}"
         );
         assert_eq!(placement_failures(), failures + 1);
+    }
+
+    #[test]
+    fn object_fd_counts_itself_while_open() {
+        let path = std::ffi::CString::new("/dev/null").unwrap();
+        let before = open_object_fds();
+        let fd = open_object_file(&path, libc::O_RDONLY, 0).expect("open /dev/null");
+        assert_eq!(open_object_fds(), before + 1);
+        drop(fd);
+        assert_eq!(open_object_fds(), before);
     }
 
     #[test]

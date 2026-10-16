@@ -90,17 +90,21 @@ fn fd_section(ctx: &InfoContext) -> ValkeyResult<()> {
     };
     ctx.builder()
         .add_section("fd")
-        // Placement
+        // Placement: every object file open, cached or held by a running GET or SET.
+        .field(
+            "open_object_fds",
+            storage::fd_placement::open_object_fds() as i64,
+        )?
         .field(
             "fd_placement_failures",
             storage::fd_placement::placement_failures() as i64,
         )?
-        // Cache
-        .field("open_fds", fds.len() as i64)?
+        // Cache: the fds kept open between GETs.
         .field(
             "fd_cache_capacity",
             storage::fd_placement::effective_cap() as i64,
         )?
+        .field("fd_cache_entries", fds.len() as i64)?
         .field(
             "fd_evictions",
             fds.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,

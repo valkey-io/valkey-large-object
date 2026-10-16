@@ -51,7 +51,7 @@ use crate::OperatingMode;
 //   commit it, so no concurrent free can reach it.
 //
 // Must pin `Arc<ObjectFile>` (the object's on-disk existence; its Drop unlinks). The
-// open fd is a separate `Arc<OwnedFd>` from `ensure_open`, held for the read's duration:
+// open fd is a separate `Arc<ObjectFd>` from `ensure_open`, held for the read's duration:
 //   - Every Tiered request that READS the object: the NVMe promotion read and the
 //     transient NVMe read (both in `cmd_get_tiered` / `cmd_get_tiered_run`), and — by the
 //     blanket rule — the DRAM serve that follows a promotion. The `ObjectFile` pin
@@ -302,7 +302,7 @@ fn cmd_get_dram_efa(
 
 /// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
 /// `file` pins the object's `ObjectFile` (existence) for the whole GET operation; the
-/// open fd is a separate `Arc<OwnedFd>` obtained via `ensure_open`.
+/// open fd is a separate `Arc<ObjectFd>` obtained via `ensure_open`.
 fn cmd_get_tiered(
     object_id: ObjectId,
     obj_len: u64,

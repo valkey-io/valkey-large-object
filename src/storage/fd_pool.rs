@@ -1,8 +1,8 @@
-//! File Descriptor Pool — owns and caches open read fds as `Arc<OwnedFd>`, keyed by `ObjectId`.
+//! File Descriptor Pool — owns and caches open read fds as `Arc<ObjectFd>`, keyed by `ObjectId`.
 //!
 //! A read fd is opened lazily on the first GET (via `ObjectFile::ensure_open` →
 //! `get_or_open`) and cached for reuse; every later GET and in-flight reader gets a clone.
-//! Being an `Arc<OwnedFd>`, it closes itself (RAII) once the last ref — the cache entry
+//! Being an `Arc<ObjectFd>`, it closes itself (RAII) once the last ref — the cache entry
 //! plus any reader clones — is gone. An fd is transient metadata, never persisted on the
 //! `LoValue` data type; it lives only in this pool, decoupled from object lifetime.
 //!
@@ -21,16 +21,17 @@
 //! `Drop for FdPool` — it is a process-lifetime static, so any fds still cached at
 //! teardown are reclaimed by process exit.
 
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::cache_policy::{now_minutes, reclaim_one, AccessStats, OIDIndexedMap};
+use super::fd_placement::{open_object_file, ObjectFd};
 use crate::data_type::ObjectId;
 
 /// One cached fd plus its LFU score.
 struct FdEntry {
-    fd: Arc<OwnedFd>,
+    fd: Arc<ObjectFd>,
     stats: AccessStats,
 }
 
@@ -55,10 +56,10 @@ impl FdPool {
     }
 
     /// Return the cached read fd for `object_id`, opening + caching it if not present.
-    /// A clone of `Arc<OwnedFd>` is returned to the caller. The reference can be
+    /// A clone of `Arc<ObjectFd>` is returned to the caller. The reference can be
     /// used to prevent the underlying fd from being closed during inflight read requests.
     /// Returns `None` only on a genuine `open()` failure.
-    pub fn get_or_open(&self, object_id: ObjectId, dir: &str) -> Option<Arc<OwnedFd>> {
+    pub fn get_or_open(&self, object_id: ObjectId, dir: &str) -> Option<Arc<ObjectFd>> {
         self.get_or_open_with(object_id, dir, super::fd_placement::effective_cap())
     }
 
@@ -69,7 +70,7 @@ impl FdPool {
         object_id: ObjectId,
         dir: &str,
         cap: usize,
-    ) -> Option<Arc<OwnedFd>> {
+    ) -> Option<Arc<ObjectFd>> {
         // max-cached-fds 0 caches nothing: the fd closes when the caller drops it.
         if cap == 0 {
             return open_read_fd(object_id, dir).map(Arc::new);
@@ -203,18 +204,14 @@ impl FdPool {
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
 
 /// Open `object_id`'s file for reads. `None` on an `open()` failure.
-fn open_read_fd(object_id: ObjectId, dir: &str) -> Option<OwnedFd> {
+fn open_read_fd(object_id: ObjectId, dir: &str) -> Option<ObjectFd> {
     let path = object_id.file_path(dir);
     let c_path = std::ffi::CString::new(path).expect("file_path null");
     let mut flags = libc::O_RDONLY;
     if crate::direct_io() {
         flags |= libc::O_DIRECT;
     }
-    let raw = super::fd_placement::open_object_file(&c_path, flags, 0);
-    if raw < 0 {
-        return None;
-    }
-    Some(unsafe { OwnedFd::from_raw_fd(raw) })
+    open_object_file(&c_path, flags, 0).ok()
 }
 
 #[cfg(test)]
@@ -262,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_reader_clone_keeps_fd_open_across_remove() {
-        // The honor rule at the refcount level: a reader holding an Arc<OwnedFd> clone
+        // The honor rule at the refcount level: a reader holding an Arc<ObjectFd> clone
         // keeps the fd open even after the pool drops its own ref (as ObjectFile::Drop
         // does on delete); the fd closes only when the last clone goes away.
         let dir = std::env::temp_dir();
