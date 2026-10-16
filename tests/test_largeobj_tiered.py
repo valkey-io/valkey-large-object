@@ -465,6 +465,15 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         assert results == [b'OK'] * n
         assert inflight() == 0
 
+    def test_commandstats_count_background_time(self):
+        """An async SET's commandstats time includes its background work, not just the
+        main-thread dispatch. The pause holds the SET 2 s before it commits."""
+        client = self.server.get_new_client()
+        assert client.execute_command('BLOB.TCP_SET', 'key', b'S' * 4096) == b'OK'
+        stats = client.info('commandstats')['cmdstat_BLOB.TCP_SET']
+        assert stats['calls'] == 1
+        assert stats['usec'] >= 2_000_000, stats
+
 
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
     """Tiered mode with max-promote-size=0 (no promotion, all reads from NVMe)."""

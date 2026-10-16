@@ -108,14 +108,17 @@ pub fn inflight_requests() -> u64 {
     INFLIGHT_REQUESTS.load(Ordering::Relaxed)
 }
 
-/// An async GET or SET, over TCP or RDMA. Its client stays blocked until this drops.
+/// An async GET or SET, over TCP or RDMA. Its client stays blocked until this drops, and
+/// `commandstats` counts the time in between toward the command.
 pub(crate) struct BlockedRequest(valkey_module::ThreadSafeContext<valkey_module::BlockedClient>);
 
 impl BlockedRequest {
     fn new(ctx: &valkey_module::Context) -> Self {
         INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        let mut blocked_client = ctx.block_client();
+        blocked_client.measure_time_start();
         Self(valkey_module::ThreadSafeContext::with_blocked_client(
-            ctx.block_client(),
+            blocked_client,
         ))
     }
 }
