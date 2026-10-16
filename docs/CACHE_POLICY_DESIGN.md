@@ -50,7 +50,7 @@ Four runtime-mutable configs:
 | `tiered-decay-time` | 1 | 0..=65535 | Minutes per one-point counter decay. 0 disables decay (pure LFU). Same semantics as core `lfu-decay-time`. |
 | `promote-min-hits` | 2 | 1..=255 | Misses an object must accumulate before a GET promotes it. 1 promotes on the first GET. |
 | `reclaim-sample-size` | 5 | 1..=64 | Entries sampled per reclaim round. Same idea as core's `maxmemory-samples`. |
-| `max-cached-fds` | 16384 | 0..=1048576 | Cap on cached read fds; 0 caches nothing. The cache is also limited to the module range (the fd numbers past the core range) minus a command reserve of `maxclients` numbers. At load a larger cap is clamped with a warning; a runtime raise that does not fit is rejected. When the open-file limit ends inside the core range, the cache is off. `INFO largeobj_fd` shows the size in use (`fd_cache_size`). See `OBJECT_FD_PLACEMENT_DESIGN.md`. |
+| `max-cached-fds` | 16384 | 0..=1048576 | How many read fds to keep cached; 0 caches nothing. The fd cache max entries is the smaller of this and what the fd limit allows: the module range (the fd numbers past the core range) minus a command reserve of `maxclients` numbers. A larger value is clamped with a warning, at load and on `CONFIG SET`. When the open-file limit does not cover the command reserve, the fd cache is off under `fd-reserve Lenient`. `INFO largeobj_fd` shows it (`fd_cache_max_entries`). See `OBJECT_FD_PLACEMENT_DESIGN.md`. |
 
 Three tuning values are constants in `src/storage/cache_policy.rs`, because no operator has a reason to change them:
 
@@ -185,7 +185,7 @@ fds: RwLock<OIDIndexedMap<FdEntry>>
 
 `get_or_open_with` takes the cap as an argument so unit tests can set it without racing on the global config; the other settings are read live. `RECLAIM_MAX_VICTIMS` does not apply, since the fd loop reclaims exactly the overflow.
 
-INFO section `largeobj_fd` (Tiered only): placement first (`open_object_fds`, `fd_placement_enabled`, `fd_placement_failures`), then the cache (`fd_cache_size`, `fd_cache_entries`, `fd_evictions`).
+INFO section `largeobj_fd` (Tiered only): placement first (`open_object_fds`, `fd_placement_enabled`, `fd_placement_failures`), then the cache (`fd_cache_max_entries`, `fd_cache_entries`, `fd_evictions`).
 
 
 ## 5. Open questions

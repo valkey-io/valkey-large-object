@@ -105,7 +105,10 @@ fn fd_section(ctx: &InfoContext) -> ValkeyResult<()> {
             storage::fd_placement::placement_failures() as i64,
         )?
         // Cache: the fds kept open between GETs.
-        .field("fd_cache_size", storage::fd_placement::cache_size() as i64)?
+        .field(
+            "fd_cache_max_entries",
+            storage::fd_placement::fd_cache_max_entries() as i64,
+        )?
         .field("fd_cache_entries", fds.len() as i64)?
         .field(
             "fd_evictions",

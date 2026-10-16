@@ -60,7 +60,7 @@ impl FdPool {
     /// used to prevent the underlying fd from being closed during inflight read requests.
     /// Returns `None` only on a genuine `open()` failure.
     pub fn get_or_open(&self, object_id: ObjectId, dir: &str) -> Option<Arc<ObjectFd>> {
-        self.get_or_open_with(object_id, dir, super::fd_placement::cache_size())
+        self.get_or_open_with(object_id, dir, super::fd_placement::fd_cache_max_entries())
     }
 
     /// `get_or_open` with an explicit `max-cached-fds` cap, so

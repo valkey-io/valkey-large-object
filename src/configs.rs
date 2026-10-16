@@ -23,6 +23,26 @@ enum_configuration! {
     }
 }
 
+// A separate module: each `enum_configuration!` expansion imports a trait by name.
+mod fd_reserve_policy {
+    use valkey_module::enum_configuration;
+
+    enum_configuration! {
+        /// What the module does when the fd limit does not cover the command reserve
+        /// (`module start + maxclients`) — set via `fd-reserve`, Tiered only.
+        /// Lenient (default): load anyway; placement and the fd cache turn off and the
+        /// server keeps serving. Strict: refuse to load, and abort if a later
+        /// `CONFIG SET maxclients` breaks the reserve.
+        #[derive(Debug, PartialEq, Eq, Copy)]
+
+        pub enum FdReserve {
+            Lenient = 0,
+            Strict = 1,
+        }
+    }
+}
+pub use fd_reserve_policy::FdReserve;
+
 // ─── Config Defaults, Limits ─────────────────────────────────────────────────
 //
 // Named constants so the values are defined once and shared between the
@@ -178,8 +198,8 @@ lazy_static::lazy_static! {
     pub static ref CFG_VICTIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_VICTIM_SAMPLE_SIZE);
 
     /// Cap on read fds cached by the FdPool. When full, opening a new fd evicts
-    /// the lowest LFU score among samples. Raising it at runtime is rejected
-    /// when the fds do not fit in the module range.
+    /// the lowest LFU score among samples. The cache holds at most what fits in the
+    /// module range; a larger value is clamped with a warning.
     pub static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(DEFAULT_MAX_CACHED_FDS);
 
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
@@ -210,6 +230,9 @@ lazy_static::lazy_static! {
     /// - Dram (0): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
     /// - Tiered (1): objects persist on NVMe, DRAMPool is a read cache with promotion.
     pub static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Dram);
+
+    /// fd-reserve policy. Immutable after module load.
+    pub static ref CFG_FD_RESERVE: Mutex<FdReserve> = Mutex::new(FdReserve::Lenient);
 
     // ─── Fabric Configs ──────────────────────────────────────────────────
 
@@ -399,6 +422,12 @@ pub fn operating_mode() -> OperatingMode {
         .expect("CFG_OPERATING_MODE lock unavailable")
 }
 
+pub fn fd_reserve() -> FdReserve {
+    *CFG_FD_RESERVE
+        .lock()
+        .expect("CFG_FD_RESERVE lock unavailable")
+}
+
 pub fn chunk_size() -> usize {
     CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
@@ -582,29 +611,16 @@ pub fn validate_config_constraint(
     validate_all_constraints().map_err(valkey_module::ValkeyError::String)
 }
 
-/// `max-cached-fds` CONFIG SET: the new cap must fit in the module range with the
-/// command reserve left for command fds. At load, `fd_placement::
-/// raise_module_start` only logs a cap that does not fit. The framework has
-/// already stored the new value; on Err core restores the old one.
-pub fn validate_max_cached_fds(
-    _ctx: &valkey_module::configuration::ConfigurationContext,
-    _name: &str,
-    val: &'static AtomicI64,
-) -> Result<(), valkey_module::ValkeyError> {
-    storage::fd_placement::check_fd_limit(val.load(std::sync::atomic::Ordering::Relaxed) as u64)
-        .map_err(valkey_module::ValkeyError::String)
-}
-
-/// `max-cached-fds` changed (after `validate_max_cached_fds` accepted it): the cache
-/// is trimmed to the new cache size right away (nothing when placement is off). No
-/// pool yet at load.
+/// `max-cached-fds` changed: the cache is trimmed to the new limit right away
+/// (nothing when placement is off), and a value that does not fit is logged. No pool
+/// yet at load.
 pub fn on_max_cached_fds_changed(
     _ctx: &valkey_module::configuration::ConfigurationContext,
     _name: &str,
     val: &'static AtomicI64,
 ) {
     if let Some(pool) = storage::FD_POOL.get() {
-        pool.shrink_to(storage::fd_placement::cache_size());
+        pool.shrink_to(storage::fd_placement::fd_cache_max_entries());
         storage::fd_placement::warn_if_cache_limited(
             val.load(std::sync::atomic::Ordering::Relaxed) as u64,
         );

@@ -19,7 +19,7 @@
 //!
 //! The fd cache never takes the numbers commands need. Its size is `max-cached-fds`
 //! limited to what the module range holds after a command reserve of `maxclients`
-//! numbers (`cache_size`). A shortfall is logged, never fatal: a command that finds
+//! numbers (`fd_cache_max_entries`). A shortfall is logged, never fatal: a command that finds
 //! no free fd in the module range fails with an error, and the server keeps running.
 
 use std::ffi::{c_int, c_void, CStr};
@@ -27,6 +27,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use valkey_module::{raw, Context};
+
+use crate::{fd_reserve, FdReserve};
 
 /// Valkey's event loop holds `maxclients + CONFIG_FDSET_INCR` fds (server.h: 32 + 96).
 const VALKEY_FDSET_INCR: u64 = 128;
@@ -81,13 +83,15 @@ impl Drop for ObjectFd {
     }
 }
 
-/// Raise the module start to the end of the core range for the current `maxclients`.
-/// Tiered only, main thread only. Turns placement off when the fd limit ends at or
-/// before the module start. Logs, and does not fail, when the limit cannot hold every
-/// object fd in the module range. Errs only
-/// when the module start is not actually past the event loop (object fds would then take fd
-/// numbers in the core range, and clients past them are never served), or
-/// when the limit cannot be raised.
+/// Raise the module start to the end of the core range for the current `maxclients`,
+/// and turn placement on or off. Tiered only, main thread only.
+///
+/// The fd limit covers the command reserve when `limit >= module start + maxclients`.
+/// If it does not: `fd-reserve Lenient` turns placement off (and with it the cache),
+/// logs, and returns Ok; `fd-reserve Strict` returns Err naming the fix. Other Errs:
+/// the module start is not actually past the event loop (object fds would then take
+/// fd numbers in the core range, and clients past them are never served), or the fd
+/// limit cannot be raised.
 pub fn raise_module_start(ctx: &Context) -> Result<(), String> {
     let maxclients: u64 = ctx
         .config_get("maxclients".to_string())
@@ -111,12 +115,23 @@ pub fn raise_module_start(ctx: &Context) -> Result<(), String> {
     let module_start = MODULE_START
         .fetch_max(module_start, Ordering::Relaxed)
         .max(module_start);
-    // Every fd number is below the limit, so none is past the core range.
-    if limit <= module_start as u64 {
+    let maxclients = module_start as u64 - VALKEY_FDSET_INCR;
+    let needed = module_start as u64 + maxclients;
+    if limit < needed {
+        let shortfall = format!(
+            "open-file limit {limit} is below {needed} (module start {module_start} + \
+             maxclients {maxclients}), so the module range cannot hold the command reserve"
+        );
+        if fd_reserve() == FdReserve::Strict {
+            PLACEMENT_ENABLED.store(false, Ordering::Relaxed);
+            return Err(format!(
+                "fd-reserve Strict: {shortfall}; set LimitNOFILE to at least {needed}, lower \
+                 maxclients, or use fd-reserve Lenient"
+            ));
+        }
         PLACEMENT_ENABLED.store(false, Ordering::Relaxed);
         ctx.log_notice(&format!(
-            "largeobj: open-file limit {limit} ends inside the core range \
-             (fd {module_start}); object-file fd placement is off"
+            "largeobj: {shortfall}; object-file fd placement is off (fd-reserve Lenient)"
         ));
         warn_if_cache_limited(crate::max_cached_fds() as u64);
         return Ok(());
@@ -129,36 +144,33 @@ pub fn raise_module_start(ctx: &Context) -> Result<(), String> {
     ctx.log_notice(&format!(
         "largeobj: object-file fd placement is on: module range starts at fd {module_start}"
     ));
-    let maxclients = module_start as u64 - VALKEY_FDSET_INCR;
-    if limit < module_start as u64 + maxclients {
-        ctx.log_warning(&format!(
-            "largeobj: open-file limit {limit} leaves {} fds in the \
-             module range; commands fail with an error when more than that run at \
-             once. Raise it to at least {}",
-            limit - module_start as u64,
-            module_start as u64 + maxclients
+    if fd_reserve() == FdReserve::Strict {
+        ctx.log_notice(&format!(
+            "largeobj: fd-reserve Strict: a CONFIG SET maxclients above {} aborts the server \
+             (the command reserve would no longer fit in open-file limit {limit})",
+            limit.saturating_sub(VALKEY_FDSET_INCR) / 2
         ));
     }
     warn_if_cache_limited(crate::max_cached_fds() as u64);
     Ok(())
 }
 
-/// Cache room: how many cached read fds fit in the module range once the command
+/// How many cached read fds the fd limit lets the module range hold once the command
 /// reserve (one number per client) is set aside for command fds (a SET's write fd, or
 /// a GET's fd evicted mid-read; both block their client, so a client holds at most
 /// one). Zero when placement is off: a cached fd would then hold a client's fd number
 /// for good.
-fn cache_room() -> u64 {
+fn cache_headroom() -> u64 {
     if !PLACEMENT_ENABLED.load(Ordering::Relaxed) {
         return 0;
     }
-    cache_room_for(
+    cache_headroom_for(
         nofile_limit().rlim_cur,
         MODULE_START.load(Ordering::Relaxed),
     )
 }
 
-fn cache_room_for(limit: u64, module_start: i32) -> u64 {
+fn cache_headroom_for(limit: u64, module_start: i32) -> u64 {
     let module_start = module_start as u64;
     // The module_start tracks the highest maxclients seen; Valkey keeps clients above a
     // lowered maxclients connected, so that is the client bound.
@@ -168,54 +180,36 @@ fn cache_room_for(limit: u64, module_start: i32) -> u64 {
         .saturating_sub(maxclients)
 }
 
-/// The number of fds the fd cache may hold: `max-cached-fds`, limited to the room.
-pub fn cache_size() -> usize {
-    (crate::max_cached_fds() as u64).min(cache_room()) as usize
+/// The fd cache max entries: the most fds the fd cache may hold. `max-cached-fds`,
+/// limited to what the fd limit allows.
+pub fn fd_cache_max_entries() -> usize {
+    (crate::max_cached_fds() as u64).min(cache_headroom()) as usize
 }
 
-/// Log, when `cap` fds cannot all be cached, how many can and what limit would fit.
-pub fn warn_if_cache_limited(cap: u64) {
-    let room = cache_room();
-    if cap == 0 || cap <= room {
+/// Log, when `max_cached_fds` fds cannot all be cached, how many can and what limit
+/// would fit.
+pub fn warn_if_cache_limited(max_cached_fds: u64) {
+    let headroom = cache_headroom();
+    if max_cached_fds == 0 || max_cached_fds <= headroom {
         return;
     }
     let limit = nofile_limit().rlim_cur;
     let module_start = MODULE_START.load(Ordering::Relaxed) as u64;
     let maxclients = module_start.saturating_sub(VALKEY_FDSET_INCR);
-    let required = module_start + cap + maxclients;
+    let required = module_start + max_cached_fds + maxclients;
     let msg = if PLACEMENT_ENABLED.load(Ordering::Relaxed) {
         format!(
-            "largeobj: open-file limit {limit} is too low for max-cached-fds {cap} and \
-             maxclients {maxclients}; the fd cache holds {room}. Raise the limit to at \
+            "largeobj: open-file limit {limit} is too low for max-cached-fds {max_cached_fds} and \
+             maxclients {maxclients}; the fd cache holds at most {headroom}. Raise the limit to at \
              least {required}"
         )
     } else {
         format!(
-            "largeobj: open-file limit {limit} ends inside the core range, so the \
-             fd cache is off (max-cached-fds {cap}). Raise the limit to at least {required}"
+            "largeobj: open-file limit {limit} does not cover the command reserve, so the \
+             fd cache is off (max-cached-fds {max_cached_fds}). Raise the limit to at least {required}"
         )
     };
     valkey_module::logging::log_warning(msg);
-}
-
-/// Whether `cap` cached fds fit in the module range with the command reserve left for
-/// command fds. `CONFIG SET max-cached-fds` rejects a cap that does not. Always Ok
-/// when placement is off: the cache is off then, and the cap is only logged.
-pub fn check_fd_limit(cap: u64) -> Result<(), String> {
-    if !PLACEMENT_ENABLED.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-    let module_start = MODULE_START.load(Ordering::Relaxed);
-    let limit = nofile_limit().rlim_cur;
-    if cap <= cache_room_for(limit, module_start) {
-        return Ok(());
-    }
-    let maxclients = module_start as u64 - VALKEY_FDSET_INCR;
-    Err(format!(
-        "open-file limit {limit} is too low for max-cached-fds {cap} and \
-         maxclients {maxclients}; raise it to at least {}",
-        module_start as u64 + cap + maxclients
-    ))
 }
 
 /// The process's `RLIMIT_NOFILE`.
@@ -405,20 +399,20 @@ mod tests {
     }
 
     #[test]
-    fn cache_room_reserves_maxclients_for_commands() {
+    fn cache_headroom_reserves_maxclients_for_commands() {
         let (module_start, maxclients) = (10_128, 10_000);
         // No numbers in the module range, or fewer than one per client: no room.
-        assert_eq!(cache_room_for(10_032, module_start), 0);
-        assert_eq!(cache_room_for(10_240, module_start), 0);
+        assert_eq!(cache_headroom_for(10_032, module_start), 0);
+        assert_eq!(cache_headroom_for(10_240, module_start), 0);
         assert_eq!(
-            cache_room_for(module_start as u64 + maxclients, module_start),
+            cache_headroom_for(module_start as u64 + maxclients, module_start),
             0
         );
         // Each number past that is one cached fd.
         assert_eq!(
-            cache_room_for(module_start as u64 + maxclients + 1, module_start),
+            cache_headroom_for(module_start as u64 + maxclients + 1, module_start),
             1
         );
-        assert_eq!(cache_room_for(65_536, module_start), 45_408);
+        assert_eq!(cache_headroom_for(65_536, module_start), 45_408);
     }
 }
