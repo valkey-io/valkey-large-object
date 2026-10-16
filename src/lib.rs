@@ -236,18 +236,24 @@ fn deinitialize(_ctx: &Context) -> Status {
 }
 
 /// `CONFIG SET maxclients` grows Valkey's event loop, possibly up into the fds
-/// the module placed at load. Raise the floor, then evict the cached fds now below
-/// it so their next GET reopens them above the floor. No room above the new range
-/// means clients would be stranded behind object fds again, so that is fatal.
+/// the module placed at load. Raise the floor, drop the cached fds now below it so
+/// their next GET reopens them above the floor, and trim the cache to what still
+/// fits above the floor with one slot per client left for commands. If the open-file
+/// limit now ends inside the new Valkey core range, fds stop being moved and the
+/// cache is emptied. Valkey has already applied the change and a module cannot veto
+/// it, so a shortfall is logged: commands fail with an error, the server keeps running.
 #[config_changed_event_handler]
 fn on_config_changed(ctx: &Context, changed: &[&str]) {
     if changed.contains(&"maxclients") {
         if let Some(pool) = storage::FD_POOL.get() {
-            if let Err(msg) = storage::fd_placement::place(ctx) {
-                // The panic hook logs the message and aborts the server.
-                panic!("CONFIG SET maxclients: cannot keep object-file fds out of Valkey's client range: {msg}");
+            if let Err(msg) = storage::fd_placement::raise_object_fd_floor(ctx) {
+                ctx.log_warning(&format!(
+                    "largeobj: CONFIG SET maxclients: cannot place object-file fds above the \
+                     Valkey core range: {msg}"
+                ));
             }
-            pool.evict_in_client_range();
+            pool.drop_fds_below_floor();
+            pool.shrink_to(storage::fd_placement::effective_cap());
         }
     }
 }
@@ -332,7 +338,7 @@ valkey_module! {
             ["victim-sample-size", &*CFG_VICTIM_SAMPLE_SIZE, DEFAULT_VICTIM_SAMPLE_SIZE, MIN_VICTIM_SAMPLE_SIZE, MAX_VICTIM_SAMPLE_SIZE,
              ConfigurationFlags::DEFAULT, None, None],
             ["max-cached-fds", &*CFG_MAX_CACHED_FDS, DEFAULT_MAX_CACHED_FDS, MIN_MAX_CACHED_FDS, MAX_MAX_CACHED_FDS,
-             ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_max_cached_fds))],
+             ConfigurationFlags::DEFAULT, Some(Box::new(on_max_cached_fds_changed)), Some(Box::new(validate_max_cached_fds))],
             ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, DEFAULT_FABRIC_MAX_IN_FLIGHT, MIN_FABRIC_MAX_IN_FLIGHT, MAX_FABRIC_MAX_IN_FLIGHT,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, MIN_FABRIC_CRC_POOL_THREADS, MAX_FABRIC_CRC_POOL_THREADS,

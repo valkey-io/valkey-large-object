@@ -91,6 +91,15 @@ fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .add_section("fd")
         .field("open_fds", fds.len() as i64)?
         .field(
+            "fd_cache_capacity",
+            storage::fd_placement::effective_cap() as i64,
+        )?
+        .field(
+            "fd_placement_failures",
+            storage::fd_placement::PLACEMENT_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+                as i64,
+        )?
+        .field(
             "fd_evictions",
             fds.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?

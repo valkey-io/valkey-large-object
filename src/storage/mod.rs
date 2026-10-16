@@ -174,11 +174,11 @@ pub fn init(
         ));
     }
     // Tiered keeps object files open (fd cache + in-flight SETs). Place those fds
-    // above Valkey's client range before any is opened, or they stop new clients
+    // above the Valkey core range before any is opened, or they stop new clients
     // being served.
     if mode == crate::OperatingMode::Tiered {
-        fd_placement::place(ctx).map_err(|e| {
-            format!("cannot keep object-file fds out of Valkey's client range: {e}")
+        fd_placement::raise_object_fd_floor(ctx).map_err(|e| {
+            format!("cannot keep object-file fds out of the Valkey core range: {e}")
         })?;
     }
     // ── Create all resources as locals (no OnceLock yet) ──
