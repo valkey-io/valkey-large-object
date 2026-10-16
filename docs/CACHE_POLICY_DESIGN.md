@@ -185,7 +185,7 @@ fds: RwLock<OIDIndexedMap<FdEntry>>
 
 `get_or_open_with` takes the cap as an argument so unit tests can set it without racing on the global config; the other settings are read live. `RECLAIM_MAX_VICTIMS` does not apply, since the fd loop reclaims exactly the overflow.
 
-INFO section `largeobj_fd` (Tiered only): `open_fds`, `fd_reclaims`.
+INFO section `largeobj_fd` (Tiered only): placement first (`fd_placement_failures`), then the cache (`open_fds`, `fd_cache_capacity`, `fd_evictions`).
 
 
 ## 5. Open questions

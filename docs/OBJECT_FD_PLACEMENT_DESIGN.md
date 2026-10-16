@@ -186,8 +186,8 @@ before the module loads.
 | Item | Behavior |
 |---|---|
 | `max-cached-fds` | 0 to 1048576, default 16384, mutable. 0 disables the cache. |
-| `INFO largeobj_fd: fd_cache_capacity` | The cache size in use. Can be below `max-cached-fds`. |
 | `INFO largeobj_fd: fd_placement_failures` | Opens that found no free number above the floor. |
+| `INFO largeobj_fd: fd_cache_capacity` | The cache size in use. Can be below `max-cached-fds`. |
 | Log | One warning per 1024 placement failures, naming the floor and the error. One warning when the cap does not fit, with the limit that would. A notice when the soft limit is raised, and when fds are not moved. |
 
 To raise the limit: set `LimitNOFILE` in the unit that starts Valkey (systemd drop-in), `--ulimit nofile=`

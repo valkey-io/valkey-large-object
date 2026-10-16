@@ -44,7 +44,7 @@ fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     core_metrics_section(ctx)?;
     dram_pool_section(ctx)?;
     nvme_staging_section(ctx)?;
-    fd_pool_section(ctx)?;
+    fd_section(ctx)?;
     smartlog_section(ctx)?;
     error_metrics_section(ctx)?;
     Ok(())
@@ -82,22 +82,24 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
     Ok(())
 }
 
-/// Tiered only: absent in Dram mode, where no FdPool exists.
-fn fd_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
+/// Tiered only: absent in Dram mode, where no FdPool exists. Object-file fd placement
+/// first, then the fd cache.
+fn fd_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let Some(fds) = storage::FD_POOL.get() else {
         return Ok(());
     };
     ctx.builder()
         .add_section("fd")
+        // Placement
+        .field(
+            "fd_placement_failures",
+            storage::fd_placement::placement_failures() as i64,
+        )?
+        // Cache
         .field("open_fds", fds.len() as i64)?
         .field(
             "fd_cache_capacity",
             storage::fd_placement::effective_cap() as i64,
-        )?
-        .field(
-            "fd_placement_failures",
-            storage::fd_placement::PLACEMENT_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
-                as i64,
         )?
         .field(
             "fd_evictions",

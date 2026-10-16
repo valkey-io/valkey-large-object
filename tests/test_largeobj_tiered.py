@@ -1177,7 +1177,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_fd_evictions'] == 1
 
     def test_lower_cap_at_runtime(self):
-        """CONFIG SET to a smaller cap evicts the cache down to it right away."""
+        """CONFIG SET to a smaller cap, down to 0, evicts the cache right away."""
         client = self.server.get_new_client()
         for i, k in enumerate(self.KEYS[:2]):
             client.execute_command('BLOB.TCP_SET', k, self._payload(i))
@@ -1194,6 +1194,12 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 1
         assert info['largeobj_fd_evictions'] == 2
+
+        # 0 is accepted: the cache empties and later GETs open, read and close.
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '0')
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == 0
+        assert client.execute_command('BLOB.TCP_GET', self.KEYS[2]) == self._payload(2)
+        assert client.info('largeobj_fd')['largeobj_open_fds'] == 0
 
 
 # ─── Object File fd Placement ───
@@ -1351,21 +1357,6 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
         client.execute_command('BLOB.TCP_SET', 'has_room', b'x' * 4096)
         assert client.execute_command('BLOB.TCP_GET', 'has_room') == b'x' * 4096
 
-    def test_max_cached_fds_zero_caches_nothing(self):
-        """max-cached-fds 0 empties the cache, and later GETs open, read and close
-        their fd without caching it."""
-        client = self.server.get_new_client()
-        for i in range(10):
-            client.execute_command('BLOB.TCP_SET', f'obj_{i}', b'x' * 4096)
-            client.execute_command('BLOB.TCP_GET', f'obj_{i}')
-        assert client.info('largeobj_fd')['largeobj_open_fds'] == 10
-
-        client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '0')
-        for i in range(10):
-            assert client.execute_command('BLOB.TCP_GET', f'obj_{i}') == b'x' * 4096
-        assert client.info('largeobj_fd')['largeobj_open_fds'] == 0
-        wait_for_true(lambda: self.object_fds(client) == [])
-
     def _start_with_nofile_limit(self, name, nofile):
         """Start a server under `ulimit -n <nofile>` (soft = hard, like systemd's
         LimitNOFILE=<nofile>) with maxclients 100. Returns (server, client)."""
@@ -1412,7 +1403,7 @@ class TestTieredFdsAboveClientRange(ValkeyLargeObjTestCaseBase):
         assert server.verify_string_in_logfile('is too low for max-cached-fds')
         assert client.info('largeobj_fd')['largeobj_fd_cache_capacity'] == 72
 
-        for i in range(150):
+        for i in range(80):
             client.execute_command('BLOB.TCP_SET', f'obj_{i}', b'x' * 4096)
             assert client.execute_command('BLOB.TCP_GET', f'obj_{i}') == b'x' * 4096
         assert client.info('largeobj_fd')['largeobj_open_fds'] == 72

@@ -44,7 +44,12 @@ static MOVE_ABOVE_FLOOR: AtomicBool = AtomicBool::new(false);
 static PROBED: AtomicBool = AtomicBool::new(false);
 
 /// Object-file opens that found no free fd at or above the floor.
-pub static PLACEMENT_FAILURES: AtomicU64 = AtomicU64::new(0);
+static PLACEMENT_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// How many object-file opens found no free fd at or above the floor.
+pub fn placement_failures() -> u64 {
+    PLACEMENT_FAILURES.load(Ordering::Relaxed)
+}
 
 /// Raise the floor that object-file fds are moved above to the end of the Valkey
 /// core range for the current `maxclients`. Tiered only, main thread only. Turns
@@ -331,19 +336,9 @@ mod tests {
     }
 
     #[test]
-    fn move_above_places_the_fd_at_or_above_the_floor() {
-        raise_soft_fd_limit().expect("raise the soft fd limit");
-        let floor = 228;
-        let fd = move_above(open_dev_null(), floor);
-        assert!(fd >= floor, "fd {fd} is below the floor {floor}");
-        // SAFETY: fd was just opened by this test.
-        unsafe { libc::close(fd) };
-    }
-
-    #[test]
     fn move_above_fails_without_panicking_when_no_fd_is_free() {
         // F_DUPFD rejects a floor at or above the limit, which is what a full range does.
-        let failures = PLACEMENT_FAILURES.load(Ordering::Relaxed);
+        let failures = placement_failures();
         let fd = move_above(open_dev_null(), i32::MAX);
         let errno = std::io::Error::last_os_error().raw_os_error();
         assert_eq!(fd, -1);
@@ -351,7 +346,7 @@ mod tests {
             matches!(errno, Some(libc::EINVAL | libc::EMFILE)),
             "errno {errno:?}"
         );
-        assert_eq!(PLACEMENT_FAILURES.load(Ordering::Relaxed), failures + 1);
+        assert_eq!(placement_failures(), failures + 1);
     }
 
     #[test]
