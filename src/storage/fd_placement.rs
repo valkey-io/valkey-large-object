@@ -19,8 +19,11 @@
 //!
 //! The fd cache never takes the numbers commands need. Its size is `max-cached-fds`
 //! limited to what the module range holds after a command reserve of `maxclients`
-//! numbers (`fd_cache_max_entries`). A shortfall is logged, never fatal: a command that finds
-//! no free fd in the module range fails with an error, and the server keeps running.
+//! numbers (`fd_cache_max_entries`). Under `fd-reserve Lenient` a shortfall is logged:
+//! the cache is clamped, or off with placement when even the reserve does not fit.
+//! Under `fd-reserve Strict` the reserve and the whole cache must fit, so the cache
+//! is never clamped: a load, a `CONFIG SET maxclients` or a `CONFIG SET max-cached-fds`
+//! that breaks that is refused (load, `max-cached-fds`) or aborts the server (`maxclients`).
 
 use std::ffi::{c_int, c_void, CStr};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -86,9 +89,10 @@ impl Drop for ObjectFd {
 /// Raise the module start to the end of the core range for the current `maxclients`,
 /// and turn placement on or off. Tiered only, main thread only.
 ///
-/// The fd limit covers the command reserve when `limit >= module start + maxclients`.
-/// If it does not: `fd-reserve Lenient` turns placement off (and with it the cache),
-/// logs, and returns Ok; `fd-reserve Strict` returns Err naming the fix. Other Errs:
+/// The fd limit covers the command reserve when `limit >= module start + maxclients`;
+/// `fd-reserve Strict` also needs `max-cached-fds` more. If it does not:
+/// `fd-reserve Lenient` turns placement off (and with it the cache), logs, and returns
+/// Ok; `fd-reserve Strict` returns Err naming the fix. Other Errs:
 /// the module start is not actually past the event loop (object fds would then take
 /// fd numbers in the core range, and clients past them are never served), or the fd
 /// limit cannot be raised.
@@ -116,24 +120,26 @@ pub fn raise_module_start(ctx: &Context) -> Result<(), String> {
         .fetch_max(module_start, Ordering::Relaxed)
         .max(module_start);
     let maxclients = module_start as u64 - VALKEY_FDSET_INCR;
-    let needed = module_start as u64 + maxclients;
+    let max_cached_fds = crate::max_cached_fds() as u64;
+    let strict = fd_reserve() == FdReserve::Strict;
+    // Strict needs the whole fd cache to fit too; Lenient needs only the command reserve.
+    let needed = module_start as u64 + maxclients + if strict { max_cached_fds } else { 0 };
     if limit < needed {
-        let shortfall = format!(
-            "open-file limit {limit} is below {needed} (module start {module_start} + \
-             maxclients {maxclients}), so the module range cannot hold the command reserve"
-        );
-        if fd_reserve() == FdReserve::Strict {
-            PLACEMENT_ENABLED.store(false, Ordering::Relaxed);
+        PLACEMENT_ENABLED.store(false, Ordering::Relaxed);
+        if strict {
             return Err(format!(
-                "fd-reserve Strict: {shortfall}; set LimitNOFILE to at least {needed}, lower \
-                 maxclients, or use fd-reserve Lenient"
+                "fd-reserve Strict: open-file limit {limit} is below {needed} (module start \
+                 {module_start} + maxclients {maxclients} + max-cached-fds {max_cached_fds}); set \
+                 LimitNOFILE to at least {needed}, lower maxclients or max-cached-fds, or use \
+                 fd-reserve Lenient"
             ));
         }
-        PLACEMENT_ENABLED.store(false, Ordering::Relaxed);
         ctx.log_notice(&format!(
-            "largeobj: {shortfall}; object-file fd placement is off (fd-reserve Lenient)"
+            "largeobj: open-file limit {limit} is below {needed} (module start {module_start} + \
+             maxclients {maxclients}), so the module range cannot hold the command reserve; \
+             object-file fd placement is off (fd-reserve Lenient)"
         ));
-        warn_if_cache_limited(crate::max_cached_fds() as u64);
+        warn_if_cache_limited(max_cached_fds);
         return Ok(());
     }
     PLACEMENT_ENABLED.store(true, Ordering::Relaxed);
@@ -144,14 +150,36 @@ pub fn raise_module_start(ctx: &Context) -> Result<(), String> {
     ctx.log_notice(&format!(
         "largeobj: object-file fd placement is on: module range starts at fd {module_start}"
     ));
-    if fd_reserve() == FdReserve::Strict {
+    if strict {
         ctx.log_notice(&format!(
             "largeobj: fd-reserve Strict: a CONFIG SET maxclients above {} aborts the server \
-             (the command reserve would no longer fit in open-file limit {limit})",
-            limit.saturating_sub(VALKEY_FDSET_INCR) / 2
+             (the command reserve and max-cached-fds {max_cached_fds} would no longer fit in \
+             open-file limit {limit})",
+            limit.saturating_sub(VALKEY_FDSET_INCR + max_cached_fds) / 2
         ));
     }
-    warn_if_cache_limited(crate::max_cached_fds() as u64);
+    warn_if_cache_limited(max_cached_fds);
+    Ok(())
+}
+
+/// `fd-reserve Strict` only: whether a new `max-cached-fds` still fits in the fd limit
+/// beside the module start and the command reserve. Lenient always passes: it clamps.
+/// Used to reject `CONFIG SET max-cached-fds`; the load and `maxclients` checks are in
+/// `raise_module_start`. Err names the fd limit that would fit.
+pub fn check_cache_fits_if_strict(max_cached_fds: u64) -> Result<(), String> {
+    if fd_reserve() != FdReserve::Strict {
+        return Ok(());
+    }
+    let limit = nofile_limit().rlim_cur;
+    let module_start = MODULE_START.load(Ordering::Relaxed) as u64;
+    let maxclients = module_start.saturating_sub(VALKEY_FDSET_INCR);
+    let required = module_start + maxclients + max_cached_fds;
+    if limit < required {
+        return Err(format!(
+            "open-file limit {limit} is too low for max-cached-fds {max_cached_fds} and \
+             maxclients {maxclients}; raise it to at least {required}, or use fd-reserve Lenient"
+        ));
+    }
     Ok(())
 }
 

@@ -1422,10 +1422,21 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         """fd-reserve Strict does not load when the limit (300) is below module start
         + maxclients (328), and the log names the limit to set."""
         server, _ = self._start_with_nofile_limit(
-            'strict-refuses', 300, 'fd-reserve Strict', connect=False)
+            'strict-refuses', 300, 'fd-reserve Strict max-cached-fds 0', connect=False)
         wait_for_true(lambda: server.server.poll() is not None)
         assert server.server.returncode != 0
         assert server.verify_string_in_logfile('set LimitNOFILE to at least 328')
+
+    def test_strict_refuses_to_load_when_only_the_cache_does_not_fit(self):
+        """Limit 400 covers module start 228 + maxclients 100, which fd-reserve Lenient
+        would accept with a clamped cache. Strict also needs max-cached-fds (100) to
+        fit, so it needs 428 and refuses."""
+        server, _ = self._start_with_nofile_limit(
+            'strict-refuses-cache', 400, 'fd-reserve Strict max-cached-fds 100',
+            connect=False)
+        wait_for_true(lambda: server.server.poll() is not None)
+        assert server.server.returncode != 0
+        assert server.verify_string_in_logfile('set LimitNOFILE to at least 428')
 
     def test_strict_aborts_when_maxclients_breaks_the_command_reserve(self):
         """Limit 400 covers module start 228 + maxclients 100. Under fd-reserve Strict
@@ -1433,7 +1444,7 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         CONFIG SET maxclients 200 (Valkey accepts it: 232 <= 400) needs 528 and
         aborts the server."""
         server, client = self._start_with_nofile_limit(
-            'strict-aborts', 400, 'fd-reserve Strict')
+            'strict-aborts', 400, 'fd-reserve Strict max-cached-fds 0')
         assert server.verify_string_in_logfile('above 136 aborts the server')
         client.execute_command('BLOB.TCP_SET', 'strict_key', b'x' * 4096)
         assert client.execute_command('BLOB.TCP_GET', 'strict_key') == b'x' * 4096
@@ -1441,6 +1452,34 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         with server.expect_crash(self):
             client.execute_command('CONFIG', 'SET', 'maxclients', '200')
         assert server.verify_string_in_logfile('set LimitNOFILE to at least 528')
+
+    def test_strict_aborts_when_maxclients_squeezes_only_the_cache(self):
+        """Limit 500 holds module start 228 + maxclients 100 + max-cached-fds 100 (428),
+        so Strict loads with the whole cache. CONFIG SET maxclients 140 (Valkey accepts
+        it: 172 <= 500) moves the module start to 268: the reserve alone still fits
+        (408) but the cache no longer does (508), so Strict aborts instead of clamping."""
+        server, client = self._start_with_nofile_limit(
+            'strict-aborts-cache', 500, 'fd-reserve Strict max-cached-fds 100')
+        assert server.verify_string_in_logfile('above 136 aborts the server')
+        assert client.info('largeobj_fd')['largeobj_fd_cache_max_entries'] == 100
+
+        with server.expect_crash(self):
+            client.execute_command('CONFIG', 'SET', 'maxclients', '140')
+        assert server.verify_string_in_logfile('set LimitNOFILE to at least 508')
+
+    def test_strict_rejects_max_cached_fds_that_does_not_fit(self):
+        """Limit 500 fits max-cached-fds 172 (228 + 100 + 172), not 173. Under
+        fd-reserve Strict CONFIG SET refuses 173, names the limit that would fit, and
+        keeps the old value."""
+        _, client = self._start_with_nofile_limit(
+            'strict-rejects', 500, 'fd-reserve Strict max-cached-fds 100')
+        with pytest.raises(ResponseError, match='raise it to at least 501'):
+            client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '173')
+        assert client.config_get('largeobj.max-cached-fds') == {
+            'largeobj.max-cached-fds': '100'}
+
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '172')
+        assert client.info('largeobj_fd')['largeobj_fd_cache_max_entries'] == 172
 
     def test_loads_with_max_cached_fds_larger_than_the_fd_limit_allows(self):
         """Limit 400 leaves 172 fds in the module range (from 228), and 100 of them are

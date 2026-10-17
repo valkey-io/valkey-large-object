@@ -50,7 +50,7 @@ Four runtime-mutable configs:
 | `tiered-decay-time` | 1 | 0..=65535 | Minutes per one-point counter decay. 0 disables decay (pure LFU). Same semantics as core `lfu-decay-time`. |
 | `promote-min-hits` | 2 | 1..=255 | Misses an object must accumulate before a GET promotes it. 1 promotes on the first GET. |
 | `reclaim-sample-size` | 5 | 1..=64 | Entries sampled per reclaim round. Same idea as core's `maxmemory-samples`. |
-| `max-cached-fds` | 16384 | 0..=1048576 | How many read fds to keep cached; 0 caches nothing. The fd cache max entries is the smaller of this and what the fd limit allows: the module range (the fd numbers past the core range) minus a command reserve of `maxclients` numbers. A larger value is clamped with a warning, at load and on `CONFIG SET`. When the open-file limit does not cover the command reserve, the fd cache is off under `fd-reserve Lenient`. `INFO largeobj_fd` shows it (`fd_cache_max_entries`). See `OBJECT_FD_PLACEMENT_DESIGN.md`. |
+| `max-cached-fds` | 16384 | 0..=1048576 | How many read fds to keep cached; 0 caches nothing. The fd cache max entries is the smaller of this and what the fd limit allows: the module range (the fd numbers past the core range) minus a command reserve of `maxclients` numbers. Under `fd-reserve Lenient` a larger value is clamped with a warning, at load and on `CONFIG SET`; under `Strict` it must fit (load refuses, `CONFIG SET` is rejected). When the open-file limit does not cover the command reserve, the fd cache is off under `fd-reserve Lenient`. `INFO largeobj_fd` shows it (`fd_cache_max_entries`). See `OBJECT_FD_PLACEMENT_DESIGN.md`. |
 
 Three tuning values are constants in `src/storage/cache_policy.rs`, because no operator has a reason to change them:
 

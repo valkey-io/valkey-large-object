@@ -31,8 +31,10 @@ mod fd_reserve_policy {
         /// What the module does when the fd limit does not cover the command reserve
         /// (`module start + maxclients`) — set via `fd-reserve`, Tiered only.
         /// Lenient (default): load anyway; placement and the fd cache turn off and the
-        /// server keeps serving. Strict: refuse to load, and abort if a later
-        /// `CONFIG SET maxclients` breaks the reserve.
+        /// server keeps serving. A `max-cached-fds` that does not fit is clamped.
+        /// Strict: the reserve and `max-cached-fds` must both fit. Otherwise refuse to
+        /// load, reject a `CONFIG SET max-cached-fds` that does not fit, and abort if a
+        /// later `CONFIG SET maxclients` breaks either.
         #[derive(Debug, PartialEq, Eq, Copy)]
 
         pub enum FdReserve {
@@ -625,6 +627,24 @@ pub fn on_max_cached_fds_changed(
             val.load(std::sync::atomic::Ordering::Relaxed) as u64,
         );
     }
+}
+
+/// `max-cached-fds` CONFIG SET under `fd-reserve Strict`: the new value must fit in the
+/// fd limit, or the command fails naming the limit that would fit. Lenient accepts any
+/// value and clamps. The framework has already stored the new value; on Err core
+/// restores the old one. No pool yet at load, where `raise_module_start` runs the check.
+pub fn validate_max_cached_fds(
+    _ctx: &valkey_module::configuration::ConfigurationContext,
+    _name: &str,
+    val: &'static AtomicI64,
+) -> Result<(), valkey_module::ValkeyError> {
+    if storage::FD_POOL.get().is_none() {
+        return Ok(());
+    }
+    storage::fd_placement::check_cache_fits_if_strict(
+        val.load(std::sync::atomic::Ordering::Relaxed) as u64,
+    )
+    .map_err(valkey_module::ValkeyError::String)
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
