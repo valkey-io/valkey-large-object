@@ -1464,6 +1464,10 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         assert fd_info['largeobj_fd_cache_entries'] == 0
         assert fd_info['largeobj_fd_cache_max_entries'] == 0
 
+    # A refused load makes Valkey drop its reference to the config data the valkey-module
+    # crate boxed for each config, and nothing frees it, so LeakSanitizer reports it at exit.
+    # That is not a leak in this module's code, so the ASAN job skips this test.
+    @pytest.mark.skip_for_asan
     @pytest.mark.parametrize('nofile,max_cached_fds,needed', [
         (300, 0, 328),    # the command reserve alone does not fit: 228 + 100
         (400, 100, 428),  # the reserve fits, the cache does not: 228 + 100 + 100

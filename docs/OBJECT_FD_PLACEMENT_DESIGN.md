@@ -174,9 +174,11 @@ once. These are numbers in the module range, not client sockets: the core range 
 holds the sockets.
 
 Consequences:
-- An fd cache of P entries needs `limit >= module_start + P + maxclients`.
-- If `limit < module_start + maxclients`, placement is off (`Lenient`) or the module does not load
-  (`Strict`), so there is no cache. `Strict` also does not load if `max-cached-fds` more numbers do not fit.
+- The command reserve is the requirement: `limit >= module_start + maxclients`. If it does not hold,
+  placement is off (`Lenient`) or the module does not load (`Strict`), so there is no cache.
+- The cache gets what is left above the reserve. An fd cache of P entries needs
+  `limit >= module_start + maxclients + P`. `Lenient` clamps P to what fits; `Strict` also does not load
+  if the whole `max-cached-fds` does not fit.
 
 The reserve relies on a client holding at most one command fd at a time. A GET drops its fd before its
 client is unblocked, and a SET's write fd closes before its client is unblocked, so a client's next command
