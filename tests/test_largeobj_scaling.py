@@ -39,7 +39,7 @@ def wait_uring_registered_matches_segments(client, timeout=10):
     def _match():
         i = info_largeobj(client)
         return (i['largeobj_dram_uring_registered_segments'] == i['largeobj_dram_segments']
-                and i['largeobj_nvme_uring_registered_segments'] == i['largeobj_nvme_segments'])
+                and i['largeobj_disk_staging_uring_registered_segments'] == i['largeobj_disk_staging_segments'])
     wait_for_true(_match, timeout=timeout)
 
 
@@ -312,7 +312,7 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
 
         # 200KB does not fit the ~124KB left in the segment, so it needs a new
         # segment, and the module rejects it.
-        with pytest.raises(ResponseError, match='pool exhausted'):
+        with pytest.raises(OutOfMemoryError):
             client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * (200 * 1024))
         after = info_largeobj(client)
         assert after['largeobj_dram_segments'] == before['largeobj_dram_segments']
@@ -418,8 +418,7 @@ class TestDramShrink(ValkeyLargeObjTestCaseBase):
         assert len(victims) == 1
         victim = victims[0]
         assert client.exists(victim) == 1
-        with pytest.raises(ResponseError, match='not found'):
-            client.execute_command('BLOB.INFO', victim)
+        assert client.execute_command('BLOB.INFO', victim) is None
         with pytest.raises(ResponseError, match='module key failed to copy'):
             client.execute_command('COPY', victim, 'copy_dst')
 
@@ -634,10 +633,10 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         expanded = info_largeobj(client)
         assert expanded['largeobj_dram_scaling_expands'] > expand_before
         dram_segments = expanded['largeobj_dram_segments']
-        registered = expanded['largeobj_efa_registered_segments']
+        registered = expanded['largeobj_rdma_registered_segments']
         assert dram_segments > 1
         # EFA registration spans BOTH pools: every live segment (DRAM + NVMe staging) is registered.
-        assert registered == dram_segments + expanded['largeobj_nvme_segments']
+        assert registered == dram_segments + expanded['largeobj_disk_staging_segments']
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
 
         # In Tiered mode shrink releases a live-data segment (data persists on NVMe), and with
@@ -650,9 +649,9 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
 
         assert client.execute_command('PING')
         after = info_largeobj(client)
-        assert after['largeobj_efa_registered_segments'] < registered
-        assert after['largeobj_efa_registered_segments'] == (
-            after['largeobj_dram_segments'] + after['largeobj_nvme_segments'])
+        assert after['largeobj_rdma_registered_segments'] < registered
+        assert after['largeobj_rdma_registered_segments'] == (
+            after['largeobj_dram_segments'] + after['largeobj_disk_staging_segments'])
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
         assert client.execute_command('BLOB.TCP_GET', 'key_a') == b'A' * SEGMENT_FILLING_SIZE
         assert client.execute_command('BLOB.TCP_GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE
@@ -711,7 +710,7 @@ class DramBudget(Budget):
     BUDGET = 1024 * 1024
     OBJ = BUDGET // 4
     PER_BUDGET = 3  # a fourth would fill the segment exactly, but talc's metadata lives in it
-    FULL = 'pool exhausted'
+    FULL = 'maxmemory'
 
     def get_module_args(self, data_dir, direct_io):
         return (f"operating-mode Dram segment-size {self.BUDGET} max-object-size {self.BUDGET - 64 * 1024}"
@@ -738,7 +737,7 @@ class TieredBudget(Budget):
     DISK_PER_OBJ = OBJ + 4096  # the ledger also charges the file's one-page header
     PER_BUDGET = 8
     BUDGET = PER_BUDGET * DISK_PER_OBJ
-    FULL = 'capacity exceeded'
+    FULL = 'disk-maxmemory'
 
     def get_module_args(self, data_dir, direct_io):
         return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET}"
@@ -863,7 +862,9 @@ class EvictionCronTests:
             keys += client.dbsize()
         client.execute_command('SELECT', 0)
         assert keys == 2 + len(payloads) - evictions, "only victims' keys were deleted"
-        assert len(surviving(client, payloads)) == client.dbsize(), "and all of them"
+        # 'renamed' is in db 0 too, and Tiered readdir order may leave it alive.
+        live = surviving(client, {**payloads, 'renamed': None})
+        assert len(live) == client.dbsize(), "and all of them"
         self.settle(client, keys)
 
 
@@ -899,7 +900,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         self.assert_refused(client, 'overflow', b'O' * self.OBJ)
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 0
-        assert info['largeobj_nvme_capacity_exceeded'] == 2
+        assert info['largeobj_disk_capacity_exceeded'] == 2
         assert surviving(client, payloads) == payloads
 
     def test_a_write_that_needs_more_than_16_victims_is_refused_but_they_stay_evicted(self):
@@ -909,7 +910,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         self.assert_refused(client, 'big', b'B' * int(self.BUDGET * 0.6))
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 16
-        assert info['largeobj_nvme_capacity_exceeded'] == 1
+        assert info['largeobj_disk_capacity_exceeded'] == 1
         self.settle(client, 64 - 16)
 
     def test_files_that_are_not_objects_are_never_victims(self):
@@ -1045,7 +1046,7 @@ class TestTieredEvictionMixed(TieredBudget):
         set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
         stop = time.time() + self.SECONDS
         failures = []
-        expected_errors = ('capacity exceeded', 'failed to copy', 'no such key')
+        expected_errors = ('disk-maxmemory', 'failed to copy', 'no such key')
 
         def worker(n):
             c = self.server.get_new_client()
@@ -1088,7 +1089,7 @@ class TestTieredEvictionMixed(TieredBudget):
 
         # The cron deletes the ghosts, then ledger == directory == live keys.
         wait_for_true(lambda: pending_evictions(client) == 0, timeout=20)
-        wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
+        wait_for_true(lambda: client.info('memory').get('lazyfree_pending_objects', 0) == 0)
         self.settle(client, None, timeout=15)
         assert len(self.object_files()) == client.dbsize()
         assert info_largeobj(client)['largeobj_disk_used_bytes'] == client.dbsize() * self.DISK_PER_OBJ

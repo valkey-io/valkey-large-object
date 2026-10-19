@@ -173,7 +173,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         Ok(fabric) => Some(fabric),
         Err(error) => {
             ctx.log_warning(&format!(
-                "largeobj: fabric unavailable, EFA path disabled: {error}. Only Large Object Commands of the TCP variant will be supported"
+                "largeobj: fabric unavailable, RDMA path disabled: {error}. Only Large Object Commands of the TCP variant will be supported"
             ));
             None
         }
@@ -194,7 +194,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     if let Some(fabric) = &fabric {
         for (index, address) in fabric.local_addresses().enumerate() {
             ctx.log_notice(&format!(
-                "largeobj: fabric service {index} address {}",
+                "largeobj: fabric service {index} rdma address {}",
                 encode_hex(address)
             ));
         }

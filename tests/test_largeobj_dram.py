@@ -208,6 +208,31 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client.delete('blob', 'blob_copy')
         wait_for_true(lambda: num_objects() == 0)
 
+    # ─── INFO largeobj tests ───────────────────────────────────────────────
+
+    def test_info_sections_by_mode(self):
+        """The disk sections are Tiered-only. The RDMA section is always present, zeroed
+        while nothing has moved over RDMA. A TCP request in Dram mode replies inline, so it
+        is never in flight."""
+        client = self.server.get_new_client()
+        client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
+        assert client.execute_command('BLOB.TCP_GET', 'key') == b'A' * 4096
+        assert client.info('largeobj_disk') == {}
+        assert client.info('largeobj_disk_staging') == {}
+        rdma = client.info('largeobj_rdma')
+        for field in ('sessions', 'read_bytes', 'write_bytes'):
+            assert rdma[f'largeobj_rdma_{field}'] == 0, field
+        assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
+
+    def test_info_reports_dram_utilization(self):
+        """INFO reports allocated bytes as a percentage of capacity, to two decimals."""
+        client = self.server.get_new_client()
+        client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
+        dram = client.info('largeobj_dram')
+        used = dram['largeobj_dram_allocated_bytes'] * 100 / dram['largeobj_dram_capacity_bytes']
+        assert 0 < used < 1
+        assert dram['largeobj_dram_utilization_pct'] == round(used, 2)
+
     # ─── BLOB.INFO tests ───────────────────────────────────────────────────
 
     def test_info(self):
@@ -245,9 +270,9 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
     def test_info_errors(self):
         """BLOB.INFO errors are correct"""
         client = self.server.get_new_client()
-        # Nonexistant key
-        self.verify_error_response(client, 'BLOB.INFO nokey', 'not found')
-        self.verify_error_response(client, 'BLOB.INFO nokey LEN', 'not found')
+        # Nonexistent key returns nil
+        assert client.execute_command('BLOB.INFO', 'nokey') is None
+        assert client.execute_command('BLOB.INFO', 'nokey', 'LEN') is None
         # Wrong type error
         client.execute_command('SET', 'strkey', 'plain')
         try:
@@ -267,7 +292,7 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             client.execute_command('BLOB.INFO', 'badkey', 'NOTREAL')
             assert False, "Expected wrong information field error"
         except ResponseError as e:
-            assert 'invalid information value' in str(e).lower(), f"Unexpected error: {e}"
+            assert 'invalid information field' in str(e).lower(), f"Unexpected error: {e}"
 
 
 class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):

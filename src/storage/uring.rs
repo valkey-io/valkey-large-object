@@ -89,6 +89,8 @@ enum PendingOp {
         /// True if issued as ReadFixed — counts against `fixed_in_flight`, which
         /// gates the whole-table re-registration (see `poller_loop`).
         fixed: bool,
+        /// Readv iovec, kept until the CQE: the kernel may read it after submit.
+        _iov: Option<Box<libc::iovec>>,
     },
     Write {
         tx: oneshot::Sender<Result<(), StorageError>>,
@@ -96,6 +98,8 @@ enum PendingOp {
         expected_bytes: u64,
         /// True if issued as WriteFixed — counts against `fixed_in_flight`.
         fixed: bool,
+        /// Writev iovec, kept until the CQE (see `Read::_iov`).
+        _iov: Option<Box<libc::iovec>>,
     },
 }
 
@@ -347,6 +351,7 @@ impl UringEngine {
                         // Kill-switch: while a re-register is pending, issue non-fixed so a
                         // stale iovec_index against the about-to-change table is never used.
                         let issue_fixed = op.use_fixed && !registration_pending;
+                        let mut iov = None;
                         let sqe = if issue_fixed {
                             io_uring::opcode::ReadFixed::new(
                                 io_uring::types::Fd(fd),
@@ -358,10 +363,14 @@ impl UringEngine {
                             .build()
                             .user_data(token)
                         } else {
-                            io_uring::opcode::Read::new(
+                            let v = iov.insert(Box::new(libc::iovec {
+                                iov_base: op.buf_ptr as *mut libc::c_void,
+                                iov_len: read_len as usize,
+                            }));
+                            io_uring::opcode::Readv::new(
                                 io_uring::types::Fd(fd),
-                                op.buf_ptr,
-                                read_len,
+                                &**v as *const libc::iovec,
+                                1,
                             )
                             .offset(op.file_offset)
                             .build()
@@ -373,12 +382,14 @@ impl UringEngine {
                                 tx,
                                 expected_bytes: op.len,
                                 fixed: issue_fixed,
+                                _iov: iov,
                             },
                         )
                     }
                     IoRequest::Write { fd, op, tx } => {
                         let write_len = super::align_up(op.len as usize) as u32;
                         let issue_fixed = op.use_fixed && !registration_pending;
+                        let mut iov = None;
                         let sqe = if issue_fixed {
                             io_uring::opcode::WriteFixed::new(
                                 io_uring::types::Fd(fd),
@@ -390,10 +401,14 @@ impl UringEngine {
                             .build()
                             .user_data(token)
                         } else {
-                            io_uring::opcode::Write::new(
+                            let v = iov.insert(Box::new(libc::iovec {
+                                iov_base: op.buf_ptr as *mut libc::c_void,
+                                iov_len: write_len as usize,
+                            }));
+                            io_uring::opcode::Writev::new(
                                 io_uring::types::Fd(fd),
-                                op.buf_ptr as *const u8,
-                                write_len,
+                                &**v as *const libc::iovec,
+                                1,
                             )
                             .offset(op.file_offset)
                             .build()
@@ -405,6 +420,7 @@ impl UringEngine {
                                 tx,
                                 expected_bytes: op.len,
                                 fixed: issue_fixed,
+                                _iov: iov,
                             },
                         )
                     }

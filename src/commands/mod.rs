@@ -4,7 +4,7 @@
 //! BLOB.TCP_GET key
 //! BLOB.RDMA_GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
 //! BLOB.TCP_SET key <data>
-//! BLOB.RDMA_SET key total_len rkey1 addr1 len1 [...]
+//! BLOB.RDMA_SET key total_len [CRC <crc32c>] rkey1 addr1 len1 [...]
 //! BLOB.INFO key [LEN|CRC|TIER]
 
 use std::sync::Arc;
@@ -24,7 +24,7 @@ const MAX_EFA_ADDRESSES: usize = 256;
 
 /// The RDMA session the client previously established with BLOB.RDMA_HELLO.
 fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
-    session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_DMA_SESSION))
+    session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_RDMA_SESSION))
 }
 
 /// Parse the client's memory addresses from `args[start_idx..]`, which must be
@@ -37,11 +37,11 @@ fn parse_efa_addresses(
 ) -> Result<Vec<ClientEFAAddress>, ValkeyError> {
     let tail = &args[start_idx..];
     if tail.is_empty() || !tail.len().is_multiple_of(3) {
-        return Err(ValkeyError::Str(errors::ERR_MALFORMED_ADDR_ARGS));
+        return Err(ValkeyError::Str(errors::ERR_MALFORMED_MEMORY_ADDR_ARGS));
     }
     let n_addrs = tail.len() / 3;
     if n_addrs > MAX_EFA_ADDRESSES {
-        return Err(ValkeyError::Str(errors::ERR_TOO_MANY_ADDRESSES));
+        return Err(ValkeyError::Str(errors::ERR_TOO_MANY_MEMORY_ADDRESSES));
     }
     let mut addrs = Vec::with_capacity(n_addrs);
     let mut total_addr_len: u64 = 0;
@@ -54,22 +54,49 @@ fn parse_efa_addresses(
         let addr: u64 = tail[base + 1]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_REMOTE_ADDR))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR))?;
         let len: u64 = tail[base + 2]
             .to_string_lossy()
             .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_ADDR_LEN))?;
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR_LEN))?;
         // A zero-length address can never absorb bytes
         if 0 == len {
-            return Err(ValkeyError::Str(errors::ERR_INVALID_ADDR_LEN));
+            return Err(ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR_LEN));
         }
         addrs.push((addr, len as usize, rkey));
         total_addr_len = total_addr_len.saturating_add(len);
     }
     if total_addr_len < required_len {
-        return Err(ValkeyError::Str(errors::ERR_INSUFFICIENT_ADDR_SPACE));
+        return Err(ValkeyError::String(format!(
+            "ERR client memory address length {} smaller than object length {}",
+            total_addr_len, required_len
+        )));
     }
     Ok(addrs)
+}
+
+/// Parse the optional `CRC <crc32c>` token from `args[start_idx]`. Returns the
+/// client-supplied CRC and the index where address triples begin. When the token
+/// is absent, addresses start at `start_idx` and the CRC is None.
+fn parse_optional_crc(
+    args: &[ValkeyString],
+    start_idx: usize,
+) -> Result<(Option<u32>, usize), ValkeyError> {
+    if args.len() > start_idx
+        && args[start_idx]
+            .to_string_lossy()
+            .eq_ignore_ascii_case("CRC")
+    {
+        let crc: u32 = args
+            .get(start_idx + 1)
+            .ok_or(ValkeyError::WrongArity)?
+            .to_string_lossy()
+            .parse()
+            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_CRC))?;
+        Ok((Some(crc), start_idx + 2))
+    } else {
+        Ok((None, start_idx))
+    }
 }
 
 // ─── BLOB.RDMA_HELLO ───────────────────────────────────────────────────────────
@@ -85,18 +112,18 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     }
 
     let Some(fabric) = transport::fabric() else {
-        return Err(ValkeyError::Str(errors::ERR_EFA_UNAVAILABLE));
+        return Err(ValkeyError::Str(errors::ERR_RDMA_UNAVAILABLE));
     };
 
-    let peer_address = decode_hex(args[1].as_slice())
-        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_PEER_ADDR_HEX))?;
+    let rdma_address = decode_hex(args[1].as_slice())
+        .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RDMA_ADDR_HEX))?;
     // An EFA address is exactly 32 bytes; a tcp one is a sockaddr, opaque beyond being non-empty.
     match crate::fabric_provider() {
-        FabricProvider::EfaDirect if peer_address.len() != 32 => {
-            return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_LEN));
+        FabricProvider::EfaDirect if rdma_address.len() != 32 => {
+            return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_LEN));
         }
-        FabricProvider::Emulated if peer_address.is_empty() => {
-            return Err(ValkeyError::Str(errors::ERR_PEER_ADDR_EMPTY));
+        FabricProvider::Emulated if rdma_address.is_empty() => {
+            return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_EMPTY));
         }
         FabricProvider::EfaDirect | FabricProvider::Emulated => {}
     }
@@ -106,12 +133,12 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // inserting the new one; when the client's old endpoint has died and the new one reuses its
     // QPN, efa-direct cannot represent both (vdma/.claude/open_issue.md). Reconnect instead.
     if session::lookup(client_id).is_some() {
-        return Err(ValkeyError::Str(errors::ERR_DMA_SESSION_EXISTS));
+        return Err(ValkeyError::Str(errors::ERR_RDMA_SESSION_EXISTS));
     }
     fabric
-        .add_peer(client_id, &peer_address)
-        .map_err(|e| ValkeyError::String(format!("{}: {}", errors::ERR_SESSION_CREATE, e)))?;
-    session::insert(client_id, Session::new(client_id, peer_address));
+        .add_peer(client_id, &rdma_address)
+        .map_err(|_| ValkeyError::Str(errors::ERR_SESSION_CREATE))?;
+    session::insert(client_id, Session::new(client_id, rdma_address));
 
     let reply: Vec<ValkeyValue> = fabric
         .local_addresses()
@@ -223,8 +250,10 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 // ─── BLOB.RDMA_SET ─────────────────────────────────────────────────────────────
 //
-// BLOB.RDMA_SET key total_len rkey1 addr1 len1 [rkey2 addr2 len2 ...]
-// Reads object data from client-registered memory via RDMA.
+// BLOB.RDMA_SET key total_len [CRC <crc32c>] rkey1 addr1 len1 [rkey2 addr2 len2 ...]
+// Reads object data from client-registered memory via RDMA. When the optional
+// CRC token is present, the server verifies the post-transfer CRC32C against the
+// client-supplied value and rejects the SET on mismatch.
 
 pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     // At least: cmd + key + total_len + one (rkey, addr, len) triple = 6 args.
@@ -255,9 +284,15 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if obj_len > max_obj_size {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
-    let addrs = parse_efa_addresses(&args, 3, obj_len)?;
+    // Optional CRC token: "CRC <u32>" between total_len and the first address triple.
+    let (client_crc, addr_start) = parse_optional_crc(&args, 3)?;
+    let addrs = parse_efa_addresses(&args, addr_start, obj_len)?;
     let session = efa_session(ctx)?;
-    let data_source = DataSource::Efa { session, addrs };
+    let data_source = DataSource::Efa {
+        session,
+        addrs,
+        client_crc,
+    };
     // Dispatch to engine — it decides sync vs async internally.
     match engine::execute_set(ctx, &args[1], obj_len, data_source, old_oid) {
         engine::EngineResult::Sync(result) => result,
@@ -282,7 +317,7 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         .map_err(|_| ValkeyError::WrongType)?
     {
         Some(v) if !v.reclaim_in_progress() => v,
-        _ => return Err(ValkeyError::Str(errors::ERR_NOT_FOUND)),
+        _ => return Ok(ValkeyValue::Null),
     };
 
     let len = ValkeyValue::Integer(value.len as i64);
@@ -325,6 +360,7 @@ mod tests {
         match parse_efa_addresses(&vs, 0, required_len) {
             Ok(addrs) => panic!("expected rejection, parsed {addrs:?}"),
             Err(ValkeyError::Str(message)) => message.to_string(),
+            Err(ValkeyError::String(message)) => message,
             Err(ValkeyError::WrongArity) => "WrongArity".to_string(),
             Err(other) => panic!("unexpected error variant: {other:?}"),
         }
@@ -377,12 +413,12 @@ mod tests {
         // Shortfall is rejected.
         assert_eq!(
             reject(&["7", "64", "4095"], 4096),
-            errors::ERR_INSUFFICIENT_ADDR_SPACE
+            "ERR client memory address length 4095 smaller than object length 4096"
         );
         // Summed across addresses, still one byte short.
         assert_eq!(
             reject(&["7", "64", "2048", "8", "9000", "2047"], 4096),
-            errors::ERR_INSUFFICIENT_ADDR_SPACE
+            "ERR client memory address length 4095 smaller than object length 4096"
         );
     }
 
@@ -390,14 +426,17 @@ mod tests {
     fn incomplete_triples_are_rejected() {
         assert_eq!(
             reject(&[] as &[&str], 4096),
-            errors::ERR_MALFORMED_ADDR_ARGS
+            errors::ERR_MALFORMED_MEMORY_ADDR_ARGS
         );
-        assert_eq!(reject(&["7"], 4096), errors::ERR_MALFORMED_ADDR_ARGS);
-        assert_eq!(reject(&["7", "64"], 4096), errors::ERR_MALFORMED_ADDR_ARGS);
+        assert_eq!(reject(&["7"], 4096), errors::ERR_MALFORMED_MEMORY_ADDR_ARGS);
+        assert_eq!(
+            reject(&["7", "64"], 4096),
+            errors::ERR_MALFORMED_MEMORY_ADDR_ARGS
+        );
         // One complete triple + one leftover.
         assert_eq!(
             reject(&["7", "64", "4096", "extra"], 4096),
-            errors::ERR_MALFORMED_ADDR_ARGS
+            errors::ERR_MALFORMED_MEMORY_ADDR_ARGS
         );
     }
 
@@ -407,7 +446,7 @@ mod tests {
             .flat_map(|i| ["7".to_string(), (i * 4096).to_string(), "4096".to_string()])
             .collect();
         let refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
-        assert_eq!(reject(&refs, 4096), errors::ERR_TOO_MANY_ADDRESSES);
+        assert_eq!(reject(&refs, 4096), errors::ERR_TOO_MANY_MEMORY_ADDRESSES);
     }
 
     #[test]
@@ -418,15 +457,88 @@ mod tests {
         );
         assert_eq!(
             reject(&["7", "notanaddr", "4096"], 4096),
-            errors::ERR_INVALID_REMOTE_ADDR
+            errors::ERR_INVALID_MEMORY_ADDR
         );
         assert_eq!(
             reject(&["7", "64", "notalen"], 4096),
-            errors::ERR_INVALID_ADDR_LEN
+            errors::ERR_INVALID_MEMORY_ADDR_LEN
         );
         assert_eq!(
             reject(&["7", "64", "0"], 4096),
-            errors::ERR_INVALID_ADDR_LEN
+            errors::ERR_INVALID_MEMORY_ADDR_LEN
+        );
+    }
+
+    // ─── CRC parsing tests ──────────────────────────────────────────────────
+
+    /// Call `parse_optional_crc` starting at index 0 and return the result or error string.
+    fn parse_crc(args: &[&str]) -> Result<(Option<u32>, usize), String> {
+        let vs = vs(args);
+        parse_optional_crc(&vs, 0).map_err(|e| match e {
+            ValkeyError::Str(message) => message.to_string(),
+            ValkeyError::WrongArity => "WrongArity".to_string(),
+            other => panic!("unexpected error variant: {other:?}"),
+        })
+    }
+
+    #[test]
+    fn crc_keyword_with_no_value_eats_rkey() {
+        // "CRC 999 4096 8192" — CRC consumes "999" as the CRC value, leaving
+        // "4096 8192" which is not a multiple of 3 → malformed triples.
+        let args = vs(&["CMD", "key", "4096", "CRC", "999", "4096", "8192"]);
+        let (client_crc, addr_start) = parse_optional_crc(&args, 3).unwrap();
+        assert_eq!(client_crc, Some(999));
+        assert_eq!(addr_start, 5);
+        // The leftover ["4096", "8192"] fails the triplet parser.
+        let err = match parse_efa_addresses(&args, addr_start, 4096) {
+            Err(ValkeyError::Str(msg)) => msg.to_string(),
+            other => panic!("expected Str error, got {other:?}"),
+        };
+        assert_eq!(err, errors::ERR_MALFORMED_MEMORY_ADDR_ARGS);
+    }
+
+    #[test]
+    fn crc_keyword_with_garbage_value_is_rejected() {
+        assert_eq!(
+            parse_crc(&["CRC", "notanumber"]),
+            Err(errors::ERR_INVALID_CRC.to_string())
+        );
+        assert_eq!(
+            parse_crc(&["CRC", "-1"]),
+            Err(errors::ERR_INVALID_CRC.to_string())
+        );
+        assert_eq!(
+            parse_crc(&["CRC", "4294967296"]),
+            Err(errors::ERR_INVALID_CRC.to_string())
+        ); // u32::MAX + 1
+    }
+
+    #[test]
+    fn numeric_rkey_at_crc_position_falls_through() {
+        // A numeric rkey like "999" at position 0 does not match the "CRC" keyword,
+        // so the parser falls through to (None, 0) and the triplet parses normally.
+        let (client_crc, addr_start) = parse_crc(&["999", "4096", "8192"]).unwrap();
+        assert_eq!(client_crc, None);
+        assert_eq!(addr_start, 0);
+        let args = vs(&["999", "4096", "8192"]);
+        assert_eq!(
+            parse_efa_addresses(&args, addr_start, 8192).unwrap(),
+            vec![(4096, 8192, 999)]
+        );
+    }
+
+    #[test]
+    fn crc_token_shifts_address_start() {
+        // Full RDMA_SET arg shape: CMD key total_len CRC <value> rkey addr len
+        // parse_optional_crc at index 3 consumes "CRC 12345" and returns addr_start=5.
+        // parse_efa_addresses at index 5 picks up the valid triple.
+        let args = vs(&["CMD", "key", "4096", "CRC", "12345", "7", "64", "4096"]);
+        let (client_crc, addr_start) = parse_optional_crc(&args, 3).unwrap();
+        assert_eq!(client_crc, Some(12345));
+        assert_eq!(addr_start, 5);
+        assert_eq!(
+            parse_efa_addresses(&args, addr_start, 4096).unwrap(),
+            vec![(64, 4096, 7)]
         );
     }
 }

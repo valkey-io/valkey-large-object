@@ -19,7 +19,7 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 | Command | Description |
 |---------|-------------|
 | `BLOB.TCP_SET key <data>` | Store object (TCP). Data length is implicit. |
-| `BLOB.RDMA_SET key total_len rkey1 addr1 len1 ...` | Store object (RDMA). Server reads `total_len` bytes from the client's memory addresses via RDMA. |
+| `BLOB.RDMA_SET key total_len [CRC crc32c] rkey1 addr1 len1 ...` | Store object (RDMA). Server reads `total_len` bytes from the client's memory addresses via RDMA. Optional CRC for end-to-end verification. |
 | `BLOB.TCP_GET key` | Retrieve object over TCP. Returns a bulk string. |
 | `BLOB.RDMA_GET key rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory addresses. Replies `[obj_len, crc32c]`. |
 | `BLOB.RDMA_HELLO client_efa_addr_hex` | Establish RDMA session for GPU-direct DMA transfers. |
@@ -55,6 +55,19 @@ valkey-server --port 7380 \
         disk-maxmemory 10gb \
         disk-staging-size 64mb
 ```
+
+## Naming conventions
+
+The codebase uses implementation-specific names internally and hardware-neutral names on all client-facing surfaces (error messages, INFO fields, config parameters, command names).
+
+| Internal (code) | Client-facing | Notes |
+|---|---|---|
+| **EFA** (Elastic Fabric Adapter) | **RDMA** | Commands use `BLOB.RDMA_*`. Error strings say "rdma address". Code uses EFA in type/function names and comments. |
+| **NVMe** | **disk** | Config uses `disk-dir`, `disk-maxmemory`. Code uses NVMe in module names (`nvme.rs`) and internal functions. |
+| **NVMe staging pool** | **disk_staging** | INFO fields prefixed `disk_staging_*`, config `disk-staging-size`. Refers to the DRAM buffers used for disk I/O, not the disk itself. |
+| **address** (unqualified) | **rdma address** or **memory address** | "rdma address" = the client's RDMA fabric endpoint (from `BLOB.RDMA_HELLO`). "memory address" = a client-side buffer described by an `(rkey, addr, len)` triple. Never use bare "address" in client-facing strings. |
+
+When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and server log messages. Any string returned to a client must use the client-facing term.
 
 ## Configuration
 

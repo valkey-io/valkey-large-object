@@ -157,7 +157,7 @@ impl Fabric {
 // ─── Global Fabric ───────────────────────────────────────────────────────────
 
 /// `None` before `commit` and after `shutdown`. `None` at commit means this instance has no
-/// fabric: the module runs TCP-only and `BLOB.RDMA_HELLO` reports EFA unavailable.
+/// fabric: the module runs TCP-only and `BLOB.RDMA_HELLO` reports RDMA unavailable.
 static FABRIC: Mutex<Option<Arc<Fabric>>> = Mutex::new(None);
 
 fn slot() -> MutexGuard<'static, Option<Arc<Fabric>>> {

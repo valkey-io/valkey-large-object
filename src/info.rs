@@ -12,16 +12,17 @@ use crate::{operating_mode, OperatingMode};
 
 // ─── Error Metrics ───────────────────────────────────────────────────────────
 
-pub static NVME_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
-pub static NVME_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
-pub static EFA_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
-pub static EFA_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static DISK_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static DISK_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static RDMA_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
+pub static RDMA_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static DRAM_POOL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
-pub static NVME_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
-pub static NVME_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
+pub static DISK_STAGING_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+pub static DISK_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
 pub static SET_FINALIZE_STALE: AtomicU64 = AtomicU64::new(0);
 pub static SET_VALUE_FAILURES: AtomicU64 = AtomicU64::new(0);
-pub static EFA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
+pub static RDMA_DISCARDED_TRANSFERS: AtomicU64 = AtomicU64::new(0);
+pub static CRC_MISMATCH: AtomicU64 = AtomicU64::new(0);
 
 // ─── Core Metrics ────────────────────────────────────────────────────────────
 
@@ -33,6 +34,20 @@ pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Tiered files. Cached copies Tiered drops are demotions, not evictions.
 pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// RDMA payload bytes of successful transfers. Reads pull client memory (the SET
+/// path); writes push into it (the GET path).
+pub static RDMA_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static RDMA_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `part` as a percentage of `whole`, to two decimals ("99.99").
+fn pct(part: u64, whole: u64) -> String {
+    // No budget, e.g. disk-maxmemory 0 (unlimited).
+    if whole == 0 {
+        return "0.00".to_string();
+    }
+    format!("{:.2}", part as f64 * 100.0 / whole as f64)
+}
+
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
     if let Err(e) = info_sections(ctx) {
@@ -43,9 +58,11 @@ pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
 fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     core_metrics_section(ctx)?;
     dram_pool_section(ctx)?;
-    nvme_staging_section(ctx)?;
+    disk_staging_section(ctx)?;
+    disk_section(ctx)?;
     fd_section(ctx)?;
     smartlog_section(ctx)?;
+    rdma_section(ctx)?;
     error_metrics_section(ctx)?;
     Ok(())
 }
@@ -76,6 +93,10 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "disk_unevictable_objects",
             storage::object_file::unevictable_count() as i64,
+        )?
+        .field(
+            "inflight_requests",
+            crate::engine::inflight_requests() as i64,
         )?
         .build_section()?
         .build_info()?;
@@ -128,7 +149,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let seg_size = crate::dram_segment_size();
     let capacity = (total - draining) * seg_size;
     let allocated = dram.allocated_bytes();
-    let util_pct = (allocated * 100).checked_div(capacity).unwrap_or(0) as i64;
+    let util_pct = pct(allocated as u64, capacity as u64);
 
     let mut section = ctx
         .builder()
@@ -176,7 +197,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         )?
         .field("dram_segment_size_bytes", seg_size as i64)?
         .field(
-            "efa_registered_segments",
+            "rdma_registered_segments",
             crate::efa_registered_segment_count() as i64,
         )?
         .field(
@@ -188,7 +209,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .map(|_| ())
 }
 
-fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
+fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let Some(nvme) = storage::NVME_POOL.get() else {
         return Ok(());
     };
@@ -196,16 +217,34 @@ fn nvme_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     let (total, _draining, unused) = nvme.segment_counts();
 
     ctx.builder()
-        .add_section("nvme_staging")
-        .field("nvme_segments", total as i64)?
-        .field("nvme_unused_segments", unused as i64)?
-        .field("nvme_fragment_count", nvme.fragment_count() as i64)?
-        .field("nvme_staging_size_bytes", crate::nvme_staging_size() as i64)?
-        .field("nvme_segment_size_bytes", crate::dram_segment_size() as i64)?
+        .add_section("disk_staging")
+        .field("disk_staging_segments", total as i64)?
+        .field("disk_staging_unused_segments", unused as i64)?
+        .field("disk_staging_fragment_count", nvme.fragment_count() as i64)?
+        .field("disk_staging_size_bytes", crate::nvme_staging_size() as i64)?
         .field(
-            "nvme_uring_registered_segments",
+            "disk_staging_segment_size_bytes",
+            crate::dram_segment_size() as i64,
+        )?
+        .field(
+            "disk_staging_uring_registered_segments",
             nvme.io_uring_registered_count() as i64,
         )?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
+/// Object files on disk, Tiered mode only: how full the disk budget is.
+fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    if operating_mode() != OperatingMode::Tiered {
+        return Ok(());
+    }
+    let util_pct = pct(storage::nvme::nvme_disk_usage(), crate::nvme_maxmemory());
+
+    ctx.builder()
+        .add_section("disk")
+        .field("disk_utilization_pct", util_pct)?
         .build_section()?
         .build_info()
         .map(|_| ())
@@ -277,36 +316,49 @@ fn smartlog_section(ctx: &InfoContext) -> ValkeyResult<()> {
     warnings.build_section()?.build_info().map(|_| ())
 }
 
+/// RDMA sessions and payload bytes, in both modes. Emitted as zeros where no fabric
+/// is available, so consumers can depend on a fixed key set.
+fn rdma_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    ctx.builder()
+        .add_section("rdma")
+        .field("rdma_sessions", crate::transport::session::count() as u64)?
+        .field("rdma_read_bytes", RDMA_READ_BYTES.load(Ordering::Relaxed))?
+        .field("rdma_write_bytes", RDMA_WRITE_BYTES.load(Ordering::Relaxed))?
+        .build_section()?
+        .build_info()
+        .map(|_| ())
+}
+
 fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
     ctx.builder()
         .add_section("error_metrics")
         .field(
-            "nvme_read_errors",
-            NVME_READ_ERRORS.load(Ordering::Relaxed) as i64,
+            "disk_read_errors",
+            DISK_READ_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "nvme_write_errors",
-            NVME_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
+            "disk_write_errors",
+            DISK_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "efa_read_errors",
-            EFA_READ_ERRORS.load(Ordering::Relaxed) as i64,
+            "rdma_read_errors",
+            RDMA_READ_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "efa_write_errors",
-            EFA_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
+            "rdma_write_errors",
+            RDMA_WRITE_ERRORS.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "dram_pool_exhausted",
             DRAM_POOL_EXHAUSTED.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "nvme_buffer_exhausted",
-            NVME_BUFFER_EXHAUSTED.load(Ordering::Relaxed) as i64,
+            "disk_staging_buffer_exhausted",
+            DISK_STAGING_BUFFER_EXHAUSTED.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "nvme_capacity_exceeded",
-            NVME_CAPACITY_EXCEEDED.load(Ordering::Relaxed) as i64,
+            "disk_capacity_exceeded",
+            DISK_CAPACITY_EXCEEDED.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "set_finalize_stale",
@@ -317,10 +369,26 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             SET_VALUE_FAILURES.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "efa_discarded_transfers",
-            EFA_DISCARDED_TRANSFERS.load(Ordering::Relaxed) as i64,
+            "rdma_discarded_transfers",
+            RDMA_DISCARDED_TRANSFERS.load(Ordering::Relaxed) as i64,
         )?
+        .field("crc_mismatch", CRC_MISMATCH.load(Ordering::Relaxed) as i64)?
         .build_section()?
         .build_info()
         .map(|_| ())
+}
+
+// ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pct_has_two_decimals() {
+        assert_eq!(pct(5, 0), "0.00");
+        assert_eq!(pct(2, 3), "66.67");
+        assert_eq!(pct(1, 8), "12.50");
+        assert_eq!(pct(4096, 4096), "100.00");
+    }
 }

@@ -6,6 +6,7 @@ import pytest
 import subprocess
 from valkey import ResponseError
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
+from valkeytestframework.util.waiters import wait_for_equal
 
 
 # A tcp-provider fabric address: FI_SOCKADDR_IN for 127.0.0.1:1. The server only records it until
@@ -42,28 +43,27 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         first = client.execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS)
         self.verify_error_response(
             client, f'BLOB.RDMA_HELLO {PEER_ADDRESS}',
-            'DMA session already established (one BLOB.RDMA_HELLO per connection)')
+            'RDMA session already established')
         assert self.server.get_new_client().execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS) == first
 
     def test_hello_rejects_bad_hex(self):
         client = self.server.get_new_client()
-        self.verify_error_response(client, 'BLOB.RDMA_HELLO zz', 'invalid peer address hex')
+        self.verify_error_response(client, 'BLOB.RDMA_HELLO zz', 'invalid rdma address hex')
         try:
             client.execute_command('BLOB.RDMA_HELLO', '')
             assert False, "Expected an error for an empty address"
         except ResponseError as e:
-            assert str(e) == 'peer address must not be empty'
+            assert str(e) == 'rdma address must not be empty'
 
     def test_efa_get_needs_hello(self):
-        """The EFA arity of BLOB.RDMA_GET is refused until this client has a session."""
+        """The RDMA arity of BLOB.RDMA_GET is refused until this client has a session."""
         client = self.server.get_new_client()
         client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
         self.verify_error_response(
-            client, 'BLOB.RDMA_GET key 999 0 4096', 'no DMA session (call BLOB.RDMA_HELLO first)')
+            client, 'BLOB.RDMA_GET key 999 0 4096', 'no RDMA session (call BLOB.RDMA_HELLO first)')
 
     def test_rdma_arity_and_malformed_triples_are_refused(self):
         """RDMA commands reject too-few args and incomplete triples.
-
         RDMA_GET: >=5 args (key + at least one triplet). Incomplete triples are refused.
         RDMA_SET: >=6 args (key + total_len + at least one triplet). Incomplete triples are refused.
         """
@@ -80,7 +80,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         # divisible by 3 — caught by parse_efa_addresses.
         self.verify_error_response(
             client, 'BLOB.RDMA_GET key 999 0 4096 7',
-            'address args must be rkey, addr, len triples')
+            'memory address args must be rkey, addr, len triples')
 
 
 class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
@@ -98,7 +98,7 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
 
     def test_hello_reports_unavailable(self):
         client = self.server.get_new_client()
-        self.verify_error_response(client, f'BLOB.RDMA_HELLO {PEER_ADDRESS}', 'EFA unavailable on this instance')
+        self.verify_error_response(client, f'BLOB.RDMA_HELLO {PEER_ADDRESS}', 'RDMA provider unavailable on this instance')
         assert client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096) == b'OK'
 
 # Position-dependent payload for fabric transfers: cycling 0x00..0xFF so that byte-ordering
@@ -184,6 +184,39 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         finally:
             process.kill()
 
+    def test_set_with_matching_crc_succeeds(self):
+        """RDMA_SET with a correct CRC token succeeds and the stored CRC matches."""
+        expected_crc = crc32c.crc32c(PATTERN)
+        process, regions = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            assert client.execute_command(
+                'BLOB.RDMA_SET', 'key', TARGET_LEN,
+                'CRC', expected_crc, *address_args(regions)) == b'OK'
+            assert client.execute_command('BLOB.TCP_GET', 'key') == PATTERN
+            assert client.execute_command('BLOB.INFO', 'key', 'CRC') == expected_crc
+        finally:
+            process.kill()
+
+    def test_set_with_wrong_crc_is_rejected(self):
+        """RDMA_SET with a wrong CRC is rejected and the key is not created."""
+        wrong_crc = crc32c.crc32c(PATTERN) ^ 0xDEADBEEF
+        process, regions = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            before = info_largeobj(client).get('largeobj_crc_mismatch', 0)
+            with pytest.raises(ResponseError, match="CRC mismatch after transfer"):
+                client.execute_command(
+                    'BLOB.RDMA_SET', 'key', TARGET_LEN,
+                    'CRC', wrong_crc, *address_args(regions))
+            assert client.execute_command('EXISTS', 'key') == 0
+            after = info_largeobj(client)
+            assert after['largeobj_crc_mismatch'] - before == 1
+        finally:
+            process.kill()
+
     def test_multi_transfer_mixed_protocol(self):
         """Do mixed sets and gets, read the server value into the client, set it back, and
         read it back in the test"""
@@ -258,10 +291,62 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             first = f'{regions[0].rkey} {regions[0].addr} {regions[0].len}'
             self.verify_error_response(
                 client, f'BLOB.RDMA_GET key {first}',
-                'client address space smaller than object length')
+                f'client memory address length {regions[0].len} smaller than object length {TARGET_LEN}')
             self.verify_error_response(
                 client, f'BLOB.RDMA_SET key {TARGET_LEN} {first}',
-                'client address space smaller than object length')
+                f'client memory address length {regions[0].len} smaller than object length {TARGET_LEN}')
+        finally:
+            process.kill()
+
+    def test_info_rdma_traffic(self):
+        """INFO counts the bytes that crossed RDMA: a GET pushes out (writes) and a SET pulls
+        in (reads). TCP traffic counts nowhere, finished requests are no longer in flight, and
+        the session goes when its connection does."""
+        process, regions = self.start_target('--read', split=[1024, 3072])
+        try:
+            client = self.server.get_new_client()
+
+            def rdma():
+                return client.info('largeobj_rdma')
+
+            client.execute_command('BLOB.TCP_SET', 'key', PATTERN)
+            assert client.execute_command('BLOB.TCP_GET', 'key') == PATTERN
+            assert set(rdma().values()) == {0}
+
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            assert rdma()['largeobj_rdma_sessions'] == 1
+            assert client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions)) == [
+                TARGET_LEN, crc32c.crc32c(PATTERN)]
+            assert rdma()['largeobj_rdma_write_bytes'] == TARGET_LEN
+            assert rdma()['largeobj_rdma_read_bytes'] == 0
+
+            assert client.execute_command(
+                'BLOB.RDMA_SET', 'copy', TARGET_LEN, *address_args(regions)) == b'OK'
+            assert rdma()['largeobj_rdma_read_bytes'] == TARGET_LEN
+            assert rdma()['largeobj_rdma_write_bytes'] == TARGET_LEN
+            assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
+
+            client.close()
+            observer = self.server.get_new_client()
+            wait_for_equal(lambda: observer.info('largeobj_rdma')['largeobj_rdma_sessions'], 0)
+        finally:
+            process.kill()
+
+    def test_info_rdma_failed_transfer_moves_no_bytes(self):
+        """A failed transfer adds no bytes, and its request is no longer in flight."""
+        process, regions = self.start_target()
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('BLOB.TCP_SET', 'key', PATTERN)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            # Just past the end of the target's registered region.
+            region = regions[0]
+            self.verify_error_response(
+                client, f'BLOB.RDMA_GET key {region.rkey} {region.addr + region.len} {region.len}',
+                'RDMA write failed')
+            assert client.info('largeobj_rdma')['largeobj_rdma_write_bytes'] == 0
+            assert client.info('largeobj_error_metrics')['largeobj_rdma_write_errors'] == 1
+            assert client.info('largeobj_core_metrics')['largeobj_inflight_requests'] == 0
         finally:
             process.kill()
 
@@ -367,11 +452,14 @@ class TestLargeObjEfaPartialFailure(ValkeyLargeObjTestCaseBase):
             client = self.server.get_new_client()
             client.execute_command('BLOB.TCP_SET', 'key', payload)
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
-            before = info_largeobj(client).get('largeobj_efa_discarded_transfers', 0)
-            with pytest.raises(ResponseError, match="EFA write"):
+            before = info_largeobj(client).get('largeobj_rdma_discarded_transfers', 0)
+            write_bytes_before = info_largeobj(client)['largeobj_rdma_write_bytes']
+            with pytest.raises(ResponseError, match="RDMA write"):
                 client.execute_command('BLOB.RDMA_GET', 'key', *address_args(regions))
             after = info_largeobj(client)
-            assert after['largeobj_efa_discarded_transfers'] - before == 1, \
-                f"expected exactly 1 discarded transfer, got {after['largeobj_efa_discarded_transfers'] - before}"
+            assert after['largeobj_rdma_discarded_transfers'] - before == 1, \
+                f"expected exactly 1 discarded transfer, got {after['largeobj_rdma_discarded_transfers'] - before}"
+            # The drained transfer still moved its bytes.
+            assert after['largeobj_rdma_write_bytes'] - write_bytes_before == regions[0].len
         finally:
             process.kill()

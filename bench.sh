@@ -68,7 +68,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --keys <N>                 Number of keys to populate (default: 500)"
             echo "  --maxmemory <BYTES>        Server maxmemory; DRAM pool scales toward it (default: 34359738368 = 32GB)"
             echo "  --segment-size <BYTES>     Segment size in bytes (default: 67108864 = 64MB)"
-            echo "  --disk-maxmemory <BYTES>   NVMe budget in bytes (default: 107374182400 = 100GB)"
+            echo "  --disk-maxmemory <BYTES>   Disk budget in bytes (default: 107374182400 = 100GB)"
             echo "  --worker-threads <N>       Tokio threads (default: 2)"
             echo ""
             echo "Modes:"
@@ -188,22 +188,22 @@ print_scaling() {
     local label="$1"
     local info
     info=$($VALKEY_CLI -p $PORT INFO largeobj 2>/dev/null | tr -d '\r')
-    local live nvme_live util expands shrinks dram_uring nvme_uring efa
+    local live nvme_live util expands shrinks dram_uring nvme_uring rdma
     live=$(echo       "$info" | grep -E "dram_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
-    nvme_live=$(echo  "$info" | grep -E "nvme_live_segments"              | awk -F: '{print $2}' | tr -d '[:space:]')
-    util=$(echo       "$info" | grep -E "utilization_pct"                 | awk -F: '{print $2}' | tr -d '[:space:]')
+    nvme_live=$(echo  "$info" | grep -E "disk_staging_segments"           | awk -F: '{print $2}' | tr -d '[:space:]')
+    util=$(echo       "$info" | grep -E "^largeobj_dram_utilization_pct:" | awk -F: '{print $2}' | tr -d '[:space:]')
     expands=$(echo    "$info" | grep -E "scaling_expands"            | awk -F: '{print $2}' | tr -d '[:space:]')
     shrinks=$(echo    "$info" | grep -E "scaling_shrinks"            | awk -F: '{print $2}' | tr -d '[:space:]')
     dram_uring=$(echo "$info" | grep -E "dram_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
-    nvme_uring=$(echo "$info" | grep -E "nvme_uring_registered_segments"  | awk -F: '{print $2}' | tr -d '[:space:]')
-    efa=$(echo        "$info" | grep -E "efa_registered_segments"         | awk -F: '{print $2}' | tr -d '[:space:]')
+    nvme_uring=$(echo "$info" | grep -E "disk_staging_uring_registered_segments" | awk -F: '{print $2}' | tr -d '[:space:]')
+    rdma=$(echo       "$info" | grep -E "rdma_registered_segments"         | awk -F: '{print $2}' | tr -d '[:space:]')
     local total_live=$(( ${live:-0} + ${nvme_live:-0} ))
     echo "     [scaling: $label] dram_live=${live:-?} nvme_live=${nvme_live:-0} total_live=${total_live} util_pct=${util:-?} expand=${expands:-?} shrink=${shrinks:-?}"
     # io_uring registration coverage, per pool: each should equal that pool's live
     # count once the post-expand re-register has completed. Dram mode shows dram=0 (no
-    # io_uring engine). EFA is fabric-global (one MR per segment, not per-pool), so
+    # io_uring engine). RDMA is fabric-global (one MR per segment, not per-pool), so
     # it is reported once against total_live.
-    echo "     [registered: $label] io_uring dram=${dram_uring:-0}/${live:-?} nvme=${nvme_uring:-0}/${nvme_live:-0}  efa=${efa:-?}/${total_live}"
+    echo "     [registered: $label] io_uring dram=${dram_uring:-0}/${live:-?} nvme=${nvme_uring:-0}/${nvme_live:-0}  rdma=${rdma:-?}/${total_live}"
 }
 
 # Run one BLOB.TCP_GET benchmark pass and print throughput + latency. Arg: label.

@@ -759,7 +759,7 @@ mod tests {
                     (&CFG_DISK_STAGING_SIZE, chunk - 1),
                     (&CFG_MAX_OBJECT_SIZE, chunk - 1),
                 ],
-                Some("segment-size must be >= chunk-size"),
+                Some("largeobj.segment-size must be >= largeobj.chunk-size"),
             ),
             (
                 "segment_lt_max_obj_rejected",
@@ -768,31 +768,31 @@ mod tests {
                     (&CFG_SEGMENT_SIZE, max_obj - 1),
                     (&CFG_DISK_STAGING_SIZE, max_obj - 1),
                 ],
-                Some("segment-size is insufficient for max-object-size"),
+                Some("largeobj.segment-size is insufficient for largeobj.max-object-size"),
             ),
             (
                 "segment_lt_promote_rejected",
                 OperatingMode::Tiered,
                 vec![(&CFG_MAX_PROMOTE_SIZE, segment + 1)],
-                Some("segment-size is insufficient for max-promote-size"),
+                Some("largeobj.segment-size is insufficient for largeobj.max-promote-size"),
             ),
             (
                 "staging_lt_segment_rejected",
                 OperatingMode::Tiered,
                 vec![(&CFG_DISK_STAGING_SIZE, segment - 1)],
-                Some("disk-staging-size must be >= segment-size"),
+                Some("largeobj.disk-staging-size must be >= largeobj.segment-size"),
             ),
             (
                 "buffers_max_lt_min_rejected",
                 OperatingMode::Dram,
                 vec![(&CFG_MAX_BUFFERS_PER_OP, min_buf - 1)],
-                Some("max-buffers-per-op must be >= min-buffers-per-op"),
+                Some("largeobj.max-buffers-per-op must be >= largeobj.min-buffers-per-op"),
             ),
             (
                 "tiered_mode_nvme_lt_max_obj_rejected",
                 OperatingMode::Tiered,
                 vec![(&CFG_DISK_MAXMEMORY, max_obj - 1)],
-                Some("disk-maxmemory must be >= max-object-size in Tiered mode"),
+                Some("largeobj.disk-maxmemory must be >= largeobj.max-object-size in Tiered mode"),
             ),
         ]
     }

@@ -65,7 +65,7 @@ Each term builds on the previous.
 
 ## 2. Option 2: Per-Request rkey with HELLO
 
-Client establishes a session once via `BLOB.RDMA_HELLO` using the provided client EFA addr. Server registers the client EFA addr on all its N EFA devices. Subsequent GET/SET commands carry the client's rkey and remote_addr — the client chooses which memory address to use per request. A second `BLOB.RDMA_HELLO` on the same connection is refused (`ERR DMA session already established`), because the efa-direct provider cannot hold a client's old and new endpoint at once when the new one reuses the old QPN.
+Client establishes a session once via `BLOB.RDMA_HELLO` using the provided client EFA addr. Server registers the client EFA addr on all its N EFA devices. Subsequent RDMA_GET/RDMA_SET commands carry the client's rkey and remote_addr — the client chooses which memory address to use per request. A second `BLOB.RDMA_HELLO` on the same connection is refused (`ERR RDMA session already established`), because the efa-direct provider cannot hold a client's old and new endpoint at once when the new one reuses the old QPN.
 
 **Threading model:** The session holds routing handles for all N server EFA devices. Any thread can use any device for a given operation — the server picks the least-loaded device (least-loaded). Threads do not own specific devices.
 
@@ -111,11 +111,13 @@ command. The address count is inferred from the argument count (must be a multip
 ### BLOB.RDMA_SET (DMA)
 
 ```
-BLOB.RDMA_SET <key> <total_len> <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
+BLOB.RDMA_SET <key> <total_len> [CRC <crc32c>] <rkey1> <addr1> <len1> [<rkey2> <addr2> <len2> ...]
 ```
 
 `total_len` is the object's length; the addresses are where its bytes currently live.
 The address count is inferred from the argument count (must be a multiple of 3).
+When the optional `CRC` token is present, the server compares the post-transfer CRC32C
+against the client-supplied value and rejects the SET on mismatch.
 
 | Step | Who | Action |
 |------|-----|--------|
@@ -124,6 +126,7 @@ The address count is inferred from the argument count (must be a multiple of 3).
 | 3 | Server | Picks EFA device (least-loaded LB) |
 | 4 | Server | Per chunk, `fi_read(buf, len, dest_fi_addr, addr, rkey)` from each address that chunk spans, in address order |
 | 5 | Server | Waits for CQ completions, writes through to the configured tier, stores key mapping |
+| 5a | Server | If CRC was provided, verifies computed CRC32C matches; rejects with error on mismatch |
 | 6 | Server | Replies OK |
 
 
