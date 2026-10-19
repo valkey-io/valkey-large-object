@@ -1262,23 +1262,29 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
             for c in clients:
                 c.close()
 
-    def test_config_set_maxclients_moves_cached_fds_to_grown_module_range(self):
-        """CONFIG SET maxclients grows the event loop over the fds placed at load
-        (228+). The module evicts those from the cache, so none stays in the core
-        range, and the next GETs reopen them in the new module range (module start
-        500 + CONFIG_FDSET_INCR 128 = 628). Lowering maxclients again keeps the module
-        start: clients above the lower value stay connected, so nothing is evicted
-        and new opens still land at 628+."""
+    def test_config_set_maxclients_evicts_cached_fds_below_the_new_module_start(self):
+        """CONFIG SET maxclients grows the event loop over the fds placed at load (228+).
+        Growing 100 to 250 moves the module start to 378: only the cached fds in 228..377
+        are evicted, those at 378+ stay. Growing to 500 moves it to 628: the rest are
+        evicted, none stays in the core range, and the next GETs reopen them at 628+.
+        Lowering maxclients again keeps the module start: clients above the lower value
+        stay connected, so nothing is evicted and new opens still land at 628+."""
         client = self.server.get_new_client()
         for i in range(self.OBJECTS):
             client.execute_command('BLOB.TCP_SET', f'obj_{i}', b'x' * 4096)
             client.execute_command('BLOB.TCP_GET', f'obj_{i}')
-        assert client.info('largeobj_fd')['largeobj_fd_cache_entries'] == self.OBJECTS
-        assert min(self.object_fds(client)) >= 228
+        before = self.object_fds(client)
+        kept = sorted(fd for fd in before if fd >= 378)
+        assert len(before) == self.OBJECTS
+        assert min(before) >= 228
+        assert kept and len(kept) < self.OBJECTS
+
+        client.execute_command('CONFIG', 'SET', 'maxclients', '250')
+        assert client.info('largeobj_fd')['largeobj_fd_cache_entries'] == len(kept)
+        assert sorted(self.object_fds(client)) == kept
 
         client.execute_command('CONFIG', 'SET', 'maxclients', '500')
         assert client.info('largeobj_fd')['largeobj_fd_cache_entries'] == 0
-
         for i in range(self.OBJECTS):
             assert client.execute_command('BLOB.TCP_GET', f'obj_{i}') == b'x' * 4096
         assert client.info('largeobj_fd')['largeobj_fd_cache_entries'] == self.OBJECTS
@@ -1292,22 +1298,6 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', 'obj_new') == b'x' * 4096
         assert client.info('largeobj_fd')['largeobj_fd_cache_entries'] == self.OBJECTS + 1
         assert min(self.object_fds(client)) >= 628
-
-    def test_config_set_maxclients_evicts_only_fds_below_new_module_start(self):
-        """Growing maxclients from 100 to 250 moves the module start from 228 to 378. Only
-        the cached fds in 228..377 are evicted; those already at 378+ stay cached."""
-        client = self.server.get_new_client()
-        for i in range(self.OBJECTS):
-            client.execute_command('BLOB.TCP_SET', f'obj_{i}', b'x' * 4096)
-            client.execute_command('BLOB.TCP_GET', f'obj_{i}')
-        before = self.object_fds(client)
-        kept = sorted(fd for fd in before if fd >= 378)
-        assert len(before) == self.OBJECTS
-        assert kept and len(kept) < self.OBJECTS
-
-        client.execute_command('CONFIG', 'SET', 'maxclients', '250')
-        assert client.info('largeobj_fd')['largeobj_fd_cache_entries'] == len(kept)
-        assert sorted(self.object_fds(client)) == kept
 
     def test_max_cached_fds_above_what_the_fd_limit_allows_is_clamped(self):
         """Limit 1000 leaves 772 fds in the module range (from 228), and 100 of them are
@@ -1392,12 +1382,14 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
             assert line.split()[3:5] == [str(nofile), str(nofile)]  # soft, hard
         return server, client
 
-    def test_loads_with_limit_inside_core_range(self):
-        """Valkey's stock open-file limit is maxclients + 32 (132 here), inside the
-        core range (fd numbers below 228). No fd number past the range exists, so no
-        client can be stranded: Tiered loads, placement is off, and the fd cache is
-        off because a cached fd would hold a client's fd number."""
-        server, client = self._start_with_nofile_limit('stock-limit', 132)
+    @pytest.mark.parametrize('nofile', [132, 300])
+    def test_lenient_loads_with_placement_and_cache_off_below_command_reserve(self, nofile):
+        """fd-reserve Lenient loads when the fd limit is below module start 228 + maxclients
+        100 = 328, with placement and the fd cache off: a cached fd would hold a client's
+        fd number. 132 is Valkey's stock limit (maxclients + 32), inside the core range, so
+        no fd number past it exists. 300 is past the module start but short of the reserve.
+        Commands still work."""
+        server, client = self._start_with_nofile_limit(f'lenient-off-{nofile}', nofile)
         assert server.verify_string_in_logfile('object-file fd placement is off')
         assert server.verify_string_in_logfile('fd cache is off')
         assert client.info('largeobj_fd')['largeobj_fd_placement_enabled'] == 0
@@ -1409,63 +1401,40 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         assert fd_info['largeobj_fd_cache_entries'] == 0
         assert fd_info['largeobj_fd_cache_max_entries'] == 0
 
-    def test_lenient_loads_with_limit_below_command_reserve(self):
-        """Limit 300 is past the module start (228) but below the command reserve's end
-        (328). fd-reserve Lenient loads with placement and the fd cache off."""
-        server, client = self._start_with_nofile_limit('partial-limit', 300)
-        assert server.verify_string_in_logfile('object-file fd placement is off')
-        fd_info = client.info('largeobj_fd')
-        assert fd_info['largeobj_fd_placement_enabled'] == 0
-        assert fd_info['largeobj_fd_cache_max_entries'] == 0
-
-    def test_strict_refuses_to_load_below_command_reserve(self):
-        """fd-reserve Strict does not load when the limit (300) is below module start
-        + maxclients (328), and the log names the limit to set."""
+    @pytest.mark.parametrize('nofile,max_cached_fds,needed', [
+        (300, 0, 328),    # the command reserve alone does not fit: 228 + 100
+        (400, 100, 428),  # the reserve fits, the cache does not: 228 + 100 + 100
+    ])
+    def test_strict_refuses_to_load_when_the_reserve_or_cache_does_not_fit(
+            self, nofile, max_cached_fds, needed):
+        """fd-reserve Strict needs module start 228 + maxclients 100 + max-cached-fds. A
+        limit below that does not load, and the log names the limit to set."""
         server, _ = self._start_with_nofile_limit(
-            'strict-refuses', 300, 'fd-reserve Strict max-cached-fds 0', connect=False)
+            f'strict-refuses-{nofile}', nofile,
+            f'fd-reserve Strict max-cached-fds {max_cached_fds}', connect=False)
         wait_for_true(lambda: server.server.poll() is not None)
         assert server.server.returncode != 0
-        assert server.verify_string_in_logfile('set LimitNOFILE to at least 328')
+        assert server.verify_string_in_logfile(f'set LimitNOFILE to at least {needed}')
 
-    def test_strict_refuses_to_load_when_only_the_cache_does_not_fit(self):
-        """Limit 400 covers module start 228 + maxclients 100, which fd-reserve Lenient
-        would accept with a clamped cache. Strict also needs max-cached-fds (100) to
-        fit, so it needs 428 and refuses."""
-        server, _ = self._start_with_nofile_limit(
-            'strict-refuses-cache', 400, 'fd-reserve Strict max-cached-fds 100',
-            connect=False)
-        wait_for_true(lambda: server.server.poll() is not None)
-        assert server.server.returncode != 0
-        assert server.verify_string_in_logfile('set LimitNOFILE to at least 428')
-
-    def test_strict_aborts_when_maxclients_breaks_the_command_reserve(self):
-        """Limit 400 covers module start 228 + maxclients 100. Under fd-reserve Strict
-        the server loads, says how far maxclients may rise (136), and serves. A
-        CONFIG SET maxclients 200 (Valkey accepts it: 232 <= 400) needs 528 and
-        aborts the server."""
+    @pytest.mark.parametrize('nofile,max_cached_fds,new_maxclients,needed', [
+        (400, 0, 200, 528),    # the reserve breaks: module start 328 + 200
+        (500, 100, 140, 508),  # the reserve (408) fits, the cache does not: 268 + 140 + 100
+    ])
+    def test_strict_aborts_when_maxclients_breaks_the_reserve_or_cache(
+            self, nofile, max_cached_fds, new_maxclients, needed):
+        """Under fd-reserve Strict the server loads, says how far maxclients may rise
+        (136 for both), and serves. A CONFIG SET maxclients Valkey accepts but the fd
+        limit cannot hold beside the reserve and the cache aborts the server."""
         server, client = self._start_with_nofile_limit(
-            'strict-aborts', 400, 'fd-reserve Strict max-cached-fds 0')
+            f'strict-aborts-{nofile}', nofile,
+            f'fd-reserve Strict max-cached-fds {max_cached_fds}')
         assert server.verify_string_in_logfile('above 136 aborts the server')
         client.execute_command('BLOB.TCP_SET', 'strict_key', b'x' * 4096)
         assert client.execute_command('BLOB.TCP_GET', 'strict_key') == b'x' * 4096
 
         with server.expect_crash(self):
-            client.execute_command('CONFIG', 'SET', 'maxclients', '200')
-        assert server.verify_string_in_logfile('set LimitNOFILE to at least 528')
-
-    def test_strict_aborts_when_maxclients_squeezes_only_the_cache(self):
-        """Limit 500 holds module start 228 + maxclients 100 + max-cached-fds 100 (428),
-        so Strict loads with the whole cache. CONFIG SET maxclients 140 (Valkey accepts
-        it: 172 <= 500) moves the module start to 268: the reserve alone still fits
-        (408) but the cache no longer does (508), so Strict aborts instead of clamping."""
-        server, client = self._start_with_nofile_limit(
-            'strict-aborts-cache', 500, 'fd-reserve Strict max-cached-fds 100')
-        assert server.verify_string_in_logfile('above 136 aborts the server')
-        assert client.info('largeobj_fd')['largeobj_fd_cache_max_entries'] == 100
-
-        with server.expect_crash(self):
-            client.execute_command('CONFIG', 'SET', 'maxclients', '140')
-        assert server.verify_string_in_logfile('set LimitNOFILE to at least 508')
+            client.execute_command('CONFIG', 'SET', 'maxclients', str(new_maxclients))
+        assert server.verify_string_in_logfile(f'set LimitNOFILE to at least {needed}')
 
     def test_strict_rejects_max_cached_fds_that_does_not_fit(self):
         """Limit 500 fits max-cached-fds 172 (228 + 100 + 172), not 173. Under

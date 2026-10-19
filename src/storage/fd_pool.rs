@@ -60,7 +60,22 @@ impl FdPool {
     /// used to prevent the underlying fd from being closed during inflight read requests.
     /// Returns `None` only on a genuine `open()` failure.
     pub fn get_or_open(&self, object_id: ObjectId, dir: &str) -> Option<Arc<ObjectFd>> {
+        // The cap reads the fd limit (a syscall), so only a miss pays for it.
+        if let Some(fd) = self.lookup(object_id) {
+            return Some(fd);
+        }
         self.get_or_open_with(object_id, dir, super::fd_placement::fd_cache_max_entries())
+    }
+
+    /// The cached fd for `object_id`, if any: shared read lock, touch the score, clone the handle.
+    fn lookup(&self, object_id: ObjectId) -> Option<Arc<ObjectFd>> {
+        let fds = self.fds.read().expect("FdPool.fds lock unavailable");
+        fds.get(&object_id).map(Self::hit)
+    }
+
+    fn hit(entry: &FdEntry) -> Arc<ObjectFd> {
+        entry.stats.touch(now_minutes(), crate::blob_decay_time());
+        Arc::clone(&entry.fd)
     }
 
     /// `get_or_open` with an explicit `max-cached-fds` cap, so
@@ -75,18 +90,8 @@ impl FdPool {
         if cap == 0 {
             return open_read_fd(object_id, dir).map(Arc::new);
         }
-        let now_min = now_minutes();
-        let decay_time = crate::blob_decay_time();
-        let hit = |entry: &FdEntry| {
-            entry.stats.touch(now_min, decay_time);
-            Arc::clone(&entry.fd)
-        };
-        // Fast path: shared read lock, touch the score and clone the cached handle.
-        {
-            let fds = self.fds.read().expect("FdPool.fds lock unavailable");
-            if let Some(entry) = fds.get(&object_id) {
-                return Some(hit(entry));
-            }
+        if let Some(fd) = self.lookup(object_id) {
+            return Some(fd);
         }
 
         // Slow path: serialize opens through the write lock.
@@ -94,9 +99,11 @@ impl FdPool {
 
         // Re-check under the lock: another caller may have opened it meanwhile.
         if let Some(entry) = fds.get(&object_id) {
-            return Some(hit(entry));
+            return Some(Self::hit(entry));
         }
 
+        let now_min = now_minutes();
+        let decay_time = crate::blob_decay_time();
         // Make room before opening, so the cap counts the new entry. Removing an
         // entry only drops the map's ref: a reader still holding a clone keeps the
         // fd open until its read finishes, then it closes. Lowering the cap shrinks
@@ -359,6 +366,25 @@ mod tests {
         for oid in &oids {
             let _ = std::fs::remove_file(oid.file_path(dir));
         }
+    }
+
+    #[test]
+    fn get_or_open_hit_does_not_read_the_cap() {
+        // In a unit test placement is off, so the global fd cache max entries is 0: a lookup
+        // that consulted it would open a fresh fd. A hit returns the cached handle.
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let object_id = ObjectId(0x7600);
+        std::fs::write(object_id.file_path(dir), b"x").unwrap();
+        let pool = FdPool::new();
+
+        if let Some(cached) = pool.get_or_open_with(object_id, dir, 16) {
+            let hit = pool.get_or_open(object_id, dir).expect("cached fd");
+            assert!(Arc::ptr_eq(&cached, &hit));
+            assert_eq!(pool.len(), 1);
+        }
+
+        let _ = std::fs::remove_file(object_id.file_path(dir));
     }
 
     #[test]

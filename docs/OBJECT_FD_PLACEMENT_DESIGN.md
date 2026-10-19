@@ -253,7 +253,7 @@ is an operator action: Valkey fixes the fd limit before the module loads.
 | Item | Behavior |
 |---|---|
 | `max-cached-fds` | 0 to 1048576, default 16384, mutable. 0 disables the cache. Under `Lenient` a value that does not fit is clamped with a warning; under `Strict` it must fit: load refuses, `CONFIG SET` is rejected. |
-| `fd-reserve` | `Lenient` (default) or `Strict`, immutable. What happens when the fd limit does not cover the command reserve (`Strict`: plus `max-cached-fds`): `Lenient` loads with placement and the cache off, or a clamped cache when only the cache is short; `Strict` refuses to load, rejects a `CONFIG SET max-cached-fds` that does not fit, and aborts on a `CONFIG SET maxclients` that breaks the reserve or squeezes the cache. |
+| `fd-reserve` | `Lenient` (default) or `Strict`, immutable. What happens when the fd limit does not cover the command reserve (`Strict`: plus `max-cached-fds`). Behavior per event: decision 1. |
 | `INFO largeobj_fd: open_object_fds` | Object files open now: cached fds, plus the fds of running GETs and SETs (a GET's fd stays counted after the cache evicts it). |
 | `INFO largeobj_fd: fd_placement_enabled` | 1 when placement is on, 0 when the fd limit does not cover the command reserve (`Lenient` only; `Strict` never runs with it off). |
 | `INFO largeobj_fd: fd_placement_failures` | Opens that found no free number in the module range. |
@@ -278,9 +278,9 @@ for Docker, or `ulimit -n` before `valkey-server`. Then restart.
 
 ## 9. Decisions and open items for review
 
-### Decisions (the built behavior is marked)
+### Decisions
 
-**1. What happens when the fd limit does not cover the command reserve?** Built: a policy, `fd-reserve`.
+**1. What happens when the fd limit does not cover the command reserve?** A policy, `fd-reserve`.
 
 The fd limit falls into three zones. `M` is `maxclients`.
 
@@ -291,8 +291,8 @@ The fd limit falls into three zones. `M` is `maxclients`.
 
 | `fd-reserve` | Empty | Partial | Full, cache short | Full, cache fits | `CONFIG SET maxclients` breaks the reserve | `CONFIG SET maxclients` squeezes only the cache | `CONFIG SET max-cached-fds` too large |
 |---|---|---|---|---|---|---|---|
-| **Lenient** (built, default) | load, placement off, cache off | load, placement off, cache off | load, placement on, cache clamped | load | placement off, cache emptied, warning | cache clamped, warning | accepted, clamped, warning |
-| **Strict** (built) | refuse | refuse | refuse | load | abort the server | abort the server | rejected, error names the limit |
+| **Lenient** (default) | load, placement off, cache off | load, placement off, cache off | load, placement on, cache clamped | load | placement off, cache emptied, warning | cache clamped, warning | accepted, clamped, warning |
+| **Strict** | refuse | refuse | refuse | load | abort the server | abort the server | rejected, error names the limit |
 
 Both settings are bad in the partial zone, which is why placement is on only in the full zone. Placement on
 makes commands fail: with an fd limit of 10129 and `M = 10000` the module range has one number, so the
@@ -327,7 +327,7 @@ Rejected shapes of the same decision:
 
 | | Behavior |
 |---|---|
-| **A. Raise** (built) | Logged. Stops Valkey lowering the hard limit on a later `CONFIG SET maxclients`. Goes further than Valkey, which raises only as far as it needs. |
+| **A. Raise** (chosen) | Logged. Stops Valkey lowering the hard limit on a later `CONFIG SET maxclients`. Goes further than Valkey, which raises only as far as it needs. |
 | B. Leave the fd limit alone | Respects a soft limit the operator set on purpose. A later `maxclients` raise can make Valkey lower the hard limit. |
 
 **3. How large is the command reserve?**
@@ -342,7 +342,7 @@ reserve is how many numbers stay free for the fds of running GETs and SETs. The 
 
 | | Reserve | What it gives | Cost |
 |---|---|---|---|
-| **A. `maxclients`** (built) | `maxclients` numbers | Each client runs one command at a time, so every client can have a command running at once and none fails for lack of an fd. | An fd cache of `P` entries needs `limit >= module_start + maxclients + P`: `20128 + P` at `maxclients 10000`. |
+| **A. `maxclients`** (chosen) | `maxclients` numbers | Each client runs one command at a time, so every client can have a command running at once and none fails for lack of an fd. | An fd cache of `P` entries needs `limit >= module_start + maxclients + P`: `20128 + P` at `maxclients 10000`. |
 | B. A configured limit on commands in flight, `N` | `N` numbers | An fd cache of `P` entries needs `limit >= module_start + N + P`, for example `10384 + P` with `N = 256`. Commands past `N` wait. | A new config, a wait mechanism, and a SET/mixed benchmark to choose `N`. |
 
 The reserve is a precondition for placement: below it, `Lenient` runs with placement and the cache off, and

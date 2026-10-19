@@ -1433,7 +1433,7 @@ this section owns the semantics.
 | `promote-min-hits` | `2` | `1` | `255` | Live | Admission-filter misses before a GET promotes an object |
 | `tiered-decay-time` | `1` | `0` (off) | `65535` | Live | LFU decay: minutes per one-point decrement |
 | `reclaim-sample-size` | `5` | `1` | `64` | Live | Objects sampled per cache-eviction round; the lowest LFU score is demoted |
-| `max-cached-fds` | `1024` | `0` (unlimited) | `1048576` | Live | FdPool cap on cached read fds |
+| `max-cached-fds` | `16384` | `0` (no cache) | `1048576` | Live | FdPool cap on cached read fds, clamped to what the fd limit allows (`fd-reserve` sets what happens when it does not fit; see `OBJECT_FD_PLACEMENT_DESIGN.md`) |
 | `max-object-size` | `512MB` | `1` | i64::MAX | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
 | `chunk-size` | `8MB` | `4096` | `256MB` | Immutable | I/O chunk / allocation unit (detail: §7.2) |
 | `max-buffers-per-op` / `min-buffers-per-op` | 8 / 2 | 2 / 1 | 64 / 64 | Live | Streaming pipeline depth (detail: §7.3.6) |
