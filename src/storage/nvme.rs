@@ -7,8 +7,8 @@
 
 use std::mem::size_of;
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use super::context::SegmentBuffer;
 use super::uring;
@@ -117,24 +117,15 @@ fn evict_and_reserve(bytes: u64) -> bool {
             continue;
         };
         match stat(oid) {
-            Ok(Some(len)) => {
+            Some(len) => {
                 covered += len;
                 victims.push((unevictable, len));
             }
             // We collect our victim candidates via a readdir snapshot. Between the
             // readdir and the victim claim (adding the oid to the RECLAIM_LIST), the
             // file may be deleted by an ObjectFile's drop.
-            Ok(None) => {
+            None => {
                 super::reclaim::RECLAIM_LIST.remove(&oid);
-            }
-            // Evicted, but orphaned with its size unknown: the retry stats and frees it.
-            Err(e) => {
-                valkey_module::logging::log_warning(format!(
-                    "largeobj: failed to stat object file {} during eviction, will retry: {e}",
-                    oid.file_path(&crate::disk_dir())
-                ));
-                crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
-                ORPHANED_FILES.push(unevictable, 0);
             }
         }
     }
@@ -159,9 +150,8 @@ fn victim_batch(n: usize) -> Vec<ObjectId> {
         .collect()
 }
 
-/// Unlink claimed `victims` and remove them from the unevictable list,
-/// except orphans, which stay in it until the retry. Returns the bytes freed, not counting
-/// orphans. Victims stay in the reclaim list: their keys read as missing until the cron
+/// Unlink claimed `victims` and remove them from the unevictable list. Returns the bytes
+/// freed. Victims stay in the reclaim list: their keys read as missing until the cron
 /// deletes them, and their teardown then only removes them from it.
 fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
     let mut freed = 0;
@@ -172,101 +162,54 @@ fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
         }
         super::get_dram_pool().remove_object(&oid);
         crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
-        if try_unlink(unevictable, size, "eviction") {
-            freed += size;
-        }
+        unlink(oid);
+        freed += size;
     }
     freed
 }
 
-// ─── Orphaned Files ──────────────────────────────────────────────────────────
-
-/// Files whose unlink failed transiently: still charged, and in the unevictable list
-/// so no eviction takes them. The cron's retry unlinks them and credits their bytes.
-/// Size 0: an eviction could not stat the file, so the retry does first.
-pub struct OrphanedFiles {
-    files: Mutex<Vec<(Arc<super::UnevictableOID>, u64)>>,
-    pub count: AtomicU64,
-    pub bytes: AtomicU64,
-    retrying: AtomicBool,
-}
-
-pub static ORPHANED_FILES: OrphanedFiles = OrphanedFiles {
-    files: Mutex::new(Vec::new()),
-    count: AtomicU64::new(0),
-    bytes: AtomicU64::new(0),
-    retrying: AtomicBool::new(false),
-};
-
-impl OrphanedFiles {
-    fn push(&self, unevictable: Arc<super::UnevictableOID>, size: u64) {
-        self.count.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(size, Ordering::Relaxed);
-        self.files
-            .lock()
-            .expect("ORPHANED_FILES lock unavailable")
-            .push((unevictable, size));
-    }
-
-    /// Scaling cron: retry the unlinks on tokio, one retry at a time.
-    pub fn retry_deletion(&'static self) {
-        if self.count.load(Ordering::Relaxed) == 0 || self.retrying.swap(true, Ordering::Acquire) {
-            return;
-        }
-        crate::runtime_handle().spawn(async {
-            let files =
-                std::mem::take(&mut *self.files.lock().expect("ORPHANED_FILES lock unavailable"));
-            for (unevictable, mut size) in files {
-                let oid = unevictable.oid();
-                let sized = size > 0
-                    || stat(oid).is_ok_and(|len| {
-                        size = len.unwrap_or(0);
-                        self.bytes.fetch_add(size, Ordering::Relaxed);
-                        true
-                    });
-                if sized && unlink(oid).is_ok() {
-                    decrease_nvme_disk_usage(size);
-                    self.count.fetch_sub(1, Ordering::Relaxed);
-                    self.bytes.fetch_sub(size, Ordering::Relaxed);
-                } else {
-                    let mut files = self.files.lock().expect("ORPHANED_FILES lock unavailable");
-                    files.push((unevictable, size));
-                }
-            }
-            self.retrying.store(false, Ordering::Release);
-        });
-    }
-}
-
 /// Unlink `oid`'s file.
-/// - Ok: unlinked, or already gone (`ENOENT`).
-/// - Err: a `transient` error. A retry may succeed.
-/// - Any other error aborts the server.
-fn unlink(oid: ObjectId) -> std::io::Result<()> {
+/// - Returns once it is unlinked, or already gone (`ENOENT`).
+/// - A `transient` error is retried once.
+/// - Any other error, or a second transient one, aborts the server.
+pub(crate) fn unlink(oid: ObjectId) {
     let path = oid.file_path(&crate::disk_dir());
-    let Err(e) = std::fs::remove_file(&path) else {
-        return Ok(());
-    };
-    match e.raw_os_error() {
-        Some(libc::ENOENT) => Ok(()),
-        _ if transient(&e) => Err(e),
-        _ => panic!("largeobj: failed to unlink object file {path}: {e}"),
+    let removed = std::fs::remove_file(&path).or_else(|e| {
+        if transient(&e) {
+            std::fs::remove_file(&path)
+        } else {
+            Err(e)
+        }
+    });
+    match removed {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
+        Err(e) => panic!("largeobj: failed to unlink object file {path}: {e}"),
     }
 }
 
-/// Size of `oid`'s file; `None` if it is gone (`ENOENT`). A `transient` error is
-/// returned; any other error aborts the server.
-fn stat(oid: ObjectId) -> std::io::Result<Option<u64>> {
+/// Size of `oid`'s file.
+/// - `None` if it is gone (`ENOENT`).
+/// - A `transient` error is retried once.
+/// - Any other error, or a second transient one, aborts the server.
+fn stat(oid: ObjectId) -> Option<u64> {
     let path = oid.file_path(&crate::disk_dir());
-    match std::fs::metadata(&path) {
-        Ok(meta) => Ok(Some(meta.len())),
-        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(None),
-        Err(e) if transient(&e) => Err(e),
+    let meta = std::fs::metadata(&path).or_else(|e| {
+        if transient(&e) {
+            std::fs::metadata(&path)
+        } else {
+            Err(e)
+        }
+    });
+    match meta {
+        Ok(meta) => Some(meta.len()),
+        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
         Err(e) => panic!("largeobj: failed to stat object file {path}: {e}"),
     }
 }
 
-/// Transient errors, retried:
+/// Transient errors, retried once, immediately. One that recurs is not transient and
+/// aborts the server.
 /// - `EINTR`: a signal interrupted the call.
 /// - `EAGAIN`: the filesystem asked us to try again (network and FUSE filesystems).
 /// - `EBUSY`: the file is in use by the system, e.g. an NFS client's stand-in for an
@@ -286,26 +229,6 @@ fn transient(e: &std::io::Error) -> bool {
         e.raw_os_error(),
         Some(libc::EINTR | libc::EAGAIN | libc::EBUSY | libc::ENOMEM)
     )
-}
-
-/// Unlink the file of `size` charged bytes. True if it is gone: the caller credits
-/// them. False if it is orphaned: the bytes stay charged until the retry credits them.
-pub(crate) fn try_unlink(unevictable: Arc<super::UnevictableOID>, size: u64, during: &str) -> bool {
-    let oid = unevictable.oid();
-    let unlinked = if crate::test_fail_unlink() {
-        Err(std::io::Error::from_raw_os_error(libc::EBUSY))
-    } else {
-        unlink(oid)
-    };
-    let Err(e) = unlinked else {
-        return true;
-    };
-    valkey_module::logging::log_warning(format!(
-        "largeobj: failed to unlink object file {} during {during}, will retry: {e}",
-        oid.file_path(&crate::disk_dir())
-    ));
-    ORPHANED_FILES.push(unevictable, size);
-    false
 }
 
 // ─── FileHeader ──────────────────────────────────────────────────────────────

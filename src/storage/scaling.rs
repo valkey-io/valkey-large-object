@@ -12,7 +12,7 @@ use super::get_dram_pool;
 ///
 /// Performs these actions in order:
 /// 1. Complete any segments whose drain finished (refcount reached 0).
-/// 2. Delete keys on the reclaim list, and retry the orphans' unlinks.
+/// 2. Delete keys on the reclaim list.
 ///    While a shrink is unfinished (a segment draining or reclaim-list keys
 ///    left), stop here: one shrink at a time, no expand or shrink on top.
 ///    While reclaim-list keys remain, the cron re-arms at `reaper-poll-ms`
@@ -33,7 +33,6 @@ pub fn scaling_cron(ctx: &Context) {
 
     // 2. Delete keys left pointing at reclaimed objects.
     super::reclaim::delete_reclaimed_keys(ctx);
-    super::nvme::ORPHANED_FILES.retry_deletion();
 
     // A shrink is still in progress: finish it before any more scaling.
     // A SET that needs room meanwhile still expands reactively. In Tiered mode the
