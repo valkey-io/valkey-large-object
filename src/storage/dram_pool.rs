@@ -212,6 +212,11 @@ impl DRAMPool {
         self.pool.io_uring_registered_count()
     }
 
+    /// See `SegmentPool::rdma_registered_count`.
+    pub fn rdma_registered_count(&self) -> usize {
+        self.pool.rdma_registered_count()
+    }
+
     // ─── Object Map ──────────────────────────────────────────────────────────
 
     /// Lookup a cached object.

@@ -72,6 +72,11 @@ impl NVMePool {
         self.pool.io_uring_registered_count()
     }
 
+    /// See `SegmentPool::rdma_registered_count`.
+    pub fn rdma_registered_count(&self) -> usize {
+        self.pool.rdma_registered_count()
+    }
+
     /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         self.pool.segment_counts()

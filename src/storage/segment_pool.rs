@@ -658,6 +658,15 @@ impl SegmentPool {
             .count()
     }
 
+    /// Count of this pool's segments (draining ones too) that are EFA-registered; 0 when no
+    /// fabric is up. Equals the pool's segment count when the fabric is up, except briefly while a
+    /// new segment is being registered. INFO metric.
+    pub fn rdma_registered_count(&self) -> usize {
+        let mut bases = Vec::new();
+        self.with_live_segment_slices(|base, _| bases.push(base as usize));
+        crate::efa_registered_among(&bases)
+    }
+
     /// Total allocated bytes across live (non-draining) segments.
     /// Sums the per-segment atomics directly — the exact figure INFO reports,
     /// with no ratio round-trip.

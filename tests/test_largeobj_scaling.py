@@ -151,6 +151,8 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         assert after['largeobj_dram_segments'] == 2
         # Dram mode has no io_uring ring, so nothing is ever io_uring-registered.
         assert after['largeobj_dram_uring_registered_segments'] == 0
+        # Fabric up: both segments, the startup one and the expanded one, are RDMA-registered.
+        assert after['largeobj_dram_rdma_registered_segments'] == 2
 
     def test_copy_lands_in_one_segment(self):
         """Dram COPY allocates the whole copy in one segment, not chunk by chunk.
@@ -518,8 +520,10 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE
         # The expanded DRAM segment joins its ring's io_uring table (per-pool).
         wait_uring_registered_matches_segments(client)
-
-
+        # With the fabric up, every segment of each pool is RDMA-registered, the expanded one too.
+        assert after['largeobj_dram_rdma_registered_segments'] == 2
+        assert (after['largeobj_disk_staging_rdma_registered_segments']
+                == after['largeobj_disk_staging_segments'])
 class TestTieredShrink(ValkeyLargeObjTestCaseBase):
     """Tiered mode: under server memory pressure the scaling cron drops cached
     DRAM copies a segment at a time; the data stays on NVMe. Tiered shrink
@@ -633,10 +637,12 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         expanded = info_largeobj(client)
         assert expanded['largeobj_dram_scaling_expands'] > expand_before
         dram_segments = expanded['largeobj_dram_segments']
-        registered = expanded['largeobj_rdma_registered_segments']
         assert dram_segments > 1
-        # EFA registration spans BOTH pools: every live segment (DRAM + NVMe staging) is registered.
-        assert registered == dram_segments + expanded['largeobj_disk_staging_segments']
+        # Each pool reports its own RDMA-registered segments: every DRAM segment (the startup one
+        # and the expanded ones) and every NVMe staging segment.
+        assert expanded['largeobj_dram_rdma_registered_segments'] == dram_segments
+        assert (expanded['largeobj_disk_staging_rdma_registered_segments']
+                == expanded['largeobj_disk_staging_segments'])
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
 
         # In Tiered mode shrink releases a live-data segment (data persists on NVMe), and with
@@ -649,9 +655,11 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
 
         assert client.execute_command('PING')
         after = info_largeobj(client)
-        assert after['largeobj_rdma_registered_segments'] < registered
-        assert after['largeobj_rdma_registered_segments'] == (
-            after['largeobj_dram_segments'] + after['largeobj_disk_staging_segments'])
+        # Only the DRAM count falls; the staging pool is untouched by a DRAM shrink.
+        assert after['largeobj_dram_rdma_registered_segments'] < dram_segments
+        assert after['largeobj_dram_rdma_registered_segments'] == after['largeobj_dram_segments']
+        assert (after['largeobj_disk_staging_rdma_registered_segments']
+                == expanded['largeobj_disk_staging_rdma_registered_segments'])
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
         assert client.execute_command('BLOB.TCP_GET', 'key_a') == b'A' * SEGMENT_FILLING_SIZE
         assert client.execute_command('BLOB.TCP_GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE

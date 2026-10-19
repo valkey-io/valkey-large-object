@@ -177,8 +177,8 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         )?
         .field("dram_segment_size_bytes", seg_size as i64)?
         .field(
-            "rdma_registered_segments",
-            crate::efa_registered_segment_count() as i64,
+            "dram_rdma_registered_segments",
+            dram.rdma_registered_count() as i64,
         )?
         .field(
             "dram_uring_registered_segments",
@@ -205,6 +205,10 @@ fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "disk_staging_segment_size_bytes",
             crate::dram_segment_size() as i64,
+        )?
+        .field(
+            "disk_staging_rdma_registered_segments",
+            nvme.rdma_registered_count() as i64,
         )?
         .field(
             "disk_staging_uring_registered_segments",
