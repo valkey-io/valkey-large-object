@@ -12,8 +12,8 @@
 //! Tiered: GETs fall back to NVMe. Dram: the objects' oids go on the reclaim
 //! list; their keys read as missing until the cron deletes them.
 //!
-//! Evict (Dram): a SET or COPY into a full arena evicts the least recently used
-//! objects the `maxmemory-policy` allows (`alloc_exact_expand_evict`), where the
+//! Evict (Dram): a SET or COPY into a full arena evicts the objects the
+//! `maxmemory-policy` allows (`alloc_exact_expand_evict`), where the
 //! server allows eviction. Dram never shrinks: that would delete keys whatever the policy.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,9 +29,9 @@ use super::segment_pool::SegmentPool;
 use crate::data_type::ObjectId;
 
 /// Dram eviction takes this many victims, then tries the allocation, for at most
-/// `LRU_EVICT_ROUNDS` rounds: a write evicts at most 16 victims, whatever their size.
-const LRU_EVICT_BATCH: usize = 8;
-const LRU_EVICT_ROUNDS: usize = 2;
+/// `EVICT_ROUNDS` rounds: a write evicts at most 16 victims, whatever their size.
+const EVICT_BATCH: usize = 8;
+const EVICT_ROUNDS: usize = 2;
 
 /// Cached objects plus a per-segment index of the same OIDs, so reclaim can
 /// sample one segment. Both change together, only through `insert`/`remove`.
@@ -60,9 +60,9 @@ impl ObjectMaps {
         Some(ctx)
     }
 
-    /// Remove and return the least recently used object no reader holds, among those the
-    /// `maxmemory-policy` allows. Dram only: the objects are the eviction candidates.
-    fn take_oldest(&mut self) -> Option<(ObjectId, Arc<ObjectContext>)> {
+    /// Remove and return the next object no reader holds in the eviction order (the least
+    /// recently used, or random under `*-random`), among those the `maxmemory-policy` allows. Dram only: the objects are the eviction candidates.
+    fn take_evictable(&mut self) -> Option<(ObjectId, Arc<ObjectContext>)> {
         let all = &self.all;
         let oid = *eviction_candidates::pick(
             1,
@@ -164,8 +164,8 @@ impl DRAMPool {
         self.pool.alloc_exact(obj_len as usize)
     }
 
-    /// `alloc_exact_or_expand`. If that fails and `eviction_allowed`, evict the least
-    /// recently used objects the `maxmemory-policy` allows (`evict_lru_for`).
+    /// `alloc_exact_or_expand`. If that fails and `eviction_allowed`, evict objects the
+    /// `maxmemory-policy` allows (`evict_for`).
     /// Dram mode, main thread only. `ctx` may be a dummy.
     pub fn alloc_exact_expand_evict(
         &self,
@@ -186,17 +186,17 @@ impl DRAMPool {
         if !crate::eviction_allowed(ctx) {
             return None;
         }
-        self.evict_lru_for(obj_len as usize)
+        self.evict_for(obj_len as usize)
     }
 
-    /// Evict the least recently used objects, `LRU_EVICT_BATCH` at a time, trying the
+    /// Evict objects, `EVICT_BATCH` at a time, trying the
     /// allocation after each batch. A victim's freed bytes may sit in a segment that
     /// cannot take the write: they stay as a hole for later writes, and victims stay
     /// evicted when the write still does not fit.
-    fn evict_lru_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
-        for _ in 0..LRU_EVICT_ROUNDS {
+    fn evict_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
+        for _ in 0..EVICT_ROUNDS {
             let mut evicted = 0;
-            for _ in 0..LRU_EVICT_BATCH {
+            for _ in 0..EVICT_BATCH {
                 let mut victim = None;
                 // List before `objects`, as in `try_shrink`.
                 super::reclaim::RECLAIM_LIST.add_with(|| {
@@ -204,7 +204,7 @@ impl DRAMPool {
                         .objects
                         .write()
                         .expect("DRAMPool.objects lock unavailable")
-                        .take_oldest();
+                        .take_evictable();
                     victim.as_ref().map(|(oid, _)| *oid)
                 });
                 // No allowed victim is left.
@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn take_oldest_takes_the_least_recently_used_unpinned_object_in_any_segment() {
+    fn take_evictable_takes_the_least_recently_used_unpinned_object_in_any_segment() {
         let p = dram_pool();
         for i in 0..3u16 {
             p.insert_object(ObjectId(9_400 + i as u64), ctx(i % 2, i));
@@ -700,7 +700,7 @@ mod tests {
             p.objects
                 .write()
                 .unwrap()
-                .take_oldest()
+                .take_evictable()
                 .map(|(oid, _)| oid.0)
         };
         // 9_400 was read and 9_401 is held by a reader: 9_402 is the oldest takeable.

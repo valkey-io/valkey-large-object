@@ -6,7 +6,14 @@
 //! It is the one place that knows an eviction order, and it has one `EvictionCandidates`
 //! variant per order. A new order is a new variant, and each function below gains one arm:
 //! - `Lru`: every object and the objects with a TTL, each in least-recently-used order.
-//!   Every `maxmemory-policy` uses it for now.
+//!   Every `maxmemory-policy` but `*-random` uses it.
+//! - `Random`: two roaring bitmaps of oids, `all` and `ttl` (a subset of `all`). The oid
+//!   is a dense integer, so it is the bit position, and `select(k)` returns the k-th set
+//!   bit: a uniformly random live oid. A GET records nothing.
+//!
+//! A change of `maxmemory-policy` to the other order drops the candidates and builds the other
+//! one from the same objects (`use_random`). Which objects exist and which have a TTL are
+//! kept; the order is not, so a new LRU order starts from creation order.
 //!
 //! An evicted object leaves the candidates at once (`remove`), so no later eviction picks it,
 //! even while its key lingers until the reclaim cron deletes it. The teardown that
@@ -20,6 +27,8 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use hashlink::LinkedHashSet;
 use linkme::distributed_slice;
+use rand::RngExt;
+use roaring::RoaringTreemap;
 use valkey_module::{Context, NotifyEvent, ValkeyValue};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
@@ -71,12 +80,25 @@ impl Lru {
     }
 }
 
+/// The bitmaps behind `EvictionCandidates::Random`.
+#[derive(Default)]
+struct Bitmaps {
+    all: RoaringTreemap,
+    /// The objects in `all` whose key has a TTL.
+    ttl: RoaringTreemap,
+}
+
 enum EvictionCandidates {
     Lru(Lru),
+    Random(Bitmaps),
 }
 
 static CANDIDATES: LazyLock<Mutex<EvictionCandidates>> =
     LazyLock::new(|| Mutex::new(EvictionCandidates::Lru(Lru::default())));
+
+/// Whether the candidates order by use, so a GET must tell it. Read without the lock, so a
+/// `*-random` GET takes none.
+static ORDERS_BY_USE: AtomicBool = AtomicBool::new(true);
 
 fn candidates() -> MutexGuard<'static, EvictionCandidates> {
     CANDIDATES
@@ -90,13 +112,19 @@ pub fn insert(oid: ObjectId) {
         EvictionCandidates::Lru(lru) => {
             lru.all.insert(oid);
         }
+        EvictionCandidates::Random(maps) => {
+            maps.all.insert(oid.0);
+        }
     }
 }
 
 /// Record a GET.
 pub fn touch(oid: ObjectId) {
-    match &mut *candidates() {
-        EvictionCandidates::Lru(lru) => lru.touch(oid),
+    if !ORDERS_BY_USE.load(Ordering::Relaxed) {
+        return;
+    }
+    if let EvictionCandidates::Lru(lru) = &mut *candidates() {
+        lru.touch(oid);
     }
 }
 
@@ -104,6 +132,10 @@ pub fn touch(oid: ObjectId) {
 pub fn remove(oid: ObjectId) {
     match &mut *candidates() {
         EvictionCandidates::Lru(lru) => lru.remove(oid),
+        EvictionCandidates::Random(maps) => {
+            maps.all.remove(oid.0);
+            maps.ttl.remove(oid.0);
+        }
     }
 }
 
@@ -113,6 +145,78 @@ pub fn remove(oid: ObjectId) {
 pub fn pick(n: usize, take: impl FnMut(ObjectId) -> bool) -> Vec<ObjectId> {
     match &*candidates() {
         EvictionCandidates::Lru(lru) => lru.oldest(VOLATILE.load(Ordering::Relaxed), n, take),
+        EvictionCandidates::Random(maps) => maps.random(VOLATILE.load(Ordering::Relaxed), n, take),
+    }
+}
+
+/// Make the candidates random if `random`, else LRU. A no-op when it already is. Called with
+/// every change of `maxmemory-policy`.
+fn use_random(random: bool) {
+    let mut candidates = candidates();
+    let current = std::mem::replace(&mut *candidates, EvictionCandidates::Lru(Lru::default()));
+    *candidates = current.into_order(random);
+    ORDERS_BY_USE.store(!random, Ordering::Relaxed);
+}
+
+impl EvictionCandidates {
+    /// The same objects and TTLs in the random order if `random`, else in the LRU order.
+    fn into_order(self, random: bool) -> Self {
+        match (self, random) {
+            (Self::Lru(lru), true) => Self::Random(Bitmaps {
+                all: lru.all.iter().map(|oid| oid.0).collect(),
+                ttl: lru.ttl.iter().map(|oid| oid.0).collect(),
+            }),
+            // Oids grow with creation, so ascending is oldest first.
+            (Self::Random(maps), false) => {
+                let mut lru = Lru::default();
+                for oid in maps.all.iter() {
+                    lru.all.insert(ObjectId(oid));
+                    if maps.ttl.contains(oid) {
+                        lru.ttl.insert(ObjectId(oid));
+                    }
+                }
+                Self::Lru(lru)
+            }
+            (current, _) => current,
+        }
+    }
+}
+
+impl Bitmaps {
+    /// Up to `n` distinct oids `take` accepts, uniformly at random, from `ttl` if
+    /// `volatile`, else from `all`. A refused oid is skipped, and the search gives up
+    /// after a bounded number of draws.
+    fn random(
+        &self,
+        volatile: bool,
+        n: usize,
+        mut take: impl FnMut(ObjectId) -> bool,
+    ) -> Vec<ObjectId> {
+        let bitmap = if volatile { &self.ttl } else { &self.all };
+        let draws = n.saturating_mul(4).max(16);
+        let mut rng = rand::rng();
+        let mut taken: Vec<u64> = Vec::new();
+        if bitmap.len() <= draws as u64 {
+            // Few enough to see every one.
+            taken.extend(bitmap.iter().filter(|&oid| take(ObjectId(oid))));
+            for i in (1..taken.len()).rev() {
+                taken.swap(i, rng.random_range(0..=i));
+            }
+            taken.truncate(n);
+        } else {
+            for _ in 0..draws {
+                if taken.len() == n {
+                    break;
+                }
+                let Some(oid) = bitmap.select(rng.random_range(0..bitmap.len())) else {
+                    continue;
+                };
+                if !taken.contains(&oid) && take(ObjectId(oid)) {
+                    taken.push(oid);
+                }
+            }
+        }
+        taken.into_iter().map(ObjectId).collect()
     }
 }
 
@@ -132,6 +236,14 @@ pub fn on_keyspace_event(ctx: &Context, _: NotifyEvent, event: &str, key: &[u8])
     let has_ttl = matches!(ctx.call("PTTL", &[&key]), Ok(ValkeyValue::Integer(ms)) if ms >= 0);
     match &mut *candidates() {
         EvictionCandidates::Lru(lru) => lru.set_ttl(oid, has_ttl),
+        EvictionCandidates::Random(maps) if maps.all.contains(oid.0) => {
+            if has_ttl {
+                maps.ttl.insert(oid.0);
+            } else {
+                maps.ttl.remove(oid.0);
+            }
+        }
+        EvictionCandidates::Random(_) => {}
     }
 }
 
@@ -155,13 +267,15 @@ pub fn refresh_policy(ctx: &Context) {
         .map(|v| v.to_string())
         .unwrap_or_default();
     let volatile = name.starts_with("volatile-");
-    if name.ends_with("-lfu") || name.ends_with("-random") || name == "volatile-ttl" {
+    if name.ends_with("-lfu") || name == "volatile-ttl" {
         valkey_module::logging::log_warning(format!(
             "largeobj: maxmemory-policy {name} evicts in {}-lru order: module eviction has \
-             no LFU, random or TTL-ordered eviction",
+             no LFU or TTL-ordered eviction",
             if volatile { "volatile" } else { "allkeys" }
         ));
     }
+    // The candidates first, so an eviction that sees the new policy finds its order.
+    use_random(name.ends_with("-random"));
     VOLATILE.store(volatile, Ordering::Relaxed);
     NOEVICTION.store(name == "noeviction", Ordering::Relaxed);
 }
@@ -218,5 +332,87 @@ mod tests {
         assert_eq!(oldest(&lru, true), [1]);
         lru.remove(ObjectId(1));
         assert!(oldest(&lru, true).is_empty());
+    }
+
+    fn bitmaps(oids: &[(u64, bool)]) -> Bitmaps {
+        let mut maps = Bitmaps::default();
+        for &(oid, ttl) in oids {
+            maps.all.insert(oid);
+            if ttl {
+                maps.ttl.insert(oid);
+            }
+        }
+        maps
+    }
+
+    fn random(
+        maps: &Bitmaps,
+        volatile: bool,
+        n: usize,
+        take: impl FnMut(ObjectId) -> bool,
+    ) -> Vec<u64> {
+        let mut picked: Vec<u64> = maps
+            .random(volatile, n, take)
+            .iter()
+            .map(|oid| oid.0)
+            .collect();
+        picked.sort_unstable();
+        picked
+    }
+
+    #[test]
+    fn random_picks_distinct_allowed_oids() {
+        // Many oids: drawn at random. Few: all seen.
+        for count in [200, 6] {
+            let maps = bitmaps(
+                &(1..=count)
+                    .map(|oid| (oid, oid % 2 == 0))
+                    .collect::<Vec<_>>(),
+            );
+            for volatile in [false, true] {
+                let picked = random(&maps, volatile, 2, |oid| oid.0 != 1);
+                assert_eq!(picked.len(), 2, "{count} oids, volatile {volatile}");
+                assert!(
+                    picked.windows(2).all(|pair| pair[0] != pair[1]),
+                    "{picked:?}"
+                );
+                assert!(
+                    picked
+                        .iter()
+                        .all(|oid| *oid != 1 && (!volatile || oid % 2 == 0)),
+                    "{picked:?}"
+                );
+            }
+        }
+        assert_eq!(
+            random(
+                &bitmaps(&[(1, true), (2, false), (3, true)]),
+                true,
+                usize::MAX,
+                |_| true
+            ),
+            [1, 3]
+        );
+    }
+
+    #[test]
+    fn switching_the_order_keeps_the_objects_and_their_ttls() {
+        let lru = Lru {
+            all: [5, 2, 9, 7].map(ObjectId).into_iter().collect(),
+            ttl: [2, 9].map(ObjectId).into_iter().collect(),
+        };
+        let EvictionCandidates::Random(maps) = EvictionCandidates::Lru(lru).into_order(true) else {
+            panic!("not random");
+        };
+        assert_eq!(random(&maps, false, usize::MAX, |_| true), [2, 5, 7, 9]);
+        assert_eq!(random(&maps, true, usize::MAX, |_| true), [2, 9]);
+
+        // Back to LRU, it starts from creation order. The same order again changes nothing.
+        let candidates = EvictionCandidates::Random(maps).into_order(false);
+        let EvictionCandidates::Lru(lru) = candidates.into_order(false) else {
+            panic!("not LRU");
+        };
+        assert_eq!(oldest(&lru, false), [2, 5, 7, 9]);
+        assert_eq!(oldest(&lru, true), [2, 9]);
     }
 }
