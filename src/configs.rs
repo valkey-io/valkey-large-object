@@ -624,6 +624,9 @@ fn on_server_config_changed(ctx: &Context, changed: &[&str]) {
     if changed.contains(&"maxclients") {
         storage::fd_placement::on_maxclients_changed(ctx);
     }
+    if changed.contains(&"maxmemory-policy") {
+        storage::eviction_candidates::refresh_policy(ctx);
+    }
 }
 
 /// `max-cached-fds` changed: the cache is trimmed to the new limit right away

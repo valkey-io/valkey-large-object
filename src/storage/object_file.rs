@@ -94,9 +94,10 @@ pub fn unevictable_count() -> usize {
 }
 
 /// Claim `oid` for eviction: add it to the reclaim list and the unevictable list,
-/// unless it is in either already, and take it off the eviction candidates. One `UNEVICTABLE` critical section, so a
-/// teardown either adds `oid` to the unevictable list first (the claim fails) or
-/// finds it in the reclaim list. Call under the server lock.
+/// unless it is in either already, and take it off the eviction candidates. One
+/// `UNEVICTABLE` critical section, so a teardown either adds `oid` to the unevictable
+/// list first (the claim fails) or finds it in the reclaim list. Call under the server
+/// lock.
 #[must_use]
 pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
     let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");

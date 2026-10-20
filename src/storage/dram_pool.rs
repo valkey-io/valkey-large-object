@@ -12,8 +12,8 @@
 //! Tiered: GETs fall back to NVMe. Dram: the objects' oids go on the reclaim
 //! list; their keys read as missing until the cron deletes them.
 //!
-//! Evict (Dram): a SET or COPY into a full arena evicts the objects the
-//! `maxmemory-policy` allows (`alloc_exact_expand_evict`), where the
+//! Evict (Dram): a SET or COPY into a full arena evicts
+//! objects the `maxmemory-policy` allows (`alloc_exact_expand_evict`), where the
 //! server allows eviction. Dram never shrinks: that would delete keys whatever the policy.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +28,7 @@ use super::eviction_candidates;
 use super::segment_pool::SegmentPool;
 use crate::data_type::ObjectId;
 
-/// Dram eviction takes this many victims, then tries the allocation, for at most
+/// An eviction takes `EVICT_BATCH` victims, then tries the allocation, for at most
 /// `EVICT_ROUNDS` rounds: a write evicts at most 16 victims, whatever their size.
 const EVICT_BATCH: usize = 8;
 const EVICT_ROUNDS: usize = 2;
@@ -58,19 +58,6 @@ impl ObjectMaps {
         let ctx = self.all.swap_remove(oid)?;
         self.by_segment[ctx.buffers[0].segment_idx as usize].swap_remove(oid);
         Some(ctx)
-    }
-
-    /// Remove and return the next object no reader holds in the eviction order (the least
-    /// recently used, or random under `*-random`), among those the `maxmemory-policy` allows. Dram only: the objects are the eviction candidates.
-    fn take_evictable(&mut self) -> Option<(ObjectId, Arc<ObjectContext>)> {
-        let all = &self.all;
-        let oid = *eviction_candidates::pick(
-            1,
-            |oid| matches!(all.get(&oid), Some(ctx) if Arc::strong_count(ctx) == 1),
-        )
-        .first()?;
-        eviction_candidates::remove(oid);
-        Some((oid, self.remove(&oid)?))
     }
 
     /// Remove every object in segment `seg` (shrink) and return their OIDs.
@@ -189,35 +176,37 @@ impl DRAMPool {
         self.evict_for(obj_len as usize)
     }
 
-    /// Evict objects, `EVICT_BATCH` at a time, trying the
-    /// allocation after each batch. A victim's freed bytes may sit in a segment that
+    /// Evict `EVICT_BATCH` victims from the eviction candidates, try the allocation, and
+    /// repeat for `EVICT_ROUNDS` rounds. A victim's freed bytes may sit in a segment that
     /// cannot take the write: they stay as a hole for later writes, and victims stay
     /// evicted when the write still does not fit.
     fn evict_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
         for _ in 0..EVICT_ROUNDS {
-            let mut evicted = 0;
-            for _ in 0..EVICT_BATCH {
-                let mut victim = None;
-                // List before `objects`, as in `try_shrink`.
-                super::reclaim::RECLAIM_LIST.add_with(|| {
-                    victim = self
-                        .objects
-                        .write()
-                        .expect("DRAMPool.objects lock unavailable")
-                        .take_evictable();
-                    victim.as_ref().map(|(oid, _)| *oid)
-                });
-                // No allowed victim is left.
-                let Some((_, ctx)) = victim else { break };
-                crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
-                evicted += 1;
-                // No reader holds it and it left the map: this is the last Arc, so its
-                // buffers return to their segment now.
-                drop(ctx);
-            }
-            if evicted == 0 {
+            let mut victims = Vec::new();
+            // List before `objects`, as in `try_shrink`.
+            super::reclaim::RECLAIM_LIST.add_with(|| {
+                let mut objects = self
+                    .objects
+                    .write()
+                    .expect("DRAMPool.objects lock unavailable");
+                // A victim has no reader: the Arc in the map is the only one.
+                let oids = eviction_candidates::pick(
+                    EVICT_BATCH,
+                    |oid| matches!(objects.all.get(&oid), Some(ctx) if Arc::strong_count(ctx) == 1),
+                );
+                for oid in &oids {
+                    eviction_candidates::remove(*oid);
+                    victims.extend(objects.remove(oid));
+                }
+                oids
+            });
+            // No allowed victim is left.
+            if victims.is_empty() {
                 return None;
             }
+            crate::info::EVICTIONS.fetch_add(victims.len() as u64, Ordering::Relaxed);
+            // The last Arcs: the buffers return to their segments now.
+            drop(victims);
             if let Some(bufs) = self.pool.alloc_exact(obj_len) {
                 return Some(bufs);
             }
@@ -689,30 +678,25 @@ mod tests {
     }
 
     #[test]
-    fn take_evictable_takes_the_least_recently_used_unpinned_object_in_any_segment() {
+    fn eviction_takes_a_batch_of_candidates_in_any_segment_and_spares_pinned_objects() {
         let p = dram_pool();
         for i in 0..3u16 {
             p.insert_object(ObjectId(9_400 + i as u64), ctx(i % 2, i));
         }
-        eviction_candidates::touch(ObjectId(9_400));
         let pinned = p.get_object(&ObjectId(9_401)).unwrap();
-        let take = || {
-            p.objects
-                .write()
-                .unwrap()
-                .take_evictable()
-                .map(|(oid, _)| oid.0)
-        };
-        // 9_400 was read and 9_401 is held by a reader: 9_402 is the oldest takeable.
-        assert_eq!(take(), Some(9_402));
-        assert_eq!(take(), Some(9_400));
-        assert_eq!(take(), None, "only the pinned object is left");
-        drop(pinned);
+        let bufs = p.evict_for(BUF as usize).expect("room after the batch");
+        p.free_n(&bufs);
         assert_eq!(p.object_count(), 1);
+        assert!(p.contains_object(&ObjectId(9_401)));
         assert_index_consistent(&p);
-        // Taken objects left the candidates too; only the pinned one is still there.
+        // The victims left the candidates too; only the pinned object is still there.
         let left = eviction_candidates::pick(usize::MAX, |oid| (9_400..9_403).contains(&oid.0));
         assert_eq!(left, [ObjectId(9_401)]);
+        assert!(p.evict_for(BUF as usize).is_none(), "nothing left to evict");
+        drop(pinned);
+        for oid in [9_400, 9_402] {
+            super::super::reclaim::RECLAIM_LIST.remove(&ObjectId(oid));
+        }
     }
 
     #[test]

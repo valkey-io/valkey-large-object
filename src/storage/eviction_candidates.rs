@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use hashlink::LinkedHashSet;
-use linkme::distributed_slice;
 use rand::RngExt;
 use roaring::RoaringTreemap;
 use valkey_module::{Context, NotifyEvent, ValkeyValue};
@@ -259,7 +258,7 @@ pub fn noeviction() -> bool {
 }
 
 /// Read `maxmemory-policy` from the server and cache it, warning if it is served in another
-/// order than its own. Call at load; `on_config_change` calls it after a `CONFIG SET`.
+/// order than its own. Call at load and after a `CONFIG SET` of the policy (`configs::on_server_config_changed`).
 pub fn refresh_policy(ctx: &Context) {
     let info = ctx.server_info("memory");
     let name = info
@@ -278,13 +277,6 @@ pub fn refresh_policy(ctx: &Context) {
     use_random(name.ends_with("-random"));
     VOLATILE.store(volatile, Ordering::Relaxed);
     NOEVICTION.store(name == "noeviction", Ordering::Relaxed);
-}
-
-#[distributed_slice(valkey_module::server_events::CONFIG_CHANGED_SERVER_EVENTS_LIST)]
-fn on_config_change(ctx: &Context, changed: &[&str]) {
-    if changed.contains(&"maxmemory-policy") {
-        refresh_policy(ctx);
-    }
 }
 
 #[cfg(test)]
