@@ -121,8 +121,8 @@ pub fn raise_module_start(ctx: &Context) -> Result<(), String> {
             ));
         }
         ctx.log_warning(&format!(
-            "largeobj: fd-reserve Lenient: open-file limit {limit} is too low, so object-file fd \
-             placement is off and the fd cache is off; to turn them on, {fix}"
+            "largeobj: fd-reserve Lenient: open-file limit {limit} is too low, so fd placement \
+             and the fd cache are off; {fix} to turn them on"
         ));
         return Ok(());
     }
@@ -202,18 +202,13 @@ fn fd_limit_needed(module_start: u64, cache_entries: u64) -> u64 {
     module_start + command_reserve(module_start) + cache_entries
 }
 
-/// What to do about a too-low fd limit: the value to set and where it comes from. Every
-/// message about a low limit ends with this, so the operator always gets the number.
+/// What to do about a too-low fd limit. Every message about a low limit ends with this,
+/// so the operator always gets the number.
 fn limit_fix(module_start: u64, cache_entries: u64) -> String {
-    let needed = fd_limit_needed(module_start, cache_entries);
-    let mut parts = format!(
-        "module start {module_start} + command reserve {}",
-        command_reserve(module_start)
-    );
-    if cache_entries > 0 {
-        parts += &format!(" + max-cached-fds {cache_entries}");
-    }
-    format!("set LimitNOFILE to at least {needed} ({parts})")
+    format!(
+        "set LimitNOFILE to at least {}",
+        fd_limit_needed(module_start, cache_entries)
+    )
 }
 
 /// How many cached read fds the fd limit lets the module range hold once the command
@@ -252,8 +247,8 @@ pub fn warn_if_cache_limited(max_cached_fds: u64) {
     let fix = limit_fix(MODULE_START.load(Ordering::Relaxed) as u64, max_cached_fds);
     let msg = if PLACEMENT_ENABLED.load(Ordering::Relaxed) {
         format!(
-            "largeobj: open-file limit {limit} is too low for max-cached-fds {max_cached_fds}, so \
-             the fd cache holds at most {headroom}; to cache all, {fix}"
+            "largeobj: open-file limit {limit} is too low for max-cached-fds {max_cached_fds}: \
+             the fd cache holds {headroom}; {fix} to cache all"
         )
     } else {
         format!(
@@ -294,7 +289,7 @@ fn check_module_start_past_event_loop(module_start: i32) -> Result<(), String> {
     // SAFETY: F_GETFD only reads the fd table.
     if unsafe { libc::fcntl(module_start, libc::F_GETFD) } != -1 {
         return Err(format!(
-            "event-loop probe: fd {module_start} is already open, so the module start cannot be checked"
+            "cannot check the event loop: fd {module_start} is already open"
         ));
     }
     let readable = raw::REDISMODULE_EVENTLOOP_READABLE as c_int;
@@ -373,21 +368,10 @@ fn move_above(fd: RawFd, module_start: i32) -> std::io::Result<RawFd> {
     };
     // SAFETY: fd is ours and no longer used; on success high refers to the same open file.
     unsafe { libc::close(fd) };
-    if let Err(err) = &moved {
-        note_failure(module_start, err);
+    if moved.is_err() {
+        PLACEMENT_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
     moved
-}
-
-/// Count a failed move and log the first of each burst of 1024.
-fn note_failure(module_start: i32, err: &std::io::Error) {
-    let count = PLACEMENT_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-    if count % 1024 == 1 {
-        valkey_module::logging::log_warning(format!(
-            "largeobj: no free fd at or above {module_start} for an object file: {err}; \
-             {count} failed so far"
-        ));
-    }
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
@@ -396,10 +380,13 @@ fn note_failure(module_start: i32, err: &std::io::Error) {
 mod tests {
     use super::*;
 
+    fn dev_null() -> std::ffi::CString {
+        std::ffi::CString::new("/dev/null").unwrap()
+    }
+
     fn open_dev_null() -> RawFd {
-        let path = std::ffi::CString::new("/dev/null").unwrap();
-        // SAFETY: path is NUL-terminated.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        // SAFETY: the path is NUL-terminated.
+        let fd = unsafe { libc::open(dev_null().as_ptr(), libc::O_RDONLY) };
         assert!(fd >= 0, "open /dev/null");
         fd
     }
@@ -417,41 +404,34 @@ mod tests {
     }
 
     #[test]
-    fn object_fd_counts_itself_while_open() {
+    fn open_object_file_counts_the_fd_and_sets_cloexec() {
+        let fd = open_object_file(&dev_null(), libc::O_RDONLY, 0).expect("open /dev/null");
         // The counter is process-wide and other tests open object files in parallel, so
         // only a lower bound holds. The integration tests check it returns to zero.
-        let path = std::ffi::CString::new("/dev/null").unwrap();
-        let fd = open_object_file(&path, libc::O_RDONLY, 0).expect("open /dev/null");
         assert!(open_object_fds() >= 1);
         // Close-on-exec whether or not placement moved the fd.
         // SAFETY: the fd is open; F_GETFD only reads its flags.
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
         assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
-        drop(fd);
     }
 
     #[test]
     fn move_above_keeps_an_fd_already_in_the_module_range() {
         let fd = open_dev_null();
-        // fd is at or above module start 0, so it is returned as it is, and still open.
+        // Module start 0: fd is already above it, so it is returned as it is and stays open.
         assert_eq!(move_above(fd, 0).expect("already above"), fd);
-        // SAFETY: fd is ours and still open; F_GETFD only reads it.
-        assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        // SAFETY: fd is ours.
-        unsafe { libc::close(fd) };
+        // SAFETY: fd is ours; F_GETFD only reads it, and close ends it.
+        unsafe {
+            assert_ne!(libc::fcntl(fd, libc::F_GETFD), -1);
+            libc::close(fd);
+        }
     }
 
     #[test]
-    fn limit_fix_names_the_limit_and_where_it_comes_from() {
+    fn limit_fix_names_the_limit_to_set() {
         // maxclients 100: module start 228, command reserve 100.
-        assert_eq!(
-            limit_fix(228, 0),
-            "set LimitNOFILE to at least 328 (module start 228 + command reserve 100)"
-        );
-        assert_eq!(
-            limit_fix(228, 100),
-            "set LimitNOFILE to at least 428 (module start 228 + command reserve 100 + max-cached-fds 100)"
-        );
+        assert_eq!(limit_fix(228, 0), "set LimitNOFILE to at least 328");
+        assert_eq!(limit_fix(228, 100), "set LimitNOFILE to at least 428");
     }
 
     #[test]
