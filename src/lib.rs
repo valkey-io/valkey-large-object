@@ -35,7 +35,7 @@
 use dma_libfabric_protocol::encode_hex;
 use valkey_module::configuration::ConfigurationFlags;
 use valkey_module::{valkey_module, Context, InfoContext, Status, ValkeyResult, ValkeyString};
-use valkey_module_macros::{config_changed_event_handler, shutdown_event_handler};
+use valkey_module_macros::shutdown_event_handler;
 
 use tokio::runtime::Runtime;
 
@@ -233,34 +233,6 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 /// shutdown.
 fn deinitialize(_ctx: &Context) -> Status {
     Status::Ok
-}
-
-/// `CONFIG SET maxclients` grows Valkey's event loop, possibly up into the fds the
-/// module placed at load. Raise the module start, drop the cached fds now below it so
-/// their next GET reopens them in the module range, and trim the cache to the new
-/// limit. Valkey has already applied the change and a module cannot veto it.
-/// If the fd limit no longer covers the command reserve, `fd-reserve Lenient` turns
-/// placement off and empties the cache (logged), and `fd-reserve Strict` aborts the
-/// server. Strict also aborts if the reserve fits but `max-cached-fds` no longer does;
-/// Lenient clamps the cache.
-#[config_changed_event_handler]
-fn on_config_changed(ctx: &Context, changed: &[&str]) {
-    if changed.contains(&"maxclients") {
-        if let Some(pool) = storage::FD_POOL.get() {
-            if let Err(msg) = storage::fd_placement::raise_module_start(ctx) {
-                // The panic hook logs the message and aborts the server.
-                if fd_reserve() == FdReserve::Strict {
-                    panic!("CONFIG SET maxclients: {msg}");
-                }
-                ctx.log_warning(&format!(
-                    "largeobj: CONFIG SET maxclients: cannot place object-file fds in the \
-                     module range: {msg}"
-                ));
-            }
-            pool.drop_fds_below_module_start();
-            pool.shrink_to(storage::fd_placement::fd_cache_max_entries());
-        }
-    }
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):

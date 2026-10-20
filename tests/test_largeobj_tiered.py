@@ -1188,7 +1188,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
 
         info = client.info('largeobj_fd')
         assert info['largeobj_fd_cache_entries'] == 2
-        assert info['largeobj_fd_evictions'] == 3
+        assert info['largeobj_fd_cache_evictions'] == 3
         # Nothing was promoted, so these were all NVMe reads.
         dram = client.info('largeobj_dram')
         assert dram['largeobj_dram_objects'] == 0
@@ -1198,7 +1198,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             assert client.execute_command('BLOB.TCP_GET', k) == self._payload(i)
         info = client.info('largeobj_fd')
         assert info['largeobj_fd_cache_entries'] == 2
-        evictions = info['largeobj_fd_evictions']
+        evictions = info['largeobj_fd_cache_evictions']
 
         # DEL drops the pool's fd through ObjectFile::Drop, so the next open
         # takes the free slot instead of reclaiming. KEYS[4] was read last, so
@@ -1209,7 +1209,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_fd')
         assert info['largeobj_fd_cache_entries'] == 2
-        assert info['largeobj_fd_evictions'] == evictions
+        assert info['largeobj_fd_cache_evictions'] == evictions
 
     def test_reclaims_coldest_keeps_hot(self):
         """A full pool reclaims the lowest-scoring fd. KEYS[0] is read three
@@ -1226,18 +1226,18 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[1]) == self._payload(1)
         info = client.info('largeobj_fd')
         assert info['largeobj_fd_cache_entries'] == 2
-        assert info['largeobj_fd_evictions'] == 0
+        assert info['largeobj_fd_cache_evictions'] == 0
 
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
         assert info['largeobj_fd_cache_entries'] == 2
-        assert info['largeobj_fd_evictions'] == 1
+        assert info['largeobj_fd_cache_evictions'] == 1
 
         # KEYS[0] survived, so reading it again needs no open and no reclaim.
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[0]) == self._payload(0)
         info = client.info('largeobj_fd')
         assert info['largeobj_fd_cache_entries'] == 2
-        assert info['largeobj_fd_evictions'] == 1
+        assert info['largeobj_fd_cache_evictions'] == 1
 
     def test_lower_cap_at_runtime(self):
         """CONFIG SET to a smaller cap, down to 0, evicts the cache right away."""
@@ -1250,13 +1250,13 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '1')
         info = client.info('largeobj_fd')
         assert info['largeobj_fd_cache_entries'] == 1
-        assert info['largeobj_fd_evictions'] == 1
+        assert info['largeobj_fd_cache_evictions'] == 1
 
         client.execute_command('BLOB.TCP_SET', self.KEYS[2], self._payload(2))
         assert client.execute_command('BLOB.TCP_GET', self.KEYS[2]) == self._payload(2)
         info = client.info('largeobj_fd')
         assert info['largeobj_fd_cache_entries'] == 1
-        assert info['largeobj_fd_evictions'] == 2
+        assert info['largeobj_fd_cache_evictions'] == 2
 
         # 0 is accepted: the cache empties and later GETs open, read and close.
         client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '0')
@@ -1509,7 +1509,7 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         keeps the old value."""
         _, client = self._start_with_nofile_limit(
             'strict-rejects', 500, 'fd-reserve Strict max-cached-fds 100')
-        with pytest.raises(ResponseError, match='raise it to at least 501'):
+        with pytest.raises(ResponseError, match='set LimitNOFILE to at least 501'):
             client.execute_command('CONFIG', 'SET', 'largeobj.max-cached-fds', '173')
         assert client.config_get('largeobj.max-cached-fds') == {
             'largeobj.max-cached-fds': '100'}

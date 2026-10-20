@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use valkey_module::enum_configuration;
 use valkey_module::Context;
 use valkey_module::ContextFlags;
+use valkey_module_macros::config_changed_event_handler;
 
 use crate::errors;
 use crate::storage;
@@ -611,6 +612,17 @@ pub fn validate_config_constraint(
         return Ok(());
     }
     validate_all_constraints().map_err(valkey_module::ValkeyError::String)
+}
+
+/// The one listener for changes to Valkey's own configs (`CONFIG SET`), fired after the
+/// change is applied. Each subsystem owns its handling; this only routes, so the order
+/// of reactions to a change is visible here. The module's own configs do not come
+/// through here: they use their per-config `on_set` / `on_changed` callbacks.
+#[config_changed_event_handler]
+fn on_server_config_changed(ctx: &Context, changed: &[&str]) {
+    if changed.contains(&"maxclients") {
+        storage::fd_placement::on_maxclients_changed(ctx);
+    }
 }
 
 /// `max-cached-fds` changed: the cache is trimmed to the new limit right away

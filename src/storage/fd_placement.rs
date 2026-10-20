@@ -87,10 +87,10 @@ impl Drop for ObjectFd {
 /// The fd limit covers the command reserve when `limit >= module start + maxclients`;
 /// `fd-reserve Strict` also needs `max-cached-fds` more. If it does not:
 /// `fd-reserve Lenient` turns placement off (and with it the cache), logs, and returns
-/// Ok; `fd-reserve Strict` returns Err naming the fix. Other Errs:
-/// the module start is not actually past the event loop (object fds would then take
-/// fd numbers in the core range, and clients past them are never served), or the fd
-/// limit cannot be raised.
+/// Ok; `fd-reserve Strict` returns Err naming the fix. Other Errs: `maxclients` too large
+/// for an fd number, or the module start is not actually past the event loop (object
+/// fds would then take fd numbers in the core range, and clients past them are never
+/// served).
 pub fn raise_module_start(ctx: &Context) -> Result<(), String> {
     let maxclients: u64 = ctx
         .config_get("maxclients".to_string())
@@ -100,61 +100,73 @@ pub fn raise_module_start(ctx: &Context) -> Result<(), String> {
         .expect("maxclients is numeric");
     let module_start = i32::try_from(maxclients + VALKEY_FDSET_INCR)
         .map_err(|_| format!("maxclients {maxclients} is too large for an fd number"))?;
-    let before = nofile_limit().rlim_cur;
-    raise_soft_fd_limit()?;
     let limit = nofile_limit().rlim_cur;
-    if limit > before {
-        ctx.log_notice(&format!(
-            "largeobj: increased the open-file soft limit to the hard limit {limit} \
-             (it was {before})"
-        ));
-    }
     // Only ever up: Valkey grows its event loop when maxclients grows, but never
     // shrinks it.
     let module_start = MODULE_START
         .fetch_max(module_start, Ordering::Relaxed)
         .max(module_start);
-    let maxclients = peak_maxclients(module_start as u64);
     let max_cached_fds = crate::max_cached_fds() as u64;
     let strict = fd_reserve() == FdReserve::Strict;
     // Strict needs the whole fd cache to fit too; Lenient needs only the command reserve.
-    let needed = fd_limit_needed(module_start as u64, if strict { max_cached_fds } else { 0 });
+    let cache_needed = if strict { max_cached_fds } else { 0 };
+    let needed = fd_limit_needed(module_start as u64, cache_needed);
     if limit < needed {
         PLACEMENT_ENABLED.store(false, Ordering::Relaxed);
+        let fix = limit_fix(module_start as u64, cache_needed);
         if strict {
             return Err(format!(
-                "fd-reserve Strict: open-file limit {limit} is below {needed} (module start \
-                 {module_start} + maxclients {maxclients} + max-cached-fds {max_cached_fds}); set \
-                 LimitNOFILE to at least {needed}, lower maxclients or max-cached-fds, or use \
+                "fd-reserve Strict: open-file limit {limit} is too low; {fix}, or use \
                  fd-reserve Lenient"
             ));
         }
-        ctx.log_notice(&format!(
-            "largeobj: open-file limit {limit} is below {needed} (module start {module_start} + \
-             maxclients {maxclients}), so the module range cannot hold the command reserve; \
-             object-file fd placement is off (fd-reserve Lenient)"
+        ctx.log_warning(&format!(
+            "largeobj: fd-reserve Lenient: open-file limit {limit} is too low, so object-file fd \
+             placement is off and the fd cache is off; to turn them on, {fix}"
         ));
-        warn_if_cache_limited(max_cached_fds);
         return Ok(());
     }
-    PLACEMENT_ENABLED.store(true, Ordering::Relaxed);
+    // Placement turns on only once the module start is known to be past the event loop.
     if !PROBED.load(Ordering::Relaxed) {
         check_module_start_past_event_loop(module_start)?;
         PROBED.store(true, Ordering::Relaxed);
     }
+    PLACEMENT_ENABLED.store(true, Ordering::Relaxed);
     ctx.log_notice(&format!(
         "largeobj: object-file fd placement is on: module range starts at fd {module_start}"
     ));
     if strict {
         ctx.log_notice(&format!(
             "largeobj: fd-reserve Strict: a CONFIG SET maxclients above {} aborts the server \
-             (the command reserve and max-cached-fds {max_cached_fds} would no longer fit in \
-             open-file limit {limit})",
+             (open-file limit {limit})",
             limit.saturating_sub(VALKEY_FDSET_INCR + max_cached_fds) / 2
         ));
     }
     warn_if_cache_limited(max_cached_fds);
     Ok(())
+}
+
+/// `CONFIG SET maxclients` grows Valkey's event loop, possibly up into the fds the
+/// module placed at load. Raise the module start, drop the cached fds now below it so
+/// their next GET reopens them in the module range, and trim the cache to the new
+/// limit. Valkey has already applied the change and a module cannot veto it.
+/// If the fd limit no longer covers the command reserve, `fd-reserve Lenient` turns
+/// placement off and empties the cache (logged), and `fd-reserve Strict` aborts the
+/// server. Strict also aborts if the reserve fits but `max-cached-fds` no longer does;
+/// Lenient clamps the cache. Routed from `configs::on_server_config_changed`.
+pub fn on_maxclients_changed(ctx: &Context) {
+    let Some(pool) = super::FD_POOL.get() else {
+        return;
+    };
+    if let Err(msg) = raise_module_start(ctx) {
+        // The panic hook logs the message and aborts the server.
+        if fd_reserve() == FdReserve::Strict {
+            panic!("CONFIG SET maxclients: {msg}");
+        }
+        ctx.log_warning(&format!("largeobj: CONFIG SET maxclients: {msg}"));
+    }
+    pool.drop_fds_below_module_start();
+    pool.shrink_to(fd_cache_max_entries());
 }
 
 /// `fd-reserve Strict` only: whether a new `max-cached-fds` still fits in the fd limit
@@ -167,27 +179,41 @@ pub fn check_cache_fits_if_strict(max_cached_fds: u64) -> Result<(), String> {
     }
     let limit = nofile_limit().rlim_cur;
     let module_start = MODULE_START.load(Ordering::Relaxed) as u64;
-    let required = fd_limit_needed(module_start, max_cached_fds);
-    if limit < required {
+    if limit < fd_limit_needed(module_start, max_cached_fds) {
         return Err(format!(
-            "open-file limit {limit} is too low for max-cached-fds {max_cached_fds} and \
-             maxclients {}; raise it to at least {required}, or use fd-reserve Lenient",
-            peak_maxclients(module_start)
+            "open-file limit {limit} is too low for max-cached-fds {max_cached_fds}; {}, or use \
+             fd-reserve Lenient",
+            limit_fix(module_start, max_cached_fds)
         ));
     }
     Ok(())
 }
 
-/// The highest `maxclients` seen, which is what the module start was computed from.
-/// Valkey keeps clients above a lowered `maxclients` connected, so this is the client bound.
-fn peak_maxclients(module_start: u64) -> u64 {
+/// The command reserve: one fd number per client, kept free for command fds. It is the
+/// highest `maxclients` seen, which is what the module start was computed from. Valkey
+/// keeps clients above a lowered `maxclients` connected, so this is the client bound.
+fn command_reserve(module_start: u64) -> u64 {
     module_start.saturating_sub(VALKEY_FDSET_INCR)
 }
 
-/// The fd limit that holds the module start, the command reserve (`maxclients`) and
-/// `cache_entries` cached fds.
+/// The fd limit that holds the module start, the command reserve and `cache_entries`
+/// cached fds.
 fn fd_limit_needed(module_start: u64, cache_entries: u64) -> u64 {
-    module_start + peak_maxclients(module_start) + cache_entries
+    module_start + command_reserve(module_start) + cache_entries
+}
+
+/// What to do about a too-low fd limit: the value to set and where it comes from. Every
+/// message about a low limit ends with this, so the operator always gets the number.
+fn limit_fix(module_start: u64, cache_entries: u64) -> String {
+    let needed = fd_limit_needed(module_start, cache_entries);
+    let mut parts = format!(
+        "module start {module_start} + command reserve {}",
+        command_reserve(module_start)
+    );
+    if cache_entries > 0 {
+        parts += &format!(" + max-cached-fds {cache_entries}");
+    }
+    format!("set LimitNOFILE to at least {needed} ({parts})")
 }
 
 /// How many cached read fds the fd limit lets the module range hold once the command
@@ -223,19 +249,16 @@ pub fn warn_if_cache_limited(max_cached_fds: u64) {
         return;
     }
     let limit = nofile_limit().rlim_cur;
-    let module_start = MODULE_START.load(Ordering::Relaxed) as u64;
-    let maxclients = peak_maxclients(module_start);
-    let required = fd_limit_needed(module_start, max_cached_fds);
+    let fix = limit_fix(MODULE_START.load(Ordering::Relaxed) as u64, max_cached_fds);
     let msg = if PLACEMENT_ENABLED.load(Ordering::Relaxed) {
         format!(
-            "largeobj: open-file limit {limit} is too low for max-cached-fds {max_cached_fds} and \
-             maxclients {maxclients}; the fd cache holds at most {headroom}. Raise the limit to at \
-             least {required}"
+            "largeobj: open-file limit {limit} is too low for max-cached-fds {max_cached_fds}, so \
+             the fd cache holds at most {headroom}; to cache all, {fix}"
         )
     } else {
         format!(
-            "largeobj: open-file limit {limit} does not cover the command reserve, so the \
-             fd cache is off (max-cached-fds {max_cached_fds}). Raise the limit to at least {required}"
+            "largeobj: the fd cache is off, so max-cached-fds {max_cached_fds} has no effect: \
+             open-file limit {limit} is too low; {fix}"
         )
     };
     valkey_module::logging::log_warning(msg);
@@ -259,79 +282,50 @@ fn nofile_limit() -> libc::rlimit {
     limit
 }
 
-/// Raise the soft `RLIMIT_NOFILE` to the hard limit, so object fds can use every
-/// fd number the hard limit allows.
-fn raise_soft_fd_limit() -> Result<(), String> {
-    let mut limit = nofile_limit();
-    limit.rlim_cur = limit.rlim_max;
-    // SAFETY: limit is a valid rlimit; raising soft up to hard needs no privilege.
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
-        return Err(format!(
-            "cannot raise the open-file soft limit to the hard limit {}: {}",
-            limit.rlim_max,
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
 /// One-shot check that `module_start` is past the end of Valkey's event loop, so the
 /// copied `maxclients + CONFIG_FDSET_INCR` really marks the end of the Valkey core
-/// range. `EventLoopAdd` answers ERANGE exactly when `fd >= setsize`. The probe is
-/// an eventfd we own (epoll rejects regular files), placed at `module_start`, so no
-/// client's event is touched; if it registers, it is removed at once. Main thread
-/// only.
+/// range. `EventLoopAdd` answers ERANGE exactly when `fd >= setsize`, and that check
+/// looks only at the number, so the probe asks about `module_start` itself with no fd
+/// of ours at that number. Anything but ERANGE means the number is inside the loop.
+/// Main thread only.
 fn check_module_start_past_event_loop(module_start: i32) -> Result<(), String> {
     unsafe extern "C" fn noop(_fd: c_int, _data: *mut c_void, _mask: c_int) {}
-    // Reads errno: call it right after the failing call, before the fds drop.
-    let probe_err = |step: &str| {
-        format!(
-            "event-loop probe at fd {module_start}: {step}: {}",
-            std::io::Error::last_os_error()
-        )
-    };
-    // SAFETY: eventfd returns a new fd or -1.
-    let low = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-    if low < 0 {
-        return Err(probe_err("eventfd"));
+    // EventLoopAdd would register whatever is open at this number.
+    // SAFETY: F_GETFD only reads the fd table.
+    if unsafe { libc::fcntl(module_start, libc::F_GETFD) } != -1 {
+        return Err(format!(
+            "event-loop probe: fd {module_start} is already open, so the module start cannot be checked"
+        ));
     }
-    // SAFETY: low is a new fd we own.
-    let low = unsafe { OwnedFd::from_raw_fd(low) };
-    // SAFETY: low is valid; returns a new fd >= module_start or -1.
-    let probe = unsafe { libc::fcntl(low.as_raw_fd(), libc::F_DUPFD_CLOEXEC, module_start) };
-    if probe < 0 {
-        return Err(probe_err("F_DUPFD_CLOEXEC"));
-    }
-    // SAFETY: probe is a new fd we own.
-    let probe = unsafe { OwnedFd::from_raw_fd(probe) };
     let readable = raw::REDISMODULE_EVENTLOOP_READABLE as c_int;
     // SAFETY: the module API is initialized (OnLoad or a server event on the main
-    // thread); probe is our own eventfd.
+    // thread); no fd is open at module_start.
     let rc = unsafe {
         raw::RedisModule_EventLoopAdd.expect("EventLoopAdd API available")(
-            probe.as_raw_fd(),
+            module_start,
             readable,
             Some(noop),
             std::ptr::null_mut(),
         )
     };
+    // Reads errno: right after the call.
+    let past_loop = std::io::Error::last_os_error().raw_os_error() == Some(libc::ERANGE);
     if rc == raw::REDISMODULE_OK as c_int {
-        // SAFETY: probe was just registered by us, and is still open.
+        // Only if another thread opened module_start after the check above.
+        // SAFETY: module_start was just registered by us.
         unsafe {
             raw::RedisModule_EventLoopDel.expect("EventLoopDel API available")(
-                probe.as_raw_fd(),
+                module_start,
                 readable,
             )
         };
-        return Err(format!(
-            "Valkey's event loop is larger than maxclients + {VALKEY_FDSET_INCR}: \
-             fd {module_start} is inside it"
-        ));
+    } else if past_loop {
+        return Ok(());
     }
-    if std::io::Error::last_os_error().raw_os_error() != Some(libc::ERANGE) {
-        return Err(probe_err("EventLoopAdd"));
-    }
-    Ok(())
+    Err(format!(
+        "Valkey's event loop is larger than maxclients + {VALKEY_FDSET_INCR}: \
+         fd {module_start} is inside it"
+    ))
 }
 
 /// Whether `fd` is below the module start, inside the core range. Always false when
@@ -350,7 +344,8 @@ pub fn open_object_file(
     mode: libc::mode_t,
 ) -> std::io::Result<ObjectFd> {
     // SAFETY: path is NUL-terminated; open returns an fd or -1.
-    let mut fd = unsafe { libc::open(path.as_ptr(), flags, mode as libc::c_uint) };
+    let mut fd =
+        unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC, mode as libc::c_uint) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -363,8 +358,12 @@ pub fn open_object_file(
 }
 
 /// Move `fd` to the lowest free number at or above `module_start` and close the original.
-/// On failure closes `fd` too.
+/// An fd already at or above `module_start` is returned as it is: moving it would need a
+/// second free number, which a full range does not have. On failure closes `fd` too.
 fn move_above(fd: RawFd, module_start: i32) -> std::io::Result<RawFd> {
+    if fd >= module_start {
+        return Ok(fd);
+    }
     // SAFETY: fd is a valid fd we own; F_DUPFD_CLOEXEC returns a new fd >= module_start or -1.
     let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, module_start) };
     let moved = if high < 0 {
@@ -419,12 +418,40 @@ mod tests {
 
     #[test]
     fn object_fd_counts_itself_while_open() {
+        // The counter is process-wide and other tests open object files in parallel, so
+        // only a lower bound holds. The integration tests check it returns to zero.
         let path = std::ffi::CString::new("/dev/null").unwrap();
-        let before = open_object_fds();
         let fd = open_object_file(&path, libc::O_RDONLY, 0).expect("open /dev/null");
-        assert_eq!(open_object_fds(), before + 1);
+        assert!(open_object_fds() >= 1);
+        // Close-on-exec whether or not placement moved the fd.
+        // SAFETY: the fd is open; F_GETFD only reads its flags.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
         drop(fd);
-        assert_eq!(open_object_fds(), before);
+    }
+
+    #[test]
+    fn move_above_keeps_an_fd_already_in_the_module_range() {
+        let fd = open_dev_null();
+        // fd is at or above module start 0, so it is returned as it is, and still open.
+        assert_eq!(move_above(fd, 0).expect("already above"), fd);
+        // SAFETY: fd is ours and still open; F_GETFD only reads it.
+        assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        // SAFETY: fd is ours.
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn limit_fix_names_the_limit_and_where_it_comes_from() {
+        // maxclients 100: module start 228, command reserve 100.
+        assert_eq!(
+            limit_fix(228, 0),
+            "set LimitNOFILE to at least 328 (module start 228 + command reserve 100)"
+        );
+        assert_eq!(
+            limit_fix(228, 100),
+            "set LimitNOFILE to at least 428 (module start 228 + command reserve 100 + max-cached-fds 100)"
+        );
     }
 
     #[test]

@@ -176,8 +176,7 @@ pub fn init(
     // Tiered keeps object files open (fd cache + command fds). Place those fds in the
     // module range before any is opened, or they stop new clients being served.
     if mode == crate::OperatingMode::Tiered {
-        fd_placement::raise_module_start(ctx)
-            .map_err(|e| format!("cannot keep object-file fds out of the core range: {e}"))?;
+        fd_placement::raise_module_start(ctx)?;
     }
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.

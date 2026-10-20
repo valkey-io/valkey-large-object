@@ -132,7 +132,7 @@ fn fd_section(ctx: &InfoContext) -> ValkeyResult<()> {
         )?
         .field("fd_cache_entries", fds.len() as i64)?
         .field(
-            "fd_evictions",
+            "fd_cache_evictions",
             fds.evictions.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .build_section()?

@@ -28,7 +28,7 @@ inside the range, there is nowhere to be stranded to, but also nowhere for the m
 
 | Term | Meaning |
 |---|---|
-| **fd limit** (`limit`) | The process's soft `RLIMIT_NOFILE`: the kernel hands out fd numbers `0 .. limit-1` only. The hard limit is just the ceiling the soft limit can be raised to. The module raises the soft limit to the hard limit at load, so afterwards the two are equal. |
+| **fd limit** (`limit`) | The process's soft `RLIMIT_NOFILE`: the kernel hands out fd numbers `0 .. limit-1` only. The module never changes it. |
 | **core range** | fd numbers `0 .. maxclients + 127`, the numbers Valkey core's event loop covers: Valkey's own fds (32 reserved), up to `maxclients` client sockets, and 96 spare. |
 | **module start** (`module_start`) | `maxclients + 128`, the first number after the core range. It uses the highest `maxclients` ever set, so it only rises. |
 | **module range** | fd numbers `module_start .. limit-1`. The module's fds live here. It is empty when `limit <= module_start`. |
@@ -72,18 +72,18 @@ The module does not choose the fd limit. Valkey does, before the module loads.
 These were checked on a real server, not only read from the code (see section 10).
 
 **Does Valkey change the limit after the module has loaded?** Only on `CONFIG SET maxclients`, and only
-when the soft limit is below the new `maxclients + 32`. Once the module has raised the soft limit to the
-hard limit, the two are equal, so that needs more than the hard limit:
-- Valkey tries to set both limits to the new `maxclients + 32`. Raising the hard limit needs root, so for
-  an ordinary user it fails, and Valkey rejects the `CONFIG SET`. The limit stays as it was.
-- If Valkey does run as root, the call succeeds and the limit rises. The module then re-reads it
-  (section 5.5).
+when the soft limit is below the new `maxclients + 32`. Valkey then tries to set both limits to
+`maxclients + 32`:
+- If that is above the hard limit, setting it needs root. For an ordinary user it fails, and Valkey
+  rejects the `CONFIG SET`. The limit stays as it was.
+- If it is within the hard limit, both limits become `maxclients + 32`, which lowers the hard limit. That
+  is below what the module needs, so 5.5 applies: `Lenient` turns placement off and `Strict` aborts.
 - A `CONFIG SET maxclients` that fits inside the current soft limit leaves it alone.
 
-So with an ordinary user the limit does not change after load. This is from reading `adjustOpenFilesLimit`
-(`server.c`) and `updateMaxclients` (`config.c`). The experiments in section 10 cover the cases without
-the module and the case with the module where the new value fits. No experiment ran a
-`CONFIG SET maxclients` beyond the limit with the module loaded.
+The module does not change the limit, so a launch with a high soft limit (for example `LimitNOFILE=65536`,
+which sets both) is never touched. This is from reading `adjustOpenFilesLimit` (`server.c`) and
+`updateMaxclients` (`config.c`). The experiments in section 10 ran without the module, which does not
+change the result.
 
 At `maxclients 10000`:
 
@@ -99,18 +99,15 @@ fd number:  0 ........ 10032 ........ 10128 ..................... limit
 
 ### 5.1 At load
 
-1. Raise the soft limit to the hard limit. Log it when it changes (`it was N`). Reason: with the soft limit
-   at the hard limit, Valkey has nothing left to raise later, so it does not lower the hard limit on a
-   later `CONFIG SET maxclients`. It also lets the module use every number the hard limit allows.
-2. Compute the module start from the current `maxclients`, and `needed = module_start + maxclients`
+1. Compute the module start from the current `maxclients`, and `needed = module_start + maxclients`
    (`Strict`: `module_start + maxclients + max-cached-fds`).
-3. If `limit < needed`:
+2. If `limit < needed`:
    - `fd-reserve Lenient`: **placement off.** The cache is off. Log a notice, and a warning naming the fd
      limit that would fit when `max-cached-fds` is non-zero. The module loads. (Under `Lenient` `needed` is
-     the reserve alone, so a cache that does not fit is not a reason to turn placement off: see step 4.)
+     the reserve alone, so a cache that does not fit is not a reason to turn placement off: see step 3.)
    - `fd-reserve Strict`: **refuse to load**, with an error that names the fix: "set LimitNOFILE to at
      least `needed`, lower maxclients or max-cached-fds, or use fd-reserve Lenient".
-4. Otherwise: **placement on.** Verify once that the module start is really past Valkey's event loop (see
+3. Otherwise: **placement on.** Verify once that the module start is really past Valkey's event loop (see
    5.7); if not, fail to load. Then, if `max-cached-fds` is larger than what the fd limit allows (`Lenient`
    only; `Strict` has just checked it fits), log a warning with the fd cache max entries and the fd limit
    that would fit `max-cached-fds`. Under `Strict`, also log the highest `maxclients` a later `CONFIG SET`
@@ -120,8 +117,9 @@ Loading never fails because the fd limit is too low, except under `fd-reserve St
 
 ### 5.2 Opening an object file
 
-With placement on: `open()` the file, copy the fd to the lowest free number in the module range
-(`F_DUPFD_CLOEXEC`), close the low one.
+With placement on: `open()` the file (close-on-exec), copy the fd to the lowest free number in the module
+range (`F_DUPFD_CLOEXEC`), close the low one. An fd that `open()` already put in the module range is kept as
+it is.
 
 If no number in the module range is free, close the low fd, count the failure, and return the error
 (`EMFILE`) to the caller. The caller turns it into an error reply: a SET reports an I/O error, a GET
@@ -224,15 +222,23 @@ Valkey accepts any `maxclients` up to `limit - 32`):
 
 The module reads the fd limit when it works out the fd cache max entries or opens a file. It does not watch for changes while
 idle. Valkey itself changes the fd limit only on `CONFIG SET maxclients`, which 5.5 handles. An fd limit changed
-from outside the server (for example `prlimit` on the running process) is not acted on; a command that
-then finds no free fd fails as in 5.2.
+from outside the server (for example `prlimit` on the running process) is picked up by the fd cache max
+entries at once, but placement is only turned on or off again at the next `CONFIG SET maxclients` (5.5). A
+command that finds no free fd fails as in 5.2.
 
-### 5.7 Startup probe
+### 5.7 Event-loop probe
 
-The module start is a copy of Valkey's `maxclients + 128`. At load the module checks that the copy is
-right: it places a probe eventfd at the module start and asks the event loop to watch it. Valkey answers `ERANGE`
-exactly when the number is past the loop; any other answer fails the load. This runs once, because the
-loop is always `maxclients + 128` wide, whatever `maxclients` later becomes.
+The module start is a copy of Valkey's `maxclients + 128`. Before placement is first turned on, the module
+checks that the copy is right: it asks the event loop to watch the module start number itself, with no fd of
+ours at that number. Valkey answers `ERANGE` exactly when the number is at or past the end of the loop;
+any other answer fails the check. If something already has that number open, the check cannot run and also
+fails, so it never registers someone else's fd.
+
+The check runs once, because the loop is never smaller than `maxclients + 128`, whatever `maxclients` later
+becomes. It normally runs at load. Under `fd-reserve Lenient` with an fd limit too low at load, placement
+starts off and the check runs at the first `CONFIG SET maxclients` that lets placement turn on. A failed
+check at load fails the load; at runtime it leaves placement off, logs the error, and is retried at the next
+`CONFIG SET maxclients`. `Strict` always runs it at load.
 
 ## 6. Examples
 
@@ -261,7 +267,7 @@ is an operator action: Valkey fixes the fd limit before the module loads.
 | `INFO largeobj_fd: fd_placement_failures` | Opens that found no free number in the module range. |
 | `INFO largeobj_fd: fd_cache_max_entries` | The most fds the fd cache holds: `max-cached-fds`, or less when the fd limit allows less. |
 | `INFO largeobj_fd: fd_cache_entries` | Fds in the cache now. |
-| Log | One warning per 1024 placement failures, naming the module start and the error. One warning when `max-cached-fds` does not fit, with the fd limit that would. A notice when the soft limit is raised, and when placement is off. |
+| Log | One warning per 1024 placement failures, naming the module start and the error. One warning when `max-cached-fds` does not fit, with the fd limit that would. A warning when placement is off. |
 
 To raise the fd limit: set `LimitNOFILE` in the unit that starts Valkey (systemd drop-in), `--ulimit nofile=`
 for Docker, or `ulimit -n` before `valkey-server`. Then restart.
@@ -325,12 +331,12 @@ Rejected shapes of the same decision:
   is one step above stock is refused while stock itself is not. `Strict` and `Lenient` are the two
   consistent ends of that.
 
-**2. Raise the soft limit to the hard limit at load.**
+**2. Leave the fd limit alone.**
 
 | | Behavior |
 |---|---|
-| **A. Raise** (chosen) | Logged. Stops Valkey lowering the hard limit on a later `CONFIG SET maxclients`. Goes further than Valkey, which raises only as far as it needs. |
-| B. Leave the fd limit alone | Respects a soft limit the operator set on purpose. A later `maxclients` raise can make Valkey lower the hard limit. |
+| A. Raise the soft limit to the hard limit at load | Stops Valkey lowering the hard limit on a later `CONFIG SET maxclients`, and uses every number the hard limit allows. But it changes the limit for the whole process, other modules included, and the operator already gets the value to set from every low-limit message. |
+| **B. Leave the fd limit alone** (chosen) | Respects a soft limit the operator set on purpose. A later `maxclients` raise can make Valkey lower the hard limit, and 5.5 then applies. |
 
 **3. How large is the command reserve?**
 
@@ -375,9 +381,8 @@ Experiments against a real `valkey-server`, `maxclients 10000` unless noted:
 | soft 1024, hard 65536, no module | After start: soft 10032, hard 10032 |
 | same, then `CONFIG SET maxclients 20000` | Rejected; limits and `maxclients` unchanged |
 | soft 20000, hard 65536, no module, then `CONFIG SET maxclients 30000` | soft 30032, hard 30032 |
-| same launch with the module loaded | soft and hard 65536 before and after the same `CONFIG SET` |
 
-The last row held in three repeats. One earlier run showed a different reading that could not be reproduced.
+The module does not change the fd limit, so loading it does not change these results.
 
 Tests:
 
