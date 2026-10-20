@@ -620,6 +620,18 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         return (TIERED_ARGS.format(data_dir=data_dir)
                 + " fabric-interfaces lo")
 
+    def test_string_configs_read_back(self):
+        """The string configs are registered as ValkeyGILGuard<ValkeyString> and mirrored into
+        Rust-side state by their set handler: CONFIG GET returns what was loaded, every time,
+        and the module is using it (the fabric came up on `lo`)."""
+        client = self.server.get_new_client()
+        for _ in range(3):
+            assert client.config_get('largeobj.fabric-interfaces') == {
+                'largeobj.fabric-interfaces': 'lo'}
+            assert client.config_get('largeobj.disk-dir') == {
+                'largeobj.disk-dir': self.data_dir}
+        assert self.server.verify_string_in_logfile('fabric service 0 rdma address')
+
     def test_shrink_releases_efa_registered_expanded_segment(self):
         client = self.server.get_new_client()
         expand_before = info_largeobj(client)['largeobj_dram_scaling_expands']
