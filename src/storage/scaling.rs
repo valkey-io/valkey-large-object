@@ -20,8 +20,7 @@ use super::get_dram_pool;
 /// 3. Proactive expand: if pool utilization exceeds the expand watermark,
 ///    add a segment before the hot path stalls on segment creation.
 /// 4. Proactive shrink: if server memory pressure exceeds the shrink watermark,
-///    evict the least-used segment. Tiered: data stays on NVMe. Dram, only under
-///    `allkeys-*`: its keys go on the reclaim list for step 2.
+///    drop the least-used segment's cached copies (Tiered only; data stays on NVMe).
 pub fn scaling_cron(ctx: &Context) {
     let expand_watermark = crate::scaling_expand_watermark();
     let shrink_watermark = crate::scaling_shrink_watermark();
