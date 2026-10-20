@@ -411,7 +411,7 @@ impl DRAMPool {
     /// every victim goes back and this returns None. The victims are returned so they drop
     /// after the locks are released. Tiered mode only.
     fn reclaim_in(&self, seg: usize, need: usize) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
-        let victims = self.take_victims(seg, need, RECLAIM_MAX_VICTIMS)?;
+        let victims = self.take_victims(seg, need)?;
         self.tiered_cache()
             .stats
             .demotions
@@ -421,13 +421,8 @@ impl DRAMPool {
 
     /// The victim search of `reclaim_in`, under the `objects` write lock: take
     /// sampled lowest-scoring objects from `seg` until they cover `need`, at most
-    /// `max_victims`. If they cannot, restore them all and return None.
-    fn take_victims(
-        &self,
-        seg: usize,
-        need: usize,
-        max_victims: usize,
-    ) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
+    /// `RECLAIM_MAX_VICTIMS`. If they cannot, restore them all and return None.
+    fn take_victims(&self, seg: usize, need: usize) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
         let samples = crate::victim_sample_size();
         let now_min = now_minutes();
         let decay_time = crate::blob_decay_time();
@@ -437,7 +432,7 @@ impl DRAMPool {
             .expect("DRAMPool.objects lock unavailable");
         let mut victims = Vec::new();
         let mut freed = 0usize;
-        while freed < need && victims.len() < max_victims {
+        while freed < need && victims.len() < RECLAIM_MAX_VICTIMS {
             let Some((oid, ctx)) = objects.take_victim(seg, samples, now_min, decay_time) else {
                 break;
             };
@@ -652,6 +647,17 @@ mod tests {
     }
 
     #[test]
+    fn the_victim_cap_stops_short_and_rolls_back() {
+        let p = pool();
+        let n = RECLAIM_MAX_VICTIMS as u16 + 1;
+        for i in 0..n {
+            p.insert_object(ObjectId(i as u64), ctx(0, i));
+        }
+        assert!(p.take_victims(0, n as usize * BUF as usize).is_none());
+        assert_eq!(p.object_count(), n as usize);
+    }
+
+    #[test]
     fn rolls_back_when_segment_cannot_cover_need() {
         let p = pool();
         for i in 0..4u16 {
@@ -660,8 +666,6 @@ mod tests {
         }
         // Segment 0 holds 4 BUF; other segments' bytes do not count.
         assert!(p.reclaim_in(0, 5 * BUF as usize).is_none());
-        // The victim cap stops short of 3 BUF.
-        assert!(p.take_victims(0, 3 * BUF as usize, 2).is_none());
         assert_eq!(p.object_count(), 8);
         assert_eq!(p.tiered_cache().stats.demotions.load(Ordering::Relaxed), 0);
         assert_index_consistent(&p);

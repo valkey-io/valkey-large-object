@@ -15,7 +15,7 @@
 //! The `maxmemory-policy` also lives here: the module API has no getter for it, so it is read
 //! at load and again when a `CONFIG SET` changes it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use hashlink::LinkedHashSet;
@@ -111,7 +111,9 @@ pub fn remove(oid: ObjectId) {
 /// is held while `take` runs, so it must not touch the candidates.
 pub fn pick(n: usize, take: impl FnMut(ObjectId) -> bool) -> Vec<ObjectId> {
     match &*candidates() {
-        EvictionCandidates::Lru(lru) => lru.oldest(VOLATILE.load(Ordering::Relaxed), n, take),
+        EvictionCandidates::Lru(lru) => {
+            lru.oldest(POLICY.load(Ordering::Relaxed) == VOLATILE, n, take)
+        }
     }
 }
 
@@ -136,13 +138,14 @@ pub fn on_keyspace_event(ctx: &Context, _: NotifyEvent, event: &str, key: &[u8])
 
 // ─── maxmemory-policy ────────────────────────────────────────────────────────
 
-/// `volatile-*`: only keys with a TTL may be evicted.
-static VOLATILE: AtomicBool = AtomicBool::new(false);
-/// `noeviction`: nothing may be evicted.
-static NOEVICTION: AtomicBool = AtomicBool::new(false);
+/// What `maxmemory-policy` lets eviction take: any key, only keys with a TTL, or nothing.
+const ALLKEYS: u8 = 0;
+const VOLATILE: u8 = 1;
+const NOEVICTION: u8 = 2;
+static POLICY: AtomicU8 = AtomicU8::new(ALLKEYS);
 
 pub fn noeviction() -> bool {
-    NOEVICTION.load(Ordering::Relaxed)
+    POLICY.load(Ordering::Relaxed) == NOEVICTION
 }
 
 /// Read `maxmemory-policy` from the server and cache it, warning if it is served in another
@@ -160,8 +163,14 @@ pub fn refresh_policy(ctx: &Context) {
             if volatile { "volatile" } else { "allkeys" }
         ));
     }
-    VOLATILE.store(volatile, Ordering::Relaxed);
-    NOEVICTION.store(name == "noeviction", Ordering::Relaxed);
+    let policy = if name == "noeviction" {
+        NOEVICTION
+    } else if volatile {
+        VOLATILE
+    } else {
+        ALLKEYS
+    };
+    POLICY.store(policy, Ordering::Relaxed);
 }
 
 #[cfg(test)]
