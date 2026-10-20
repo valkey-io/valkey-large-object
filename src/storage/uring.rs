@@ -67,7 +67,7 @@ enum IoRequest {
         op: UringOp,
         tx: oneshot::Sender<Result<(), StorageError>>,
     },
-    /// Rebuild this ring's fixed-buffer table from its live segments. 5.10 has
+    /// Rebuild this ring's fixed-buffer table from its segments. 5.10 has
     /// only a whole-table re-register: the poller sets `registration_pending` (new ops
     /// go non-fixed), waits for in-flight fixed ops to drain, then
     /// unregister + register. Fire-and-forget from expand()/release().

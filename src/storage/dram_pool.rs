@@ -212,6 +212,11 @@ impl DRAMPool {
         self.pool.io_uring_registered_count()
     }
 
+    /// See `SegmentPool::rdma_registered_count`.
+    pub fn rdma_registered_count(&self) -> usize {
+        self.pool.rdma_registered_count()
+    }
+
     // ─── Object Map ──────────────────────────────────────────────────────────
 
     /// Lookup a cached object.
@@ -439,28 +444,28 @@ impl DRAMPool {
         self.pool.utilization_ratio()
     }
 
-    /// Total allocated bytes across live segments. Used by INFO largeobj.
+    /// Total allocated bytes across non-draining segments. Used by INFO largeobj.
     pub fn allocated_bytes(&self) -> usize {
         self.pool.allocated_bytes()
     }
 
-    /// Total free-gap count across live segments — the fragmentation signal.
+    /// Total free-gap count across non-draining segments — the fragmentation signal.
     /// Used by INFO largeobj.
     pub fn fragment_count(&self) -> usize {
         self.pool.fragment_count()
     }
 
-    /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
+    /// Counts of (total, draining, unused) segments; total includes draining. Used by INFO largeobj.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         self.pool.segment_counts()
     }
 
     /// Call `f` with each segment's base pointer and size. Used for EFA registration.
-    pub fn with_live_segment_slices<F>(&self, f: F)
+    pub fn with_segment_slices<F>(&self, f: F)
     where
         F: FnMut(*const u8, usize),
     {
-        self.pool.with_live_segment_slices(f);
+        self.pool.with_segment_slices(f);
     }
 
     /// Free segments that finished draining since the last scaling cron tick.
@@ -508,7 +513,7 @@ impl DRAMPool {
     /// Mark the segment with the least cached bytes draining and remove its objects.
     ///
     /// Victim selection: the non-draining segment with the fewest allocated bytes.
-    /// Uses the per-segment `allocated_bytes` counter — O(live segments), no HashMap scan.
+    /// Uses the per-segment `allocated_bytes` counter — O(segments), no HashMap scan.
     ///
     /// Removing the objects drops the map's Arcs, so the segment releases as soon
     /// as in-flight readers drop theirs.

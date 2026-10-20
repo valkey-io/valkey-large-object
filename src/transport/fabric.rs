@@ -3,7 +3,7 @@
 //! `BLOB.RDMA_HELLO` inserts the client's address on all of them. On disconnect the client's entry on
 //! each is released.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, RwLock};
 
 use dma_libfabric::asynchronous::{FabricService, Transfer};
 use dma_libfabric::{discover_domains, Configuration, MemoryRegion, Pool, TransferRequest};
@@ -121,13 +121,12 @@ impl Fabric {
         drop(regions);
     }
 
-    /// Count of currently EFA-registered segments (one map entry per base). Equals the live
-    /// segment count when the fabric is up — used to assert that invariant in tests, not a metric.
-    pub fn registered_segment_count(&self) -> usize {
+    /// Whether the segment at `base` is currently EFA-registered.
+    pub fn is_registered(&self, base: usize) -> bool {
         self.regions
             .lock()
             .expect("Fabric.regions lock unavailable")
-            .len()
+            .contains_key(&base)
     }
 
     /// Insert the client's address into every service's address vector at BLOB.RDMA_HELLO, so its
@@ -158,32 +157,24 @@ impl Fabric {
 
 /// `None` before `commit` and after `shutdown`. `None` at commit means this instance has no
 /// fabric: the module runs TCP-only and `BLOB.RDMA_HELLO` reports RDMA unavailable.
-static FABRIC: Mutex<Option<Arc<Fabric>>> = Mutex::new(None);
-
-fn slot() -> MutexGuard<'static, Option<Arc<Fabric>>> {
-    FABRIC.lock().expect("FABRIC lock unavailable")
-}
+/// RwLock: every EFA transfer reads it from tokio workers; only commit and shutdown write.
+static FABRIC: RwLock<Option<Arc<Fabric>>> = RwLock::new(None);
 
 /// Store the fabric from `initialize`, once it has been set up.
 pub fn commit(fabric: Option<Fabric>) {
-    let mut slot = slot();
+    let mut slot = FABRIC.write().expect("FABRIC lock unavailable");
     assert!(slot.is_none(), "fabric already committed");
     *slot = fabric.map(Arc::new);
 }
 
 /// The running fabric, or `None` when this instance has none.
 pub fn fabric() -> Option<Arc<Fabric>> {
-    slot().clone()
-}
-
-/// Number of EFA-registered segments, or 0 when no fabric is up.
-pub fn registered_segment_count() -> usize {
-    fabric().map_or(0, |f| f.registered_segment_count())
+    FABRIC.read().expect("FABRIC lock unavailable").clone()
 }
 
 /// Drop the services. Each closes its channel, drains its in-flight transfers, and joins its
 /// worker.
 pub fn shutdown() {
-    let fabric = slot().take();
+    let fabric = FABRIC.write().expect("FABRIC lock unavailable").take();
     drop(fabric);
 }
