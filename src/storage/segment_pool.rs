@@ -726,7 +726,12 @@ impl SegmentPool {
         (allocated as f64) / (capacity as f64)
     }
 
-    /// Counts of (total, draining, unused) segments; total includes draining.
+    /// Counts of `(total, draining, unused)`.
+    /// - `total`: slots holding a segment, draining ones included. A segment with no
+    ///   objects in it still counts.
+    /// - `draining`: the part of `total` that is being shrunk away and takes no new allocations.
+    /// - `unused`: empty slots, with no segment and no memory. Releasing a drained segment
+    ///   leaves one, and the next `expand` reuses it.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         let st = self.state.lock().expect("state lock unavailable");
         let mut total = 0usize;
