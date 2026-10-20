@@ -94,7 +94,7 @@ pub fn unevictable_count() -> usize {
 }
 
 /// Claim `oid` for eviction: add it to the reclaim list and the unevictable list,
-/// unless it is in either already. One `UNEVICTABLE` critical section, so a
+/// unless it is in either already, and take it off the eviction candidates. One `UNEVICTABLE` critical section, so a
 /// teardown either adds `oid` to the unevictable list first (the claim fails) or
 /// finds it in the reclaim list. Call under the server lock.
 #[must_use]
@@ -105,6 +105,8 @@ pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
     {
         return None;
     }
+    // Claimed: no later eviction may pick it.
+    super::eviction_candidates::remove(oid);
     Some(UnevictableOID::insert(&mut unevictable, oid))
 }
 
@@ -128,6 +130,7 @@ impl ObjectFile {
     /// `ensure_open`. `disk_len` is the true on-disk size; `Drop` releases exactly
     /// that many bytes.
     pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
+        super::eviction_candidates::insert(object_id);
         Self {
             object_id,
             disk_len,
@@ -212,6 +215,8 @@ impl Drop for ObjectFile {
         // unless an eviction owns it, unlink the file.
         let object_id = self.object_id;
         let disk_len = self.disk_len;
+        // Eviction must not pick a file that is being torn down.
+        super::eviction_candidates::remove(object_id);
         // We do not allow the eviction of a file that is being torn down.
         let unevictable = UnevictableOID::new(object_id);
 
@@ -241,5 +246,21 @@ impl Drop for ObjectFile {
         } else {
             teardown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{eviction_candidates, reclaim::RECLAIM_LIST};
+    use super::*;
+
+    #[test]
+    fn a_claimed_victim_leaves_the_eviction_candidates() {
+        let oid = ObjectId(9_500);
+        eviction_candidates::insert(oid);
+        let claim = claim_victim(oid).expect("not claimed yet");
+        assert!(eviction_candidates::pick(usize::MAX, |o| o == oid).is_empty());
+        drop(claim);
+        RECLAIM_LIST.remove(&oid);
     }
 }

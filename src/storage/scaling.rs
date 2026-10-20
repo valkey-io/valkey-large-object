@@ -20,8 +20,8 @@ use super::get_dram_pool;
 /// 3. Proactive expand: if pool utilization exceeds the expand watermark,
 ///    add a segment before the hot path stalls on segment creation.
 /// 4. Proactive shrink: if server memory pressure exceeds the shrink watermark,
-///    evict the least-used segment. Tiered: data stays on NVMe. Dram: its keys
-///    go on the reclaim list for step 2.
+///    evict the least-used segment. Tiered: data stays on NVMe. Dram, only under
+///    `allkeys-*`: its keys go on the reclaim list for step 2.
 pub fn scaling_cron(ctx: &Context) {
     let expand_watermark = crate::scaling_expand_watermark();
     let shrink_watermark = crate::scaling_shrink_watermark();
@@ -61,8 +61,8 @@ pub fn scaling_cron(ctx: &Context) {
     // 4. Proactive shrink: yield memory back to core when server is under pressure.
     //
     // Only a segment release lowers used_memory: core evicting an LO key just
-    // returns its buffer to the segment. Without shrink, an evicting policy would
-    // keep evicting keys without ever getting under maxmemory.
+    // returns its buffer to the segment. Dram has no shrink (see `may_shrink`), so a
+    // Dram pool keeps its segments and evicted objects leave holes.
     //
     // Shrink is SERVER-scoped (crate::server_memory), not module-scoped: we give
     // DRAM back only under Valkey-wide pressure, so the module's own pool pressure
@@ -84,13 +84,13 @@ pub fn scaling_cron(ctx: &Context) {
         return;
     }
     let ratio = used as f64 / maxmemory as f64;
-    // Tiered shrink only drops cached copies, so it always runs. Dram shrink
-    // deletes keys, so it follows `maxmemory-policy`: none under `noeviction`.
-    let may_shrink =
-        crate::operating_mode() == crate::OperatingMode::Tiered || crate::eviction_allowed(ctx);
+    // Only Tiered shrinks: it drops cached copies and deletes no key. Dram has no
+    // shrink: releasing a segment would delete its keys whatever the policy says,
+    // so evicted objects leave holes for later writes.
+    let may_shrink = crate::operating_mode() == crate::OperatingMode::Tiered;
     if ratio > shrink_watermark && may_shrink && pool.try_shrink() {
         ctx.log_notice(&format!(
-            "largeobj: scaling — memory pressure {:.1}% > {:.0}%, evicted one DRAM segment",
+            "largeobj: scaling — memory pressure {:.1}% > {:.0}%, dropped one cached DRAM segment",
             ratio * 100.0,
             shrink_watermark * 100.0
         ));
@@ -98,7 +98,7 @@ pub fn scaling_cron(ctx: &Context) {
         pool.release_drained_segments();
     }
 
-    // A Dram shrink just filled the reclaim list: start cleanup on the fast tick.
+    // Evictions may have filled the reclaim list: start cleanup on the fast tick.
     rearm_scaling_cron(ctx, next_poll_ms());
 }
 

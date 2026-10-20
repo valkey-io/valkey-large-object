@@ -212,6 +212,9 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         panic!("Runtime already initialized");
     }
 
+    // Cache maxmemory-policy; `CONFIG SET` keeps it current.
+    storage::eviction_candidates::refresh_policy(ctx);
+
     // Mark module as initialized so runtime CONFIG SET validation is enabled.
     MODULE_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -273,6 +276,9 @@ valkey_module! {
         ["BLOB.RDMA_GET", commands::lo_rdma_get, "readonly fast", 1, 1, 1, "read largeobj fast"],
         ["BLOB.RDMA_SET", commands::lo_rdma_set, "write deny-oom fast", 1, 1, 1, "write largeobj fast"],
         ["BLOB.INFO", commands::lo_info, "readonly fast", 1, 1, 1, "read largeobj fast"],
+    ],
+    event_handlers: [
+        [@GENERIC: storage::eviction_candidates::on_keyspace_event],
     ],
     configurations: [
         i64: [

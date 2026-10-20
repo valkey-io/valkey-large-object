@@ -280,7 +280,7 @@ DEL key:
   7. Untrack buffer / delete object
 ```
 
-**Key property:** Data exists ONLY in DRAM. Dropping an object from the DRAMPool = data loss = equivalent to DEL. Today two things do it: Valkey's `maxmemory-policy` (whole-key eviction) and the module's segment shrink under server memory pressure, which deletes the keys on the released segment (§8.3, §8.5). Module-driven eviction of individual objects from the DRAMPool object map is planned (§8.1).
+**Key property:** Data exists ONLY in DRAM. Dropping an object from the DRAMPool = data loss = equivalent to DEL. Today two things do it: Valkey's `maxmemory-policy` (whole-key eviction) and module-driven eviction of individual objects (§8.1). Dram has no segment shrink: releasing a segment would delete its keys whatever the policy says (§8.3). 
 
 ### 5.2 DRAM + NVMe Mode
 
@@ -962,7 +962,7 @@ shrink, which releases segments, gives memory back to core.
 |---|---|---|---|
 | **Core maxmemory eviction** | Valkey's `maxmemory-policy` deletes a victim key (LO keys included) and calls the module free callback. `noeviction` → `BLOB.TCP_SET` / `BLOB.RDMA_SET` fails (OOM). Frees space inside a segment, not `used_memory` (fact 2). | **Yes** | Both |
 | **Module cache eviction** (`make_room_for`) | Demotes cached DRAM copies to make room for a promotion; the object stays on NVMe. | No | Tiered |
-| **Module segment shrink** (`try_shrink`) | Under server memory pressure, releases the least-loaded DRAM segment. | Tiered: no (data on NVMe). Dram: **yes** — the segment's keys are deleted | Both |
+| **Module segment shrink** (`try_shrink`) | Under server memory pressure, releases the least-loaded DRAM segment. | No: data is on NVMe | Tiered only |
 | **Module DRAM object eviction** *(planned)* | Evicts individual objects from the DRAMPool object map; their keys are deleted. | **Yes** | Dram |
 | **Module NVMe object eviction** *(planned)* | Evicts objects from the filesystem to free NVMe capacity (`disk-maxmemory`); their keys are deleted. | **Yes** | Tiered |
 
@@ -970,6 +970,53 @@ The two planned actors complete the reclaim family: like Dram shrink, they free 
 object's storage first and put its oid on the reclaim list (§8.5), and both feed the
 `reclaims` counter. `reclaim-sample-size` and the reclaim-named internals are reserved
 for them.
+
+**Which keys eviction may take follows `maxmemory-policy`.** The module API has no getter
+for the policy, so it is read once at load and again on the server's config-change event
+(`eviction_candidates::refresh_policy`), which `CONFIG SET` fires after applying the change; an
+eviction reads the cached value with one atomic load:
+
+| Policy | Keys eviction may take (both modes) |
+|---|---|
+| `volatile-*` | Only objects whose key has a TTL (the TTL list of the eviction candidates); with none left the write is refused, as in core |
+| `allkeys-*` | Any object |
+
+**The eviction candidates** (`eviction_candidates`) is one global structure that serves Dram and
+Tiered alike. Dram: it holds the objects in the DRAMPool. Tiered: it holds the objects
+that have an NVMe file, not their cached copies. It keeps two lists of oids in
+least-recently-used order, one over every object and one over the objects whose key has a
+TTL; `volatile-*` walks the TTL list, `allkeys-*` the full one, so no victim is walked
+past. Each is a `hashlink::LinkedHashSet` of oids, so an object carries no handle. A GET is
+a use; so is a TTL change, as in core. An oid leaves the candidates when it is evicted, so
+it is never picked twice, and again, harmlessly, when its key is torn down.
+TTL membership comes from the `expire`, `persist` and `copy_to` keyspace events
+(`eviction_candidates::on_keyspace_event`, both modes); `expire` covers EXPIRE, PEXPIRE,
+EXPIREAT and PEXPIREAT. RENAME and MOVE carry the object and its TTL together, and an
+overwrite mints a new oid, so none needs an event.
+
+The candidates are the only place that know an eviction order. They are reached through five
+functions (`insert`, `touch`, `set_ttl`, `remove`, `pick`), so another order is
+another variant behind them, and neither the Dram nor the Tiered eviction code changes.
+
+**When eviction runs.** Dram: only when the server may evict, that is `maxmemory` is set,
+the policy is not `noeviction`, and this is not a replica; the expand gate on `maxmemory`
+is what makes a SET miss. Tiered: whenever a write would exceed `disk-maxmemory`, unless
+`maxmemory-policy` is `noeviction` or this is a replica. The server's `maxmemory` is not
+required: it bounds DRAM, not the disk.
+
+**Order among the allowed keys.** Every policy runs as LRU, and the module logs a warning
+each time the policy is set, at load or by `CONFIG SET`, to one it serves in another
+order: `*-lfu`, `*-random` and `volatile-ttl`. Honoring LFU, random or TTL order is a
+future problem. Dram LRU evicts from the global list, not one segment: the freed bytes of
+a victim may sit in a segment that cannot take the write, so they stay as holes. One write
+evicts `LRU_EVICT_BATCH` (8) victims, then tries the allocation, and repeats once
+(`LRU_EVICT_ROUNDS`): at most 16 victims, so the main thread's work is bounded by a count,
+not by the size of the objects. A batch may evict more than the write needs; the extra
+holes serve the writes that follow. If the write still does not fit, the victims stay
+evicted and the write fails.
+
+Tiered cache demotion is not a policy eviction: it drops a cached copy, deletes no key,
+and ranks by decayed LFU score, not by `maxmemory-policy`.
 
 **Detection:**
 
@@ -1015,18 +1062,17 @@ with the fewest allocated bytes, drops every object on it, and releases it (§8.
 | Mode | Condition | Effect on the victim's objects |
 |---|---|---|
 | Tiered | ratio > watermark | Cached copies dropped; objects stay on NVMe, next GET reads NVMe. |
-| Dram | ratio > watermark **and** `maxmemory-policy` is not `noeviction` | The objects *are* the data. Their oids go on the reclaim list; the keys read as missing and the cron deletes them (§8.5). |
+| Dram | never | The objects *are* the data; releasing a segment would delete them. See below. |
 
-**Why the policy decides Dram shrink** (`eviction_allowed`). Dram shrink
-deletes keys, so it runs only when the operator allowed eviction (the module context
-flag `EVICT`: `maxmemory` set and the policy is not `noeviction`); under `noeviction`
-writes fail with OOM instead. A replica that ignores maxmemory (the default) never has
-the flag, so it leaves eviction to its primary. Under any evicting policy shrink is required, not
-optional: core evicting an LO key frees almost no `used_memory` (fact 2), so without a
-segment release core's eviction loop would keep deleting keys without ever getting
-under `maxmemory`. Tiered shrink drops only cached copies, so it runs under every
-policy: it is what makes room for new keys, client query buffers (a TCP `BLOB.TCP_SET`
-buffers its whole payload) and output buffers, even in an LO-only keyspace.
+**Why Dram does not shrink.** Releasing a segment deletes every key on it, TTL or not,
+hot or cold, which no `maxmemory-policy` allows. So Dram never shrinks: evicted objects
+leave holes that later writes reuse. The cost is that core evicting an LO key frees almost
+no `used_memory` (fact 2), so on a server that also holds other data, core's eviction
+loop can keep deleting keys without getting under `maxmemory`. Dram gets memory back only
+once segments can be emptied by migrating their objects instead of deleting them. Tiered
+shrink drops only cached copies, so it runs under every policy: it is what makes room for
+new keys, client query buffers (a TCP `BLOB.TCP_SET` buffers its whole payload) and output
+buffers, even in an LO-only keyspace.
 
 **Why proactive only.** Nothing "fails" to prompt a shrink: the trigger is external
 (the server approaching `maxmemory`), which the module only sees by polling. An alloc
@@ -1468,7 +1514,7 @@ bound is physical RAM, as in core Valkey.
 
 | Mode | At the ceiling |
 |---|---|
-| Dram | A `BLOB.TCP_SET` / `BLOB.RDMA_SET` that needs a new segment is rejected (OOM). Under an evicting `maxmemory-policy` the cron shrinks a segment and deletes its keys; under `noeviction` writes keep failing (§8.3). |
+| Dram | A `BLOB.TCP_SET` / `BLOB.RDMA_SET` that needs a new segment is rejected (OOM). An evicting `maxmemory-policy` makes room by evicting objects into holes (§8.1); under `noeviction` writes keep failing. Dram never shrinks (§8.3). |
 | Tiered | The cache stops growing; the cron shrinks segments (cached copies dropped, data stays on NVMe). |
 
 Segment **count** is always derived from demand, never a knob. Every segment is
@@ -1478,10 +1524,9 @@ exactly `segment-size`.
 
 - **Tiered mode:** DRAMPool is a cache, reclaimable under pressure without data loss.
   NVMe capacity is a hard SET bound today; module-driven NVMe eviction is planned (§8.1).
-- **Dram mode:** DRAMPool is the data. Under server memory pressure and an evicting
-  `maxmemory-policy`, the cron deletes the keys on the least-loaded segment (§8.5); core's
-  `maxmemory-policy` evicts whole keys independently but cannot lower `used_memory`
-  by itself (§8.1 fact 2). Module-driven per-object eviction is planned (§8.1).
+- **Dram mode:** DRAMPool is the data. It never shrinks (§8.3), so memory comes back only by
+  evicting objects into holes; core's `maxmemory-policy` evicts whole keys independently but
+  cannot lower `used_memory` by itself (§8.1 fact 2). Module-driven per-object eviction is planned (§8.1).
 
 **NVMe staging is not a scalable budget.** It sizes transient I/O buffers for
 concurrency, is fixed at startup and never shrinks.

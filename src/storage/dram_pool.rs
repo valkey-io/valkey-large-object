@@ -12,8 +12,9 @@
 //! Tiered: GETs fall back to NVMe. Dram: the objects' oids go on the reclaim
 //! list; their keys read as missing until the cron deletes them.
 //!
-//! Evict (Dram): a SET or COPY into a full arena evicts cold objects the same
-//! way (`alloc_exact_expand_evict`), where the server allows eviction.
+//! Evict (Dram): a SET or COPY into a full arena evicts the least recently used
+//! objects the `maxmemory-policy` allows (`alloc_exact_expand_evict`), where the
+//! server allows eviction. Dram never shrinks: that would delete keys whatever the policy.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -23,8 +24,14 @@ use super::cache_policy::{
     RECLAIM_MAX_VICTIMS,
 };
 use super::context::{ObjectContext, SegmentBuffer};
+use super::eviction_candidates;
 use super::segment_pool::SegmentPool;
 use crate::data_type::ObjectId;
+
+/// Dram eviction takes this many victims, then tries the allocation, for at most
+/// `LRU_EVICT_ROUNDS` rounds: a write evicts at most 16 victims, whatever their size.
+const LRU_EVICT_BATCH: usize = 8;
+const LRU_EVICT_ROUNDS: usize = 2;
 
 /// Cached objects plus a per-segment index of the same OIDs, so reclaim can
 /// sample one segment. Both change together, only through `insert`/`remove`.
@@ -51,6 +58,19 @@ impl ObjectMaps {
         let ctx = self.all.swap_remove(oid)?;
         self.by_segment[ctx.buffers[0].segment_idx as usize].swap_remove(oid);
         Some(ctx)
+    }
+
+    /// Remove and return the least recently used object no reader holds, among those the
+    /// `maxmemory-policy` allows. Dram only: the objects are the eviction candidates.
+    fn take_oldest(&mut self) -> Option<(ObjectId, Arc<ObjectContext>)> {
+        let all = &self.all;
+        let oid = *eviction_candidates::pick(
+            1,
+            |oid| matches!(all.get(&oid), Some(ctx) if Arc::strong_count(ctx) == 1),
+        )
+        .first()?;
+        eviction_candidates::remove(oid);
+        Some((oid, self.remove(&oid)?))
     }
 
     /// Remove every object in segment `seg` (shrink) and return their OIDs.
@@ -144,8 +164,8 @@ impl DRAMPool {
         self.pool.alloc_exact(obj_len as usize)
     }
 
-    /// `alloc_exact_or_expand`. If that fails and `eviction_allowed`, evict in the
-    /// least-loaded segments and retry the alloc in each (`make_room_for`).
+    /// `alloc_exact_or_expand`. If that fails and `eviction_allowed`, evict the least
+    /// recently used objects the `maxmemory-policy` allows (`evict_lru_for`).
     /// Dram mode, main thread only. `ctx` may be a dummy.
     pub fn alloc_exact_expand_evict(
         &self,
@@ -166,7 +186,43 @@ impl DRAMPool {
         if !crate::eviction_allowed(ctx) {
             return None;
         }
-        self.make_room_for(obj_len as usize)
+        self.evict_lru_for(obj_len as usize)
+    }
+
+    /// Evict the least recently used objects, `LRU_EVICT_BATCH` at a time, trying the
+    /// allocation after each batch. A victim's freed bytes may sit in a segment that
+    /// cannot take the write: they stay as a hole for later writes, and victims stay
+    /// evicted when the write still does not fit.
+    fn evict_lru_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
+        for _ in 0..LRU_EVICT_ROUNDS {
+            let mut evicted = 0;
+            for _ in 0..LRU_EVICT_BATCH {
+                let mut victim = None;
+                // List before `objects`, as in `try_shrink`.
+                super::reclaim::RECLAIM_LIST.add_with(|| {
+                    victim = self
+                        .objects
+                        .write()
+                        .expect("DRAMPool.objects lock unavailable")
+                        .take_oldest();
+                    victim.as_ref().map(|(oid, _)| *oid)
+                });
+                // No allowed victim is left.
+                let Some((_, ctx)) = victim else { break };
+                crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
+                evicted += 1;
+                // No reader holds it and it left the map: this is the last Arc, so its
+                // buffers return to their segment now.
+                drop(ctx);
+            }
+            if evicted == 0 {
+                return None;
+            }
+            if let Some(bufs) = self.pool.alloc_exact(obj_len) {
+                return Some(bufs);
+            }
+        }
+        None
     }
 
     pub fn free(&self, buf: &SegmentBuffer) {
@@ -240,25 +296,29 @@ impl DRAMPool {
         self.pool.is_segment_draining(seg_idx)
     }
 
-    /// Insert an ObjectContext (promotion path).
+    /// Insert an ObjectContext (promotion path). Dram: the object is an eviction candidate.
     pub fn insert_object(&self, oid: ObjectId, ctx: Arc<ObjectContext>) {
         self.objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
             .insert(oid, ctx);
+        if self.cache.is_none() {
+            eviction_candidates::insert(oid);
+        }
     }
 
     /// Remove an ObjectContext (free callback / eviction). Dram: also clears `oid`
-    /// from the reclaim list: its key is gone. Map first, then list: a shrink
-    /// that runs in between no longer sees the object, so cannot list it.
-    /// Tiered: the file's teardown clears it instead.
+    /// from the eviction candidates and the reclaim list: its key is gone. Map first, then
+    /// list: a shrink that runs in between no longer sees the object, so cannot list it.
+    /// Tiered: the file's teardown clears them instead.
     pub fn remove_object(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
         let removed = self
             .objects
             .write()
             .expect("DRAMPool.objects lock unavailable")
             .remove(oid);
-        if crate::operating_mode() == crate::OperatingMode::Dram {
+        if self.cache.is_none() {
+            eviction_candidates::remove(*oid);
             super::reclaim::RECLAIM_LIST.remove(oid);
         }
         removed
@@ -330,8 +390,8 @@ impl DRAMPool {
 
     // ─── Reclaim ─────────────────────────────────────────────────────────────
 
-    /// Allocate `obj_len` in one of the `RECLAIM_MAX_SEGMENTS` least-loaded
-    /// segments, reclaiming cold objects from each in turn if needed. None if it
+    /// Tiered: allocate `obj_len` in one of the `RECLAIM_MAX_SEGMENTS` least-loaded
+    /// segments, demoting cold cached copies from each in turn if needed. None if it
     /// cannot be made to fit.
     ///
     /// TODO: hold the SegmentPool state lock from `segment_shortfalls` through
@@ -340,12 +400,6 @@ impl DRAMPool {
     /// `ObjectContext::drop` uses, and a fix for the lock order (shrink frees
     /// buffers while holding `objects`, so today the order is objects -> state).
     fn make_room_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
-        // Tiered only drops cached copies, so only Dram needs eviction allowed.
-        assert!(
-            crate::operating_mode() != crate::OperatingMode::Dram
-                || crate::eviction_allowed(&valkey_module::Context::dummy()),
-            "Dram eviction without eviction_allowed"
-        );
         for (seg, short) in self.pool.segment_shortfalls(obj_len, RECLAIM_MAX_SEGMENTS) {
             // short == 0: the bytes fit but talc overhead blocked the alloc, so
             // free at least one victim.
@@ -353,9 +407,7 @@ impl DRAMPool {
                 continue;
             };
             // take_victim only takes objects no reader holds, and removes them from the map,
-            // so each Arc here is the last: dropping it frees its buffers to `seg` now. Dram:
-            // the keys stay until the cron deletes them; lo_free's remove_object then finds
-            // no entry, so nothing is freed twice.
+            // so each Arc here is the last: dropping it frees its buffers to `seg` now.
             drop(victims);
             if let Some(bufs) = self.pool.alloc_exact_in(seg, obj_len) {
                 return Some(bufs);
@@ -364,39 +416,17 @@ impl DRAMPool {
         None
     }
 
-    /// Remove the lowest-scoring unpinned objects in segment `seg` until their
-    /// bytes cover `need`, at most `RECLAIM_MAX_VICTIMS` in Tiered. All or nothing: if
-    /// they fall short, every victim goes back and this returns None. The victims
-    /// are returned so they drop after the locks are released.
-    ///
-    /// Dram: the victims' oids go on the reclaim list, as in `try_shrink`.
+    /// Demote the lowest-scoring unpinned objects in segment `seg` until their bytes
+    /// cover `need`, at most `RECLAIM_MAX_VICTIMS`. All or nothing: if they fall short,
+    /// every victim goes back and this returns None. The victims are returned so they drop
+    /// after the locks are released. Tiered mode only.
     fn reclaim_in(&self, seg: usize, need: usize) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
-        match &self.cache {
-            Some(cache) => {
-                let victims = self.take_victims(seg, need, RECLAIM_MAX_VICTIMS)?;
-                cache
-                    .stats
-                    .demotions
-                    .fetch_add(victims.len() as u64, Ordering::Relaxed);
-                Some(victims)
-            }
-            None => {
-                let mut victims = None;
-                // List before `objects`, as in `try_shrink`.
-                super::reclaim::RECLAIM_LIST.add_with(|| {
-                    // Dram victims are the data: no cap.
-                    victims = self.take_victims(seg, need, usize::MAX);
-                    victims
-                        .iter()
-                        .flatten()
-                        .map(|(oid, _)| *oid)
-                        .collect::<Vec<_>>()
-                });
-                let evicted = victims.as_ref()?.len() as u64;
-                crate::info::EVICTIONS.fetch_add(evicted, Ordering::Relaxed);
-                victims
-            }
-        }
+        let victims = self.take_victims(seg, need, RECLAIM_MAX_VICTIMS)?;
+        self.tiered_cache()
+            .stats
+            .demotions
+            .fetch_add(victims.len() as u64, Ordering::Relaxed);
+        Some(victims)
     }
 
     /// The victim search of `reclaim_in`, under the `objects` write lock: take
@@ -505,46 +535,35 @@ impl DRAMPool {
         Some(idx)
     }
 
-    /// Mark the segment with the least cached bytes draining and remove its objects.
+    /// Tiered only: mark the segment with the least cached bytes draining and drop its
+    /// cached copies. The data persists on NVMe and GETs fall back, so no key is touched.
+    /// Dram has no shrink: it would delete the segment's keys whatever the policy says.
     ///
     /// Victim selection: the non-draining segment with the fewest allocated bytes.
     /// Uses the per-segment `allocated_bytes` counter — O(live segments), no HashMap scan.
     ///
     /// Removing the objects drops the map's Arcs, so the segment releases as soon
     /// as in-flight readers drop theirs.
-    /// - **Tiered:** data persists on NVMe; GETs fall back.
-    /// - **Dram:** the oids go on the reclaim list. Their keys read as missing
-    ///   until the scaling cron deletes them.
     ///
     /// Returns true if a victim was selected, false if nothing to shrink.
     pub fn try_shrink(&self) -> bool {
+        assert!(
+            crate::operating_mode() == crate::OperatingMode::Tiered,
+            "try_shrink: Tiered only"
+        );
         let Some((victim_idx, _)) = self.pool.find_shrink_victim() else {
             return false;
         };
         self.pool.mark_segment_draining(victim_idx);
-
-        // Hold the reclaim list across the map scan. A concurrent `remove_object`
-        // either removed the object first (not seen, not listed) or blocks
-        // until we are done and then clears the oid we listed.
-        super::reclaim::RECLAIM_LIST.add_with(|| {
-            let removed = self
-                .objects
-                .write()
-                .expect("DRAMPool.objects lock unavailable")
-                .remove_by_segment_id(victim_idx);
-            let n = removed.len() as u64;
-            // Tiered: the objects live on in NVMe, so their keys stay valid.
-            if crate::operating_mode() == crate::OperatingMode::Dram {
-                crate::info::EVICTIONS.fetch_add(n, Ordering::Relaxed);
-                removed
-            } else {
-                self.tiered_cache()
-                    .stats
-                    .demotions
-                    .fetch_add(n, Ordering::Relaxed);
-                Default::default()
-            }
-        });
+        let removed = self
+            .objects
+            .write()
+            .expect("DRAMPool.objects lock unavailable")
+            .remove_by_segment_id(victim_idx);
+        self.tiered_cache()
+            .stats
+            .demotions
+            .fetch_add(removed.len() as u64, Ordering::Relaxed);
 
         self.shrink_count.fetch_add(1, Ordering::Relaxed);
         true
@@ -670,17 +689,30 @@ mod tests {
     }
 
     #[test]
-    fn dram_eviction_has_no_victim_cap() {
+    fn take_oldest_takes_the_least_recently_used_unpinned_object_in_any_segment() {
         let p = dram_pool();
-        let n = RECLAIM_MAX_VICTIMS + 1;
-        for i in 0..n as u16 {
-            p.insert_object(ObjectId(9_200 + i as u64), ctx(0, i));
+        for i in 0..3u16 {
+            p.insert_object(ObjectId(9_400 + i as u64), ctx(i % 2, i));
         }
-        let victims = p.reclaim_in(0, n * BUF as usize).unwrap();
-        assert_eq!(victims.len(), n);
-        for (oid, _) in &victims {
-            super::super::reclaim::RECLAIM_LIST.remove(oid);
-        }
+        eviction_candidates::touch(ObjectId(9_400));
+        let pinned = p.get_object(&ObjectId(9_401)).unwrap();
+        let take = || {
+            p.objects
+                .write()
+                .unwrap()
+                .take_oldest()
+                .map(|(oid, _)| oid.0)
+        };
+        // 9_400 was read and 9_401 is held by a reader: 9_402 is the oldest takeable.
+        assert_eq!(take(), Some(9_402));
+        assert_eq!(take(), Some(9_400));
+        assert_eq!(take(), None, "only the pinned object is left");
+        drop(pinned);
+        assert_eq!(p.object_count(), 1);
+        assert_index_consistent(&p);
+        // Taken objects left the candidates too; only the pinned one is still there.
+        let left = eviction_candidates::pick(usize::MAX, |oid| (9_400..9_403).contains(&oid.0));
+        assert_eq!(left, [ObjectId(9_401)]);
     }
 
     #[test]
