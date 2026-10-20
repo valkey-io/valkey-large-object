@@ -51,7 +51,7 @@ use crate::OperatingMode;
 //   commit it, so no concurrent free can reach it.
 //
 // Must pin `Arc<ObjectFile>` (the object's on-disk existence; its Drop unlinks). The
-// open fd is a separate `Arc<OwnedFd>` from `ensure_open`, held for the read's duration:
+// open fd is a separate `Arc<ObjectFd>` from `ensure_open`, held for the read's duration:
 //   - Every Tiered request that READS the object: the NVMe promotion read and the
 //     transient NVMe read (both in `cmd_get_tiered` / `cmd_get_tiered_run`), and — by the
 //     blanket rule — the DRAM serve that follows a promotion. The `ObjectFile` pin
@@ -337,7 +337,7 @@ fn cmd_get_dram_efa(
 
 /// Tiered GET: check DRAMPool → try promote → fall back to NVMe.
 /// `file` pins the object's `ObjectFile` (existence) for the whole GET operation; the
-/// open fd is a separate `Arc<OwnedFd>` obtained via `ensure_open`.
+/// open fd is a separate `Arc<ObjectFd>` obtained via `ensure_open`.
 fn cmd_get_tiered(
     object_id: ObjectId,
     obj_len: u64,
@@ -595,9 +595,36 @@ async fn cmd_get_tiered_run(
 // SET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute BLOB.TCP_SET / BLOB.RDMA_SET with mode + transport routing.
-/// Engine owns all routing decisions. Command handler just matches EngineResult.
-pub fn execute_set(
+/// BLOB.TCP_SET routing. DRAM is fully sync and copies straight from the borrowed
+/// arg into the segment — no intermediate `Vec`. Tiered moves the bytes to a
+/// tokio worker, which cannot borrow the arg, so it owns a copy.
+pub fn execute_set_tcp(
+    ctx: &valkey_module::Context,
+    key_name: &valkey_module::ValkeyString,
+    obj_len: u64,
+    data: &[u8],
+    old_oid: Option<ObjectId>,
+) -> EngineResult {
+    let object_id = ObjectId::next();
+    if crate::operating_mode() == OperatingMode::Dram {
+        return EngineResult::Sync(cmd_set_dram_tcp(ctx, key_name, obj_len, data, object_id));
+    }
+    let thread_ctx = BlockedRequest::new(ctx);
+    let key_name_bytes = key_name.as_slice().to_vec();
+    cmd_set_tiered(
+        key_name_bytes,
+        obj_len,
+        DataSource::Tcp(data.to_vec()),
+        thread_ctx,
+        object_id,
+        old_oid,
+    );
+    EngineResult::Async
+}
+
+/// Execute BLOB.RDMA_SET with mode routing. Always async (EFA transfers happen on
+/// a tokio worker); TCP SET is handled by execute_set_tcp.
+pub fn execute_set_rdma(
     ctx: &valkey_module::Context,
     key_name: &valkey_module::ValkeyString,
     obj_len: u64,
@@ -608,40 +635,32 @@ pub fn execute_set(
     // Assign object_id at command dispatch time (main thread) — establishes
     // ordering by arrival, not completion. Used for version checks on async paths.
     let object_id = ObjectId::next();
-    match (mode, &data_source) {
-        (OperatingMode::Dram, DataSource::Tcp(data)) => {
-            // Fully sync — alloc + memcpy + create LoValue inline.
-            EngineResult::Sync(cmd_set_dram_tcp(ctx, key_name, obj_len, data, object_id))
+    // Async — block client, dispatch to tokio.
+    let thread_ctx = BlockedRequest::new(ctx);
+    let key_name_bytes = key_name.as_slice().to_vec();
+    match mode {
+        OperatingMode::Dram => {
+            cmd_set_dram_efa(
+                ctx,
+                key_name_bytes,
+                obj_len,
+                data_source,
+                thread_ctx,
+                object_id,
+            );
         }
-        _ => {
-            // Async — block client, dispatch to tokio.
-            let thread_ctx = BlockedRequest::new(ctx);
-            let key_name_bytes = key_name.as_slice().to_vec();
-            match mode {
-                OperatingMode::Dram => {
-                    cmd_set_dram_efa(
-                        ctx,
-                        key_name_bytes,
-                        obj_len,
-                        data_source,
-                        thread_ctx,
-                        object_id,
-                    );
-                }
-                OperatingMode::Tiered => {
-                    cmd_set_tiered(
-                        key_name_bytes,
-                        obj_len,
-                        data_source,
-                        thread_ctx,
-                        object_id,
-                        old_oid,
-                    );
-                }
-            }
-            EngineResult::Async
+        OperatingMode::Tiered => {
+            cmd_set_tiered(
+                key_name_bytes,
+                obj_len,
+                data_source,
+                thread_ctx,
+                object_id,
+                old_oid,
+            );
         }
     }
+    EngineResult::Async
 }
 
 // ─── DRAM-only TCP SET ───────────────────────────────────────────────────────

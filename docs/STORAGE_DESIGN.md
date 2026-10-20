@@ -360,7 +360,7 @@ The three durable fields (`object_id`, `len`, `crc32c`) are serialized to RDB. T
 lazily, an open read fd) and is never serialized or reconstructed on load. No other
 runtime state (DRAM cache location, flags) lives on LoValue — those are in
 module-internal structures:
-- **FdPool:** `OIDIndexedMap<FdEntry>` (each entry wraps an `Arc<OwnedFd>` plus an LFU `AccessStats` score) — rebuilt on load, not serialized (§6.4)
+- **FdPool:** `OIDIndexedMap<FdEntry>` (each entry wraps an `Arc<ObjectFd>` plus an LFU `AccessStats` score) — rebuilt on load, not serialized (§6.4)
 - **DRAMPool:** `ObjectMaps` — `Arc<ObjectContext>` per oid plus a per-segment oid index; buffers in DRAMPool segments. Tiered: populated by GET promotion, demoted independently. Dram: populated by SET
 - **NVMePool inflight:** transient `StreamingContext` per in-flight request — buffers in NVMePool segments, dropped on completion
 - **Allocators:** one `Mutex<Talc>` **per segment** (inside each `Segment`), in both pools — no shared cross-segment allocator (§4.5, §8.7)
@@ -466,8 +466,8 @@ recovery/reconciliation — never on the hot serving path (LoValue in the keyspa
 carries all metadata needed to serve).
 
 **Runtime references:**
-- The read fd is opened lazily on the first GET and cached in FdPool as `Arc<OwnedFd>` (SET opens its own private fd, not via FdPool — §6.4)
-- Lookup: `fd_pool.get_or_open(object_id, disk_dir)` → `Arc<OwnedFd>` for io_uring submission
+- The read fd is opened lazily on the first GET and cached in FdPool as `Arc<ObjectFd>` (SET opens its own private fd, not via FdPool — §6.4)
+- Lookup: `fd_pool.get_or_open(object_id, disk_dir)` → `Arc<ObjectFd>` for io_uring submission
 - File size = `4096 + ceil(len / 4096) * 4096` (header page + O_DIRECT-padded data)
 - Actual object length stored in `LoValue.len` (hot path) and `FileHeader.len` (recovery path)
 - On DEL/free: `ObjectFile::Drop` removes the fd from FdPool (closes on last ref) and unlinks the file
@@ -481,7 +481,7 @@ without changing that primitive.
 
 ```rust
 struct FdEntry {
-    fd: Arc<OwnedFd>,    // The owned fd; in-flight readers hold clones of this Arc
+    fd: Arc<ObjectFd>,    // The owned fd; in-flight readers hold clones of this Arc
     stats: AccessStats,  // packed LFU score (counter + last-decay minute)
 }
 
@@ -489,25 +489,25 @@ struct FdPool {
     fds: RwLock<OIDIndexedMap<FdEntry>>, // IndexMap: dense storage enables sampled reclaim
     reclaims: AtomicU64,                 // fds dropped to stay under max-cached-fds
 }
-// The cap is the `max-cached-fds` config (0 = unlimited), read at call time.
+// The cap is the `max-cached-fds` config, read at call time.
 ```
 
-The lifetime-safety primitive is `Arc<OwnedFd>`: each in-flight read holds a clone,
+The lifetime-safety primitive is `Arc<ObjectFd>`: each in-flight read holds a clone,
 so an fd removed from the map — by DEL or by eviction — stays valid until the last
 reader finishes, and `OwnedFd` closes it via RAII on the final drop. **Everything
 else is policy built on this primitive; none of it can cause a use-after-close.**
 
 **Operations:**
 - **GET:** `fd_pool.get_or_open(oid, disk_dir)` — read-lock fast path returns a clone
-  of the cached `Arc<OwnedFd>` and bumps its `AccessStats`; on a miss it
+  of the cached `Arc<ObjectFd>` and bumps its `AccessStats`; on a miss it
   takes the write lock, re-checks (double-checked locking), `libc::open`s the file
-  (`O_RDONLY`, plus `O_DIRECT` when `direct-io` is on), wraps it in `Arc<OwnedFd>`,
+  (`O_RDONLY`, plus `O_DIRECT` when `direct-io` is on), wraps it in `Arc<ObjectFd>`,
   inserts an `FdEntry`, and returns a clone. Returns `None` only on a genuine
   `open()` failure.
 - **SET:** does **not** use FdPool — the write path opens its own private `OwnedFd`
   that closes when the SET task's scope ends.
 - **DEL/free:** `ObjectFile::Drop` calls `fd_pool.remove(oid)`, dropping the map's
-  `Arc<OwnedFd>`. The fd closes once the last in-flight-read clone is also dropped.
+  `Arc<ObjectFd>`. The fd closes once the last in-flight-read clone is also dropped.
 
 **Cap and eviction (LFU):** when an insert would exceed `max-cached-fds`, the pool
 samples up to `reclaim-sample-size` entries and drops the lowest decayed LFU score
@@ -542,7 +542,7 @@ Example: 50MB object cached in DRAMPool (long-lived). NVMePool would look the sa
 Valkey keyspace                Module internals
 ──────────────                 ────────────────
 key "obj-A"
-  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<OwnedFd> → {disk-dir}/000000000000002a.dat (50MB)
+  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<ObjectFd> → {disk-dir}/000000000000002a.dat (50MB)
        len=50MB,                                                ▲
        crc32c=0xAB12}                                           │  N buffers : 1 file
                                                                 │  (parallel ReadFixed/WriteFixed
@@ -1337,7 +1337,7 @@ This section describes how shared state is protected, which structures are refco
 | StreamingContext (NVMePool) | Owned by single tokio task, no Arc needed | The one task that owns it | Task completion: `nvme_pool_talc.lock().free()` for each buffer |
 | SegmentBuffer | **Not refcounted** — a plain move/copy descriptor (`segment_idx`, `offset`, `len`), no `Drop` | ObjectContext or StreamingContext (never shared independently) | Freed by the parent context's `Drop` (or explicit `pool.free(&buf)` on error paths) — `talc.free()` + segment refcount decrement |
 | ObjectFile | `Arc<ObjectFile>` | LoValue (1), each in-flight GET request (1 each) | `Drop` impl: remove fd from FdPool, `remove_file`, `decrease_nvme_disk_usage` |
-| Open fd | `Arc<OwnedFd>` (inside `FdEntry`) | FdPool map (1), each in-flight I/O op (1 each) | RAII: `OwnedFd` closes when last `Arc` drops. The strong count *is* the in-flight count; eviction just drops the map's clone, and a reader's clone keeps the fd open until it finishes |
+| Open fd | `Arc<ObjectFd>` (inside `FdEntry`) | FdPool map (1), each in-flight I/O op (1 each) | RAII: `OwnedFd` closes when last `Arc` drops. The strong count *is* the in-flight count; eviction just drops the map's clone, and a reader's clone keeps the fd open until it finishes |
 | Segment | `AtomicU32` refcount + `AtomicBool draining` + own `Mutex<Talc>` | Each live buffer allocated from this segment (+1 per alloc, −1 per free) | Releasable when draining && refcount==0. The scaling cron takes it out of its slot and drops it: `Segment::drop` deregisters EFA, then deallocs the backing memory (the segment's talc metadata lives inside it). Tiered: the DRAM ring then rebuilds its fixed-buffer table without it (§8.4). |
 
 ### 9.2 Threading Model: Which Thread Does What
@@ -1370,7 +1370,7 @@ Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a 
 | DRAMPool object map | `HashMap<ObjectId, Arc<ObjectContext>>` | `RwLock` | Main (read on GET hit, remove on free callback), tokio (read for coalesce check, write for promotion insert + Filling state update) |
 | DRAMPool allocators | one `Mutex<Talc>` **per segment** (inside each `Segment`) | Mutex (per segment) | Main (free callback — talc.free via Arc Drop), tokio (promotion alloc, DRAM-only SET alloc). Allocs on different segments never contend. |
 | NVMePool allocators | one `Mutex<Talc>` **per segment** (inside each `Segment`) | Mutex (per segment) | Tokio (alloc for all Tiered I/O — SET and GET miss), Arc Drop from any thread (free on StreamingContext drop) |
-| FdPool | `OIDIndexedMap<FdEntry>` (entry = `Arc<OwnedFd>` + LFU `AccessStats`) | `RwLock` | Main (remove via ObjectFile::Drop on DEL/free), tokio (get_or_open lazily on first GET; LFU eviction takes the write lock to remove a cold entry). SET does NOT use FdPool — it opens a private fd. |
+| FdPool | `OIDIndexedMap<FdEntry>` (entry = `Arc<ObjectFd>` + LFU `AccessStats`) | `RwLock` | Main (remove via ObjectFile::Drop on DEL/free), tokio (get_or_open lazily on first GET; LFU eviction takes the write lock to remove a cold entry). SET does NOT use FdPool — it opens a private fd. |
 | NVMe disk-usage counter | `AtomicU64` (NVME_DISK_USAGE) | lock-free atomic | Tokio (reserve on SET/COPY), any thread (decrement on ObjectFile::Drop / error rollback) |
 | Segment registry | `Mutex<SegmentState { slots: Vec<Option<Segment>> }>` (per pool) | Mutex | All threads take it briefly to reach a segment (alloc picker, free, buffer_ptr, iovec lookup). Slots are mutated only by expand/release on the main thread; the Tiered DRAM ring's poller rewrites `iovecs` and each segment's `iovec_index` during a rebuild (§8.6). Each segment's `refcount`/`allocated_bytes`/`draining` are atomics; its talc is a separate per-segment Mutex. |
 | Reclaim list | `RECLAIM_LIST: LazyLock<ReclaimList>` (`HashSet<ObjectId>` behind a `Mutex`) | Mutex | Main (add on Dram shrink; `contains` on BLOB.TCP_GET/BLOB.RDMA_GET/INFO/COPY; cron scan + remove; INFO), BIO (`lo_free` → `remove_object` removes), tokio (refused EFA commit → `remove_object`). Lock order: reclaim list before `DRAMPool.objects`. All readers run on the main thread, so a RwLock would buy nothing. |
@@ -1408,7 +1408,7 @@ lo_free(LoValue):
 
   2. LoValue drops → its Option<Arc<ObjectFile>> drops.
      → On the last Arc, ObjectFile::Drop performs the disk teardown:
-         - FdPool.remove(oid)      → drops the pool's Arc<OwnedFd> (fd closes when
+         - FdPool.remove(oid)      → drops the pool's Arc<ObjectFd> (fd closes when
                                       the last in-flight-read clone is also gone)
          - std::fs::remove_file(path)   (path derived from the ObjectId)
          - decrease_nvme_disk_usage(disk_len)
@@ -1417,7 +1417,7 @@ lo_free(LoValue):
        tokio so the main thread never does blocking fs work.
 ```
 
-**Invariant:** `lo_free` never blocks on in-flight operations. The key stops being visible immediately (new requests get key-not-found). Buffers, fd, and the NVMe file are reclaimed lazily via `Arc` drops — the two-Arc model (`Arc<ObjectFile>` for existence + `Arc<OwnedFd>` for the fd) keeps any in-flight read safe until it completes, and disk teardown is kept off the main thread.
+**Invariant:** `lo_free` never blocks on in-flight operations. The key stops being visible immediately (new requests get key-not-found). Buffers, fd, and the NVMe file are reclaimed lazily via `Arc` drops — the two-Arc model (`Arc<ObjectFile>` for existence + `Arc<ObjectFd>` for the fd) keeps any in-flight read safe until it completes, and disk teardown is kept off the main thread.
 
 ### 9.5 Segment Draining Lifecycle
 
@@ -1479,7 +1479,7 @@ this section owns the semantics.
 | `promote-min-hits` | `2` | `1` | `255` | Live | Admission-filter misses before a GET promotes an object |
 | `tiered-decay-time` | `1` | `0` (off) | `65535` | Live | LFU decay: minutes per one-point decrement |
 | `reclaim-sample-size` | `5` | `1` | `64` | Live | Objects sampled per cache-eviction round; the lowest LFU score is demoted |
-| `max-cached-fds` | `1024` | `0` (unlimited) | `1048576` | Live | FdPool cap on cached read fds |
+| `max-cached-fds` | `16384` | `0` (no cache) | `1048576` | Live | FdPool cap on cached read fds, clamped to what the fd limit allows (`fd-reserve` sets what happens when it does not fit; see `OBJECT_FD_PLACEMENT_DESIGN.md`) |
 | `max-object-size` | `512MB` | `1` | i64::MAX | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
 | `chunk-size` | `8MB` | `4096` | `256MB` | Immutable | I/O chunk / allocation unit (detail: §7.2) |
 | `max-buffers-per-op` / `min-buffers-per-op` | 8 / 2 | 2 / 1 | 64 / 64 | Live | Streaming pipeline depth (detail: §7.3.6) |
