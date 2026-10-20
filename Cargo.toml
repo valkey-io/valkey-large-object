@@ -14,8 +14,8 @@ libc = "0.2"
 crc-fast = "1"
 io-uring = "0.7"
 crossbeam-channel = "0.5"
-dma-libfabric = { git = "https://github.com/momentohq/vdma.git", rev = "e2679fb03fb62daf4c04d15c2cf89772788857bf" }
-dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = "e2679fb03fb62daf4c04d15c2cf89772788857bf" }
+dma-libfabric = { git = "https://github.com/momentohq/vdma.git", rev = "72c3a088fcfd111f21d96cfa43c05ea5bd40ae18" }
+dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = "72c3a088fcfd111f21d96cfa43c05ea5bd40ae18" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 indexmap = "2"
 hashlink = "0.12"
