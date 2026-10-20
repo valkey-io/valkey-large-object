@@ -77,7 +77,7 @@ impl NVMePool {
         self.pool.rdma_registered_count()
     }
 
-    /// Counts of (live, draining, unused) segments. Used by INFO largeobj.
+    /// Counts of (total, draining, unused) segments; total includes draining. Used by INFO largeobj.
     pub fn segment_counts(&self) -> (usize, usize, usize) {
         self.pool.segment_counts()
     }
@@ -88,10 +88,10 @@ impl NVMePool {
     }
 
     /// Call `f` with each segment's base pointer and size. Used for EFA registration.
-    pub fn with_live_segment_slices<F>(&self, f: F)
+    pub fn with_segment_slices<F>(&self, f: F)
     where
         F: FnMut(*const u8, usize),
     {
-        self.pool.with_live_segment_slices(f);
+        self.pool.with_segment_slices(f);
     }
 }

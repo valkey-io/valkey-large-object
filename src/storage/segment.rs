@@ -103,7 +103,7 @@ impl Segment {
         self.io_uring_registered.load(Ordering::Relaxed)
     }
 
-    /// Mark this segment as registered — see the field's doc. Never un-set while the segment is live.
+    /// Mark this segment as registered — see the field's doc. Never un-set while the segment exists.
     pub fn mark_io_uring_registered(&self) {
         self.io_uring_registered.store(true, Ordering::Relaxed);
     }

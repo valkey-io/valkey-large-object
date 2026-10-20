@@ -1009,7 +1009,7 @@ The proactive expand is skipped on a tick where a shrink is still unfinished (§
 ### 8.3 When to Shrink
 
 The scaling cron reads `used_memory / maxmemory` on every tick (`scaling-poll-ms`).
-Above `scaling-shrink-watermark` it shrinks: it picks the live, non-draining segment
+Above `scaling-shrink-watermark` it shrinks: it picks the non-draining segment
 with the fewest allocated bytes, drops every object on it, and releases it (§8.5).
 
 | Mode | Condition | Effect on the victim's objects |

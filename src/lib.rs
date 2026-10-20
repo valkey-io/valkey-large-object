@@ -112,12 +112,6 @@ pub fn efa_release_segment(base: usize) {
     }
 }
 
-/// How many of the segments at `bases` are EFA-registered (0 when no fabric). Each pool counts its
-/// own segments, so INFO reports them per pool.
-pub fn efa_registered_among(bases: &[usize]) -> usize {
-    transport::fabric::registered_among(bases)
-}
-
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
 
 fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {

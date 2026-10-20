@@ -256,17 +256,17 @@ pub fn init(mode: crate::OperatingMode, disk_dir: &str) -> Result<String, String
 pub fn all_segment_slices() -> Vec<&'static [u8]> {
     let mut slices = Vec::new();
     if let Some(nvme_pool) = NVME_POOL.get() {
-        nvme_pool.with_live_segment_slices(|base, size| {
+        nvme_pool.with_segment_slices(|base, size| {
             slices.push(unsafe { std::slice::from_raw_parts(base, size) });
         });
     }
-    get_dram_pool().with_live_segment_slices(|base, size| {
+    get_dram_pool().with_segment_slices(|base, size| {
         slices.push(unsafe { std::slice::from_raw_parts(base, size) });
     });
     slices
 }
 
-/// Rebuild ONE pool's dense io_uring fixed-buffer table from its live segments,
+/// Rebuild ONE pool's dense io_uring fixed-buffer table from its segments,
 /// reassigning each a dense pool-local `iovec_index`, marking it registered, and
 /// returning the iovec array for that ring's `register_buffers`. Dense because
 /// 5.10 can only re-register the whole table. Only `PoolType::Dram` re-registers

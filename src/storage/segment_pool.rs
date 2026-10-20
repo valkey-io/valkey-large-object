@@ -5,7 +5,7 @@
 //! ## Design
 //!
 //! `slots: Vec<Option<Segment>>` behind a `Mutex` — each slot is either
-//! `Some(segment)` (live) or `None` (empty/removed). Slot index is what
+//! `Some(segment)` (in use, draining or not) or `None` (unused). Slot index is what
 //! `SegmentBuffer.segment_idx` names: it only locates the segment in `slots`.
 //! A segment's `iovec_index` is its position in this pool's own io_uring buffer
 //! table (each pool has its own ring) and is read from the segment itself. The
@@ -13,7 +13,7 @@
 //!
 //! Each `Segment` owns its own `Talc<>` instance covering exactly its own
 //! `[base, base+size)` range. There is NO shared allocator across segments.
-//! `alloc_one` walks live non-draining segments in least-loaded-first order
+//! `alloc_one` walks non-draining segments in least-loaded-first order
 //! under one state lock, picks the least-loaded that clears a fast byte
 //! filter, and allocates from its own talc — `talc.allocate` itself is the exact
 //! all-or-nothing check (returns Err on OOM without committing). Per-segment
@@ -115,7 +115,7 @@ impl SegmentPool {
         self.alloc_object_in_one_segment(&Self::chunk_sizes(size), Some(seg_idx))
     }
 
-    /// `(seg_idx, bytes_short)` for the `n` least-loaded live segments, emptiest
+    /// `(seg_idx, bytes_short)` for the `n` least-loaded non-draining segments, emptiest
     /// first. 0 means the bytes fit and only talc overhead could block the alloc.
     pub(super) fn segment_shortfalls(&self, size: usize, n: usize) -> Vec<(usize, usize)> {
         let total: usize = Self::chunk_sizes(size).iter().sum();
@@ -226,7 +226,7 @@ impl SegmentPool {
         Some(buffers)
     }
 
-    /// Mirror talc's authoritative live figures (`allocated_bytes`,
+    /// Mirror talc's authoritative figures (`allocated_bytes`,
     /// `fragment_count`) into the segment's atomics. Call while holding the
     /// segment's talc lock: talc updates these inside allocate/deallocate, so
     /// the mirror is drift-free and overhead-aware, and the scaling cron / INFO
@@ -319,7 +319,7 @@ impl SegmentPool {
     /// Allocate up to `count` uniform buffers of `chunk_size` each, requiring at
     /// least `min_required`. All-or-nothing when `min_required == count`.
     ///
-    /// Each iteration walks the live non-draining segments in LEAST-LOADED-first
+    /// Each iteration walks the non-draining segments in LEAST-LOADED-first
     /// order under one state lock and allocates from the least-loaded segment's
     /// own talc allocator (`talc.allocate` is the exact fit check). Allocation
     /// may return `None` when the segment allocator cannot satisfy the request.
@@ -366,7 +366,7 @@ impl SegmentPool {
         Some(buffers)
     }
 
-    /// One allocation: pick the least-loaded live, non-draining segment that
+    /// One allocation: pick the least-loaded non-draining segment that
     /// clears the fast byte filter (single O(N) `min_by_key` pass, no sort, no
     /// candidate Vec), then allocate from its talc. Returns None if there is no
     /// eligible segment, or the picked segment's `talc.allocate` returns None.
@@ -415,7 +415,7 @@ impl SegmentPool {
         let ptr = talc.allocate(layout).ok()?.cast::<u8>();
         let offset = ptr.as_ptr() as usize - seg_base as usize;
         seg.inc_ref();
-        // Mirror talc's authoritative live figures under the lock we hold
+        // Mirror talc's authoritative figures under the lock we hold
         // (drift-free, overhead-aware) — read lock-free by the cron/INFO.
         self.mirror_counters(seg, &talc);
         drop(talc);
@@ -445,7 +445,7 @@ impl SegmentPool {
             let st = self.state.lock().expect("state lock unavailable");
             let seg = st.slots[seg_idx]
                 .as_ref()
-                .expect("segment slot empty for live buffer — invariant broken");
+                .expect("segment slot empty for an allocated buffer — invariant broken");
             let ptr = unsafe { seg.base.add(buf.offset as usize) };
             {
                 let talc = seg.talc.lock().expect("segment talc lock unavailable");
@@ -475,22 +475,22 @@ impl SegmentPool {
     /// Returns `(slot_idx, segment_slice)` on success. The slice is `'static` (segment memory
     /// is stable for the module's lifetime) so the caller can register it with the transport
     /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if this pool
-    /// already has `MAX_SEGMENTS` live segments.
+    /// already has `MAX_SEGMENTS` segments.
     pub fn expand(&self) -> Option<(u16, &'static [u8])> {
         let mut seg = Segment::new(self.segment_size);
         // Segment memory is stable for the module's lifetime (never freed until
-        // the segment is released, and a live segment is not released while a
+        // the segment is released, and a segment is not released while a
         // registration references it). SAFETY: base/size describe the just-
         // allocated backing buffer.
         let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(seg.base, seg.size) };
 
         let mut st = self.state.lock().expect("state lock unavailable");
         // On None, `seg` drops here and nothing enters `slots`.
-        let live = st.slots.iter().flatten().count();
-        if live >= super::MAX_SEGMENTS {
+        let segment_count = st.slots.iter().flatten().count();
+        if segment_count >= super::MAX_SEGMENTS {
             return None;
         }
-        seg.iovec_index = live as u16; // placeholder
+        seg.iovec_index = segment_count as u16; // placeholder
         let slot = match st.slots.iter().position(|s| s.is_none()) {
             Some(i) => {
                 st.slots[i] = Some(seg);
@@ -516,7 +516,7 @@ impl SegmentPool {
     /// emptiest first. The caller holds the state lock so slots stay stable.
     /// The allocator's pick, the shrink victim, and `segment_shortfalls` use it.
     fn least_loaded(st: &SegmentState, n: usize) -> Vec<(usize, usize)> {
-        let mut live: Vec<(usize, usize)> = st
+        let mut candidates: Vec<(usize, usize)> = st
             .slots
             .iter()
             .enumerate()
@@ -531,9 +531,9 @@ impl SegmentPool {
                 })
             })
             .collect();
-        live.sort_by_key(|&(_, bytes)| bytes);
-        live.truncate(n);
-        live
+        candidates.sort_by_key(|&(_, bytes)| bytes);
+        candidates.truncate(n);
+        candidates
     }
 
     /// Mark a specific segment as draining by slot index.
@@ -592,7 +592,7 @@ impl SegmentPool {
         unsafe {
             st.slots[buf.segment_idx as usize]
                 .as_ref()
-                .expect("segment slot empty for live buffer — invariant broken")
+                .expect("segment slot empty for an allocated buffer — invariant broken")
                 .base
                 .add(buf.offset as usize)
         }
@@ -603,7 +603,7 @@ impl SegmentPool {
         let st = self.state.lock().expect("state lock unavailable");
         st.slots[buf.segment_idx as usize]
             .as_ref()
-            .expect("segment slot empty for live buffer")
+            .expect("segment slot empty for an allocated buffer")
             .iovec_index
     }
 
@@ -617,11 +617,11 @@ impl SegmentPool {
         let st = self.state.lock().expect("state lock unavailable");
         st.slots[buf.segment_idx as usize]
             .as_ref()
-            .expect("segment slot empty for live buffer")
+            .expect("segment slot empty for an allocated buffer")
             .is_io_uring_registered()
     }
 
-    /// Mark every currently-live segment as io_uring-registered. Called once at
+    /// Mark every segment as io_uring-registered. Called once at
     /// startup after the initial IORING_REGISTER_BUFFERS succeeds, since those
     /// segments' iovecs are in the kernel table.
     pub fn mark_all_registered(&self) {
@@ -633,7 +633,7 @@ impl SegmentPool {
         }
     }
 
-    /// Rebuild this pool's ring table: reindex live segments densely from 0, mark
+    /// Rebuild this pool's ring table: reindex segments densely from 0, mark
     /// them registered, and return the iovec array for `register_buffers`. Dense
     /// because 5.10 cannot register a sparse table.
     pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
@@ -647,7 +647,7 @@ impl SegmentPool {
         out
     }
 
-    /// Count of live segments marked io_uring-registered. Below this pool's live
+    /// Count of segments marked io_uring-registered. Below the pool's segment
     /// count means an expanded segment's re-register hasn't completed yet. INFO metric.
     pub fn io_uring_registered_count(&self) -> usize {
         let st = self.state.lock().expect("state lock unavailable");
@@ -658,16 +658,21 @@ impl SegmentPool {
             .count()
     }
 
-    /// Count of this pool's segments (draining ones too) that are EFA-registered; 0 when no
-    /// fabric is up. Equals the pool's segment count when the fabric is up, except briefly while a
-    /// new segment is being registered. INFO metric.
+    /// Count of segments (draining ones too) that are EFA-registered; 0 when no fabric is up.
+    /// Below the pool's segment count only while a new segment is being registered. INFO metric.
     pub fn rdma_registered_count(&self) -> usize {
-        let mut bases = Vec::new();
-        self.with_live_segment_slices(|base, _| bases.push(base as usize));
-        crate::efa_registered_among(&bases)
+        let Some(fabric) = crate::transport::fabric::fabric() else {
+            return 0;
+        };
+        let st = self.state.lock().expect("state lock unavailable");
+        st.slots
+            .iter()
+            .flatten()
+            .filter(|seg| fabric.is_registered(seg.base as usize))
+            .count()
     }
 
-    /// Total allocated bytes across live (non-draining) segments.
+    /// Total allocated bytes across non-draining segments.
     /// Sums the per-segment atomics directly — the exact figure INFO reports,
     /// with no ratio round-trip.
     pub fn allocated_bytes(&self) -> usize {
@@ -683,7 +688,7 @@ impl SegmentPool {
             .sum()
     }
 
-    /// Total free-gap count across live (non-draining) segments — the pool's
+    /// Total free-gap count across non-draining segments — the pool's
     /// fragmentation signal. Sums the per-segment `fragment_count` atomics.
     /// A count, not a byte figure: rising against flat `allocated_bytes` means
     /// free space is scattering into small holes.
@@ -700,24 +705,24 @@ impl SegmentPool {
             .sum()
     }
 
-    /// Utilization ratio: allocated_bytes / total_live_capacity.
+    /// Utilization ratio: allocated_bytes / capacity of the non-draining segments.
     /// 0.0 = empty, 1.0 = fully allocated.
     pub fn utilization_ratio(&self) -> f64 {
         let st = self.state.lock().expect("state lock unavailable");
-        let mut live = 0usize;
+        let mut non_draining = 0usize;
         let mut allocated = 0usize;
         for seg in st.slots.iter().flatten() {
             if !seg.draining.load(std::sync::atomic::Ordering::Relaxed) {
-                live += 1;
+                non_draining += 1;
                 allocated += seg
                     .allocated_bytes
                     .load(std::sync::atomic::Ordering::Relaxed);
             }
         }
-        if live == 0 {
+        if non_draining == 0 {
             return 0.0;
         }
-        let capacity = live * self.segment_size;
+        let capacity = non_draining * self.segment_size;
         (allocated as f64) / (capacity as f64)
     }
 
@@ -741,9 +746,9 @@ impl SegmentPool {
         (total, draining, unused)
     }
 
-    /// Call `f` with each live segment's base pointer and size.
+    /// Call `f` with each segment's base pointer and size (draining ones included).
     /// Used by `all_segment_slices` for EFA registration.
-    pub fn with_live_segment_slices<F>(&self, mut f: F)
+    pub fn with_segment_slices<F>(&self, mut f: F)
     where
         F: FnMut(*const u8, usize),
     {
