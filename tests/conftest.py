@@ -8,3 +8,9 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'buil
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), 'build/valkeytestframework')))
 
 from valkeytestframework.conftest import resource_port_tracker
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        'markers',
+        'skip_for_asan: skipped in the ASAN job (ci.yml runs -m "not skip_for_asan")')

@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use valkey_module::enum_configuration;
 use valkey_module::Context;
 use valkey_module::ContextFlags;
+use valkey_module_macros::config_changed_event_handler;
 
 use crate::errors;
 use crate::storage;
@@ -22,6 +23,28 @@ enum_configuration! {
         Tiered = 1,
     }
 }
+
+// A separate module: each `enum_configuration!` expansion imports a trait by name.
+mod fd_reserve_policy {
+    use valkey_module::enum_configuration;
+
+    enum_configuration! {
+        /// What the module does when the fd limit does not cover the command reserve
+        /// (`module start + maxclients`) — set via `fd-reserve`, Tiered only.
+        /// Lenient (default): load anyway; placement and the fd cache turn off and the
+        /// server keeps serving. A `max-cached-fds` that does not fit is clamped.
+        /// Strict: the reserve and `max-cached-fds` must both fit. Otherwise refuse to
+        /// load, reject a `CONFIG SET max-cached-fds` that does not fit, and abort if a
+        /// later `CONFIG SET maxclients` breaks either.
+        #[derive(Debug, PartialEq, Eq, Copy)]
+
+        pub enum FdReserve {
+            Lenient = 0,
+            Strict = 1,
+        }
+    }
+}
+pub use fd_reserve_policy::FdReserve;
 
 // ─── Config Defaults, Limits ─────────────────────────────────────────────────
 //
@@ -79,7 +102,7 @@ pub const DEFAULT_VICTIM_SAMPLE_SIZE: i64 = 5;
 pub const MIN_VICTIM_SAMPLE_SIZE: i64 = 1;
 pub const MAX_VICTIM_SAMPLE_SIZE: i64 = 64;
 // max-cached-fds
-pub const DEFAULT_MAX_CACHED_FDS: i64 = 1024;
+pub const DEFAULT_MAX_CACHED_FDS: i64 = 16_384;
 pub const MIN_MAX_CACHED_FDS: i64 = 0;
 pub const MAX_MAX_CACHED_FDS: i64 = 1_048_576;
 // scaling-expand-watermark
@@ -178,7 +201,8 @@ lazy_static::lazy_static! {
     pub static ref CFG_VICTIM_SAMPLE_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_VICTIM_SAMPLE_SIZE);
 
     /// Cap on read fds cached by the FdPool. When full, opening a new fd evicts
-    /// the lowest LFU score among samples. 0 means unlimited.
+    /// the lowest LFU score among samples. The cache holds at most what fits in the
+    /// module range; a larger value is clamped with a warning.
     pub static ref CFG_MAX_CACHED_FDS: AtomicI64 = AtomicI64::new(DEFAULT_MAX_CACHED_FDS);
 
     /// Proactive expand watermark (0.0–1.0). When DRAMPool utilization exceeds this
@@ -209,6 +233,9 @@ lazy_static::lazy_static! {
     /// - Dram (0): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
     /// - Tiered (1): objects persist on NVMe, DRAMPool is a read cache with promotion.
     pub static ref CFG_OPERATING_MODE: Mutex<OperatingMode> = Mutex::new(OperatingMode::Dram);
+
+    /// fd-reserve policy. Immutable after module load.
+    pub static ref CFG_FD_RESERVE: Mutex<FdReserve> = Mutex::new(FdReserve::Lenient);
 
     // ─── Fabric Configs ──────────────────────────────────────────────────
 
@@ -398,6 +425,12 @@ pub fn operating_mode() -> OperatingMode {
         .expect("CFG_OPERATING_MODE lock unavailable")
 }
 
+pub fn fd_reserve() -> FdReserve {
+    *CFG_FD_RESERVE
+        .lock()
+        .expect("CFG_FD_RESERVE lock unavailable")
+}
+
 pub fn chunk_size() -> usize {
     CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
@@ -579,6 +612,51 @@ pub fn validate_config_constraint(
         return Ok(());
     }
     validate_all_constraints().map_err(valkey_module::ValkeyError::String)
+}
+
+/// The one listener for changes to Valkey's own configs (`CONFIG SET`), fired after the
+/// change is applied. Each subsystem owns its handling; this only routes, so the order
+/// of reactions to a change is visible here. The module's own configs do not come
+/// through here: they use their per-config `on_set` / `on_changed` callbacks.
+#[config_changed_event_handler]
+fn on_server_config_changed(ctx: &Context, changed: &[&str]) {
+    if changed.contains(&"maxclients") {
+        storage::fd_placement::on_maxclients_changed(ctx);
+    }
+}
+
+/// `max-cached-fds` changed: the cache is trimmed to the new limit right away
+/// (nothing when placement is off), and a value that does not fit is logged. No pool
+/// yet at load.
+pub fn on_max_cached_fds_changed(
+    _ctx: &valkey_module::configuration::ConfigurationContext,
+    _name: &str,
+    val: &'static AtomicI64,
+) {
+    if let Some(pool) = storage::FD_POOL.get() {
+        pool.shrink_to(storage::fd_placement::fd_cache_max_entries());
+        storage::fd_placement::warn_if_cache_limited(
+            val.load(std::sync::atomic::Ordering::Relaxed) as u64,
+        );
+    }
+}
+
+/// `max-cached-fds` CONFIG SET under `fd-reserve Strict`: the new value must fit in the
+/// fd limit, or the command fails naming the limit that would fit. Lenient accepts any
+/// value and clamps. The framework has already stored the new value; on Err core
+/// restores the old one. No pool yet at load, where `raise_module_start` runs the check.
+pub fn validate_max_cached_fds(
+    _ctx: &valkey_module::configuration::ConfigurationContext,
+    _name: &str,
+    val: &'static AtomicI64,
+) -> Result<(), valkey_module::ValkeyError> {
+    if storage::FD_POOL.get().is_none() {
+        return Ok(());
+    }
+    storage::fd_placement::check_cache_fits_if_strict(
+        val.load(std::sync::atomic::Ordering::Relaxed) as u64,
+    )
+    .map_err(valkey_module::ValkeyError::String)
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
