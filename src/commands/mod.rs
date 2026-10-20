@@ -240,8 +240,7 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         .map_err(|_| ValkeyError::WrongType)?
         .map(|v| v.object_id);
     // TCP path: data.len() IS the authoritative length. No user-provided len needed.
-    let data = args[2].as_slice().to_vec();
-    let obj_len = data.len() as u64;
+    let obj_len = args[2].as_slice().len() as u64;
     // Reject zero-length values.
     if obj_len == 0 {
         return Err(ValkeyError::Str(errors::ERR_ZERO_LENGTH_OBJECT));
@@ -253,8 +252,9 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if obj_len > max_obj_size {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
+    let data = args[2].as_slice();
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set(ctx, &args[1], obj_len, DataSource::Tcp(data), old_oid) {
+    match engine::execute_set_tcp(ctx, &args[1], obj_len, data, old_oid) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }
@@ -307,7 +307,7 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         client_crc,
     };
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set(ctx, &args[1], obj_len, data_source, old_oid) {
+    match engine::execute_set_rdma(ctx, &args[1], obj_len, data_source, old_oid) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }

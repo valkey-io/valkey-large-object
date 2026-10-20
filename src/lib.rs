@@ -18,7 +18,7 @@
 //   1. Fabric::start()         — one libfabric service per domain. On missing
 //                                fabric, the EFA path is unavailable and BLOB.RDMA_HELLO
 //                                gives an error.
-//   2. storage::init(mode, disk_dir)
+//   2. storage::init(ctx, mode, disk_dir)
 //                              — validate config, allocate pool segments, create
 //                                the per-pool io_uring engines and start the
 //                                smartlog poller (Tiered only). All resources are
@@ -182,7 +182,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Step 2: Initialize storage layer (pools, io_uring engine, validation).
     // All pool/engine OnceLocks are set inside init() only after everything succeeds.
     // On failure, locals drop naturally — no cleanup needed.
-    let storage_summary = match storage::init(mode, &dir) {
+    let storage_summary = match storage::init(ctx, mode, &dir) {
         Ok(summary) => summary,
         Err(e) => {
             ctx.log_warning(&format!("largeobj: storage init failed: {}", e));
@@ -315,7 +315,7 @@ valkey_module! {
             ["victim-sample-size", &*CFG_VICTIM_SAMPLE_SIZE, DEFAULT_VICTIM_SAMPLE_SIZE, MIN_VICTIM_SAMPLE_SIZE, MAX_VICTIM_SAMPLE_SIZE,
              ConfigurationFlags::DEFAULT, None, None],
             ["max-cached-fds", &*CFG_MAX_CACHED_FDS, DEFAULT_MAX_CACHED_FDS, MIN_MAX_CACHED_FDS, MAX_MAX_CACHED_FDS,
-             ConfigurationFlags::DEFAULT, None, None],
+             ConfigurationFlags::DEFAULT, Some(Box::new(on_max_cached_fds_changed)), Some(Box::new(validate_max_cached_fds))],
             ["fabric-max-in-flight", &*CFG_FABRIC_MAX_IN_FLIGHT, DEFAULT_FABRIC_MAX_IN_FLIGHT, MIN_FABRIC_MAX_IN_FLIGHT, MAX_FABRIC_MAX_IN_FLIGHT,
              ConfigurationFlags::IMMUTABLE, None, None],
             ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, MIN_FABRIC_CRC_POOL_THREADS, MAX_FABRIC_CRC_POOL_THREADS,
@@ -336,6 +336,8 @@ valkey_module! {
             ["operating-mode", &*CFG_OPERATING_MODE, OperatingMode::Dram,
              ConfigurationFlags::IMMUTABLE, None],
             ["fabric-provider", &*CFG_FABRIC_PROVIDER, FabricProvider::EfaDirect,
+             ConfigurationFlags::IMMUTABLE, None],
+            ["fd-reserve", &*CFG_FD_RESERVE, FdReserve::Lenient,
              ConfigurationFlags::IMMUTABLE, None],
         ],
         module_args_as_configuration: true,

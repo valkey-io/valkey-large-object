@@ -1,8 +1,8 @@
-//! File Descriptor Pool — owns and caches open read fds as `Arc<OwnedFd>`, keyed by `ObjectId`.
+//! File Descriptor Pool — owns and caches open read fds as `Arc<ObjectFd>`, keyed by `ObjectId`.
 //!
 //! A read fd is opened lazily on the first GET (via `ObjectFile::ensure_open` →
 //! `get_or_open`) and cached for reuse; every later GET and in-flight reader gets a clone.
-//! Being an `Arc<OwnedFd>`, it closes itself (RAII) once the last ref — the cache entry
+//! Being an `Arc<ObjectFd>`, it closes itself (RAII) once the last ref — the cache entry
 //! plus any reader clones — is gone. An fd is transient metadata, never persisted on the
 //! `LoValue` data type; it lives only in this pool, decoupled from object lifetime.
 //!
@@ -21,16 +21,17 @@
 //! `Drop for FdPool` — it is a process-lifetime static, so any fds still cached at
 //! teardown are reclaimed by process exit.
 
-use std::os::unix::io::{FromRawFd, OwnedFd};
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::cache_policy::{now_minutes, reclaim_one, AccessStats, OIDIndexedMap};
+use super::fd_placement::{open_object_file, ObjectFd};
 use crate::data_type::ObjectId;
 
 /// One cached fd plus its LFU score.
 struct FdEntry {
-    fd: Arc<OwnedFd>,
+    fd: Arc<ObjectFd>,
     stats: AccessStats,
 }
 
@@ -55,33 +56,42 @@ impl FdPool {
     }
 
     /// Return the cached read fd for `object_id`, opening + caching it if not present.
-    /// A clone of `Arc<OwnedFd>` is returned to the caller. The reference can be
+    /// A clone of `Arc<ObjectFd>` is returned to the caller. The reference can be
     /// used to prevent the underlying fd from being closed during inflight read requests.
     /// Returns `None` only on a genuine `open()` failure.
-    pub fn get_or_open(&self, object_id: ObjectId, dir: &str) -> Option<Arc<OwnedFd>> {
-        self.get_or_open_with(object_id, dir, crate::max_cached_fds())
+    pub fn get_or_open(&self, object_id: ObjectId, dir: &str) -> Option<Arc<ObjectFd>> {
+        // The cap reads the fd limit (a syscall), so only a miss pays for it.
+        if let Some(fd) = self.lookup(object_id) {
+            return Some(fd);
+        }
+        self.get_or_open_with(object_id, dir, super::fd_placement::fd_cache_max_entries())
     }
 
-    /// `get_or_open` with an explicit `max-cached-fds` cap (0 = unlimited), so
+    /// The cached fd for `object_id`, if any: shared read lock, touch the score, clone the handle.
+    fn lookup(&self, object_id: ObjectId) -> Option<Arc<ObjectFd>> {
+        let fds = self.fds.read().expect("FdPool.fds lock unavailable");
+        fds.get(&object_id).map(Self::hit)
+    }
+
+    fn hit(entry: &FdEntry) -> Arc<ObjectFd> {
+        entry.stats.touch(now_minutes(), crate::blob_decay_time());
+        Arc::clone(&entry.fd)
+    }
+
+    /// `get_or_open` with an explicit `max-cached-fds` cap, so
     /// parallel unit tests do not share the global config.
     pub(crate) fn get_or_open_with(
         &self,
         object_id: ObjectId,
         dir: &str,
         cap: usize,
-    ) -> Option<Arc<OwnedFd>> {
-        let now_min = now_minutes();
-        let decay_time = crate::blob_decay_time();
-        let hit = |entry: &FdEntry| {
-            entry.stats.touch(now_min, decay_time);
-            Arc::clone(&entry.fd)
-        };
-        // Fast path: shared read lock, touch the score and clone the cached handle.
-        {
-            let fds = self.fds.read().expect("FdPool.fds lock unavailable");
-            if let Some(entry) = fds.get(&object_id) {
-                return Some(hit(entry));
-            }
+    ) -> Option<Arc<ObjectFd>> {
+        // max-cached-fds 0 caches nothing: the fd closes when the caller drops it.
+        if cap == 0 {
+            return open_read_fd(object_id, dir).map(Arc::new);
+        }
+        if let Some(fd) = self.lookup(object_id) {
+            return Some(fd);
         }
 
         // Slow path: serialize opens through the write lock.
@@ -89,35 +99,20 @@ impl FdPool {
 
         // Re-check under the lock: another caller may have opened it meanwhile.
         if let Some(entry) = fds.get(&object_id) {
-            return Some(hit(entry));
+            return Some(Self::hit(entry));
         }
 
+        let now_min = now_minutes();
+        let decay_time = crate::blob_decay_time();
         // Make room before opening, so the cap counts the new entry. Removing an
         // entry only drops the map's ref: a reader still holding a clone keeps the
-        // fd open until its read finishes, then it closes.
-        if cap > 0 {
-            let samples = crate::victim_sample_size();
-            while fds.len() >= cap {
-                reclaim_one(&mut fds, samples, |e| {
-                    Some(e.stats.decayed_counter(now_min, decay_time))
-                })
-                .expect("a non-empty map always yields a victim");
-                self.evictions.fetch_add(1, Ordering::Relaxed);
-            }
+        // fd open until its read finishes, then it closes. Lowering the cap shrinks
+        // the pool at once (`shrink_to`), so this evicts one entry at most.
+        while fds.len() >= cap {
+            self.evict_one(&mut fds, now_min, decay_time);
         }
 
-        let path = object_id.file_path(dir);
-        let c_path = std::ffi::CString::new(path).expect("file_path null");
-        let mut flags = libc::O_RDONLY;
-        if crate::direct_io() {
-            flags |= libc::O_DIRECT;
-        }
-        // SAFETY: c_path is a valid NUL-terminated path; open returns a fd or -1.
-        let raw = unsafe { libc::open(c_path.as_ptr(), flags) };
-        if raw < 0 {
-            return None;
-        }
-        let fd = Arc::new(unsafe { OwnedFd::from_raw_fd(raw) });
+        let fd = Arc::new(open_read_fd(object_id, dir)?);
         fds.insert(
             object_id,
             FdEntry {
@@ -141,6 +136,59 @@ impl FdPool {
         drop(removed);
     }
 
+    /// Drop the pool's ref to every cached fd below the module start (inside the
+    /// core range), so the next GET reopens it in the module range. Like `remove`: an
+    /// in-flight reader's clone keeps its fd open until the read finishes. Called when
+    /// the module start rises.
+    pub fn drop_fds_below_module_start(&self) {
+        let removed: Vec<FdEntry> = {
+            let mut fds = self.fds.write().expect("FdPool.fds lock unavailable");
+            let stale: Vec<ObjectId> = fds
+                .iter()
+                .filter(|(_, e)| super::fd_placement::below_module_start(e.fd.as_raw_fd()))
+                .map(|(oid, _)| *oid)
+                .collect();
+            stale
+                .iter()
+                .filter_map(|oid| fds.swap_remove(oid))
+                .collect()
+        };
+        // Drop outside the lock, as in `remove`.
+        drop(removed);
+    }
+
+    /// Evict the coldest cached fds until at most `cap` remain. Called when
+    /// `max-cached-fds` is lowered, so the pool never holds more than the cap. Like
+    /// `remove`: an in-flight reader's clone keeps its fd open until the read finishes.
+    pub fn shrink_to(&self, cap: usize) {
+        let now_min = now_minutes();
+        let decay_time = crate::blob_decay_time();
+        let evicted: Vec<FdEntry> = {
+            let mut fds = self.fds.write().expect("FdPool.fds lock unavailable");
+            let over = fds.len().saturating_sub(cap);
+            (0..over)
+                .map(|_| self.evict_one(&mut fds, now_min, decay_time))
+                .collect()
+        };
+        // Drop outside the lock, as in `remove`.
+        drop(evicted);
+    }
+
+    /// Remove the lowest-scoring sampled fd and count it as an eviction.
+    fn evict_one(
+        &self,
+        fds: &mut OIDIndexedMap<FdEntry>,
+        now_min: u16,
+        decay_time: u64,
+    ) -> FdEntry {
+        let (_, entry) = reclaim_one(fds, crate::victim_sample_size(), |e| {
+            Some(e.stats.decayed_counter(now_min, decay_time))
+        })
+        .expect("a non-empty map always yields a victim");
+        self.evictions.fetch_add(1, Ordering::Relaxed);
+        entry
+    }
+
     /// Number of cached fds. Test/introspection helper.
     pub fn len(&self) -> usize {
         self.fds.read().expect("FdPool.fds lock unavailable").len()
@@ -161,6 +209,17 @@ impl FdPool {
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
+
+/// Open `object_id`'s file for reads. `None` on an `open()` failure.
+fn open_read_fd(object_id: ObjectId, dir: &str) -> Option<ObjectFd> {
+    let path = object_id.file_path(dir);
+    let c_path = std::ffi::CString::new(path).expect("file_path null");
+    let mut flags = libc::O_RDONLY;
+    if crate::direct_io() {
+        flags |= libc::O_DIRECT;
+    }
+    open_object_file(&c_path, flags, 0).ok()
+}
 
 #[cfg(test)]
 mod tests {
@@ -189,10 +248,12 @@ mod tests {
         std::fs::write(&path, b"hello").unwrap();
 
         let pool = FdPool::new();
-        if let Some(fd1) = pool.get_or_open(object_id, dir) {
+        if let Some(fd1) = pool.get_or_open_with(object_id, dir, 16) {
             assert_eq!(pool.len(), 1, "open registers exactly one cached fd");
             // Second call reuses the cached handle (a clone of the same Arc).
-            let fd2 = pool.get_or_open(object_id, dir).expect("cached fd");
+            let fd2 = pool
+                .get_or_open_with(object_id, dir, 16)
+                .expect("cached fd");
             assert_eq!(fd1.as_raw_fd(), fd2.as_raw_fd());
             assert!(
                 Arc::ptr_eq(&fd1, &fd2),
@@ -205,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_reader_clone_keeps_fd_open_across_remove() {
-        // The honor rule at the refcount level: a reader holding an Arc<OwnedFd> clone
+        // The honor rule at the refcount level: a reader holding an Arc<ObjectFd> clone
         // keeps the fd open even after the pool drops its own ref (as ObjectFile::Drop
         // does on delete); the fd closes only when the last clone goes away.
         let dir = std::env::temp_dir();
@@ -215,7 +276,7 @@ mod tests {
         std::fs::write(&path, b"world").unwrap();
 
         let pool = FdPool::new();
-        if let Some(reader) = pool.get_or_open(object_id, dir) {
+        if let Some(reader) = pool.get_or_open_with(object_id, dir, 16) {
             let weak = Arc::downgrade(&reader);
             assert_eq!(pool.len(), 1);
 
@@ -274,5 +335,74 @@ mod tests {
         for oid in &oids {
             let _ = std::fs::remove_file(oid.file_path(dir));
         }
+    }
+
+    #[test]
+    fn shrink_to_evicts_down_to_the_cap_at_once() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let full = 20;
+        let oids: Vec<ObjectId> = (0..full as u64).map(|i| ObjectId(0x7400 + i)).collect();
+        for oid in &oids {
+            std::fs::write(oid.file_path(dir), b"x").unwrap();
+        }
+        let pool = FdPool::new();
+
+        if pool.get_or_open_with(oids[0], dir, full).is_some() {
+            for oid in &oids[1..] {
+                pool.get_or_open_with(*oid, dir, full).unwrap();
+            }
+            assert_eq!(pool.len(), full);
+
+            pool.shrink_to(1);
+            assert_eq!(pool.len(), 1);
+            assert_eq!(pool.evictions.load(Ordering::Relaxed), full as u64 - 1);
+
+            // Already under the cap: nothing to evict.
+            pool.shrink_to(1);
+            assert_eq!(pool.evictions.load(Ordering::Relaxed), full as u64 - 1);
+        }
+
+        for oid in &oids {
+            let _ = std::fs::remove_file(oid.file_path(dir));
+        }
+    }
+
+    #[test]
+    fn get_or_open_hit_does_not_read_the_cap() {
+        // In a unit test placement is off, so the global fd cache max entries is 0: a lookup
+        // that consulted it would open a fresh fd. A hit returns the cached handle.
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let object_id = ObjectId(0x7600);
+        std::fs::write(object_id.file_path(dir), b"x").unwrap();
+        let pool = FdPool::new();
+
+        if let Some(cached) = pool.get_or_open_with(object_id, dir, 16) {
+            let hit = pool.get_or_open(object_id, dir).expect("cached fd");
+            assert!(Arc::ptr_eq(&cached, &hit));
+            assert_eq!(pool.len(), 1);
+        }
+
+        let _ = std::fs::remove_file(object_id.file_path(dir));
+    }
+
+    #[test]
+    fn cap_zero_opens_without_caching() {
+        let dir = std::env::temp_dir();
+        let dir = dir.to_str().unwrap();
+        let object_id = ObjectId(0x7500);
+        std::fs::write(object_id.file_path(dir), b"x").unwrap();
+        let pool = FdPool::new();
+
+        if let Some(fd) = pool.get_or_open_with(object_id, dir, 0) {
+            assert!(pool.is_empty(), "cap 0 caches nothing");
+            assert_eq!(pool.evictions.load(Ordering::Relaxed), 0);
+            let weak = Arc::downgrade(&fd);
+            drop(fd);
+            assert!(weak.upgrade().is_none(), "fd closes with the caller's ref");
+        }
+
+        let _ = std::fs::remove_file(object_id.file_path(dir));
     }
 }
