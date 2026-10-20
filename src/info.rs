@@ -50,6 +50,10 @@ fn pct(part: u64, whole: u64) -> String {
 
 /// Main INFO handler, registered in `valkey_module!` as `info: lo_info`.
 pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
+    // Hide INFO while disabled, unless objects remain.
+    if !crate::module_enabled() && LARGE_OBJECT_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     if let Err(e) = info_sections(ctx) {
         valkey_module::logging::log_warning(format!("lo_info: failed to emit INFO: {e}"));
     }

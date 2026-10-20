@@ -187,6 +187,40 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client.execute_command('CONFIG', 'SET', 'largeobj.max-object-size', str(limit // 2))
         assert client.execute_command('BLOB.TCP_GET', 'okkey') == b'Y' * limit
 
+    def test_enabled_config(self):
+        """largeobj.enabled no rejects every BLOB command, keeps existing keys, and hides
+        INFO only while no objects exist. yes restores normal behavior."""
+        client = self.server.get_new_client()
+        cmds = [
+            ('BLOB.TCP_SET', 'key', b'A' * 4096),
+            ('BLOB.TCP_GET', 'key'),
+            ('BLOB.INFO', 'key'),
+            ('BLOB.RDMA_HELLO', '00'),
+            ('BLOB.RDMA_GET', 'key', '1', '1', '1'),
+            ('BLOB.RDMA_SET', 'key', '1', '1', '1', '1'),
+        ]
+
+        def assert_all_disabled():
+            for cmd in cmds:
+                try:
+                    client.execute_command(*cmd)
+                    assert False, f"{cmd[0]} should be rejected"
+                except ResponseError as e:
+                    assert str(e) == 'DISABLED largeobj module is disabled', f"{cmd[0]}: {e}"
+
+        assert client.config_get('largeobj.enabled') == {'largeobj.enabled': 'yes'}
+        client.config_set('largeobj.enabled', 'no')
+        assert_all_disabled()
+        assert client.info('largeobj_core_metrics') == {}
+        client.config_set('largeobj.enabled', 'yes')
+        assert client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096) == b'OK'
+        client.config_set('largeobj.enabled', 'no')
+        assert_all_disabled()
+        assert client.execute_command('DBSIZE') == 1
+        assert info_largeobj(client)['largeobj_num_objects'] == 1
+        client.config_set('largeobj.enabled', 'yes')
+        assert client.execute_command('BLOB.TCP_GET', 'key') == b'A' * 4096
+
     # ─── SMART LOG tests ───────────────────────────────────────────────────
 
     def test_smartlog_section_absent(self):

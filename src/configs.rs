@@ -115,6 +115,8 @@ pub const MAX_FABRIC_MAX_IN_FLIGHT: i64 = 65_536;
 pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MIN_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MAX_FABRIC_CRC_POOL_THREADS: i64 = 1024;
+
+pub const DEFAULT_MODULE_ENABLED: bool = true;
 // ─── Test Hooks ──────────────────────────────────────────────────────────────
 // test-pause-before-finalize-set-ms
 pub const DEFAULT_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: i64 = 0;
@@ -204,6 +206,10 @@ lazy_static::lazy_static! {
     ///
     /// DEFAULT: yes (production path — always use O_DIRECT on XFS/NVMe instance store).
     pub static ref CFG_DIRECT_IO: AtomicBool = AtomicBool::new(true);
+
+    /// When false, BLOB.* commands from clients are rejected. Existing keys are kept and
+    /// replicated commands still apply. Default: true.
+    pub static ref CFG_MODULE_ENABLED: AtomicBool = AtomicBool::new(DEFAULT_MODULE_ENABLED);
 
     /// Operating mode. Immutable after module load.
     /// - Dram (0): all objects live exclusively in DRAMPool. No NVMe. Fastest reads.
@@ -390,6 +396,10 @@ pub fn would_cross_memory_watermark(ctx: &Context, extra_bytes: u64) -> bool {
 
 pub fn direct_io() -> bool {
     CFG_DIRECT_IO.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn module_enabled() -> bool {
+    CFG_MODULE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn operating_mode() -> OperatingMode {
