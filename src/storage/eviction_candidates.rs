@@ -149,10 +149,9 @@ pub fn noeviction() -> bool {
 /// order than its own. Call at load and after a `CONFIG SET` of the policy (`configs::on_server_config_changed`).
 pub fn refresh_policy(ctx: &Context) {
     let info = ctx.server_info("memory");
-    let name = info
-        .field("maxmemory_policy")
-        .map(|v| v.to_string())
-        .unwrap_or_default();
+    // `field_c` borrows from `info`. `field` leaks its string: the crate retains the string
+    // the server just created, then releases it once.
+    let name = info.field_c("maxmemory_policy").unwrap_or_default();
     let volatile = name.starts_with("volatile-");
     if name.ends_with("-lfu") || name.ends_with("-random") || name == "volatile-ttl" {
         valkey_module::logging::log_warning(format!(
