@@ -60,7 +60,6 @@
 
 // The pool/transport seams are internal traits used only within this crate; the
 // raw-pointer buffer accessors and async trait methods are idiomatic here.
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(async_fn_in_trait)]
 
 use std::os::unix::io::RawFd;

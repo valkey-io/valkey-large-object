@@ -513,10 +513,6 @@ struct ConfigConstraint {
     error_msg: &'static str,
 }
 
-// SAFETY: All AtomicI64 references are to lazy_static statics with 'static lifetime.
-// The fn pointers and &str are inherently Send+Sync.
-unsafe impl Sync for ConfigConstraint {}
-
 fn config_constraints() -> &'static [ConfigConstraint] {
     use std::sync::LazyLock;
     static CONSTRAINTS: LazyLock<Vec<ConfigConstraint>> = LazyLock::new(|| {

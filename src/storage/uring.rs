@@ -51,9 +51,6 @@ pub struct UringOp {
     pub use_fixed: bool,
 }
 
-// SAFETY: buf_ptr points to segment memory that is stable for module lifetime.
-unsafe impl Send for UringOp {}
-
 /// I/O request — internal transport to the poller thread.
 /// Contains the oneshot sender directly — no callback boxing.
 enum IoRequest {

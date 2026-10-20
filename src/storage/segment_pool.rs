@@ -208,7 +208,8 @@ impl SegmentPool {
                         .expect("alloc_object_in_one_segment: rollback layout");
                     // SAFETY: this pointer was returned by this TalcCell's allocate for this
                     // exact layout, and is freed exactly once here in rollback.
-                    let p = unsafe { NonNull::new_unchecked(seg_base.add(buf.offset as usize)) };
+                    let p = NonNull::new(seg_base.wrapping_add(buf.offset as usize))
+                        .expect("segment buffer pointer is null");
                     unsafe { talc.deallocate(p, l) };
                     seg.dec_ref();
                 }
@@ -449,15 +450,14 @@ impl SegmentPool {
             let seg = st.slots[seg_idx]
                 .as_ref()
                 .expect("segment slot empty for an allocated buffer — invariant broken");
-            let ptr = unsafe { seg.base.add(buf.offset as usize) };
+            let ptr = NonNull::new(seg.base.wrapping_add(buf.offset as usize))
+                .expect("segment buffer pointer is null");
             {
                 let talc = seg.talc.lock().expect("segment talc lock unavailable");
                 // SAFETY: ptr was returned by this segment's TalcCell::allocate for this
                 // exact layout, and is freed exactly once -- the buffer's sole owner
                 // (ObjectContext/StreamingContext) calls free once in its Drop.
-                unsafe {
-                    talc.deallocate(NonNull::new_unchecked(ptr), layout);
-                }
+                unsafe { talc.deallocate(ptr, layout) };
                 // Mirror talc's authoritative post-free figures while holding the
                 // lock (drift-free, overhead-aware) — see mirror_counters.
                 self.mirror_counters(seg, &talc);
@@ -600,13 +600,11 @@ impl SegmentPool {
     /// Get absolute pointer for a SegmentBuffer.
     pub fn buffer_ptr(&self, buf: &SegmentBuffer) -> *mut u8 {
         let st = self.state.read().expect("state lock unavailable");
-        unsafe {
-            st.slots[buf.segment_idx as usize]
-                .as_ref()
-                .expect("segment slot empty for an allocated buffer — invariant broken")
-                .base
-                .add(buf.offset as usize)
-        }
+        st.slots[buf.segment_idx as usize]
+            .as_ref()
+            .expect("segment slot empty for an allocated buffer — invariant broken")
+            .base
+            .wrapping_add(buf.offset as usize)
     }
 
     /// Return the io_uring iovec_index for the segment owning `buf`.
