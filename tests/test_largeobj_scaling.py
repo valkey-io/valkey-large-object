@@ -524,6 +524,8 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
         assert after['largeobj_dram_rdma_registered_segments'] == 2
         assert (after['largeobj_disk_staging_rdma_registered_segments']
                 == after['largeobj_disk_staging_segments'])
+
+
 class TestTieredShrink(ValkeyLargeObjTestCaseBase):
     """Tiered mode: under server memory pressure the scaling cron drops cached
     DRAM copies a segment at a time; the data stays on NVMe. Tiered shrink
