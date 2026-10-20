@@ -30,8 +30,7 @@ pub static CRC_MISMATCH: AtomicU64 = AtomicU64::new(0);
 /// LargeObject keys in the keyspace, plus a SET's value briefly before commit.
 pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Objects evicted to make room for a write, or by a Dram shrink: Dram objects or
-/// Tiered files. Cached copies Tiered drops are demotions, not evictions.
+/// Objects evicted to make room for a write: Dram objects or Tiered files. Cached copies Tiered drops are demotions, not evictions.
 pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// RDMA payload bytes of successful transfers. Reads pull client memory (the SET

@@ -386,8 +386,8 @@ pub fn server_memory(ctx: &Context) -> (u64, u64) {
 
 /// Whether the server may evict keys: `maxmemory` is set and `maxmemory-policy`
 /// is not `noeviction`. Not set on a replica that ignores maxmemory (the default),
-/// which leaves eviction to its primary. Dram shrink and Dram SET eviction delete
-/// keys, so they run only when this holds.
+/// which leaves eviction to its primary. Dram SET eviction deletes keys, so it runs
+/// only when this holds.
 pub fn eviction_allowed(ctx: &Context) -> bool {
     ctx.get_flags().contains(ContextFlags::EVICTED)
 }
