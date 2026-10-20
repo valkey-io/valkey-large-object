@@ -1,9 +1,11 @@
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
+use valkey_module::configuration::ConfigurationContext;
 use valkey_module::enum_configuration;
 use valkey_module::Context;
 use valkey_module::ContextFlags;
+use valkey_module::{ValkeyError, ValkeyGILGuard, ValkeyString};
 use valkey_module_macros::config_changed_event_handler;
 
 use crate::errors;
@@ -162,7 +164,12 @@ pub const MAX_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS: i64 = 60_000;
 
 lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
-    pub static ref CFG_DISK_DIR: Mutex<String> = Mutex::new(String::new());
+    /// String configs are registered as a `ValkeyGILGuard<ValkeyString>`, the type whose
+    /// `CONFIG GET` path the crate does not leak. `on_string_config_set` copies the value
+    /// into `DISK_DIR`, which is what the rest of the module reads.
+    pub static ref CFG_DISK_DIR: ValkeyGILGuard<ValkeyString> =
+        ValkeyGILGuard::new(ValkeyString::create(None, ""));
+    static ref DISK_DIR: Mutex<String> = Mutex::new(String::new());
 
     /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 1GiB.
     /// Used in Tiered mode for read/write staging. Split into uniform
@@ -269,7 +276,10 @@ lazy_static::lazy_static! {
     pub static ref CFG_FABRIC_PROVIDER: Mutex<FabricProvider> = Mutex::new(FabricProvider::EfaDirect);
 
     /// Comma-separated fabric domains to open a service on. Default: All domains.
-    pub static ref CFG_FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
+    /// Registered like `CFG_DISK_DIR`; the module reads `FABRIC_INTERFACES`.
+    pub static ref CFG_FABRIC_INTERFACES: ValkeyGILGuard<ValkeyString> =
+        ValkeyGILGuard::new(ValkeyString::create(None, ""));
+    static ref FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
 
     /// Transfers each fabric service keeps in flight. Default: the crate's provider-derived default.
     pub static ref CFG_FABRIC_MAX_IN_FLIGHT: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_MAX_IN_FLIGHT);
@@ -343,10 +353,24 @@ pub static MODULE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
 pub fn disk_dir() -> String {
-    CFG_DISK_DIR
-        .lock()
-        .expect("CFG_DISK_DIR lock unavailable")
-        .clone()
+    DISK_DIR.lock().expect("DISK_DIR lock unavailable").clone()
+}
+
+/// Set handler for the string configs: copies the new value out of the Valkey-owned
+/// string into the Rust-side `Mutex<String>` the accessors read.
+pub fn on_string_config_set(
+    config_ctx: &ConfigurationContext,
+    name: &str,
+    val: &'static ValkeyGILGuard<ValkeyString>,
+) -> Result<(), ValkeyError> {
+    let value = val.lock(config_ctx).to_string_lossy();
+    let mirror = match name {
+        "disk-dir" => &*DISK_DIR,
+        "fabric-interfaces" => &*FABRIC_INTERFACES,
+        _ => return Err(ValkeyError::Str("Unknown configuration parameter")),
+    };
+    *mirror.lock().expect("string config lock unavailable") = value;
+    Ok(())
 }
 
 pub fn nvme_staging_size() -> usize {
@@ -527,9 +551,9 @@ pub fn fabric_provider() -> FabricProvider {
 }
 
 pub fn fabric_interfaces() -> Vec<String> {
-    CFG_FABRIC_INTERFACES
+    FABRIC_INTERFACES
         .lock()
-        .expect("CFG_FABRIC_INTERFACES lock unavailable")
+        .expect("FABRIC_INTERFACES lock unavailable")
         .split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())
