@@ -66,7 +66,7 @@ impl ReclaimList {
     }
 
     /// Remove `oid` from the list; false if it was not there. Always locks:
-    /// `remove_object` must wait for a shrink that is adding this oid.
+    /// `remove_object` must wait for an eviction that is adding this oid.
     pub fn remove(&self, oid: &ObjectId) -> bool {
         let mut oids = self.lock();
         let removed = oids.remove(oid);

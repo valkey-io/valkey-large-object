@@ -6,15 +6,16 @@
 //! by the scaling cron when utilization exceeds the expand watermark.
 //! Adds one `segment-size` segment via `try_expand()`.
 //!
-//! Shrink: triggered proactively by the scaling cron when `used_memory`
-//! approaches `maxmemory`. Picks the least-used segment, marks it draining, and
-//! removes its objects so the segment releases once in-flight readers drop.
-//! Tiered: GETs fall back to NVMe. Dram: the objects' oids go on the reclaim
-//! list; their keys read as missing until the cron deletes them.
+//! Shrink (Tiered only): triggered proactively by the scaling cron when
+//! `used_memory` approaches `maxmemory`. Picks the least-used segment, marks it
+//! draining, and removes its cached copies so the segment releases once in-flight
+//! readers drop. GETs fall back to NVMe; no key is touched. Dram never shrinks: that
+//! would delete keys whatever the policy.
 //!
-//! Evict (Dram): a SET or COPY into a full arena evicts
-//! objects the `maxmemory-policy` allows (`alloc_exact_expand_evict`), where the
-//! server allows eviction. Dram never shrinks: that would delete keys whatever the policy.
+//! Evict (Dram): a SET or COPY into a full arena evicts objects the
+//! `maxmemory-policy` allows (`alloc_exact_expand_evict`), where the server allows
+//! eviction. The evicted oids go on the reclaim list; their keys read as missing
+//! until the scaling cron deletes them. The freed bytes stay in their segments as holes.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -60,7 +61,7 @@ impl ObjectMaps {
         Some(ctx)
     }
 
-    /// Remove every object in segment `seg` (shrink) and return their OIDs.
+    /// Remove every object in segment `seg` (Tiered shrink) and return their OIDs.
     fn remove_by_segment_id(&mut self, seg: usize) -> OIDIndexedSet {
         let Some(ids) = self.by_segment.get_mut(seg) else {
             return OIDIndexedSet::new();
@@ -183,7 +184,7 @@ impl DRAMPool {
     fn evict_for(&self, obj_len: usize) -> Option<Vec<SegmentBuffer>> {
         for _ in 0..EVICT_ROUNDS {
             let mut victims = Vec::new();
-            // List before `objects`, as in `try_shrink`.
+            // Lock order: reclaim list before `objects`.
             super::reclaim::RECLAIM_LIST.add_with(|| {
                 let mut objects = self
                     .objects
@@ -298,7 +299,7 @@ impl DRAMPool {
 
     /// Remove an ObjectContext (free callback / eviction). Dram: also clears `oid`
     /// from the eviction candidates and the reclaim list: its key is gone. Map first, then
-    /// list: a shrink that runs in between no longer sees the object, so cannot list it.
+    /// list: an eviction that runs in between no longer sees the object, so cannot list it.
     /// Tiered: the file's teardown clears them instead.
     pub fn remove_object(&self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
         let removed = self

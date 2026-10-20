@@ -1,8 +1,8 @@
 //! DRAMPool scaling cron — proactive expand and shrink.
 //!
 //! Called on a configurable timer from the Valkey main event-loop thread.
-//! Handles: draining completion, Dram-mode shrink key deletion, proactive
-//! expand, proactive shrink.
+//! Handles: draining completion, deleting the keys of evicted objects, proactive
+//! expand, proactive shrink (Tiered only).
 
 use valkey_module::Context;
 
@@ -12,9 +12,9 @@ use super::get_dram_pool;
 ///
 /// Performs these actions in order:
 /// 1. Complete any segments whose drain finished (refcount reached 0).
-/// 2. Delete keys on the reclaim list, and retry the orphans' unlinks.
-///    While a shrink is unfinished (a segment draining or reclaim-list keys
-///    left), stop here: one shrink at a time, no expand or shrink on top.
+/// 2. Delete the keys of evicted Dram objects (the reclaim list), and retry the
+///    orphans' unlinks. While a Tiered shrink is unfinished (a segment draining),
+///    stop here: one shrink at a time, no expand or shrink on top.
 ///    While reclaim-list keys remain, the cron re-arms at `reaper-poll-ms`
 ///    instead of `scaling-poll-ms`, so cleanup runs in short, frequent slices.
 /// 3. Proactive expand: if pool utilization exceeds the expand watermark,
@@ -34,13 +34,10 @@ pub fn scaling_cron(ctx: &Context) {
     super::reclaim::delete_reclaimed_keys(ctx);
     super::nvme::ORPHANED_FILES.retry_deletion();
 
-    // A shrink is still in progress: finish it before any more scaling.
-    // A SET that needs room meanwhile still expands reactively. In Tiered mode the
-    // reclaim list holds NVMe evictions, not shrinks.
+    // A Tiered shrink is still draining: finish it before any more scaling. Dram
+    // never drains a segment.
     let (_, draining, _) = pool.segment_counts();
-    let reclaiming = crate::operating_mode() == crate::OperatingMode::Dram
-        && !super::reclaim::RECLAIM_LIST.is_empty();
-    if draining > 0 || reclaiming {
+    if draining > 0 {
         rearm_scaling_cron(ctx, next_poll_ms());
         return;
     }
@@ -97,7 +94,8 @@ pub fn scaling_cron(ctx: &Context) {
         pool.release_drained_segments();
     }
 
-    // Evictions may have filled the reclaim list: start cleanup on the fast tick.
+    // Evictions (Dram objects, Tiered files) may have filled the reclaim list: start
+    // cleanup on the fast tick.
     rearm_scaling_cron(ctx, next_poll_ms());
 }
 
