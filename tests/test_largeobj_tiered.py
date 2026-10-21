@@ -1488,6 +1488,9 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         assert server.server.returncode != 0
         assert server.verify_string_in_logfile(f'set LimitNOFILE to at least {needed}')
 
+    # The abort runs Valkey's crash-report memtest, which overflows its own stack array
+    # under ASAN. That is a Valkey bug, not this module's, so the ASAN job skips this test.
+    @pytest.mark.skip_for_asan
     @pytest.mark.parametrize('nofile,max_cached_fds,new_maxclients,needed', [
         (400, 0, 200, 528),    # the reserve breaks: module start 328 + 200
         (500, 100, 140, 508),  # the reserve (408) fits, the cache does not: 268 + 140 + 100
