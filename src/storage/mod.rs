@@ -13,6 +13,7 @@ pub type Crc = u32;
 pub mod cache_policy;
 pub mod context;
 pub mod dram_pool;
+pub mod eviction_candidates;
 pub mod fd_placement;
 pub mod fd_pool;
 pub mod nvme;

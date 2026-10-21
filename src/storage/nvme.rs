@@ -76,7 +76,7 @@ pub fn nvme_disk_usage() -> u64 {
 
 // ─── NVMe Eviction ───────────────────────────────────────────────────────────
 
-/// Directory entries read per eviction.
+/// Candidates picked per eviction.
 const EVICT_BATCH: usize = 64;
 
 /// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
@@ -109,7 +109,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
     // Claim, then stat: a claimed file cannot change under us.
     let mut victims = Vec::new();
     let mut covered = 0;
-    for oid in victim_batch(EVICT_BATCH) {
+    for oid in super::eviction_candidates::pick(EVICT_BATCH, |_| true) {
         if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
             break;
         }
@@ -122,9 +122,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
                 covered += len;
                 victims.push((unevictable, len));
             }
-            // We collect our victim candidates via a readdir snapshot. Between the
-            // readdir and the victim claim (adding the oid to the RECLAIM_LIST), the
-            // file may be deleted by an ObjectFile's drop.
+            // Torn down between the pick and the claim, so its key is gone.
             Ok(None) => {
                 super::reclaim::RECLAIM_LIST.remove(&oid);
             }
@@ -148,16 +146,6 @@ fn evict_and_reserve(bytes: u64) -> bool {
         decrease_nvme_disk_usage(taken + freed);
     }
     reserved
-}
-
-/// The first `n` object files in `disk_dir`.
-fn victim_batch(n: usize) -> Vec<ObjectId> {
-    let Ok(dir) = std::fs::read_dir(crate::disk_dir()) else {
-        return Vec::new();
-    };
-    dir.filter_map(|entry| ObjectId::from_filename(entry.ok()?.file_name().to_str()?))
-        .take(n)
-        .collect()
 }
 
 /// Unlink claimed `victims` and remove them from the unevictable list,

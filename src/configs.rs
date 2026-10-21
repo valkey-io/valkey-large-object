@@ -386,19 +386,20 @@ pub fn server_memory(ctx: &Context) -> (u64, u64) {
 
 /// Whether the server may evict keys: `maxmemory` is set and `maxmemory-policy`
 /// is not `noeviction`. Not set on a replica that ignores maxmemory (the default),
-/// which leaves eviction to its primary. Dram shrink and Dram SET eviction delete
-/// keys, so they run only when this holds.
+/// which leaves eviction to its primary. Dram SET eviction deletes keys, so it runs
+/// only when this holds.
 pub fn eviction_allowed(ctx: &Context) -> bool {
     ctx.get_flags().contains(ContextFlags::EVICTED)
 }
 
-/// Whether Tiered eviction may evict object files: `disk-maxmemory` is set and
-/// `eviction_allowed` holds (`maxmemory` is set and `maxmemory-policy` is not `noeviction`).
+/// Whether Tiered eviction may evict object files: `disk-maxmemory` is set,
+/// `maxmemory-policy` is not `noeviction`, and this is not a replica, which leaves
+/// eviction to its primary. The server's `maxmemory` is not involved: it bounds DRAM,
+/// not the disk.
 pub fn tiered_eviction_allowed(ctx: &Context) -> bool {
-    if nvme_maxmemory() == 0 {
-        return false;
-    }
-    eviction_allowed(ctx)
+    nvme_maxmemory() != 0
+        && !storage::eviction_candidates::noeviction()
+        && !ctx.get_flags().contains(ContextFlags::SLAVE)
 }
 
 /// Whether allocating `extra_bytes` more would push server memory to/over the
@@ -622,6 +623,9 @@ pub fn validate_config_constraint(
 fn on_server_config_changed(ctx: &Context, changed: &[&str]) {
     if changed.contains(&"maxclients") {
         storage::fd_placement::on_maxclients_changed(ctx);
+    }
+    if changed.contains(&"maxmemory-policy") {
+        storage::eviction_candidates::refresh_policy(ctx);
     }
 }
 
