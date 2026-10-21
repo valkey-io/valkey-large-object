@@ -185,6 +185,18 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     };
 
     let fabric_services = fabric.as_ref().map_or(0, transport::Fabric::service_count);
+    // Startup segments must fit the RDMA limit too, or registering them below aborts.
+    let limit = max_rdma_registered_bytes();
+    let startup: u64 = storage::all_segment_slices()
+        .iter()
+        .map(|s| s.len() as u64)
+        .sum();
+    if fabric.is_some() && limit != 0 && startup > limit {
+        ctx.log_warning(&format!(
+            "largeobj: startup segments ({startup} bytes) exceed max-rdma-registered-bytes ({limit})"
+        ));
+        return Status::Err;
+    }
     if let Some(fabric) = &fabric {
         for (index, address) in fabric.local_addresses().enumerate() {
             ctx.log_notice(&format!(
@@ -320,6 +332,8 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, MIN_FABRIC_CRC_POOL_THREADS, MAX_FABRIC_CRC_POOL_THREADS,
              ConfigurationFlags::IMMUTABLE, None, None],
+            ["max-rdma-registered-bytes", &*CFG_MAX_RDMA_REGISTERED_BYTES, DEFAULT_MAX_RDMA_REGISTERED_BYTES, MIN_MAX_RDMA_REGISTERED_BYTES, MAX_MAX_RDMA_REGISTERED_BYTES,
+             ConfigurationFlags::MEMORY, None, None],
         ],
         string: [
             ["disk-dir", &*CFG_DISK_DIR, "", ConfigurationFlags::IMMUTABLE, None],

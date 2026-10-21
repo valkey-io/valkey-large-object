@@ -1041,7 +1041,10 @@ Expansion adds one `segment-size` segment (≤1GiB, §2).
 Both are gated by the server ceiling: an expand that would push `used_memory` past
 `scaling-shrink-watermark` × `maxmemory` is refused (`would_cross_memory_watermark`),
 so the pool never grows into memory the shrink would immediately take back. With
-`maxmemory = 0` growth is unbounded, as in core Valkey. In Dram mode a refused
+`maxmemory = 0` growth is unbounded, as in core Valkey. With a fabric up, an expand
+that would take EFA-registered segment bytes past `max-rdma-registered-bytes` is
+refused the same way, since the EFA device limits how much memory can be registered
+and a failed `fi_mr_reg` is fatal. In Dram mode a refused
 reactive expand rejects the `BLOB.TCP_SET` / `BLOB.RDMA_SET` (OOM); in Tiered mode the cache stops growing,
 and a promotion that finds no room is skipped (the GET reads NVMe).
 
@@ -1489,6 +1492,7 @@ this section owns the semantics.
 | `scaling-poll-ms` | `5000` | `1000` | `60000` | Live | Scaling cron interval: how often it checks utilization and memory pressure |
 | `scaling-expand-watermark` | `80` | `50` | `95` | Live | Pool utilization % above which the cron adds a segment proactively |
 | `scaling-shrink-watermark` | `90` | `50` | `95` | Live | Server `used_memory / maxmemory` % above which the cron shrinks a segment; also the ceiling expand may not cross |
+| `max-rdma-registered-bytes` | `380GB` | `0` (no limit) | i64::MAX | Live | With a fabric up, EFA-registered segment bytes (DRAM pool + staging) expand may not cross |
 | `reclaim-poll-ms` | `100` | `10` | `60000` | Live | Cron interval while the reclaim list is non-empty (evicted-key cleanup); `scaling-poll-ms` resumes once it is empty |
 | `reclaim-scan-budget-us` | `1000` | `100` | `100000` | Live | Main-thread time per cron tick spent scanning for and deleting reclaimed keys |
 | `smartlog-poll-secs` | `60` | `0` (off) | `86400` | Immutable | NVMe SMART poll interval (Tiered) |

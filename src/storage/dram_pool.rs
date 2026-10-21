@@ -516,6 +516,10 @@ impl DRAMPool {
         if crate::would_cross_memory_watermark(ctx, self.pool.segment_size as u64) {
             return None;
         }
+        // Past the EFA registration limit fi_mr_reg fails, which is fatal.
+        if super::would_exceed_rdma_limit(self.pool.segment_size as u64) {
+            return None;
+        }
 
         let (idx, slice) = self.pool.expand()?;
         self.expand_count.fetch_add(1, Ordering::Relaxed);

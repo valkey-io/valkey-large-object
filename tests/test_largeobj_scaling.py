@@ -321,6 +321,24 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         assert after['largeobj_dram_segments'] == before['largeobj_dram_segments']
         assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands']
 
+    def test_expansion_capped_by_rdma_limit(self):
+        """With the fabric up, an expand past max-rdma-registered-bytes is refused with OOM
+        instead of failing the EFA registration. Raising the limit lets the pool grow again."""
+        client = self.server.get_new_client()
+        client.config_set('maxmemory-policy', 'noeviction')
+        # The one startup segment is all the limit allows.
+        client.config_set('largeobj.max-rdma-registered-bytes', 1048576)
+        client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
+
+        with pytest.raises(OutOfMemoryError):
+            client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * (200 * 1024))
+        info = info_largeobj(client)
+        assert info['largeobj_dram_segments'] == 1
+        assert info['largeobj_dram_rdma_registered_segments'] == 1
+
+        client.config_set('largeobj.max-rdma-registered-bytes', 2 * 1048576)
+        assert client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * (200 * 1024)) == b'OK'
+        assert info_largeobj(client)['largeobj_dram_rdma_registered_segments'] == 2
 
 class TestDramNoShrink(ValkeyLargeObjTestCaseBase):
     """Dram mode never shrinks: releasing a segment would delete its keys whatever
@@ -423,6 +441,24 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
         assert (after['largeobj_disk_staging_rdma_registered_segments']
                 == after['largeobj_disk_staging_segments'])
 
+    def test_tiered_promotion_capped_by_rdma_limit(self):
+        """With the fabric up, a promotion that needs an expand past max-rdma-registered-bytes
+        is skipped, and the GET still reads the object from NVMe."""
+        client = self.server.get_new_client()
+        info = info_largeobj(client)
+        # Staging plus the one startup DRAM segment is all the limit allows.
+        registered = info['largeobj_disk_staging_rdma_registered_segments'] + 1
+        client.config_set('largeobj.max-rdma-registered-bytes', registered * 1048576)
+        client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE)
+
+        promote(client, ['key_a'])
+        assert client.execute_command('BLOB.TCP_GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE
+
+        after = info_largeobj(client)
+        assert after['largeobj_dram_objects'] == 1
+        assert after['largeobj_dram_segments'] == 1
+        assert after['largeobj_dram_rdma_registered_segments'] == 1
 
 class TestTieredShrink(ValkeyLargeObjTestCaseBase):
     """Tiered mode: under server memory pressure the scaling cron drops cached

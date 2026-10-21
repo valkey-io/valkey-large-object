@@ -263,6 +263,18 @@ pub fn init(
     ))
 }
 
+/// Whether EFA-registering `extra_bytes` more would exceed `max-rdma-registered-bytes`.
+/// False without a fabric (TCP-only registers nothing) or with the limit at 0.
+pub fn would_exceed_rdma_limit(extra_bytes: u64) -> bool {
+    let limit = crate::max_rdma_registered_bytes();
+    if limit == 0 || crate::transport::fabric::fabric().is_none() {
+        return false;
+    }
+    let segments = DRAM_POOL.get().map_or(0, DRAMPool::rdma_registered_count)
+        + NVME_POOL.get().map_or(0, NVMePool::rdma_registered_count);
+    (segments as u64 * crate::segment_size() as u64).saturating_add(extra_bytes) > limit
+}
+
 /// Get combined iovecs for transport registration (fi_mr_reg per segment).
 pub fn all_segment_slices() -> Vec<&'static [u8]> {
     let mut slices = Vec::new();

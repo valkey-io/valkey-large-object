@@ -130,6 +130,10 @@ pub const MAX_MIN_BUFFERS_PER_OP: i64 = 64;
 pub const DEFAULT_MAX_OBJECT_SIZE: i64 = 512 * 1024 * 1024; // 512 MiB
 pub const MIN_MAX_OBJECT_SIZE: i64 = 1;
 pub const MAX_MAX_OBJECT_SIZE: i64 = i64::MAX;
+// max-rdma-registered-bytes
+pub const DEFAULT_MAX_RDMA_REGISTERED_BYTES: i64 = 380 * 1024 * 1024 * 1024; // 380 GiB
+pub const MIN_MAX_RDMA_REGISTERED_BYTES: i64 = 0; // no limit
+pub const MAX_MAX_RDMA_REGISTERED_BYTES: i64 = i64::MAX;
 // fabric-max-in-flight
 pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 0; // crate default
 pub const MIN_FABRIC_MAX_IN_FLIGHT: i64 = 0;
@@ -250,6 +254,10 @@ lazy_static::lazy_static! {
 
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
     pub static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_CRC_POOL_THREADS);
+
+    /// Cap on segment bytes EFA-registered (DRAM pool + staging), kept under the EFA
+    /// device's registration limit. 0 = no limit. Default: 380 GiB.
+    pub static ref CFG_MAX_RDMA_REGISTERED_BYTES: AtomicI64 = AtomicI64::new(DEFAULT_MAX_RDMA_REGISTERED_BYTES);
 
     // ─── Test Hooks ──────────────────────────────────────────────────────
 
@@ -479,6 +487,10 @@ pub fn fabric_max_in_flight() -> usize {
 
 pub fn fabric_crc_pool_threads() -> usize {
     CFG_FABRIC_CRC_POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn max_rdma_registered_bytes() -> u64 {
+    CFG_MAX_RDMA_REGISTERED_BYTES.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn max_object_size() -> u64 {
