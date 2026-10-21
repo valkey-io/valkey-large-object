@@ -1176,3 +1176,125 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
         info = client.info('largeobj_fd')
         assert info['largeobj_open_fds'] == 1
         assert info['largeobj_fd_reclaims'] == 2
+
+
+# ─── Staging wait ────────────────────────────────────────────────────────────
+
+
+class _StagingWaitBase(ValkeyLargeObjTestCaseBase):
+    """One 1 MiB staging segment and a 768 KiB object (12 × 64 KiB chunks). With
+    min-buffers-per-op = max = 16 every op needs all 12 buffers, and two such
+    windows cannot fit in 1 MiB. A SET paused before commit (test-pause hook)
+    holds its window for the whole pause, so it leaves no room for a second op.
+
+    There is no staging timeout: a SET that finds the pool full queues and waits
+    until buffers free, and a client disconnect cancels its own queued request."""
+
+    OBJ = 768 * 1024
+    PAUSE_MS = 1500
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" nvme-dir {data_dir}"
+            f" nvme-staging-size 1048576"
+            f" segment-size 1048576"
+            f" chunk-size 65536"
+            f" max-buffers-per-op 16"
+            f" min-buffers-per-op 16"
+            f" max-promote-size 0"
+            f" bench-mode no"
+            f" direct-io no"
+        )
+
+    def _exhausted(self, client):
+        return client.info('largeobj_error_metrics')['largeobj_nvme_buffer_exhausted']
+
+    def _start_paused_holder(self):
+        """SET on a background client that pauses (test hook) holding the whole
+        staging segment. Returns (holder_client, thread). The pause is cleared for
+        OTHER clients by the caller once the contender is in place."""
+        holder = self.server.get_new_client()
+        holder.execute_command(
+            'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', str(self.PAUSE_MS)
+        )
+        thread = threading.Thread(
+            target=holder.execute_command, args=('BLOB.SET', 'holder', b'H' * self.OBJ)
+        )
+        thread.start()
+        time.sleep(0.3)  # the holder has its window and is paused
+        return holder, thread
+
+
+class TestLargeObjStagingWaitSucceeds(_StagingWaitBase):
+    """A SET that finds staging full queues and then succeeds once the holder frees
+    its window — no timeout, bounded only by how long the holder holds."""
+
+    def test_waiting_set_succeeds_after_holder_frees(self):
+        client = self.server.get_new_client()
+        contender = self.server.get_new_client()
+        before = self._exhausted(client)
+        _holder, thread = self._start_paused_holder()
+        # Clear the hook so the contender itself won't pause once it gets buffers.
+        contender.execute_command(
+            'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0'
+        )
+        start = time.monotonic()
+        # Blocks until the holder frees its window (~1.2s of pause left), then commits.
+        assert contender.execute_command('BLOB.SET', 'contender', b'C' * self.OBJ) == b'OK'
+        elapsed = time.monotonic() - start
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "holder SET did not finish"
+        assert elapsed > 0.5, f"contender did not actually wait (took {elapsed:.2f}s)"
+        assert contender.execute_command('BLOB.GET', 'contender') == b'C' * self.OBJ
+        assert client.execute_command('BLOB.GET', 'holder') == b'H' * self.OBJ
+        # Waiting is not an error.
+        assert self._exhausted(client) == before
+
+
+class TestLargeObjStagingDisconnectCancels(_StagingWaitBase):
+    """GATE TEST for the whole design: a client disconnect must cancel its own
+    queued staging waiter. Valkey fires the module client-disconnect event even for
+    a client currently blocked by the module (freeClient fires it before unblocking),
+    so the disconnect handler cancels the queued request; it leaves the queue without
+    allocating, never wedging the FIFO behind it."""
+
+    def test_disconnect_cancels_queued_waiter(self):
+        client = self.server.get_new_client()
+        contender = self.server.get_new_client()
+        _holder, thread = self._start_paused_holder()
+        # Clear the hook so a later SET won't pause.
+        client.execute_command(
+            'CONFIG', 'SET', 'largeobj.test-pause-before-finalize-set-ms', '0'
+        )
+
+        # The contender's SET queues behind the full pool. Run it on a thread and,
+        # once it is blocked, kill the contender's connection outright.
+        err = [None]
+        def contender_set():
+            try:
+                contender.execute_command('BLOB.SET', 'contender', b'C' * self.OBJ)
+            except Exception as e:  # the killed socket surfaces as a connection error
+                err[0] = e
+        ct = threading.Thread(target=contender_set)
+        ct.start()
+        time.sleep(0.3)  # contender is now queued waiting for staging
+        # Hard-disconnect the contender while it is blocked in the module.
+        contender.connection_pool.disconnect()
+        ct.join(timeout=10)
+        assert not ct.is_alive(), "contender thread did not finish after disconnect"
+
+        # The holder's own SET still completes normally.
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "holder SET did not finish"
+        assert client.execute_command('BLOB.GET', 'holder') == b'H' * self.OBJ
+        # The cancelled waiter never committed its key.
+        assert client.execute_command('EXISTS', 'contender') == 0
+
+        # Critically, the FIFO is not wedged: a fresh SET on a healthy client gets
+        # the freed staging and succeeds. (If the cancelled waiter had held the queue
+        # lock or left a buffer pinned, this would hang or fail.)
+        fresh = self.server.get_new_client()
+        assert fresh.execute_command('BLOB.SET', 'after', b'A' * self.OBJ) == b'OK'
+        assert fresh.execute_command('BLOB.GET', 'after') == b'A' * self.OBJ
+

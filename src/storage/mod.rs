@@ -39,7 +39,7 @@ pub(crate) use nvme::warn_failed_unlink;
 
 pub use dram_pool::DRAMPool;
 pub use fd_pool::FdPool;
-pub use nvme_pool::NVMePool;
+pub use nvme_pool::{AllocOutcome, NVMePool};
 
 /// O_DIRECT / io_uring alignment requirement (XFS default block size).
 /// Both buffer address and I/O length must be multiples of this.
@@ -138,6 +138,15 @@ pub fn get_nvme_pool() -> &'static NVMePool {
 
 pub fn get_fd_pool() -> &'static FdPool {
     FD_POOL.get().expect("FdPool not initialized")
+}
+
+/// Cancel any staging-buffer waiters owned by a disconnected client. Safe to call
+/// in any mode: a no-op when the NVMe pool is absent (Dram mode never queues on it).
+/// Called from the client-disconnect server event on the main thread.
+pub fn cancel_staging_waiters(client_id: u64) {
+    if let Some(pool) = NVME_POOL.get() {
+        pool.cancel_client(client_id);
+    }
 }
 
 // ─── Initialization ──────────────────────────────────────────────────────────

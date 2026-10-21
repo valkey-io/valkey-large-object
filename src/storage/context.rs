@@ -205,9 +205,7 @@ impl Drop for StreamingContext {
     fn drop(&mut self) {
         // Guard: pool may not be initialized in unit tests.
         if let Some(nvme_pool) = super::NVME_POOL.get() {
-            for buf in &self.buffers {
-                nvme_pool.free(buf);
-            }
+            nvme_pool.free_n(&self.buffers);
         }
     }
 }

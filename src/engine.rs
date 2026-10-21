@@ -225,7 +225,17 @@ pub fn execute_get(
                 OperatingMode::Tiered => {
                     let file =
                         file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
-                    cmd_get_tiered(object_id, obj_len, crc32c, file, transport, blocked_client);
+                    // Capture the client id on the main thread for staging-wait cancellation.
+                    let client_id = ctx.get_client_id();
+                    cmd_get_tiered(
+                        object_id,
+                        obj_len,
+                        crc32c,
+                        file,
+                        transport,
+                        blocked_client,
+                        client_id,
+                    );
                 }
             }
             EngineResult::Async
@@ -300,6 +310,7 @@ fn cmd_get_tiered(
     file: Arc<ObjectFile>,
     transport: Transport,
     blocked_client: valkey_module::BlockedClient,
+    client_id: u64,
 ) {
     let dram_pool = storage::get_dram_pool();
     let cache = dram_pool.tiered_cache();
@@ -398,46 +409,46 @@ fn cmd_get_tiered(
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
-    let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
-        Some(bufs) => bufs,
-        None => {
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            reply_err(
-                &thread_ctx,
-                &info::NVME_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
-            );
-            return;
-        }
+    let get_info = GetObjectInfo {
+        object_id,
+        obj_len,
+        crc32c,
     };
-    let stream_ctx = storage::StreamingContext::new(buffers);
-    let fd_pool = storage::get_fd_pool();
-    let fd = match file.ensure_open(fd_pool, &crate::nvme_dir()) {
-        Some(fd) => fd,
-        None => {
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+    crate::runtime_handle().spawn(async move {
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        // Wait for staging off the main thread. The fd is opened only after the wait,
+        // so a queued GET does not hold one. No timeout: the client's own timeout bounds
+        // the wait, and a disconnect cancels this request (nothing to reply to then).
+        let buffers = match nvme_pool
+            .alloc_window_cancellable(client_id, obj_len as usize, max_buffers, min_buffers)
+            .await
+        {
+            storage::AllocOutcome::Got(buffers) => buffers,
+            storage::AllocOutcome::CantFit => {
+                reply_err(
+                    &thread_ctx,
+                    &info::NVME_BUFFER_EXHAUSTED,
+                    ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
+                );
+                return;
+            }
+            storage::AllocOutcome::Cancelled => return,
+        };
+        // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
+        // open fd are held alive for the read's duration. No promotion → no cache,
+        // source reads straight from the NVMe pool window.
+        let stream_ctx = storage::StreamingContext::new(buffers);
+        let Some(fd) = file.ensure_open(storage::get_fd_pool(), &crate::nvme_dir()) else {
             reply_err(
                 &thread_ctx,
                 &info::NVME_READ_ERRORS,
                 ValkeyError::Str(errors::ERR_NVME_READ),
             );
             return;
-        }
-    };
-    let raw_fd = fd.as_raw_fd();
-    let batch_width = stream_ctx.buffers.len();
-    let get_info = GetObjectInfo {
-        object_id,
-        obj_len,
-        crc32c,
-    };
-    let nvme_pool = storage::get_nvme_pool();
-    let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
-    crate::runtime_handle().spawn(async move {
-        // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
-        // open fd are held alive for the read's duration. No promotion → no cache,
-        // source reads straight from the NVMe pool window.
-        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        };
+        let raw_fd = fd.as_raw_fd();
+        let batch_width = stream_ctx.buffers.len();
+        let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
         // Declared after thread_ctx so it drops first (see the promotion path).
         let _keep_alive = (file, fd);
         cmd_get_tiered_run(
@@ -587,12 +598,14 @@ pub fn execute_set(
                     );
                 }
                 OperatingMode::Tiered => {
+                    let client_id = ctx.get_client_id();
                     cmd_set_tiered(
                         key_name_bytes,
                         obj_len,
                         data_source,
                         blocked_client,
                         object_id,
+                        client_id,
                     );
                 }
             }
@@ -771,67 +784,51 @@ fn cmd_set_tiered(
     data_source: DataSource,
     blocked_client: valkey_module::BlockedClient,
     object_id: ObjectId,
+    client_id: u64,
 ) {
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
     let nvme_pool = storage::get_nvme_pool();
-    let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
-        Some(bufs) => bufs,
-        None => {
-            let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-            reply_err(
-                &thread_ctx,
-                &info::NVME_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
-            );
-            return;
-        }
-    };
-    let stream_ctx = storage::StreamingContext::new(buffers);
-    let chunk_size = crate::chunk_size();
-    let batch_width = stream_ctx.buffers.len();
-    match data_source {
-        DataSource::Tcp(data) => {
-            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
-            crate::runtime_handle().spawn(async move {
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                let set_info = SetObjectInfo {
-                    object_id,
-                    obj_len,
-                    key_name,
-                };
-                cmd_set_tiered_run(
-                    set_info,
-                    stream_ctx,
-                    chunk_iter,
-                    thread_ctx,
-                    SetSource::Tcp(data),
-                )
-                .await;
-            });
-        }
-        DataSource::Efa { session, addrs } => {
-            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs));
-            crate::runtime_handle().spawn(async move {
-                let thread_ctx =
-                    valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
-                let set_info = SetObjectInfo {
-                    object_id,
-                    obj_len,
-                    key_name,
-                };
-                cmd_set_tiered_run(
-                    set_info,
-                    stream_ctx,
-                    chunk_iter,
-                    thread_ctx,
-                    SetSource::Efa(session),
-                )
-                .await;
-            });
-        }
-    }
+    crate::runtime_handle().spawn(async move {
+        let thread_ctx = valkey_module::ThreadSafeContext::with_blocked_client(blocked_client);
+        // Wait for staging off the main thread instead of failing a SET that arrives
+        // while the pool is momentarily full. No timeout: the client's own timeout
+        // bounds the wait, and a disconnect cancels this request.
+        let buffers = match nvme_pool
+            .alloc_window_cancellable(client_id, obj_len as usize, max_buffers, min_buffers)
+            .await
+        {
+            storage::AllocOutcome::Got(buffers) => buffers,
+            storage::AllocOutcome::CantFit => {
+                reply_err(
+                    &thread_ctx,
+                    &info::NVME_BUFFER_EXHAUSTED,
+                    ValkeyError::Str(errors::ERR_INSUFFICIENT_NVME_BUFFERS),
+                );
+                return;
+            }
+            storage::AllocOutcome::Cancelled => return,
+        };
+        let stream_ctx = storage::StreamingContext::new(buffers);
+        let chunk_size = crate::chunk_size();
+        let batch_width = stream_ctx.buffers.len();
+        let set_info = SetObjectInfo {
+            object_id,
+            obj_len,
+            key_name,
+        };
+        let (chunk_iter, source) = match data_source {
+            DataSource::Tcp(data) => (
+                ChunkIterator::new(obj_len, chunk_size, batch_width, None),
+                SetSource::Tcp(data),
+            ),
+            DataSource::Efa { session, addrs } => (
+                ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs)),
+                SetSource::Efa(session),
+            ),
+        };
+        cmd_set_tiered_run(set_info, stream_ctx, chunk_iter, thread_ctx, source).await;
+    });
 }
 
 /// The per-transport variant of a Tiered NVMe SET — the ONLY thing that differs
