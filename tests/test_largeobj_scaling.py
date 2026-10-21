@@ -619,7 +619,7 @@ class DramBudget(Budget):
     OBJ = BUDGET // 4
     PER_BUDGET = 3  # a fourth would fill the segment exactly, but talc's metadata lives in it
     FULL = 'maxmemory'
-    EVICTS_EXACTLY = False  # a batch of LRU_EVICT_BATCH victims, whatever the write needs
+    EVICTS_EXACTLY = False  # a batch of EVICT_BATCH victims, whatever the write needs
 
     def get_module_args(self, data_dir, direct_io):
         return (f"operating-mode Dram segment-size {self.BUDGET} max-object-size {self.BUDGET - 64 * 1024}"
@@ -788,7 +788,7 @@ class TestDramEviction(EvictionTests, DramBudget):
 
     def test_a_read_object_outlives_unread_ones(self):
         """A GET ranks the object by use, so eviction takes the objects never read first. Dram
-        evicts `LRU_EVICT_BATCH` (8) objects before it tries the write, so the cache must hold
+        evicts `EVICT_BATCH` (8) objects before it tries the write, so the cache must hold
         many more than that."""
         client = self.new_client()
         payloads = set_objects(client, 'obj_', self.SMALL_FILLING, self.SMALL)
@@ -807,11 +807,36 @@ class TestDramEviction(EvictionTests, DramBudget):
         assert gone == {f'obj_{i}' for i in range(1, 1 + len(gone))}, "oldest unread first"
 
 
+    def test_random_does_not_evict_the_oldest_first(self):
+        """One batch of random victims out of 32 is almost never the batch of oldest writes."""
+        client = self.new_client('allkeys-random')
+        payloads = set_objects(client, 'obj_', self.SMALL_FILLING, self.SMALL)
+        extra = 0
+        while self.evictions(client) == 0:
+            assert extra < 100, "the segment never filled"
+            assert client.execute_command('BLOB.TCP_SET', f'extra_{extra}', b'N' * self.SMALL) == b'OK'
+            extra += 1
+        gone = set(payloads) - set(surviving(client, payloads))
+        assert len(gone) >= 2
+        assert gone != {f'obj_{i}' for i in range(len(gone))}, "evicted in write order"
+
+
 class TestDramEvictionCron(EvictionCronTests, DramBudget):
     pass
 
 
 class TestTieredEviction(EvictionTests, TieredBudget):
+
+    def test_random_does_not_evict_the_oldest_first(self):
+        """LRU would evict exactly the six oldest writes. Six random victims are those with
+        chance under 1 in 1000 (a newcomer may be among them)."""
+        client = self.new_client('allkeys-random')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        keys = list(payloads)
+        for i in range(6):
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+        assert self.evictions(client) == 6
+        assert set(keys) - set(surviving(client, payloads)) != set(keys[:6]), "evicted in write order"
 
     def test_more_than_the_budget_is_refused(self):
         """No eviction makes room for more than the cap."""
@@ -1037,9 +1062,10 @@ class EvictionPolicyTests:
     """Run against both budgets: `volatile-*` evicts only keys with a TTL, `*-lru` the least
     recently used first."""
 
-    def test_volatile_evicts_only_keys_with_a_ttl(self):
+    @pytest.mark.parametrize('policy', ['volatile-lru', 'volatile-random'])
+    def test_volatile_evicts_only_keys_with_a_ttl(self, policy):
         """With no TTL key left, a volatile policy refuses the write, as in core."""
-        client = self.new_client('volatile-lru')
+        client = self.new_client(policy)
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
         keys = list(payloads)
         persistent, volatile = keys[:self.PER_BUDGET // 2], keys[self.PER_BUDGET // 2:]
@@ -1051,9 +1077,10 @@ class EvictionPolicyTests:
         self.assert_refused(client, 'refused', b'R' * self.OBJ)
         assert self.evictions(client) == len(volatile)
 
-    def test_persist_and_copy_carry_the_ttl_into_eviction(self):
+    @pytest.mark.parametrize('policy', ['volatile-lru', 'volatile-random'])
+    def test_persist_and_copy_carry_the_ttl_into_eviction(self, policy):
         """PERSIST takes a key out of volatile eviction; COPY copies its source's TTL into it."""
-        client = self.new_client('volatile-lru')
+        client = self.new_client(policy)
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
         assert client.execute_command('EXPIRE', 'obj_0', 1000) == 1
         assert client.execute_command('PERSIST', 'obj_0') == 1
@@ -1092,6 +1119,34 @@ class EvictionPolicyTests:
         else:
             pytest.fail("volatile-lru never refused")
         assert self.evictions(client) == evicted
+
+    def test_switching_the_order_keeps_every_key_and_its_ttl(self):
+        """LRU to random and back rebuilds the candidates from the same objects: volatile eviction
+        still takes only keys with a TTL."""
+        client = self.new_client('volatile-lru')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        keys = list(payloads)
+        persistent, volatile = keys[:self.PER_BUDGET // 2], keys[self.PER_BUDGET // 2:]
+        for key in volatile:
+            assert client.execute_command('EXPIRE', key, 1000) == 1
+        for policy in ['volatile-random', 'volatile-lru', 'volatile-random']:
+            client.config_set('maxmemory-policy', policy)
+        for i in range(len(volatile)):
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+        assert sorted(surviving(client, payloads)) == sorted(persistent)
+        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+
+    def test_switching_from_random_starts_lru_from_the_oldest_write(self):
+        client = self.new_client('allkeys-random')
+        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
+        keys = list(payloads)
+        client.config_set('maxmemory-policy', 'allkeys-lru')
+        if self.EVICTS_EXACTLY:
+            # A GET after the switch is a use again: the oldest write is now the newest.
+            assert client.execute_command('BLOB.TCP_GET', keys[0]) == payloads[keys[0]]
+            keys = keys[1:] + keys[:1]
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        self.assert_lru_victims(client, payloads, keys, 1)
 
     def free_a_slot(self, client, key):
         """DEL `key` and wait until its object is freed, leaving room for exactly one write."""

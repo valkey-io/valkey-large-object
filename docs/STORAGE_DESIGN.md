@@ -982,12 +982,17 @@ eviction reads the cached value with one atomic load:
 
 **The eviction candidates** (`eviction_candidates`) is one global structure that serves Dram and
 Tiered alike. Dram: it holds the objects in the DRAMPool. Tiered: it holds the objects
-that have an NVMe file, not their cached copies. It keeps two lists of oids in
-least-recently-used order, one over every object and one over the objects whose key has a
-TTL; `volatile-*` walks the TTL list, `allkeys-*` the full one, so no victim is walked
-past. Each is a `hashlink::LinkedHashSet` of oids, so an object carries no handle. A GET is
-a use; so is a TTL change, as in core. An oid leaves the candidates when it is evicted, so
-it is never picked twice, and again, harmlessly, when its key is torn down.
+that have an NVMe file, not their cached copies. It has one variant per eviction order,
+and each knows which objects exist and which have a TTL:
+
+| Order | Policies | Structure | Victim |
+|---|---|---|---|
+| LRU | every policy but `*-random` | two `hashlink::LinkedHashSet`s of oids in least-recently-used order: every object, and the objects whose key has a TTL | The oldest of the TTL set under `volatile-*`, of the full set under `allkeys-*`, so no victim is walked past |
+| Random | `*-random` | two roaring bitmaps of oids: `all`, and `ttl` (a subset of `all`). The oid is a dense integer, so it is the bit position, and `select(k)` is the k-th set bit | A uniform random pick from `ttl` under `volatile-*`, from `all` under `allkeys-*` |
+
+A GET is a use for LRU, as is a TTL change, as in core; random records neither, and a
+random GET takes no lock. An oid leaves the candidates when it is evicted, so it is never
+picked twice, and again, harmlessly, when its key is torn down.
 TTL membership comes from the `expire` and `persist` keyspace events
 (`eviction_candidates::on_keyspace_event`, both modes): `expire` fires only when a TTL was
 set, `persist` only when one was removed. A COPY has a TTL exactly when its source has one, so
@@ -998,22 +1003,31 @@ The candidates are the only place that know an eviction order. They are reached 
 functions (`insert`, `touch`, `remove`, `pick`, `inherit_ttl`), so another order is
 another variant behind them, and neither the Dram nor the Tiered eviction code changes.
 
+**A change of `maxmemory-policy` between LRU and random rebuilds the candidates.** The config
+event drops the candidates and builds the other one from the same objects. Which objects exist
+and which have a TTL are kept; the order is not. A new LRU order starts from creation
+order (oids grow with creation), and random candidates have no order to keep. A change within
+an order (`allkeys-lru` to `volatile-lru`, say) rebuilds nothing, since both sets, or both
+bitmaps, are always kept. `noeviction` keeps candidates too, so a later switch to an
+evicting policy finds every object. The rebuild walks every object under the candidates lock,
+on the main thread, once per such change; it has not been measured.
+
 **When eviction runs.** Dram: only when the server may evict, that is `maxmemory` is set,
 the policy is not `noeviction`, and this is not a replica; the expand gate on `maxmemory`
 is what makes a SET miss. Tiered: whenever a write would exceed `disk-maxmemory`, unless
 `maxmemory-policy` is `noeviction` or this is a replica. The server's `maxmemory` is not
 required: it bounds DRAM, not the disk.
 
-**Order among the allowed keys.** Every policy runs as LRU, and the module logs a warning
-each time the policy is set, at load or by `CONFIG SET`, to one it serves in another
-order: `*-lfu`, `*-random` and `volatile-ttl`. Honoring LFU, random or TTL order is a
-future problem. Dram LRU evicts from the global list, not one segment: the freed bytes of
-a victim may sit in a segment that cannot take the write, so they stay as holes. One write
-evicts `EVICT_BATCH` (8) victims, then tries the allocation, and repeats once
-(`EVICT_ROUNDS`): at most 16 victims, so the main thread's work is bounded by a count,
-not by the size of the objects. A batch may evict more than the write needs; the extra
-holes serve the writes that follow. If the write still does not fit, the victims stay
-evicted and the write fails.
+**Order among the allowed keys.** `*-lru` evicts the least recently used and `*-random` a
+random object. The module serves `*-lfu` and `volatile-ttl` as LRU and logs a warning each
+time the policy is set, at load or by `CONFIG SET`, to one of them. Honoring LFU or TTL
+order is a future problem: a new variant of the candidates. Dram evicts from all the candidates,
+not one segment: the freed bytes of a victim may sit in a segment that cannot take the
+write, so they stay as holes. One write evicts `EVICT_BATCH` (8) victims, then tries the
+allocation, and repeats once (`EVICT_ROUNDS`): at most 16 victims, so the main thread's
+work is bounded by a count, not by the size of the objects. A batch may evict more than
+the write needs; the extra holes serve the writes that follow. If the write still does
+not fit, the victims stay evicted and the write fails.
 
 Tiered cache demotion is not a policy eviction: it drops a cached copy, deletes no key,
 and ranks by decayed LFU score, not by `maxmemory-policy`.
