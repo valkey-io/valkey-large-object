@@ -15,7 +15,7 @@ env:
 
 jobs:
   test:
-    runs-on: [self-hosted, ci]
+    runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
       matrix:
@@ -28,34 +28,25 @@ jobs:
             cache_key_suffix: asan
     name: ${{ matrix.name }}
     steps:
-      - name: Ensure disk headroom
-        run: |
-          set -euo pipefail
-          THRESHOLD=85
-          USE=$(df --output=pcent "$RUNNER_WORKSPACE" | tail -1 | tr -dc '0-9')
-          echo "Disk at ${USE}% on $(df --output=target "$RUNNER_WORKSPACE" | tail -1)"
-          if [ "${USE:-0}" -ge "$THRESHOLD" ]; then
-            echo "::warning::Disk at ${USE}%, trimming cargo cache"
-            "$HOME/.cargo/bin/cargo-cache" --autoclean || echo "cargo-cache not installed, skipping"
-          fi
-
       - uses: actions/checkout@v4
 
+      # libasan ships with gcc on Ubuntu, so ASAN needs no extra package.
       - name: Install system dependencies
         run: |
-          sudo yum install -y clang clang-devel gcc make git python3 python3-pip pkgconfig libfabric libfabric-devel
-          ${{ matrix.asan && 'sudo yum install -y libasan' || '' }}
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev build-essential pkg-config libfabric-dev
 
       # dma-libfabric probes libfabric through pkg-config. Check reachability early.
       - name: Check libfabric
         run: pkg-config --modversion libfabric
 
-      - name: Install Rust
-        run: |
-          if ! command -v cargo &> /dev/null; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          fi
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.cache_key_suffix }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
       - name: cargo fmt check
         run: cargo fmt --check
@@ -80,17 +71,16 @@ jobs:
           path: |
             tests/build/binaries
             tests/build/valkeytestframework
-          key: valkey-unstable-arm64-${{ matrix.cache_key_suffix }}-w${{ steps.week.outputs.week }}
+          key: valkey-unstable-${{ runner.os }}-${{ runner.arch }}-${{ matrix.cache_key_suffix }}-w${{ steps.week.outputs.week }}
 
       - name: Build valkey-server
         if: steps.cache-valkey.outputs.cache-hit != 'true'
         run: |
           mkdir -p tests/build/binaries/unstable
           cd tests/build
-          git clone "${{ env.VALKEY_REPO_URL }}"
+          git clone --depth 1 --branch unstable "${{ env.VALKEY_REPO_URL }}"
           cd valkey
-          git checkout unstable
-          ${{ matrix.asan && 'make distclean && make -j SANITIZER=address' || 'make -j' }}
+          ${{ matrix.asan && 'make -j"$(nproc)" SANITIZER=address' || 'make -j"$(nproc)"' }}
           cp src/valkey-server ../binaries/unstable/
           cd ../..
           rm -rf valkey
@@ -98,15 +88,15 @@ jobs:
       - name: Set up test framework
         if: steps.cache-valkey.outputs.cache-hit != 'true'
         run: |
-          git clone ${{ env.TEST_FRAMEWORK_REPO }}
+          git clone --depth 1 ${{ env.TEST_FRAMEWORK_REPO }}
           mkdir -p ${{ env.TEST_FRAMEWORK_DIR }}
           mv valkey-test-framework/src/* ${{ env.TEST_FRAMEWORK_DIR }}/
           rm -rf valkey-test-framework
 
       - name: Install Python dependencies
         run: |
-          python3 -m pip install --upgrade pip
-          pip3 install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Set module path
         run: echo "MODULE_PATH=$(realpath target/release/libvalkey_large_object.so)" >> $GITHUB_ENV
@@ -116,27 +106,24 @@ jobs:
 
       - name: Run integration tests
         if: ${{ !matrix.asan }}
-        run: python3 -m pytest --cache-clear -v "tests/"
+        # io_uring and fabric buffer registration count against RLIMIT_MEMLOCK (8 MB default).
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          python -m pytest --cache-clear -v "tests/"
 
       - name: Run integration tests (ASAN)
         if: ${{ matrix.asan }}
         env:
           ASAN_BUILD: "1"
         run: |
-          python3 -m pytest --capture=sys --cache-clear -v "tests/" -m "not skip_for_asan" > test_output.tmp 2>&1 || true
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          python -m pytest --capture=sys --cache-clear -v "tests/" -m "not skip_for_asan" > test_output.tmp 2>&1 || true
           cat test_output.tmp
           if grep -q "LeakSanitizer: detected memory leaks" test_output.tmp; then
             echo "::error::Memory leaks detected by AddressSanitizer"
             grep -B 2 "LeakSanitizer: detected memory leaks" test_output.tmp | grep ".*\.py::"
-            rm -f test_output.tmp
             exit 1
           fi
           if grep -q "FAILED\|ERROR" test_output.tmp; then
-            rm -f test_output.tmp
             exit 1
           fi
-          rm -f test_output.tmp
-
-      - name: Cleanup stale servers
-        if: always()
-        run: pkill -9 -f valkey-server || true
