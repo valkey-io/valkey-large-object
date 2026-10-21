@@ -86,7 +86,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `scaling-poll-ms` | 2500 | Yes | Scaling cron poll interval in milliseconds. Min 1000, max 60000. |
 | `scaling-expand-watermark` | 80 | Yes | Percent utilization to trigger proactive segment expansion. Min 50, max 95. |
 | `scaling-shrink-watermark` | 90 | Yes | Percent used_memory/maxmemory to trigger DRAM segment eviction. Min 50, max 95. |
-| `max-rdma-registered-bytes` | 380gb | Yes | With a fabric up: cap on segment bytes registered with EFA (DRAM pool plus disk staging). An expand past it is refused like a `maxmemory` one, and a startup that needs more fails to load. 0 = no limit. |
+| `max-rdma-registered-bytes` | 380gb | Yes | With a fabric up: cap on segment bytes registered with EFA (DRAM pool plus disk staging). An expand past it is refused like a `maxmemory` one. 0 = no limit. |
 | `reaper-poll-ms` | 100 | Yes | Scaling cron poll interval in milliseconds while evicted keys wait to be deleted. Min 10, max 60000. |
 | `reaper-scan-budget-us` | 1000 | Yes | Microseconds per tick for deleting evicted keys. Min 100, max 100000. |
 | `victim-sample-size` | 5 | Yes | Entries sampled per victim search (eviction, DRAM cache drop, fd close); the lowest LFU score goes. Min 1, max 64. |
