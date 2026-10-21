@@ -993,13 +993,14 @@ and each knows which objects exist and which have a TTL:
 A GET is a use for LRU, as is a TTL change, as in core; random records neither, and a
 random GET takes no lock. An oid leaves the candidates when it is evicted, so it is never
 picked twice, and again, harmlessly, when its key is torn down.
-TTL membership comes from the `expire`, `persist` and `copy_to` keyspace events
-(`eviction_candidates::on_keyspace_event`, both modes); `expire` covers EXPIRE, PEXPIRE,
-EXPIREAT and PEXPIREAT. RENAME and MOVE carry the object and its TTL together, and an
-overwrite mints a new oid, so none needs an event.
+TTL membership comes from the `expire` and `persist` keyspace events
+(`eviction_candidates::on_keyspace_event`, both modes): `expire` fires only when a TTL was
+set, `persist` only when one was removed. A COPY has a TTL exactly when its source has one, so
+the copy callback passes it on (`inherit_ttl`). RENAME and MOVE carry the object and its TTL
+together, and an overwrite mints a new oid, so none needs an event.
 
 The candidates are the only place that know an eviction order. They are reached through five
-functions (`insert`, `touch`, `set_ttl`, `remove`, `pick`), so another order is
+functions (`insert`, `touch`, `remove`, `pick`, `inherit_ttl`), so another order is
 another variant behind them, and neither the Dram nor the Tiered eviction code changes.
 
 **A change of `maxmemory-policy` between LRU and random rebuilds the candidates.** The config

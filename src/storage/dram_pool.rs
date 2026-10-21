@@ -411,7 +411,7 @@ impl DRAMPool {
     /// every victim goes back and this returns None. The victims are returned so they drop
     /// after the locks are released. Tiered mode only.
     fn reclaim_in(&self, seg: usize, need: usize) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
-        let victims = self.take_victims(seg, need)?;
+        let victims = self.take_demotion_victims(seg, need)?;
         self.tiered_cache()
             .stats
             .demotions
@@ -422,7 +422,11 @@ impl DRAMPool {
     /// The victim search of `reclaim_in`, under the `objects` write lock: take
     /// sampled lowest-scoring objects from `seg` until they cover `need`, at most
     /// `RECLAIM_MAX_VICTIMS`. If they cannot, restore them all and return None.
-    fn take_victims(&self, seg: usize, need: usize) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
+    fn take_demotion_victims(
+        &self,
+        seg: usize,
+        need: usize,
+    ) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
         let samples = crate::victim_sample_size();
         let now_min = now_minutes();
         let decay_time = crate::blob_decay_time();
@@ -653,7 +657,9 @@ mod tests {
         for i in 0..n {
             p.insert_object(ObjectId(i as u64), ctx(0, i));
         }
-        assert!(p.take_victims(0, n as usize * BUF as usize).is_none());
+        assert!(p
+            .take_demotion_victims(0, n as usize * BUF as usize)
+            .is_none());
         assert_eq!(p.object_count(), n as usize);
     }
 

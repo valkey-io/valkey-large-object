@@ -150,10 +150,12 @@ impl LoValue {
         if self.reclaim_in_progress() {
             return None;
         }
-        match crate::operating_mode() {
+        let copy = match crate::operating_mode() {
             crate::OperatingMode::Dram => self.create_copy_dram(),
             crate::OperatingMode::Tiered => self.create_copy_tiered(),
-        }
+        }?;
+        crate::storage::eviction_candidates::inherit_ttl(self.object_id, copy.object_id);
+        Some(copy)
     }
 
     /// Dram mode: deep-copy ObjectContext via try_clone, insert with new OID.
