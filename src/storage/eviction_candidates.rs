@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use hashlink::LinkedHashSet;
-use valkey_module::{Context, NotifyEvent, ValkeyValue};
+use valkey_module::{Context, NotifyEvent};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 
@@ -41,6 +41,7 @@ impl Lru {
     /// A TTL change is a use, as in core (EXPIRE and PERSIST touch the key).
     fn set_ttl(&mut self, oid: ObjectId, has_ttl: bool) {
         if !self.all.to_back(&oid) {
+            // Evicted: the key lingers until the reclaim cron deletes it.
             return;
         }
         if has_ttl {
@@ -117,20 +118,34 @@ pub fn pick(n: usize, take: impl FnMut(ObjectId) -> bool) -> Vec<ObjectId> {
     }
 }
 
-/// Keyspace events that can change a key's TTL without changing its oid. An overwrite
-/// (BLOB.TCP_SET / BLOB.RDMA_SET) needs none: it mints a new oid, and Valkey drops the key's TTL.
-/// RENAME and MOVE need none either: the object and its TTL move together. `expire` covers
-/// EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT.
-pub fn on_keyspace_event(ctx: &Context, _: NotifyEvent, event: &str, key: &[u8]) {
-    if !matches!(event, "expire" | "persist" | "copy_to") {
-        return;
+/// A COPY's object has a TTL exactly when its source has one, so it inherits the source's.
+/// Call it once the copy is a candidate (`insert`).
+pub fn inherit_ttl(from: ObjectId, to: ObjectId) {
+    match &mut *candidates() {
+        EvictionCandidates::Lru(lru) => {
+            if lru.ttl.contains(&from) {
+                lru.set_ttl(to, true);
+            }
+        }
     }
+}
+
+/// Keyspace events that change a key's TTL without changing its oid: `expire` (EXPIRE,
+/// PEXPIRE, EXPIREAT, PEXPIREAT, GETEX) fires only when a TTL was set, and `persist` only when
+/// one was removed. An overwrite (BLOB.TCP_SET / BLOB.RDMA_SET) needs none: it mints a new oid,
+/// and Valkey drops the key's TTL. RENAME and MOVE need none: the object and its TTL move
+/// together. COPY is handled by `inherit_ttl`.
+pub fn on_keyspace_event(ctx: &Context, _: NotifyEvent, event: &str, key: &[u8]) {
+    let has_ttl = match event {
+        "expire" => true,
+        "persist" => false,
+        _ => return,
+    };
     let key = ctx.create_string(key);
     let oid = match ctx.open_key(&key).get_value::<LoValue>(&LO_TYPE) {
         Ok(Some(lo)) => lo.object_id,
         _ => return,
     };
-    let has_ttl = matches!(ctx.call("PTTL", &[&key]), Ok(ValkeyValue::Integer(ms)) if ms >= 0);
     match &mut *candidates() {
         EvictionCandidates::Lru(lru) => lru.set_ttl(oid, has_ttl),
     }
