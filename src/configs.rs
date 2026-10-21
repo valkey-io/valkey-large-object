@@ -315,7 +315,8 @@ pub fn on_string_config_set(
     name: &str,
     val: &'static ValkeyGILGuard<ValkeyString>,
 ) -> Result<(), ValkeyError> {
-    let value = val.lock(config_ctx).to_string_lossy();
+    // Reject invalid UTF-8: a lossy copy would make the mirror differ from what CONFIG GET reports.
+    let value = val.lock(config_ctx).try_as_str()?.to_owned();
     let mirror = match name {
         "disk-dir" => &*DISK_DIR,
         "fabric-interfaces" => &*FABRIC_INTERFACES,
