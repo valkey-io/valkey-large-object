@@ -141,7 +141,7 @@ pub fn on_keyspace_event(ctx: &Context, _: NotifyEvent, event: &str, key: &[u8])
         "persist" => false,
         _ => return,
     };
-    let key = ctx.create_string(key);
+    let key = valkey_module::ValkeyString::create_from_slice(ctx.get_raw(), key);
     let oid = match ctx.open_key(&key).get_value::<LoValue>(&LO_TYPE) {
         Ok(Some(lo)) => lo.object_id,
         _ => return,

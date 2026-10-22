@@ -215,7 +215,7 @@ fn commit_lo_value(
     object_id: ObjectId,
     lo_value: LoValue,
 ) -> Result<CommitOutcome, ValkeyError> {
-    let key_str = ctx.create_string(key_name.to_vec());
+    let key_str = valkey_module::ValkeyString::create_from_slice(ctx.get_raw(), key_name);
     let key = ctx.open_key_writable(&key_str);
     // One lookup drives both the version guard and the create/update event.
     let event = match key.get_value::<LoValue>(&LO_TYPE) {
