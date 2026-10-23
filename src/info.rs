@@ -234,17 +234,18 @@ fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
     };
 
     let (total, _draining, unused) = nvme.segment_counts();
+    let seg_size = crate::dram_segment_size();
+    // The staging pool is fixed-size and never drains.
+    let util_pct = pct(nvme.allocated_bytes() as u64, (total * seg_size) as u64);
 
     ctx.builder()
         .add_section("disk_staging")
         .field("disk_staging_segments", total as i64)?
         .field("disk_staging_unused_segments", unused as i64)?
         .field("disk_staging_fragment_count", nvme.fragment_count() as i64)?
+        .field("disk_staging_utilization_pct", util_pct)?
         .field("disk_staging_size_bytes", crate::nvme_staging_size() as i64)?
-        .field(
-            "disk_staging_segment_size_bytes",
-            crate::dram_segment_size() as i64,
-        )?
+        .field("disk_staging_segment_size_bytes", seg_size as i64)?
         .field(
             "disk_staging_rdma_registered_segments",
             nvme.rdma_registered_count() as i64,

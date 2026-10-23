@@ -467,6 +467,42 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         assert results == [b'OK'] * n
         assert inflight() == 0
 
+    def test_info_reports_disk_staging_utilization(self):
+        """A Tiered SET holds its staging buffers until it replies, so staging utilization
+        rises while the pause holds the SET and returns to 0 after. A one-chunk SET holds
+        one buffer of the object's size."""
+        client = self.server.get_new_client()
+        setter = self.server.get_new_client()
+        errors = []
+        value_len = 4096
+
+        def staging():
+            assert not errors, f"SET raised: {errors}"
+            return client.info('largeobj_disk_staging')
+
+        def util():
+            return staging()['largeobj_disk_staging_utilization_pct']
+
+        def background_set():
+            try:
+                setter.execute_command('BLOB.TCP_SET', 'key', b'S' * value_len)
+            except Exception as e:
+                errors.append(e)
+
+        info = staging()
+        capacity = (info['largeobj_disk_staging_segments']
+                    * info['largeobj_disk_staging_segment_size_bytes'])
+        assert util() == 0
+        t = threading.Thread(target=background_set)
+        t.start()
+        try:
+            wait_for_true(lambda: util() > 0)
+            assert util() == round(value_len * 100 / capacity, 2)
+        finally:
+            t.join(timeout=10)
+        assert not t.is_alive(), "SET thread did not finish"
+        assert util() == 0
+
     def test_commandstats_count_background_time(self):
         """An async SET's commandstats time includes its background work, not just the
         main-thread dispatch. The pause holds the SET 2 s before it commits."""
