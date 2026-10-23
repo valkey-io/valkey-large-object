@@ -116,8 +116,8 @@ Default: 200. Auto-reduced for large objects when staging cap limits concurrency
 |------|---------|-------------|
 | `--port` | (required) | Valkey server port |
 | `--disk-dir` | (optional) | Directory for object files. If set, default modes = `fio Dram Tiered NVMe`. |
-| `--modes` | auto | Space-separated modes. Valid: `fio`, `Dram`, `Tiered`, `NVMe`. |
-| `--sizes` | `"4KB 1MB 50MB"` | Object sizes. Valid: 4KB, 16KB, 50KB, 256KB, 1MB, 4MB, 16MB, 50MB. |
+| `--modes` | auto | Space- or comma-separated modes. Valid: `fio`, `Dram`, `Tiered`, `NVMe`. |
+| `--sizes` | `"4KB 1MB 50MB"` | Space- or comma-separated object sizes. Valid: 4KB, 16KB, 50KB, 256KB, 1MB, 4MB, 16MB, 50MB. |
 | `--clients` | 200 | Concurrent benchmark clients. |
 | `--duration` | 10 | Seconds per benchmark run. |
 | `--keys` | 500 | Base key count (scaled down for large objects). |
@@ -125,6 +125,48 @@ Default: 200. Auto-reduced for large objects when staging cap limits concurrency
 | `--segment-size` | 67108864 (64MB) | Segment size in bytes. |
 | `--disk-maxmemory` | 107374182400 (100GB) | NVMe budget in bytes. |
 | `--worker-threads` | 2 | Tokio worker threads. |
+| `--workload` | `get` | `get` (built-in BLOB.TCP_GET throughput) or a plugin in `bench/workloads/` (see [Workloads](#workloads)). Flags bench.sh doesn't know are passed to the workload. |
+
+### Workloads
+
+`get` is built into bench.sh. Every other workload is a plugin, `bench/workloads/<name>.sh`, that bench.sh sources for `--workload <name>`. bench.sh starts a fresh server for each mode × size, populates it with blobs, and runs one pass of the workload against it. Each workload adds its own flags; list them with `./bench.sh --workload <name> --help`. To add one, see [bench/workloads/README.md](bench/workloads/README.md).
+
+#### fuzz
+
+Populates `key:0`..`key:N-1` with blobs (`bench-mode no`), then runs `valkey-benchmark --fuzz` (Valkey 9.1+) with `-r N`, so the fuzzer's generic commands (DEL, COPY, RENAME, MOVE, SWAPDB, EXPIRE, OBJECT, MEMORY USAGE, Lua, MULTI/EXEC, wrong-type commands) land on blob keys. `config-commands` also randomizes module configs, since they appear in `CONFIG GET *`. The fuzzer sends `BLOB.*` commands with no arguments only, as the module registers no command argument docs.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--fuzz-requests` | 100000 | Total commands, split across `--clients`. |
+| `--fuzz-mode` | (valid commands only) | Passed to `valkey-benchmark --fuzz-mode`: `malformed-commands`, `config-commands`, or both comma-separated. |
+| `--fuzz-duration` | 300 | Seconds per pass. The fuzzer is stopped at this limit if it hasn't sent `--fuzz-requests` yet. |
+
+Each pass ends when the fuzzer has sent `--fuzz-requests` commands or `--fuzz-duration` runs out, whichever comes first. Hitting the time limit is not a failure: in `malformed-commands` mode the server closes the connection on most commands, so the fuzzer spends most of its time reconnecting. Fuzzer clients that give up (a failed reconnect, or a generated blocking command outlasting the fuzzer's own 15s timeout) are reported as a warning, since that also happens against a stock server.
+
+A pass fails the run if the server crashed (printing the signal, stack, and offending command from the server log), stopped answering PING (hung), or sent the fuzzer a malformed reply; or if `largeobj_num_objects` differs from the blob keys across all databases, or (Tiered/NVMe) the object files in `disk-dir` differ from objects plus `largeobj_disk_orphaned_files`.
+
+```bash
+./bench.sh --port 7380 --workload fuzz --sizes 4KB --fuzz-mode malformed-commands,config-commands
+```
+
+From a PR: `/bench --workload fuzz --sizes 4KB --modes Dram,Tiered`.
+
+#### tcp-connections
+
+A high rate of new connections against blob reads and writes over the TCP commands. Runs `valkey-benchmark -k 0`, which opens a fresh connection for every request, with `BLOB.TCP_GET` and `BLOB.TCP_SET` on the populated keys side by side (`bench-mode no`, so GETs send full replies). Clients keep disconnecting while their GET reply is prepared off the main thread or their SET is still committing. SET values are capped at 64KB because valkey-benchmark takes them on the command line.
+
+TCP only: it doesn't exercise the EFA commands (`BLOB.RDMA_*`) or their per-connection DMA sessions. Those need a libfabric peer holding the client's memory and a `BLOB.RDMA_HELLO` on every connection, which valkey-benchmark can't do, so they will get their own `efa-connections` workload.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tcp-connections-duration` | 60 | Seconds of reconnect churn per pass. |
+| `--tcp-connections-commands` | `get,set` | `get`, `set`, or both; `--clients` is split across them. |
+
+A pass fails the run if the server crashed, panicked, or hung; if a populated blob is missing afterwards; or if the module's accounting is off (as for fuzz).
+
+```bash
+./bench.sh --port 7380 --workload tcp-connections --sizes 4KB,1MB --tcp-connections-duration 30
+```
 
 Config values in bench.sh use **raw bytes** for module load args. The module also accepts memory notation (e.g., `1gb`) via `CONFIG SET` at runtime.
 

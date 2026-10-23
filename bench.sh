@@ -39,6 +39,8 @@ SERVER_CPUS="0-15"                # taskset for valkey-server
 BENCH_CPUS="16-63"                # taskset for valkey-benchmark
 MODES_STR=""                      # empty = auto (Dram if no disk-dir; all 3 if disk-dir)
 SIZES_STR="4KB 1MB 50MB"
+WORKLOAD="get"                    # get (built in) or a plugin: bench/workloads/<name>.sh
+WORKLOAD_ARGS=()                  # flags bench.sh doesn't know, handed to the workload
 
 # ─── Parse args ───────────────────────────────────────────────────────────────
 
@@ -46,8 +48,9 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)          PORT="$2"; shift 2 ;;
         --disk-dir)      DISK_DIR="$2"; shift 2 ;;
-        --modes)         MODES_STR="$2"; shift 2 ;;
-        --sizes)         SIZES_STR="$2"; shift 2 ;;
+        # Commas separate as well as spaces, so /bench comments can pass lists unquoted.
+        --modes)         MODES_STR="${2//,/ }"; shift 2 ;;
+        --sizes)         SIZES_STR="${2//,/ }"; shift 2 ;;
         --clients)       CLIENTS="$2"; shift 2 ;;
         --duration)      DURATION="$2"; shift 2 ;;
         --keys)          NUM_KEYS="$2"; shift 2 ;;
@@ -55,6 +58,7 @@ while [[ $# -gt 0 ]]; do
         --segment-size)      SEGMENT_SIZE="$2"; shift 2 ;;
         --disk-maxmemory)    NVME_MAXMEMORY="$2"; shift 2 ;;
         --worker-threads)    WORKER_THREADS="$2"; shift 2 ;;
+        --workload)          WORKLOAD="$2"; shift 2 ;;
         --help|-h)
             echo "Usage: $0 --port <PORT> [options]"
             echo ""
@@ -70,6 +74,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --segment-size <BYTES>     Segment size in bytes (default: 67108864 = 64MB)"
             echo "  --disk-maxmemory <BYTES>   Disk budget in bytes (default: 107374182400 = 100GB)"
             echo "  --worker-threads <N>       Tokio threads (default: 2)"
+            echo "  --workload <NAME>          get (default) or bench/workloads/<NAME>.sh; --workload <NAME> --help for its options"
             echo ""
             echo "Modes:"
             echo "  Dram    All objects in DRAMPool. No NVMe."
@@ -81,9 +86,10 @@ while [[ $# -gt 0 ]]; do
             echo "  $0 --port 7380 --disk-dir /mnt/nvme               # All 3 modes"
             echo "  $0 --port 7380 --disk-dir /mnt/nvme --modes Tiered  # Tiered only"
             echo "  $0 --port 7380 --modes Dram --sizes \"4KB 1MB\"      # Dram, specific sizes"
+            source "$(dirname "$0")/bench/lib.sh" && print_workload_usage
             exit 0
             ;;
-        *) echo "Unknown option: $1"; exit 1 ;;
+        *) WORKLOAD_ARGS+=("$1"); shift ;;
     esac
 done
 
@@ -150,6 +156,9 @@ for bin in "$VALKEY_SERVER" "$VALKEY_CLI" "$VALKEY_BENCH"; do
         exit 1
     fi
 done
+
+source "$(dirname "$0")/bench/lib.sh"
+load_workload "${WORKLOAD_ARGS[@]}"
 
 if [ $RUN_FIO -eq 1 ]; then
     if ! command -v fio &>/dev/null; then
@@ -240,6 +249,7 @@ echo "Worker threads: $WORKER_THREADS"
 echo "IO threads:     $IO_THREADS"
 echo "Server CPUs:    $SERVER_CPUS"
 echo "Bench CPUs:     $BENCH_CPUS"
+print_workload_header
 echo "=============================================="
 echo ""
 
@@ -384,7 +394,7 @@ for BENCH_MODE in $MODES_STR; do
                 echo "  ERROR: Unknown mode $BENCH_MODE"; continue ;;
         esac
         MODULE_ARGS="$MODULE_ARGS worker-threads $WORKER_THREADS"
-        MODULE_ARGS="$MODULE_ARGS bench-mode yes"
+        MODULE_ARGS="$MODULE_ARGS bench-mode ${WORKLOAD_BENCH_MODE:-yes}"
 
         # Clean disk-dir for Tiered/NVMe modes
         if [ "$BENCH_MODE" = "Tiered" ] || [ "$BENCH_MODE" = "NVMe" ]; then
@@ -461,7 +471,7 @@ s.setsockopt(6, 1, 1)
 payload = os.urandom($BYTES)
 start = time.monotonic()
 for i in range($EFFECTIVE_KEYS):
-    s.sendall(resp('BLOB.TCP_SET', f'k:{i:012d}', payload))
+    s.sendall(resp('BLOB.TCP_SET', '$KEY_FORMAT'.format(i=i), payload))
     r = s.recv(1024)
 elapsed = time.monotonic() - start
 s.close()
@@ -480,6 +490,12 @@ print(f'  Populated $EFFECTIVE_KEYS keys ($LABEL) in {elapsed:.1f}s ({$EFFECTIVE
             echo "         BLOB.TCP_SET populate failed or keys were not stored correctly."
             $VALKEY_CLI -p $PORT SHUTDOWN NOSAVE 2>/dev/null || true
             exit 1
+        fi
+
+        if [ "$WORKLOAD" != "get" ]; then
+            run_workload_pass
+            stop_server
+            continue
         fi
 
         # ── Two-phase benchmark ──────────────────────────────────────────────
