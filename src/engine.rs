@@ -169,6 +169,21 @@ async fn test_pause_before_finalize() {
     }
 }
 
+/// Test hook: pause the promotion leader after the Filling ObjectContext is in
+/// the map but before NVMe reads start. Widens the window so concurrent GETs
+/// deterministically register as coalesced waiters. Controlled by
+/// `test-pause-during-promotion-ms` config. 0 = disabled (production default).
+async fn test_pause_during_promotion() {
+    let pause_ms = crate::test_pause_during_promotion_ms();
+    if pause_ms > 0 {
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        })
+        .await
+        .ok();
+    }
+}
+
 /// Collect all DRAMPool buffers into a contiguous Vec for TCP reply.
 fn collect_dram_bytes(
     dram_pool: &storage::DRAMPool,
@@ -352,32 +367,24 @@ fn cmd_get_tiered(
     let dram_pool = storage::get_dram_pool();
     let cache = dram_pool.tiered_cache();
     // ─── DRAMPool hit ────────────────────────────────────────────────────
-    let mut filling = false;
-    if let Some(obj_ctx) = dram_pool.get_object(&object_id) {
-        if obj_ctx.is_ready() {
-            cache.stats.record_hit(&obj_ctx.stats);
-            cmd_get_from_dram(
-                dram_pool,
-                &obj_ctx,
-                obj_len,
-                crc32c,
-                transport,
-                thread_ctx,
-                Some((file, unevictable)),
-            );
-            return;
-        }
-        // Filling state: promotion in progress.
-        // TODO: coalesce — register as waiter on this ObjectContext.
-        // For now: fall through to NVMe read.
-        filling = true;
-    }
+    let (transport, thread_ctx) = match try_serve_dram_hit(
+        dram_pool,
+        &object_id,
+        obj_len,
+        crc32c,
+        transport,
+        thread_ctx,
+        &file,
+        &unevictable,
+    ) {
+        None => return,     // served (Ready or coalesced waiter)
+        Some(args) => args, // not in DRAMPool — continue to promotion / fallback
+    };
     // Everything below reads from NVMe, whether or not it also promotes.
     cache.stats.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // Admit via the admission filter, then allocate (reclaiming cold copies if full).
-    // Skip both if another GET is already promoting this OID (Filling).
-    let promoted = if !filling && cache.admission.admit(object_id, obj_len) {
+    let promoted = if cache.admission.admit(object_id, obj_len) {
         dram_pool.try_promote_object(object_id, obj_len)
     } else {
         None
@@ -414,6 +421,8 @@ fn cmd_get_tiered(
             // Drops before the captured thread_ctx: the fd clone is gone before
             // the client unblocks, so its next GET sees the fd unpinned.
             let _keep_alive = (file, fd, unevictable);
+            // Test hook: pause before NVMe reads so concurrent GETs can subscribe.
+            test_pause_during_promotion().await;
             // Promotion: read the NVMe file INTO the DRAM buffers (pool=Dram), and the
             // progress hook marks the cached entry Ready.
             let progress = crate::stream::PromotionProgress {
@@ -437,8 +446,10 @@ fn cmd_get_tiered(
         return;
     }
     // ─── NVMePool fallback (promotion skipped) ───────────────────────────
-    // Reaches here when admission rejected the object, try_promote_object returned None
-    // or another GET is already promoting this OID.
+    // Reaches here when admission is rejected or try_promote_object returns
+    // None (pool full or object exceeds segment capacity after reclaim).
+    // We are still on the main thread so no other GET can have modified the
+    // DRAMPool map since our first check.
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
@@ -1090,6 +1101,11 @@ fn cmd_get_from_dram(
     thread_ctx: BlockedRequest,
     file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOID>)>,
 ) {
+    // Tiered mode: every DRAM serve is a cache hit — record it once here so
+    // all paths (already-ready, subscribe-race, coalesced waiter) are covered.
+    if let Some(cache) = &dram_pool.cache {
+        cache.stats.record_hit(&obj_ctx.stats);
+    }
     match transport {
         Transport::Tcp => {
             if crate::bench_mode() {
@@ -1135,6 +1151,113 @@ fn cmd_get_from_dram(
                     Err(e) => crate::stream::reply_stream_err(&thread_ctx, e),
                 }
             });
+        }
+    }
+}
+
+// ─── Coalesced Waiter Registration ───────────────────────────────────────────
+
+/// Check DRAMPool for a cached object and serve it if found. Returns None if
+/// the request was served (Ready → DRAM serve, Filling → coalesced waiter).
+/// Returns Some((transport, thread_ctx)) if the object is not in the map,
+/// giving ownership back to the caller for the next fallback path.
+#[allow(clippy::too_many_arguments)]
+fn try_serve_dram_hit(
+    dram_pool: &'static storage::DRAMPool,
+    object_id: &ObjectId,
+    obj_len: u64,
+    crc32c: Crc,
+    transport: Transport,
+    thread_ctx: BlockedRequest,
+    file: &Arc<ObjectFile>,
+    unevictable: &Arc<storage::UnevictableOID>,
+) -> Option<(Transport, BlockedRequest)> {
+    let obj_ctx = match dram_pool.get_object(object_id) {
+        Some(ctx) => ctx,
+        None => return Some((transport, thread_ctx)), // cache miss — caller continues
+    };
+    if obj_ctx.is_ready() {
+        cmd_get_from_dram(
+            dram_pool,
+            &obj_ctx,
+            obj_len,
+            crc32c,
+            transport,
+            thread_ctx,
+            Some((file.clone(), unevictable.clone())),
+        );
+        return None;
+    }
+    serve_filling_or_became_ready(
+        dram_pool,
+        obj_ctx,
+        obj_len,
+        crc32c,
+        transport,
+        thread_ctx,
+        Some((file.clone(), unevictable.clone())),
+    );
+    None
+}
+
+/// Handle a Filling ObjectContext: try to subscribe as a coalesced waiter.
+/// If subscribe succeeds, spawns a waiter task that waits for Ready then serves
+/// via cmd_get_from_dram. If subscribe returns None (transitioned to Ready between
+/// checks), serves directly.
+fn serve_filling_or_became_ready(
+    dram_pool: &'static storage::DRAMPool,
+    obj_ctx: Arc<ObjectContext>,
+    obj_len: u64,
+    crc32c: Crc,
+    transport: Transport,
+    thread_ctx: BlockedRequest,
+    file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOID>)>,
+) {
+    if let Some(rx) = obj_ctx.subscribe() {
+        info::COALESCED_READS.fetch_add(1, Ordering::Relaxed);
+        crate::runtime_handle().spawn(async move {
+            serve_coalesced_waiter(obj_ctx, rx, obj_len, crc32c, transport, thread_ctx, file).await;
+        });
+    } else if obj_ctx.promotion_failure() != storage::PromotionFailureReason::None {
+        // subscribe() returned None because the promotion leader failed and
+        // dropped the sender (set_promotion_failure) before remove_object ran.
+        // The DRAM buffers are half-filled — reply with a disk read error.
+        reply_err(
+            &thread_ctx,
+            &info::DISK_READ_ERRORS,
+            ValkeyError::Str(errors::ERR_DISK_READ),
+        );
+    } else {
+        // subscribe() returned None → transitioned to Ready between checks.
+        cmd_get_from_dram(
+            dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, file,
+        );
+    }
+}
+
+/// Coalesced waiter: wait for the promotion leader to finish, then serve via the
+/// standard DRAM path. Transport-agnostic — cmd_get_from_dram handles both TCP
+/// (collect_dram_bytes) and EFA (run_get with Source::DramResident + Target::EfaWrite).
+async fn serve_coalesced_waiter(
+    obj_ctx: Arc<ObjectContext>,
+    rx: tokio::sync::watch::Receiver<()>,
+    obj_len: u64,
+    crc32c: Crc,
+    transport: Transport,
+    thread_ctx: BlockedRequest,
+    file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOID>)>,
+) {
+    match obj_ctx.await_promotion(rx).await {
+        Ok(()) => {
+            let dram_pool = storage::get_dram_pool();
+            cmd_get_from_dram(
+                dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, file,
+            );
+        }
+        Err(_reason) => {
+            // Promotion leader failed — reply error without bumping
+            // DISK_READ_ERRORS (the leader already counted the real failure).
+            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_DISK_READ)));
         }
     }
 }

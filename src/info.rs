@@ -33,6 +33,9 @@ pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Objects evicted to make room for a write: Dram objects or Tiered files. Cached copies Tiered drops are demotions, not evictions.
 pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// GETs that coalesced behind a promotion leader instead of issuing their own read.
+pub static COALESCED_READS: AtomicU64 = AtomicU64::new(0);
+
 /// RDMA payload bytes of successful transfers. Reads pull client memory (the SET
 /// path); writes push into it (the GET path).
 pub static RDMA_READ_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -174,6 +177,10 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             .field(
                 "cache_demotions",
                 cache.stats.demotions.load(Ordering::Relaxed) as i64,
+            )?
+            .field(
+                "coalesced_reads",
+                COALESCED_READS.load(Ordering::Relaxed) as i64,
             )?;
     }
     section

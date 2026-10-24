@@ -477,6 +477,123 @@ class TestTieredDeleteDuringSet(ValkeyLargeObjTestCaseBase):
         assert stats['usec'] >= 2_000_000, stats
 
 
+class TestTieredCoalescing(ValkeyLargeObjTestCaseBase):
+    """Deterministic coalescing test with test-pause-during-promotion-ms set at
+    load time (immutable config). The 2s pause ensures concurrent GETs register
+    as coalesced waiters on the Filling ObjectContext."""
+
+    def get_module_args(self, data_dir, direct_io):
+        base = TestLargeObjTieredPromotion.get_module_args(self, data_dir, direct_io)
+        return base + " test-pause-during-promotion-ms 2000"
+
+    def test_coalescing_deterministic(self):
+        """Deterministic coalescing: pause the promotion leader so concurrent
+        GETs are guaranteed to register as waiters on the Filling ObjectContext.
+        Asserts the coalesced_reads metric incremented and all readers get
+        correct data.
+
+        Timeline:
+            Leader GET:  insert Filling → [PAUSE 2s] → NVMe read → mark Ready
+            Waiter GETs: arrive during pause → subscribe → wait → serve from DRAM
+        """
+        client = self.server.get_new_client()
+        payload = os.urandom(32768)
+        client.execute_command('BLOB.TCP_SET', 'det_coal_key', payload)
+        waiters_before = int(
+            client.info('largeobj').get('largeobj_coalesced_reads', 0)
+        )
+        num_readers = 4
+        results = [None] * num_readers
+        errors = [None] * num_readers
+        def reader(idx):
+            try:
+                c = self.server.get_new_client()
+                results[idx] = c.execute_command('BLOB.TCP_GET', 'det_coal_key')
+            except Exception as e:
+                errors[idx] = e
+        # Fire all readers — the first becomes the leader, the rest arrive
+        # during the 2s pause and deterministically become waiters.
+        threads = []
+        for i in range(num_readers):
+            t = threading.Thread(target=reader, args=(i,))
+            threads.append(t)
+        for t in threads:
+            t.start()
+        # Wait for all to return (leader unblocks after 2s pause + read).
+        for t in threads:
+            t.join(timeout=10)
+        for i in range(num_readers):
+            assert errors[i] is None, f"Reader {i} got error: {errors[i]}"
+            assert results[i] == payload, (
+                f"Reader {i} data mismatch: got "
+                f"{len(results[i]) if results[i] else 'None'} bytes"
+            )
+        # Exactly num_readers - 1 should have coalesced (one is the leader).
+        waiters_after = int(
+            client.info('largeobj').get('largeobj_coalesced_reads', 0)
+        )
+        assert waiters_after - waiters_before == num_readers - 1, (
+            f"Expected {num_readers - 1} coalesced reads, "
+            f"got {waiters_after - waiters_before} "
+            f"(before={waiters_before} after={waiters_after})"
+        )
+
+    def test_delete_during_promotion(self):
+        """DEL a key while a promotion leader and a coalesced waiter are both
+        in-flight. The 2s pause holds the leader mid-promotion so the waiter
+        registers as coalesced and the DEL lands while both are blocked.
+        Timeline:
+            t=0.0s  Leader GET starts promotion, enters 2s pause
+            t=0.3s  Waiter GET arrives, subscribes as coalesced waiter
+            t=0.6s  DEL arrives on a third client
+            t=2.0s  Pause ends, leader + waiter complete or error
+        No crash. Both GETs return either correct data or an error. The key
+        must be gone afterwards. coalesced_reads must increment by 1."""
+        client = self.server.get_new_client()
+        payload = os.urandom(32768)
+        client.execute_command('BLOB.TCP_SET', 'delprom_key', payload)
+        coalesced_before = int(
+            client.info('largeobj').get('largeobj_coalesced_reads', 0)
+        )
+        num_readers = 2
+        results = [None] * num_readers
+        errors = [None] * num_readers
+        def background_get(idx):
+            try:
+                c = self.server.get_new_client()
+                results[idx] = c.execute_command('BLOB.TCP_GET', 'delprom_key')
+            except Exception as e:
+                errors[idx] = e
+        # Reader 0 becomes the promotion leader and enters the 2s pause.
+        threads = [threading.Thread(target=background_get, args=(i,)) for i in range(num_readers)]
+        threads[0].start()
+        # Reader 1 arrives during the pause — becomes a coalesced waiter.
+        time.sleep(0.3)
+        threads[1].start()
+        # DEL arrives while both readers are blocked on the paused promotion.
+        time.sleep(0.3)
+        del_client = self.server.get_new_client()
+        del_result = del_client.execute_command('DEL', 'delprom_key')
+        for t in threads:
+            t.join(timeout=10)
+        assert not any(t.is_alive() for t in threads), "GET threads did not finish"
+        # Both GETs: either correct payload or error — no crash, no corruption.
+        for i in range(num_readers):
+            if errors[i] is None and isinstance(results[i], bytes):
+                assert results[i] == payload, f"Reader {i} data mismatch"
+        assert del_result in (0, 1)
+        wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
+        # Key must be gone.
+        assert client.execute_command('BLOB.TCP_GET', 'delprom_key') is None
+        # Confirm the waiter actually coalesced (promotion path was taken).
+        coalesced_after = int(
+            client.info('largeobj').get('largeobj_coalesced_reads', 0)
+        )
+        assert coalesced_after - coalesced_before == 1, (
+            f"Expected 1 coalesced read, got {coalesced_after - coalesced_before}"
+        )
+
+
 class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
     """Tiered mode with max-promote-size=0 (no promotion, all reads from NVMe)."""
 
@@ -1538,3 +1655,110 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         self.set_objects(client, 80)
         self.get_objects(client, 80)
         assert self.fd_stat(client, 'fd_cache_entries') == 72
+
+
+class TestTieredPromotionFailureRace(ValkeyLargeObjTestCaseBase):
+    """Exercises the race where a GET arrives between set_promotion_failure and
+    remove_object.  Without the else-if guard in serve_filling_or_became_ready,
+    the late GET would try to serve half-filled DRAM buffers.
+
+    Hooks:
+        test-fail-promotion-read          — inject NvmeRead error on first promotion
+        test-pause-after-promotion-failure-ms — widen the window between
+            set_promotion_failure and remove_object so the second GET lands
+            in the race window deterministically
+        test-pause-during-promotion-ms    — hold the leader long enough for the
+            second GET to find the Filling entry (before the failure fires)
+    """
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
+            f" segment-size 4194304"
+            f" promote-min-hits 1"
+            f" max-promote-size 2093056"
+            f" max-object-size 1048576"
+            f" bench-mode no"
+            f" direct-io no"
+            f" chunk-size 4096"
+            f" fabric-provider Emulated"
+            f" test-fail-promotion-read yes"
+            f" test-pause-during-promotion-ms 1000"
+            f" test-pause-after-promotion-failure-ms 2000"
+        )
+
+    def test_late_get_during_promotion_failure_gets_error(self):
+        """A GET that arrives after set_promotion_failure but before
+        remove_object must receive an error, not corrupt data.
+
+        Timeline:
+            GET-A (leader): insert Filling → [PAUSE 1s] → NVMe read fails →
+                set_promotion_failure → [PAUSE 2s] → remove_object
+            GET-B (late):   arrives during the 2s pause → finds Filling entry →
+                subscribe() returns None → else-if returns disk read error
+        """
+        client = self.server.get_new_client()
+        payload = os.urandom(32768)
+        client.execute_command('BLOB.TCP_SET', 'race_key', payload)
+
+        errors_before = int(
+            client.info('largeobj_error_metrics').get('largeobj_disk_read_errors', 0)
+        )
+
+        results = [None, None]
+        caught = [None, None]
+
+        def get_a():
+            """Leader GET — triggers promotion, hits injected failure."""
+            try:
+                c = self.server.get_new_client()
+                results[0] = c.execute_command('BLOB.TCP_GET', 'race_key')
+            except ResponseError as e:
+                caught[0] = e
+
+        def get_b():
+            """Late GET — arrives during the pause after promotion failure.
+            Wait long enough for the leader to enter the failure pause window
+            (1s promotion pause + a small margin), but before remove_object
+            runs (failure pause is 2s)."""
+            time.sleep(1.5)
+            try:
+                c = self.server.get_new_client()
+                results[1] = c.execute_command('BLOB.TCP_GET', 'race_key')
+            except ResponseError as e:
+                caught[1] = e
+
+        ta = threading.Thread(target=get_a)
+        tb = threading.Thread(target=get_b)
+        ta.start()
+        tb.start()
+        ta.join(timeout=10)
+        tb.join(timeout=10)
+
+        # GET-A (leader) must get an error — the promotion read was injected to fail.
+        assert caught[0] is not None, (
+            f"GET-A should have received a disk read error, got: {results[0]}"
+        )
+        assert 'disk read failed' in str(caught[0]).lower(), (
+            f"GET-A unexpected error: {caught[0]}"
+        )
+
+        # GET-B (late subscriber) must also get an error — not corrupt DRAM data.
+        assert caught[1] is not None, (
+            f"GET-B should have received a disk read error, got: {results[1]}"
+        )
+        assert 'disk read failed' in str(caught[1]).lower(), (
+            f"GET-B unexpected error: {caught[1]}"
+        )
+
+        # disk_read_errors metric should have incremented for both GETs.
+        errors_after = int(
+            client.info('largeobj_error_metrics').get('largeobj_disk_read_errors', 0)
+        )
+        assert errors_after >= errors_before + 2, (
+            f"Expected disk_read_errors to increment by at least 2, "
+            f"got {errors_after - errors_before} "
+            f"(before={errors_before} after={errors_after})"
+        )

@@ -378,7 +378,7 @@ pub(crate) fn reply_stream_err(
 }
 
 /// DRAM-promotion side effects run around the batch loop (GET only). When present,
-/// the driver advances chunks_ready / marks Ready and, on a source (NVMe) error,
+/// the driver marks Ready on completion and, on a source (NVMe) error,
 /// evicts the half-filled DRAM entry; on a target (EFA) error it keeps reading so
 /// the DRAM copy still fills for coalesced waiters, replying the error at the end.
 pub struct PromotionProgress<'a> {
@@ -519,6 +519,33 @@ impl<'a> StreamJob<'a> {
 /// The single streaming driver. Moves every chunk from `source` to `target`,
 /// interleaving per chunk within a window, preserving all of main's semantics.
 ///
+/// Test hook: inject a synthetic promotion failure before any NVMe reads start.
+/// Mimics drive_window's source-error path (set_promotion_failure → remove_object)
+/// but inserts a configurable pause between the two to widen the race window so a
+/// concurrent GET deterministically sees the failed Filling entry before removal.
+/// Returns Ok(()) when the hook is disabled or not applicable; Err(NvmeRead) when
+/// it fires.
+async fn test_inject_promotion_failure(
+    progress: Option<&PromotionProgress<'_>>,
+) -> Result<(), StreamError> {
+    let p = match progress {
+        Some(p) if crate::test_fail_promotion_read() => p,
+        _ => return Ok(()),
+    };
+    p.obj_ctx
+        .set_promotion_failure(storage::PromotionFailureReason::ReadError);
+    let pause_ms = crate::test_pause_after_promotion_failure_ms();
+    if pause_ms > 0 {
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        })
+        .await
+        .ok();
+    }
+    p.dram_pool.remove_object(&p.object_id);
+    Err(StreamError::NvmeRead)
+}
+
 /// The shared window loop for BOTH verbs: snapshot each batch, fan out
 /// `source.produce`, and as each chunk lands feed `target.consume` (the
 /// interleave), latching the first source and first target error. This is the
@@ -526,8 +553,8 @@ impl<'a> StreamJob<'a> {
 /// it with their own pre/post work.
 ///
 /// `progress` present ⇒ DRAM promotion (a GET): a target (EFA-write) error is
-/// latched but the loop keeps filling DRAM for coalesced waiters, and each batch
-/// advances `chunks_ready` / marks Ready. Absent ⇒ a target error aborts at once.
+/// latched but the loop keeps filling DRAM for coalesced waiters, and the loop
+/// marks Ready on completion. Absent ⇒ a target error aborts at once.
 /// A source error always aborts (evicting the half-filled DRAM entry under `progress`).
 ///
 /// Returns the (advanced) iterator — so the caller can compute the object CRC from
@@ -545,6 +572,7 @@ async fn drive_window(
     let mut target_err: Option<StreamError> = None;
 
     while chunks_done < total_chunks {
+        test_inject_promotion_failure(progress).await?;
         let batch_count = window.min((total_chunks - chunks_done) as usize);
 
         // Snapshot this batch's chunks (advances the iterator by batch_count).
@@ -607,6 +635,8 @@ async fn drive_window(
         // A source error is fatal to the whole op (bad disk read / lost client read).
         if let Some(e) = source_err {
             if let Some(p) = progress {
+                p.obj_ctx
+                    .set_promotion_failure(storage::PromotionFailureReason::ReadError);
                 p.dram_pool.remove_object(&p.object_id); // evict half-filled DRAM entry
             }
             return Err(e);
@@ -621,10 +651,6 @@ async fn drive_window(
             }
         }
 
-        if let Some(p) = progress {
-            p.obj_ctx.advance_chunks_ready(batch_count as u32);
-            // TODO: obj_ctx.notify_progress() for coalesced waiters.
-        }
         chunks_done += batch_count as u32;
     }
 
