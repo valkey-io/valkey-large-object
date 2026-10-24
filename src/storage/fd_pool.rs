@@ -21,6 +21,8 @@
 //! `Drop for FdPool` — it is a process-lifetime static, so any fds still cached at
 //! teardown are reclaimed by process exit.
 
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -213,12 +215,12 @@ impl FdPool {
 /// Open `object_id`'s file for reads. `None` on an `open()` failure.
 fn open_read_fd(object_id: ObjectId, dir: &str) -> Option<ObjectFd> {
     let path = object_id.file_path(dir);
-    let c_path = std::ffi::CString::new(path).expect("file_path null");
-    let mut flags = libc::O_RDONLY;
+    let mut opts = OpenOptions::new();
+    opts.read(true);
     if crate::direct_io() {
-        flags |= libc::O_DIRECT;
+        opts.custom_flags(libc::O_DIRECT);
     }
-    open_object_file(&c_path, flags, 0).ok()
+    open_object_file(&path, &opts).ok()
 }
 
 #[cfg(test)]

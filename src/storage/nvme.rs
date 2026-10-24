@@ -6,7 +6,9 @@
 //! knows what an NVMe object file *is*.
 
 use super::fd_placement::ObjectFd;
+use std::fs::OpenOptions;
 use std::mem::size_of;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -504,12 +506,12 @@ pub async fn read_and_verify_file_header(
 /// Open an NVMe file for writing with O_CREAT|O_TRUNC and optionally O_DIRECT.
 /// Returns an `ObjectFd` that closes the file descriptor on drop.
 pub fn open_nvme_file_for_write(file_path: &str) -> Result<ObjectFd, super::StorageError> {
-    let c_path = std::ffi::CString::new(file_path).expect("file_path null");
-    let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC;
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true).mode(0o644);
     if crate::direct_io() {
-        flags |= libc::O_DIRECT;
+        opts.custom_flags(libc::O_DIRECT);
     }
-    super::fd_placement::open_object_file(&c_path, flags, 0o644).map_err(|e| {
+    super::fd_placement::open_object_file(file_path, &opts).map_err(|e| {
         super::StorageError::IoError {
             code: e.raw_os_error().unwrap_or(libc::EIO),
         }
