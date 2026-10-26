@@ -438,9 +438,17 @@ pub fn would_cross_memory_watermark(ctx: &Context, extra_bytes: u64) -> bool {
     if maxmemory == 0 {
         return false;
     }
-    let ceiling = (maxmemory as f64 * scaling_shrink_watermark()) as u64;
+    // Stay below the shrink line and wait out a recent shrink, so the pool does
+    // not flip between expand and shrink.
+    if crate::storage::scaling::in_shrink_cooldown() {
+        return true;
+    }
+    let ceiling = (maxmemory as f64 * (scaling_shrink_watermark() - EXPAND_HEADROOM)) as u64;
     used.saturating_add(extra_bytes) >= ceiling
 }
+
+/// Gap between the highest point an expand may reach and the shrink watermark.
+const EXPAND_HEADROOM: f64 = 0.05;
 
 pub fn direct_io() -> bool {
     CFG_DIRECT_IO.load(std::sync::atomic::Ordering::Relaxed)

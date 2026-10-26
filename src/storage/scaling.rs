@@ -4,9 +4,24 @@
 //! Handles: draining completion, deleting the keys of evicted objects, proactive
 //! expand, proactive shrink (Tiered only).
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use valkey_module::Context;
 
 use super::get_dram_pool;
+
+/// No expand for this long after a shrink (see `would_cross_memory_watermark`).
+const EXPAND_COOLDOWN: Duration = Duration::from_secs(30);
+static LAST_SHRINK: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// True within `EXPAND_COOLDOWN` of the last shrink.
+pub fn in_shrink_cooldown() -> bool {
+    LAST_SHRINK
+        .lock()
+        .expect("LAST_SHRINK lock unavailable")
+        .is_some_and(|t| t.elapsed() < EXPAND_COOLDOWN)
+}
 
 /// Scaling cron. Fires on the main event-loop thread via a Valkey module timer.
 ///
@@ -85,6 +100,7 @@ pub fn scaling_cron(ctx: &Context) {
     // so evicted objects leave holes for later writes.
     let may_shrink = crate::operating_mode() == crate::OperatingMode::Tiered;
     if ratio > shrink_watermark && may_shrink && pool.try_shrink() {
+        *LAST_SHRINK.lock().expect("LAST_SHRINK lock unavailable") = Some(Instant::now());
         ctx.log_notice(&format!(
             "largeobj: scaling — memory pressure {:.1}% > {:.0}%, dropped one cached DRAM segment",
             ratio * 100.0,
