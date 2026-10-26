@@ -572,6 +572,7 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
                 'largeobj.disk-dir': self.data_dir}
         assert self.server.verify_string_in_logfile('fabric service 0 rdma address')
 
+    @pytest.mark.skip_for_asan
     @pytest.mark.parametrize('name', ['disk-dir', 'fabric-interfaces'])
     def test_string_config_rejects_invalid_utf8(self, name):
         """A string config set outside the module arguments (as `largeobj.<name>`, the way a
