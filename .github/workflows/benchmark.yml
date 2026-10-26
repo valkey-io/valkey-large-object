@@ -54,6 +54,22 @@ jobs:
             core.setOutput('ref', pr.data.head.ref);
             core.setOutput('sha', pr.data.head.sha);
 
+      - name: Parse /bench arguments
+        id: args
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Everything after "/bench" on its line is passed to bench.sh as flags, e.g.
+            // "/bench --workload fuzz --sizes 4KB". Only flag-shaped characters are allowed, since
+            // the value is word-split into the bench.sh command line.
+            const match = context.payload.comment.body.match(/^\/bench[ \t]*(.*)$/m);
+            const args = match ? match[1].trim() : '';
+            if (!/^[A-Za-z0-9 ._,=-]*$/.test(args)) {
+              core.setFailed(`Rejected /bench arguments: ${args}`);
+              return;
+            }
+            core.setOutput('args', args);
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.pr.outputs.sha }}
@@ -74,11 +90,17 @@ jobs:
           fi
 
       - name: Run benchmark
+        env:
+          BENCH_ARGS: ${{ steps.args.outputs.args }}
         run: |
+          # Without pipefail, tee's exit status hides a failed bench.sh.
+          set -o pipefail
           pkill -9 -f valkey-server 2>/dev/null || true
           sleep 2
           mkdir -p /mnt/bigobj-data/bench-test
-          ./bench.sh --port 7399 --disk-dir /mnt/bigobj-data/bench-test 2>&1 | tee bench-results.txt
+          echo "bench.sh arguments: ${BENCH_ARGS:-<none>}"
+          # BENCH_ARGS is unquoted on purpose: one word per flag. Parse step restricts its characters.
+          ./bench.sh --port 7399 --disk-dir /mnt/bigobj-data/bench-test $BENCH_ARGS 2>&1 | tee bench-results.txt
 
       - name: React with rocket (done)
         if: always()

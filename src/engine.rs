@@ -495,8 +495,13 @@ fn cmd_get_tiered(
     cache.stats.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // Admit via the admission filter, then allocate (reclaiming cold copies if full).
-    // Skip both if another GET is already promoting this OID (Filling).
-    let promoted = if !filling && cache.admission.admit(object_id, obj_len) {
+    // Skip both if another GET is already promoting this OID (Filling), or if the
+    // DRAM ring's iovec table is being re-registered and promote-during-dram-scaling
+    // is disabled — promotion reads would go unfixed (Readv instead of ReadFixed),
+    // so fall back to the NVMe streaming path whose ring never re-registers.
+    let skip_promotion =
+        !crate::promote_during_dram_scaling() && storage::uring::is_registration_pending();
+    let promoted = if !filling && !skip_promotion && cache.admission.admit(object_id, obj_len) {
         dram_pool.try_promote_object(object_id, obj_len)
     } else {
         None

@@ -329,6 +329,7 @@ valkey_module! {
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
+            ["promote-during-dram-scaling", &*CFG_PROMOTE_DURING_DRAM_SCALING, false, ConfigurationFlags::IMMUTABLE, None],
             ["test-rdma-fail-partial", &*CFG_TEST_RDMA_FAIL_PARTIAL, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["test-fail-unlink", &*CFG_TEST_FAIL_UNLINK, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],

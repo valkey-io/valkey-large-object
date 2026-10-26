@@ -223,6 +223,14 @@ lazy_static::lazy_static! {
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
     pub static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
 
+    /// Controls whether DRAM promotion is attempted while the DRAM pool is
+    /// scaling (expand/shrink). When false (default), promotion is skipped
+    /// during the scaling window and reads fall through to the NVMe streaming
+    /// path, which always uses fixed I/O because its pool never changes in size.
+    /// When true, promotion proceeds and the poller forces any in-window
+    /// reads to non-fixed I/O. Immutable after load.
+    pub static ref CFG_PROMOTE_DURING_DRAM_SCALING: AtomicBool = AtomicBool::new(false);
+
     /// Direct I/O mode: when enabled, file opens use O_DIRECT to bypass the kernel page cache.
     ///
     /// WHY: Large objects (4KB-50MB) would thrash the page cache if buffered. O_DIRECT ensures
@@ -342,6 +350,10 @@ pub fn max_promote_size() -> u64 {
 
 pub fn bench_mode() -> bool {
     CFG_BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn promote_during_dram_scaling() -> bool {
+    CFG_PROMOTE_DURING_DRAM_SCALING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn scaling_poll_ms() -> u64 {
