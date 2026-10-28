@@ -1,6 +1,24 @@
 import os
+import shutil
+import pytest
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
 from valkeytestframework.util.waiters import wait_for_equal
+
+
+def _rejects_o_direct(path):
+    """tmpfs refuses O_DIRECT with EINVAL, which makes it a stand-in for a filesystem
+    that cannot serve the write path. Confirm it rather than assume it."""
+    probe = os.path.join(path, "o-direct-check")
+    try:
+        fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_DIRECT, 0o644)
+    except OSError:
+        return True
+    os.close(fd)
+    os.unlink(probe)
+    return False
+
+
+NO_TMPFS = not os.path.isdir("/dev/shm") or not _rejects_o_direct("/dev/shm")
 
 
 class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
@@ -73,6 +91,29 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         assert not os.path.exists(orphan_tmp), "orphaned .dat.tmp not purged at startup"
         assert not os.path.exists(orphan_misc), "arbitrarily-named object not purged"
         assert os.path.exists(foreign), "file outside disk-dir must be preserved"
+        # The startup probe writes a real file to prove disk-dir can serve a write, so it
+        # has to clean up after itself too: disk-dir is empty by the time clients arrive.
+        assert self._object_files() == [], "startup left a file in disk-dir"
+
+    @pytest.mark.skipif(NO_TMPFS, reason="needs a filesystem that rejects O_DIRECT")
+    def test_a_disk_dir_that_cannot_serve_the_configured_io_refuses_the_load(self):
+        """The startup probe performs the operations an object write needs. Point disk-dir
+        at tmpfs with direct-io on and its O_DIRECT open fails, so the module refuses to
+        load rather than starting a node whose every write would fail."""
+        self.server.exit(cleanup=False)
+        bad_dir = f"/dev/shm/largeobj-probe-{os.getpid()}"
+        os.makedirs(bad_dir, exist_ok=True)
+        good_args = self.server.args["loadmodule"]
+        self.server.args["loadmodule"] = good_args.replace(
+            f"disk-dir {self.data_dir}", f"disk-dir {bad_dir}"
+        ).replace("direct-io no", "direct-io yes")
+        try:
+            with pytest.raises(RuntimeError):
+                self.server.start()
+            assert self.server.verify_string_in_logfile("not usable with direct-io=true")
+        finally:
+            shutil.rmtree(bad_dir, ignore_errors=True)
+            self.server.args["loadmodule"] = good_args
 
     def test_restart_leaves_no_object_files(self):
         """End-to-end: data written before a restart does not linger."""

@@ -149,6 +149,15 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
+    // Fail fast if disk-dir can't serve a write with the configured I/O mode.
+    if let Err(e) = storage::probe_disk_dir(mode, &dir) {
+        ctx.log_warning(&format!(
+            "largeobj: disk-dir {dir} not usable with direct-io={}: {e}",
+            crate::direct_io()
+        ));
+        return Status::Err;
+    }
+
     // Step 0: Create tokio runtime as a local. Set in OnceLock only after all init succeeds.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads())

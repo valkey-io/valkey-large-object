@@ -511,6 +511,41 @@ pub fn validate_and_clean_disk_dir(mode: crate::OperatingMode, dir: &str) -> std
     std::fs::create_dir_all(dir)
 }
 
+/// Refuse module load if `disk-dir` can't actually serve a write. Performs an open,
+/// writes a block, fsync,  and unlink. Catches what permission bits miss: ACLs,
+/// NFS root-squash, a read-only mount, a full disk, no O_DIRECT support.
+///
+/// Blocking I/O, since the io_uring engine doesn't exist yet; proves the filesystem,
+/// not io_uring. Tiered mode only, after `validate_and_clean_disk_dir` makes the dir.
+pub fn probe_disk_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
+    if mode != crate::OperatingMode::Tiered {
+        return Ok(());
+    }
+    let path = format!("{dir}/probe-{}.tmp", std::process::id());
+    let written = write_one_block(&path);
+    // Clean up before propagating: a failed write can still leave the file behind. And a
+    // remove that fails is fatal on its own — `unlink` aborts, so the first DEL would panic.
+    let removed = std::fs::remove_file(&path);
+    written?;
+    removed
+}
+
+fn write_one_block(path: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    if crate::direct_io() {
+        options.custom_flags(libc::O_DIRECT);
+    }
+    let mut file = options.open(path)?;
+    // `Vec` isn't block-aligned and O_DIRECT demands it: take two blocks, write the aligned one.
+    let padded = vec![0u8; 2 * super::IO_ALIGN];
+    let start = padded.as_ptr().align_offset(super::IO_ALIGN);
+    file.write_all(&padded[start..start + super::IO_ALIGN])?;
+    file.sync_all()
+}
+
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -610,5 +645,30 @@ mod tests {
         // align_up(5000)=8192, align_up(3193)=4096. Data total = 12288.
         let mut iter = super::super::ChunkIterator::new(8193, 5000, 2, None);
         assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 4096);
+    }
+
+    /// The probe must reach the same verdict as the filesystem itself: an unaligned
+    /// buffer or a missed syscall would fail `EINVAL` on a disk that is in fact usable,
+    /// and refuse the module load. It must also leave `disk-dir` empty — a leftover
+    /// would be mistaken for an object file.
+    #[test]
+    fn probe_agrees_with_the_filesystem_and_leaves_nothing_behind() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("lo-probe-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Independent of the probe: does this filesystem take the configured flags at all?
+        let reference = dir.join("o-direct-check");
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        if crate::direct_io() {
+            opts.custom_flags(libc::O_DIRECT);
+        }
+        let supported = opts.open(&reference).is_ok();
+        std::fs::remove_file(&reference).ok();
+
+        let probed = probe_disk_dir(crate::OperatingMode::Tiered, dir.to_str().unwrap());
+        assert_eq!(probed.is_ok(), supported, "probe disagreed: {probed:?}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
