@@ -64,6 +64,15 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         result = client.execute_command('BLOB.TCP_GET', 'delkey')
         assert result is None
 
+    def test_key_with_nul_byte(self):
+        """A key containing a NUL byte round-trips instead of aborting the server."""
+        client = self.server.get_new_client()
+        key = b'nul\x00key'
+        assert client.execute_command('BLOB.TCP_SET', key, b'N' * 4096) == b'OK'
+        assert client.execute_command('BLOB.TCP_GET', key) == b'N' * 4096
+        assert client.execute_command('PEXPIRE', key, 100) == 1
+        wait_for_true(lambda: client.execute_command('EXISTS', key) == 0)
+
     def test_object_larger_than_segment_rejected(self):
         """An object larger than max-object-size is rejected.
         Compare with test_max_object_size where max-object-size is lowered at
