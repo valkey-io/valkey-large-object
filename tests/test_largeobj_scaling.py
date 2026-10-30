@@ -965,7 +965,7 @@ class TestTieredEvictionMixed(TieredBudget):
         set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
         stop = time.time() + self.SECONDS
         failures = []
-        expected_errors = ('disk-maxmemory', 'failed to copy', 'no such key', 'staging buffer')
+        expected_errors = ('disk-maxmemory', 'failed to copy', 'no such key', 'pending disk requests')
 
         def worker(n):
             c = self.server.get_new_client()

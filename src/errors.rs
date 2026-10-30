@@ -54,7 +54,6 @@ define_errors! {
 
     // Streaming Errors
     ERR_TOO_MANY_DISK_REQUESTS => "ERR too many pending disk requests",
-    ERR_DISK_STAGING_EXHAUSTED => "ERR disk staging buffer pool exhausted",
     ERR_SET_VALUE => "ERR failed to set key",
 
     // Config Validation Errors

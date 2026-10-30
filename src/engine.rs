@@ -943,14 +943,14 @@ fn cmd_set_tiered(
 
     match data_source {
         DataSource::Tcp(data) => {
-            // TCP: immediate allocation, no queueing.
+            // TCP: immediate allocation, no queueing. Defers to queued EFA requests.
             let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
                 Some(bufs) => bufs,
                 None => {
                     reply_err(
                         &thread_ctx,
-                        &info::DISK_STAGING_BUFFER_EXHAUSTED,
-                        ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
+                        &info::DISK_STAGING_QUEUE_FULL,
+                        ValkeyError::Str(errors::ERR_TOO_MANY_DISK_REQUESTS),
                     );
                     return;
                 }
