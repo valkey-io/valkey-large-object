@@ -252,9 +252,8 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     if obj_len > max_obj_size {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
-    let data = args[2].as_slice();
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set_tcp(ctx, &args[1], obj_len, data, old_oid) {
+    match engine::execute_set_tcp(ctx, &args[1], obj_len, &args[2], old_oid) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }

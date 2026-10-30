@@ -23,7 +23,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use valkey_module::{NotifyEvent, ValkeyError, ValkeyValue, VALKEY_OK};
+use valkey_module::{raw, NotifyEvent, ValkeyError, ValkeyValue, VALKEY_OK};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
@@ -114,30 +114,152 @@ pub fn inflight_requests() -> u64 {
 
 /// An async GET or SET, over TCP or RDMA. Its client stays blocked until this drops, and
 /// `commandstats` counts the time in between toward the command.
-pub(crate) struct BlockedRequest(valkey_module::ThreadSafeContext<valkey_module::BlockedClient>);
+///
+/// Built on the raw blocked-client API (not `valkey_module::BlockedClient`) so a
+/// TCP GET can hand its value back as a string object that the main thread replies
+/// with on unblock; Valkey then sends it without copying (`reply_string`).
+pub(crate) struct BlockedRequest {
+    bc: *mut raw::RedisModuleBlockedClient,
+    /// Thread-safe context bound to `bc`; replies through it are queued for the client.
+    ctx: *mut raw::RedisModuleCtx,
+    bulk: std::sync::Mutex<Option<ReplyString>>,
+}
+
+// SAFETY: the raw handles are only used through thread-safe module APIs.
+unsafe impl Send for BlockedRequest {}
+unsafe impl Sync for BlockedRequest {}
 
 impl BlockedRequest {
     fn new(ctx: &valkey_module::Context) -> Self {
         INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
-        let mut blocked_client = ctx.block_client();
-        blocked_client.measure_time_start();
-        Self(valkey_module::ThreadSafeContext::with_blocked_client(
-            blocked_client,
-        ))
+        // SAFETY: called on the main thread inside a command, as BlockClient requires.
+        unsafe {
+            let bc = raw::RedisModule_BlockClient.unwrap()(
+                ctx.ctx,
+                Some(bulk_reply_callback),
+                None,
+                Some(bulk_free_callback),
+                0,
+            );
+            raw::RedisModule_BlockedClientMeasureTimeStart.unwrap()(bc);
+            let tsc = raw::RedisModule_GetThreadSafeContext.unwrap()(bc);
+            Self {
+                bc,
+                ctx: tsc,
+                bulk: std::sync::Mutex::new(None),
+            }
+        }
     }
-}
 
-impl std::ops::Deref for BlockedRequest {
-    type Target = valkey_module::ThreadSafeContext<valkey_module::BlockedClient>;
+    /// Queue a reply for the client (sent when it unblocks).
+    pub(crate) fn reply(&self, r: valkey_module::ValkeyResult) -> raw::Status {
+        valkey_module::Context::new(self.ctx).reply(r)
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    /// Take the GIL (same global lock as a client-bound thread-safe context).
+    pub(crate) fn lock(&self) -> valkey_module::ContextGuard {
+        valkey_module::ThreadSafeContext::new().lock()
+    }
+
+    /// Reply with `s` from the main thread on unblock, which lets Valkey reference
+    /// the string in the client's output instead of copying it.
+    pub(crate) fn reply_string(&self, s: ReplyString) {
+        *self.bulk.lock().expect("bulk lock poisoned") = Some(s);
+    }
+
+    pub(crate) fn send(&self, r: TcpGetReply) {
+        match r {
+            TcpGetReply::Value(v) => {
+                self.reply(Ok(v));
+            }
+            TcpGetReply::Str(s) => self.reply_string(s),
+        }
     }
 }
 
 impl Drop for BlockedRequest {
     fn drop(&mut self) {
         INFLIGHT_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+        let privdata = match self.bulk.get_mut().expect("bulk lock poisoned").take() {
+            Some(s) => Box::into_raw(Box::new(s)) as *mut std::os::raw::c_void,
+            None => std::ptr::null_mut(),
+        };
+        // SAFETY: same order as valkey_module: free the context, then unblock.
+        unsafe {
+            raw::RedisModule_BlockedClientMeasureTimeEnd.unwrap()(self.bc);
+            raw::RedisModule_FreeThreadSafeContext.unwrap()(self.ctx);
+            raw::RedisModule_UnblockClient.unwrap()(self.bc, privdata);
+        }
+    }
+}
+
+/// Main thread, on unblock: reply with the stashed string, if any.
+unsafe extern "C" fn bulk_reply_callback(
+    ctx: *mut raw::RedisModuleCtx,
+    _argv: *mut *mut raw::RedisModuleString,
+    _argc: std::os::raw::c_int,
+) -> std::os::raw::c_int {
+    let p = raw::RedisModule_GetBlockedClientPrivateData.unwrap()(ctx) as *const ReplyString;
+    if !p.is_null() {
+        raw::RedisModule_ReplyWithString.unwrap()(ctx, (*p).inner);
+    }
+    raw::REDISMODULE_OK as std::os::raw::c_int
+}
+
+/// Main thread: free the stashed string (the reply holds its own reference).
+unsafe extern "C" fn bulk_free_callback(
+    _ctx: *mut raw::RedisModuleCtx,
+    privdata: *mut std::os::raw::c_void,
+) {
+    drop(Box::from_raw(privdata as *mut ReplyString));
+}
+
+/// A TCP GET reply: a plain value, or the object bytes in a `ReplyString`.
+pub(crate) enum TcpGetReply {
+    Value(ValkeyValue),
+    Str(ReplyString),
+}
+
+/// A Valkey string object of the object's length, filled by a worker and replied
+/// with zero-copy. Private (refcount 1, no context) until handed to Valkey.
+pub(crate) struct ReplyString {
+    inner: *mut raw::RedisModuleString,
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: private until replied; workers only write disjoint ranges via `write_at`.
+unsafe impl Send for ReplyString {}
+unsafe impl Sync for ReplyString {}
+
+impl ReplyString {
+    pub(crate) fn with_len(len: usize) -> Self {
+        // SAFETY: a NULL-context string is a plain allocation (zero-filled sds).
+        unsafe {
+            let inner =
+                raw::RedisModule_CreateString.unwrap()(std::ptr::null_mut(), std::ptr::null(), len);
+            let mut got = 0usize;
+            let ptr = raw::RedisModule_StringPtrLen.unwrap()(inner, &mut got) as *mut u8;
+            assert_eq!(got, len, "ReplyString length mismatch");
+            Self { inner, ptr, len }
+        }
+    }
+
+    /// Copy `src` to byte `off`. Callers write disjoint ranges.
+    pub(crate) fn write_at(&self, off: usize, src: &[u8]) {
+        assert!(
+            off + src.len() <= self.len,
+            "ReplyString write out of bounds"
+        );
+        // SAFETY: in bounds; the string is private and ranges do not overlap.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.add(off), src.len()) };
+    }
+}
+
+impl Drop for ReplyString {
+    fn drop(&mut self) {
+        // SAFETY: we own one reference; any reply holds its own.
+        unsafe { raw::RedisModule_FreeString.unwrap()(std::ptr::null_mut(), self.inner) };
     }
 }
 
@@ -146,7 +268,7 @@ impl Drop for BlockedRequest {
 /// Increment a metric counter and reply with an error.
 /// Consolidates the most common error-reply pattern in the engine.
 pub(crate) fn reply_err(
-    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    thread_ctx: &BlockedRequest,
     metric: &std::sync::atomic::AtomicU64,
     err: ValkeyError,
 ) {
@@ -561,7 +683,7 @@ async fn cmd_get_tiered_run(
     fd: RawFd,
     batch_width: usize,
     chunk_iter: ChunkIterator,
-    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    thread_ctx: &BlockedRequest,
     target: GetTarget,
 ) {
     let GetObjectInfo {
@@ -598,14 +720,17 @@ async fn cmd_get_tiered_run(
             };
             crate::stream::run_get(&job, chunk_iter, &source, &tgt, progress)
                 .await
-                .map(|target_err| (target_err, efa_get_reply(obj_len, crc32c_expected)))
+                .map(|target_err| {
+                    (
+                        target_err,
+                        TcpGetReply::Value(efa_get_reply(obj_len, crc32c_expected)),
+                    )
+                })
         }
     };
     match outcome {
         Ok((Some(e), _)) => crate::stream::reply_stream_err(thread_ctx, e), // promotion continue-filling
-        Ok((None, reply)) => {
-            thread_ctx.reply(Ok(reply));
-        }
+        Ok((None, reply)) => thread_ctx.send(reply),
         Err(e) => crate::stream::reply_stream_err(thread_ctx, e),
     }
 }
@@ -621,9 +746,10 @@ pub fn execute_set_tcp(
     ctx: &valkey_module::Context,
     key_name: &valkey_module::ValkeyString,
     obj_len: u64,
-    data: &[u8],
+    value: &valkey_module::ValkeyString,
     old_oid: Option<ObjectId>,
 ) -> EngineResult {
+    let data = value.as_slice();
     let object_id = ObjectId::next();
     if crate::operating_mode() == OperatingMode::Dram {
         return EngineResult::Sync(cmd_set_dram_tcp(ctx, key_name, obj_len, data, object_id));
@@ -633,12 +759,78 @@ pub fn execute_set_tcp(
     cmd_set_tiered(
         key_name_bytes,
         obj_len,
-        DataSource::Tcp(data.to_vec()),
+        DataSource::Tcp(TcpPayload::new(ctx, value)),
         thread_ctx,
         object_id,
         old_oid,
     );
     EngineResult::Async
+}
+
+/// A BLOB.TCP_SET value arg retained (not copied) on the main thread, so the
+/// worker reads it in place. The refcount is not atomic, so off the main thread it
+/// is released under the GIL (the main thread already holds it). Never drop one
+/// while already holding the GIL: the lock is not reentrant.
+///
+/// The byte pointer is resolved by `pin`, not at construction: once the module
+/// retains an arg, the command dispatcher may realloc it (trimStringObjectIfNeeded)
+/// after the handler returns, which happens under the GIL. A worker that takes the
+/// GIL before its first read sees the final pointer; nothing moves it afterwards.
+pub struct TcpPayload {
+    value: Option<valkey_module::ValkeyString>,
+    ptr: std::sync::atomic::AtomicPtr<u8>,
+    len: usize,
+    main_thread: std::thread::ThreadId,
+}
+
+// SAFETY: the bytes are immutable once pinned; the refcount is only touched
+// on the main thread (retain) or under the GIL (release).
+unsafe impl Send for TcpPayload {}
+// SAFETY: `&TcpPayload` only exposes the immutable bytes.
+unsafe impl Sync for TcpPayload {}
+
+impl TcpPayload {
+    fn new(ctx: &valkey_module::Context, value: &valkey_module::ValkeyString) -> Self {
+        Self {
+            len: value.as_slice().len(),
+            ptr: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            value: Some(value.safe_clone(ctx)),
+            main_thread: std::thread::current().id(),
+        }
+    }
+
+    /// Resolve the byte pointer. Must be called under the GIL before the first deref.
+    fn pin(&self, _gil: &valkey_module::ContextGuard) {
+        let bytes = self
+            .value
+            .as_ref()
+            .expect("TcpPayload pinned after drop")
+            .as_slice();
+        debug_assert_eq!(bytes.len(), self.len);
+        self.ptr.store(bytes.as_ptr() as *mut u8, Ordering::Release);
+    }
+}
+
+impl std::ops::Deref for TcpPayload {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        let ptr = self.ptr.load(Ordering::Acquire);
+        assert!(!ptr.is_null(), "TcpPayload deref before pin");
+        // SAFETY: pinned under the GIL after the dispatcher's trim; `value` keeps
+        // the string alive and nothing mutates it until drop.
+        unsafe { std::slice::from_raw_parts(ptr, self.len) }
+    }
+}
+
+impl Drop for TcpPayload {
+    fn drop(&mut self) {
+        if std::thread::current().id() == self.main_thread {
+            drop(self.value.take());
+        } else {
+            let _gil = valkey_module::ThreadSafeContext::new().lock();
+            drop(self.value.take());
+        }
+    }
 }
 
 /// Execute BLOB.RDMA_SET with mode routing. Always async (EFA transfers happen on
@@ -740,7 +932,7 @@ fn cmd_set_dram_tcp(
 
 pub enum DataSource {
     /// TCP: data is inline bytes from the RESP command args.
-    Tcp(Vec<u8>),
+    Tcp(TcpPayload),
     /// EFA: data pulled from client GPU via session.read.
     Efa {
         session: Arc<Session>,
@@ -946,7 +1138,7 @@ fn cmd_set_tiered(
 /// right source + object-CRC rule; everything else in the envelope is shared.
 enum SetSource {
     /// TCP: inline payload memcpy'd into the buffers; CRC is over the whole payload.
-    Tcp(Vec<u8>),
+    Tcp(TcpPayload),
     /// EFA: each chunk fi_read from the client; CRC combines per-chunk transport CRCs.
     Efa(Arc<Session>),
 }
@@ -1015,6 +1207,8 @@ async fn cmd_set_tiered_run(
     // The one per-transport branch: build the source + choose the object-CRC rule.
     let result = match &variant {
         SetSource::Tcp(data) => {
+            // Under the GIL, so the dispatcher's post-command trim has run.
+            data.pin(&thread_ctx.lock());
             let source = crate::stream::Source::TcpInline {
                 data,
                 buffers: &stream_ctx.buffers,
@@ -1097,9 +1291,9 @@ async fn cmd_set_tiered_run(
 
 // ─── Serve from DRAMPool ─────────────────────────────────────────────────────
 
-/// Serve a Ready ObjectContext from DRAMPool. TCP accumulates into Vec;
-/// EFA writes per-chunk to client GPU (parallelized).
-/// On the EFA path, `obj_ctx` and `file` are pinned for the async transfer's duration.
+/// Serve a Ready ObjectContext from DRAMPool. TCP copies into a `ReplyString` on a
+/// worker; EFA writes per-chunk to client GPU (parallelized).
+/// `obj_ctx` and `file` are pinned for the async transfer's duration on both paths.
 fn cmd_get_from_dram(
     dram_pool: &storage::DRAMPool,
     obj_ctx: &Arc<ObjectContext>,
@@ -1119,14 +1313,28 @@ fn cmd_get_from_dram(
             if crate::bench_mode() {
                 thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
             } else {
-                let mut chunk_iter =
-                    ChunkIterator::new(obj_len, crate::chunk_size(), obj_ctx.buffers.len(), None);
-                thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-                    dram_pool,
-                    obj_ctx,
-                    obj_len,
-                    &mut chunk_iter,
-                ))));
+                // Copy and reply on a worker, as the NVMe path does, so a hit
+                // does not hold the main thread for the whole value copy.
+                let obj_ctx = obj_ctx.clone();
+                crate::runtime_handle().spawn(async move {
+                    let _keep_alive = file;
+                    let mut chunk_iter = ChunkIterator::new(
+                        obj_len,
+                        crate::chunk_size(),
+                        obj_ctx.buffers.len(),
+                        None,
+                    );
+                    let out = ReplyString::with_len(obj_len as usize);
+                    let dram_pool = storage::get_dram_pool();
+                    let chunk_size = crate::chunk_size();
+                    while let Some(chunk) = chunk_iter.next_chunk() {
+                        let ptr = dram_pool.buffer_ptr(&obj_ctx.buffers[chunk.buffer_idx]);
+                        // SAFETY: the buffer holds this chunk's `user_data_len` bytes.
+                        let slice = unsafe { std::slice::from_raw_parts(ptr, chunk.user_data_len) };
+                        out.write_at(chunk.index as usize * chunk_size, slice);
+                    }
+                    thread_ctx.reply_string(out);
+                });
             }
         }
         Transport::Efa { session, addrs } => {

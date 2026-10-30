@@ -200,8 +200,8 @@ impl Source<'_> {
 pub enum Target<'a> {
     /// Accumulate chunk bytes into the reply buffer (GET TCP); bench = size only.
     TcpReply {
-        reply: std::sync::Mutex<Vec<u8>>,
-        bench: bool,
+        /// None in bench mode (reply is the size only).
+        reply: Option<crate::engine::ReplyString>,
     },
     /// fi_write each ready chunk to the client (GET EFA).
     EfaWrite { session: Arc<Session> },
@@ -218,26 +218,18 @@ impl Target<'_> {
     /// GET TCP reply constructor.
     pub fn tcp_reply(obj_len: u64, bench: bool) -> Self {
         Target::TcpReply {
-            reply: std::sync::Mutex::new(if bench {
-                Vec::new()
-            } else {
-                Vec::with_capacity(obj_len as usize)
-            }),
-            bench,
+            reply: (!bench).then(|| crate::engine::ReplyString::with_len(obj_len as usize)),
         }
     }
 
     /// GET reply after the loop: collected bytes, or obj_len in bench mode.
     /// Only valid on `TcpReply`; the EFA GET reply is [obj_len, crc32c] built by the caller.
-    pub fn into_reply(self, obj_len: u64) -> ValkeyValue {
+    pub fn into_reply(self, obj_len: u64) -> crate::engine::TcpGetReply {
         match self {
-            Target::TcpReply { reply, bench } => {
-                if bench {
-                    ValkeyValue::Integer(obj_len as i64)
-                } else {
-                    ValkeyValue::StringBuffer(reply.into_inner().expect("reply lock poisoned"))
-                }
-            }
+            Target::TcpReply { reply } => match reply {
+                Some(s) => crate::engine::TcpGetReply::Str(s),
+                None => crate::engine::TcpGetReply::Value(ValkeyValue::Integer(obj_len as i64)),
+            },
             _ => unreachable!("into_reply is only called on the TcpReply GET target"),
         }
     }
@@ -250,16 +242,13 @@ impl Target<'_> {
         chunk_size: usize,
     ) -> Result<(), StreamError> {
         match self {
-            Target::TcpReply { reply, bench } => {
-                if !*bench {
+            Target::TcpReply { reply } => {
+                if let Some(reply) = reply {
                     // SAFETY: buffer holds `chunk.user_data_len` bytes the source just produced.
                     let slice = unsafe {
                         std::slice::from_raw_parts(buf_ptr as *mut u8, chunk.user_data_len)
                     };
-                    reply
-                        .lock()
-                        .expect("reply lock poisoned")
-                        .extend_from_slice(slice);
+                    reply.write_at(chunk.index as usize * chunk_size, slice);
                 }
                 Ok(())
             }
@@ -356,10 +345,7 @@ pub enum StreamError {
 /// Map a `StreamError` to its metric + reply string and send the error.
 /// One place, so every path that drives `run_get` / `run_set` reports failures
 /// identically.
-pub(crate) fn reply_stream_err(
-    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
-    e: StreamError,
-) {
+pub(crate) fn reply_stream_err(thread_ctx: &crate::engine::BlockedRequest, e: StreamError) {
     use StreamError::*;
     let (metric, err): (&std::sync::atomic::AtomicU64, &str) = match e {
         NvmeRead => (&crate::info::DISK_READ_ERRORS, crate::errors::ERR_DISK_READ),
