@@ -228,29 +228,6 @@ pub fn is_registration_pending() -> bool {
     REGISTRATION_PENDING.load(Ordering::Relaxed)
 }
 
-// ─── Registered-table check ──────────────────────────────────────────────────
-
-/// (base, len) of each registered iovec, by index.
-fn registered_ranges(iovecs: &[libc::iovec]) -> Vec<(usize, usize)> {
-    iovecs
-        .iter()
-        .map(|v| (v.iov_base as usize, v.iov_len))
-        .collect()
-}
-
-/// True if `op`'s buffer lies inside the registered iovec at `op.iovec_index`.
-/// An op built before a re-register can carry an index the dense rebuild has
-/// since moved to another segment; issuing that as fixed fails with EFAULT, so
-/// such an op goes non-fixed instead.
-fn in_table(table: &[(usize, usize)], op: &UringOp, len: u32) -> bool {
-    table
-        .get(op.iovec_index as usize)
-        .is_some_and(|&(base, size)| {
-            let start = op.buf_ptr as usize;
-            start >= base && start + len as usize <= base + size
-        })
-}
-
 // ─── UringEngine ─────────────────────────────────────────────────────────────
 
 pub struct UringEngine {
@@ -277,7 +254,6 @@ impl UringEngine {
         let ring =
             io_uring::IoUring::new(256).map_err(|e| format!("io_uring init failed: {}", e))?;
         // Register buffers on main thread.
-        let table = registered_ranges(&iovecs);
         if !iovecs.is_empty() {
             unsafe { ring.submitter().register_buffers(&iovecs) }
                 .map_err(|e| format!("IORING_REGISTER_BUFFERS failed: {}", e))?;
@@ -289,7 +265,7 @@ impl UringEngine {
         let poller = thread::Builder::new()
             .name(format!("lo-uring-poller-{:?}", pool))
             .spawn(move || {
-                Self::poller_loop(pool, rx, shutdown_clone, ring, table);
+                Self::poller_loop(pool, rx, shutdown_clone, ring);
             })
             .expect("failed to spawn io_uring poller thread");
         Ok(Self {
@@ -307,8 +283,6 @@ impl UringEngine {
         rx: Receiver<IoRequest>,
         shutdown: Arc<AtomicBool>,
         mut ring: io_uring::IoUring,
-        // The table currently registered with the kernel, as (base, len) per index.
-        mut table: Vec<(usize, usize)>,
     ) {
         let mut pending: HashMap<u64, PendingOp> = HashMap::new();
         let mut next_token: u64 = 1;
@@ -336,7 +310,6 @@ impl UringEngine {
                             .expect("largeobj: io_uring re-register_buffers failed");
                     }
                 }
-                table = registered_ranges(&iovecs);
                 REGISTRATION_PENDING.store(false, Ordering::Relaxed);
             }
             // Channel disconnected without shutdown flag = bug. The sender lives
@@ -409,8 +382,7 @@ impl UringEngine {
                         // stale iovec_index against the about-to-change table is never used.
                         let issue_fixed = op.use_fixed
                             && !(pool == PoolType::Dram
-                                && REGISTRATION_PENDING.load(Ordering::Relaxed))
-                            && in_table(&table, &op, read_len);
+                                && REGISTRATION_PENDING.load(Ordering::Relaxed));
                         let mut iov = None;
                         let sqe = if issue_fixed {
                             io_uring::opcode::ReadFixed::new(
@@ -450,8 +422,7 @@ impl UringEngine {
                         let write_len = super::align_up(op.len as usize) as u32;
                         let issue_fixed = op.use_fixed
                             && !(pool == PoolType::Dram
-                                && REGISTRATION_PENDING.load(Ordering::Relaxed))
-                            && in_table(&table, &op, write_len);
+                                && REGISTRATION_PENDING.load(Ordering::Relaxed));
                         let mut iov = None;
                         let sqe = if issue_fixed {
                             io_uring::opcode::WriteFixed::new(
@@ -604,38 +575,5 @@ impl UringEngine {
                 );
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn op(iovec_index: u16, addr: usize) -> UringOp {
-        UringOp {
-            iovec_index,
-            buf_ptr: addr as *mut u8,
-            file_offset: 0,
-            len: 4096,
-            use_fixed: true,
-        }
-    }
-
-    #[test]
-    fn in_table_rejects_an_index_the_rebuild_moved() {
-        // Segments A, B, C at indices 0, 1, 2; a shrink drops B, so the dense
-        // rebuild puts C at index 1. An op built before the rebuild still names C
-        // as index 2.
-        let before = [(0x10000, 0x10000), (0x40000, 0x10000), (0x80000, 0x10000)];
-        let after = [(0x10000, 0x10000), (0x80000, 0x10000)];
-        let stale = op(2, 0x80000);
-        assert!(in_table(&before, &stale, 4096));
-        assert!(!in_table(&after, &stale, 4096)); // past the end
-        let moved = op(1, 0x80000); // built after the rebuild
-        assert!(in_table(&after, &moved, 4096));
-        let wrong_seg = op(1, 0x40000); // B's old index, B is gone
-        assert!(!in_table(&after, &wrong_seg, 4096));
-        // A buffer that runs past its segment's end is not inside it.
-        assert!(!in_table(&after, &op(1, 0x8f000 + 1), 4096));
     }
 }
