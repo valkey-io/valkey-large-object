@@ -33,6 +33,9 @@ pub static LARGE_OBJECT_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Objects evicted to make room for a write: Dram objects or Tiered files. Cached copies Tiered drops are demotions, not evictions.
 pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// GETs that coalesced behind a promotion leader instead of issuing their own read.
+pub static COALESCED_READS: AtomicU64 = AtomicU64::new(0);
+
 /// RDMA payload bytes of successful transfers. Reads pull client memory (the SET
 /// path); writes push into it (the GET path).
 pub static RDMA_READ_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -136,7 +139,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .expect("DRAM_POOL not initialized — lo_info called before module init");
 
     let (total, draining, unused) = dram.segment_counts();
-    let seg_size = crate::dram_segment_size();
+    let seg_size = crate::segment_size();
     let capacity = (total - draining) * seg_size;
     let allocated = dram.allocated_bytes();
     let util_pct = pct(allocated as u64, capacity as u64);
@@ -174,6 +177,10 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             .field(
                 "cache_demotions",
                 cache.stats.demotions.load(Ordering::Relaxed) as i64,
+            )?
+            .field(
+                "coalesced_reads",
+                COALESCED_READS.load(Ordering::Relaxed) as i64,
             )?;
     }
     section
@@ -211,14 +218,6 @@ fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field("disk_used_bytes", used as i64)?
         .field("disk_utilization_pct", pct(used, crate::nvme_maxmemory()))?
         .field(
-            "disk_orphaned_files",
-            storage::nvme::ORPHANED_FILES.count.load(Ordering::Relaxed) as i64,
-        )?
-        .field(
-            "disk_orphaned_bytes",
-            storage::nvme::ORPHANED_FILES.bytes.load(Ordering::Relaxed) as i64,
-        )?
-        .field(
             "disk_unevictable_objects",
             storage::object_file::unevictable_count() as i64,
         )?
@@ -233,18 +232,18 @@ fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
         return Ok(());
     };
 
-    let (total, _draining, unused) = nvme.segment_counts();
+    let (total, ..) = nvme.segment_counts();
+    let seg_size = crate::segment_size();
+    // The staging pool is fixed-size and never drains.
+    let util_pct = pct(nvme.allocated_bytes() as u64, (total * seg_size) as u64);
 
     ctx.builder()
         .add_section("disk_staging")
         .field("disk_staging_segments", total as i64)?
-        .field("disk_staging_unused_segments", unused as i64)?
         .field("disk_staging_fragment_count", nvme.fragment_count() as i64)?
+        .field("disk_staging_utilization_pct", util_pct)?
         .field("disk_staging_size_bytes", crate::nvme_staging_size() as i64)?
-        .field(
-            "disk_staging_segment_size_bytes",
-            crate::dram_segment_size() as i64,
-        )?
+        .field("disk_staging_segment_size_bytes", seg_size as i64)?
         .field(
             "disk_staging_rdma_registered_segments",
             nvme.rdma_registered_count() as i64,

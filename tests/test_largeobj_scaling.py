@@ -951,59 +951,6 @@ class TestTieredEvictionCron(EvictionCronTests, TieredBudget):
     pass
 
 
-class TestTieredUnlinkFailure(TieredBudget):
-    """Every unlink fails transiently except the cron's retry, which runs once a second here. A
-    file left in place stays charged and unevictable until the retry unlinks it."""
-
-    POLL_MS = 1000
-
-    def get_module_args(self, data_dir, direct_io):
-        return super().get_module_args(data_dir, direct_io) + " test-fail-unlink yes"
-
-    def assert_no_orphans(self, client):
-        info = info_largeobj(client)
-        assert info['largeobj_disk_orphaned_files'] == info['largeobj_disk_orphaned_bytes'] == 0
-
-    def test_a_victim_whose_unlink_fails_frees_nothing_until_the_retry(self):
-        client = self.new_client()
-        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        self.assert_refused(client, 'refused', b'R' * self.OBJ)
-        assert self.evictions(client) == 1
-        assert len(surviving(client, payloads)) == self.PER_BUDGET - 1
-        self.settle(client, self.PER_BUDGET - 1)
-        self.assert_no_orphans(client)
-        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
-        assert self.evictions(client) == 1, "the retry's credit made the room"
-
-    def test_a_deleted_object_whose_unlink_fails_stays_charged_until_the_retry(self):
-        client = self.new_client()
-        set_objects(client, 'obj_', 2, self.OBJ)
-        client.delete('obj_0')
-        self.settle(client, 1)
-        self.assert_no_orphans(client)
-
-
-class TestTieredOrphanHeld(TieredBudget):
-    """Unlinks fail as above, but the cron never ticks during a test, so orphans stay put."""
-
-    def get_module_args(self, data_dir, direct_io):
-        return super().get_module_args(data_dir, direct_io) + " test-fail-unlink yes"
-
-    def test_an_orphan_stays_charged_and_is_never_evicted(self):
-        client = self.new_client()
-        payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        orphan = self.first_in_line(payloads)
-        client.delete(orphan)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_orphaned_files'] == 1)
-        info = info_largeobj(client)
-        assert info['largeobj_disk_orphaned_bytes'] == self.DISK_PER_OBJ
-        assert info['largeobj_disk_used_bytes'] == self.BUDGET
-        assert info['largeobj_disk_unevictable_objects'] == 1
-        assert len(self.object_files()) == self.PER_BUDGET
-        self.assert_refused(client, 'newcomer', b'N' * self.OBJ)
-        assert len(surviving(client, payloads)) == self.PER_BUDGET - 2, "the victim was not the orphan"
-
-
 class TestTieredEvictionMixed(TieredBudget):
     """GET, SET, overwrite, COPY, DEL and UNLINK from many clients at once, all at the cap, so
     nearly every write evicts. Each client owns its keys, so it knows what each may read back.

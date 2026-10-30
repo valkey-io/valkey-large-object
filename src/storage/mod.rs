@@ -26,7 +26,7 @@ pub mod segment_pool;
 pub mod uring;
 
 // Re-exports for convenience.
-pub use context::{ObjectContext, SegmentBuffer, StreamingContext};
+pub use context::{ObjectContext, PromotionFailureReason, SegmentBuffer, StreamingContext};
 pub use object_file::{ObjectFile, UnevictableOID};
 
 // Re-exports from nvme.rs
@@ -151,7 +151,7 @@ pub fn init(
     mode: crate::OperatingMode,
     disk_dir: &str,
 ) -> Result<String, String> {
-    let dram_seg_size = crate::dram_segment_size();
+    let seg_size = crate::segment_size();
     let nvme_staging = crate::nvme_staging_size();
     // DRAMPool always starts with 1 segment and grows on demand — reactively
     // when an allocation can't fit, and proactively via the scaling cron. Growth
@@ -162,7 +162,7 @@ pub fn init(
     // Ceiling division so total staging capacity is never below the requested
     // disk-staging-size (floor would under-provision: 100MB / 64MB = 1 seg = 64MB).
     let nvme_segments: usize = if mode == crate::OperatingMode::Tiered {
-        (nvme_staging.div_ceil(dram_seg_size)).max(1)
+        (nvme_staging.div_ceil(seg_size)).max(1)
     } else {
         0
     };
@@ -182,7 +182,7 @@ pub fn init(
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.
     let nvme_pool = if mode == crate::OperatingMode::Tiered {
-        Some(NVMePool::new(nvme_segments, dram_seg_size))
+        Some(NVMePool::new(nvme_segments, seg_size))
     } else {
         None
     };
@@ -193,7 +193,7 @@ pub fn init(
     };
     // DRAMPool: always needed (both modes).
     let cache = (mode == crate::OperatingMode::Tiered).then(cache_policy::TieredCache::default);
-    let dram_pool = DRAMPool::new(dram_segment_count, dram_seg_size, cache);
+    let dram_pool = DRAMPool::new(dram_segment_count, seg_size, cache);
     // io_uring engines: only in Tiered mode. TWO independent engines — one for
     // the DRAM ring, one for the NVMe ring — each registering ONLY its own pool's
     // segments. Ring creation + buffer registration happen on this (main) thread
@@ -258,7 +258,7 @@ pub fn init(
         mode,
         disk_dir,
         dram_segment_count,
-        dram_seg_size / (1024 * 1024),
+        seg_size / (1024 * 1024),
         nvme_staging / (1024 * 1024),
     ))
 }

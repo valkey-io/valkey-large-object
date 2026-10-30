@@ -70,19 +70,15 @@ pub fn runtime_handle() -> &'static tokio::runtime::Handle {
     RUNTIME.get().expect("runtime not initialized").handle()
 }
 
-/// The Valkey main event-loop thread, captured at module load as its OS thread
-/// handle. We use `pthread_self` rather than `std::thread::current()` on purpose:
-/// `current()` lazily allocates a `Thread` handle into thread-local storage that
-/// LSan reports as a leak at graceful shutdown, and this predicate is called on
-/// every teardown thread.
-static MAIN_THREAD: OnceLock<libc::pthread_t> = OnceLock::new();
+thread_local! {
+    /// Set on the Valkey main thread at module load. Const init with no destructor,
+    /// unlike `std::thread::current()`, so no TLS allocation for LSan to report.
+    static IS_MAIN_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// True iff the caller runs on the Valkey main event-loop thread.
 pub fn is_main_thread() -> bool {
-    MAIN_THREAD
-        .get()
-        // SAFETY: pthread_self/pthread_equal take no pointers and always succeed.
-        .is_some_and(|&main| unsafe { libc::pthread_equal(libc::pthread_self(), main) != 0 })
+    IS_MAIN_THREAD.get()
 }
 
 // ─── EFA Registration Helpers ────────────────────────────────────────────────
@@ -125,9 +121,8 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         std::process::abort();
     }));
 
-    // Record the main event-loop thread. SAFETY: pthread_self takes no arguments
-    // and always succeeds; we store the opaque handle for later pthread_equal.
-    let _ = MAIN_THREAD.set(unsafe { libc::pthread_self() });
+    // Record the main event-loop thread.
+    IS_MAIN_THREAD.set(true);
 
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
@@ -294,6 +289,10 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, DEFAULT_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, MIN_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, MAX_TEST_PAUSE_BEFORE_FINALIZE_SET_MS,
              ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
+            ["test-pause-during-promotion-ms", &*CFG_TEST_PAUSE_DURING_PROMOTION_MS, DEFAULT_TEST_PAUSE_DURING_PROMOTION_MS, MIN_TEST_PAUSE_DURING_PROMOTION_MS, MAX_TEST_PAUSE_DURING_PROMOTION_MS,
+             ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
+            ["test-pause-after-promotion-failure-ms", &*CFG_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS, DEFAULT_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS, MIN_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS, MAX_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS,
+             ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
             ["scaling-poll-ms", &*CFG_SCALING_POLL_MS, DEFAULT_SCALING_POLL_MS, MIN_SCALING_POLL_MS, MAX_SCALING_POLL_MS,
              ConfigurationFlags::DEFAULT, None, None],
             ["reaper-scan-budget-us", &*CFG_REAPER_SCAN_BUDGET_US, DEFAULT_REAPER_SCAN_BUDGET_US, MIN_REAPER_SCAN_BUDGET_US, MAX_REAPER_SCAN_BUDGET_US,
@@ -331,7 +330,7 @@ valkey_module! {
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["promote-during-dram-scaling", &*CFG_PROMOTE_DURING_DRAM_SCALING, false, ConfigurationFlags::IMMUTABLE, None],
             ["test-rdma-fail-partial", &*CFG_TEST_RDMA_FAIL_PARTIAL, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
-            ["test-fail-unlink", &*CFG_TEST_FAIL_UNLINK, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
+            ["test-fail-promotion-read", &*CFG_TEST_FAIL_PROMOTION_READ, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],
             ["enabled", &*CFG_MODULE_ENABLED, DEFAULT_MODULE_ENABLED, ConfigurationFlags::DEFAULT, None],
         ],

@@ -143,7 +143,7 @@ Populates `key:0`..`key:N-1` with blobs (`bench-mode no`), then runs `valkey-ben
 
 Each pass ends when the fuzzer has sent `--fuzz-requests` commands or `--fuzz-duration` runs out, whichever comes first. Hitting the time limit is not a failure: in `malformed-commands` mode the server closes the connection on most commands, so the fuzzer spends most of its time reconnecting. Fuzzer clients that give up (a failed reconnect, or a generated blocking command outlasting the fuzzer's own 15s timeout) are reported as a warning, since that also happens against a stock server.
 
-A pass fails the run if the server crashed (printing the signal, stack, and offending command from the server log), stopped answering PING (hung), or sent the fuzzer a malformed reply; or if `largeobj_num_objects` differs from the blob keys across all databases, or (Tiered/NVMe) the object files in `disk-dir` differ from objects plus `largeobj_disk_orphaned_files`.
+A pass fails the run if the server crashed (printing the signal, stack, and offending command from the server log), stopped answering PING (hung), or sent the fuzzer a malformed reply; or if `largeobj_num_objects` differs from the blob keys across all databases, or (Tiered/NVMe) the object files in `disk-dir` differ from the object count.
 
 ```bash
 ./bench.sh --port 7380 --workload fuzz --sizes 4KB --fuzz-mode malformed-commands,config-commands

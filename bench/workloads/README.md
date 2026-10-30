@@ -22,7 +22,7 @@ bench.sh itself only has a few hooks into `bench/lib.sh` (`load_workload`, `prin
 Shared checks from `bench/lib.sh`:
 
 - `assert_server_healthy`: fails on a crash, a Rust panic, or a server that doesn't answer PING within 10s.
-- `assert_accounting`: fails if `largeobj_num_objects` differs from the blob keys across all databases, or (Tiered/NVMe) if the object files differ from objects plus orphans.
+- `assert_accounting`: fails if `largeobj_num_objects` differs from the blob keys across all databases, or (Tiered/NVMe) if the object files differ from the object count.
 - `fail "<message>"`: prints the message, stops the server, and exits the run.
 - `pass_log`: prints the part of the server log written during this pass.
 

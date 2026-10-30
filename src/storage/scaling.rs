@@ -27,9 +27,9 @@ pub fn in_shrink_cooldown() -> bool {
 ///
 /// Performs these actions in order:
 /// 1. Complete any segments whose drain finished (refcount reached 0).
-/// 2. Delete the keys of evicted Dram objects (the reclaim list), and retry the
-///    orphans' unlinks. While a Tiered shrink is unfinished (a segment draining),
-///    stop here: one shrink at a time, no expand or shrink on top.
+/// 2. Delete the keys of evicted Dram objects (the reclaim list). While a Tiered
+///    shrink is unfinished (a segment draining), stop here: one shrink at a time,
+///    no expand or shrink on top.
 ///    While reclaim-list keys remain, the cron re-arms at `reaper-poll-ms`
 ///    instead of `scaling-poll-ms`, so cleanup runs in short, frequent slices.
 /// 3. Proactive expand: if pool utilization exceeds the expand watermark,
@@ -47,7 +47,6 @@ pub fn scaling_cron(ctx: &Context) {
 
     // 2. Delete keys left pointing at reclaimed objects.
     super::reclaim::delete_reclaimed_keys(ctx);
-    super::nvme::ORPHANED_FILES.retry_deletion();
 
     // A Tiered shrink is still draining: finish it before any more scaling. Dram
     // never drains a segment.

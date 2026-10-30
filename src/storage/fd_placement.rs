@@ -20,7 +20,7 @@
 //! it refuses to load, rejects a `CONFIG SET max-cached-fds`, or aborts on a
 //! `CONFIG SET maxclients`.
 
-use std::ffi::{c_int, c_void, CStr};
+use std::ffi::{c_int, c_void};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
@@ -333,45 +333,33 @@ pub fn below_module_start(fd: RawFd) -> bool {
 /// `raise_module_start`. When no fd is free in the module range it closes the low fd
 /// and fails: keeping it would take an fd number in the core range. The
 /// caller turns the failure into an error reply.
-pub fn open_object_file(
-    path: &CStr,
-    flags: libc::c_int,
-    mode: libc::mode_t,
-) -> std::io::Result<ObjectFd> {
-    // SAFETY: path is NUL-terminated; open returns an fd or -1.
-    let mut fd =
-        unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC, mode as libc::c_uint) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+pub fn open_object_file(path: &str, opts: &std::fs::OpenOptions) -> std::io::Result<ObjectFd> {
+    let mut fd: OwnedFd = opts.open(path)?.into();
     if PLACEMENT_ENABLED.load(Ordering::Relaxed) {
         fd = move_above(fd, MODULE_START.load(Ordering::Relaxed))?;
     }
     OPEN_OBJECT_FDS.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: fd is a newly opened file descriptor owned exclusively by us.
-    Ok(ObjectFd(unsafe { OwnedFd::from_raw_fd(fd) }))
+    Ok(ObjectFd(fd))
 }
 
-/// Move `fd` to the lowest free number at or above `module_start` and close the original.
-/// An fd already at or above `module_start` is returned as it is: moving it would need a
-/// second free number, which a full range does not have. On failure closes `fd` too.
-fn move_above(fd: RawFd, module_start: i32) -> std::io::Result<RawFd> {
-    if fd >= module_start {
+/// Move `fd` to the lowest free number at or above `module_start`; the original closes
+/// on drop either way. An fd already at or above `module_start` is returned as it is:
+/// moving it would need a second free number, which a full range does not have.
+fn move_above(fd: OwnedFd, module_start: i32) -> std::io::Result<OwnedFd> {
+    let raw = fd.as_raw_fd();
+    if raw >= module_start {
         return Ok(fd);
     }
-    // SAFETY: fd is a valid fd we own; F_DUPFD_CLOEXEC returns a new fd >= module_start or -1.
-    let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, module_start) };
-    let moved = if high < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(high)
-    };
-    // SAFETY: fd is ours and no longer used; on success high refers to the same open file.
-    unsafe { libc::close(fd) };
-    if moved.is_err() {
+    // SAFETY: fd keeps raw open; F_DUPFD_CLOEXEC returns a new fd >= module_start or -1.
+    let high = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, module_start) };
+    if high < 0 {
+        // Read errno before fd drops: close can overwrite it.
+        let err = std::io::Error::last_os_error();
         PLACEMENT_FAILURES.fetch_add(1, Ordering::Relaxed);
+        return Err(err);
     }
-    moved
+    // SAFETY: high is a fresh fd owned only by us.
+    Ok(unsafe { OwnedFd::from_raw_fd(high) })
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
@@ -380,15 +368,10 @@ fn move_above(fd: RawFd, module_start: i32) -> std::io::Result<RawFd> {
 mod tests {
     use super::*;
 
-    fn dev_null() -> std::ffi::CString {
-        std::ffi::CString::new("/dev/null").unwrap()
-    }
-
-    fn open_dev_null() -> RawFd {
-        // SAFETY: the path is NUL-terminated.
-        let fd = unsafe { libc::open(dev_null().as_ptr(), libc::O_RDONLY) };
-        assert!(fd >= 0, "open /dev/null");
-        fd
+    fn open_dev_null() -> OwnedFd {
+        std::fs::File::open("/dev/null")
+            .expect("open /dev/null")
+            .into()
     }
 
     #[test]
@@ -405,7 +388,8 @@ mod tests {
 
     #[test]
     fn open_object_file_counts_the_fd_and_sets_cloexec() {
-        let fd = open_object_file(&dev_null(), libc::O_RDONLY, 0).expect("open /dev/null");
+        let fd = open_object_file("/dev/null", std::fs::OpenOptions::new().read(true))
+            .expect("open /dev/null");
         // The counter is process-wide and other tests open object files in parallel, so
         // only a lower bound holds. The integration tests check it returns to zero.
         assert!(open_object_fds() >= 1);
@@ -418,13 +402,9 @@ mod tests {
     #[test]
     fn move_above_keeps_an_fd_already_in_the_module_range() {
         let fd = open_dev_null();
-        // Module start 0: fd is already above it, so it is returned as it is and stays open.
-        assert_eq!(move_above(fd, 0).expect("already above"), fd);
-        // SAFETY: fd is ours; F_GETFD only reads it, and close ends it.
-        unsafe {
-            assert_ne!(libc::fcntl(fd, libc::F_GETFD), -1);
-            libc::close(fd);
-        }
+        let raw = fd.as_raw_fd();
+        // Module start 0: fd is already above it, so the same fd comes back.
+        assert_eq!(move_above(fd, 0).expect("already above").as_raw_fd(), raw);
     }
 
     #[test]

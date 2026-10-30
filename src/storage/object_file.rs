@@ -170,14 +170,13 @@ impl ObjectFile {
             return None;
         }
         let new_oid = ObjectId::next();
-        let copy = UnevictableOID::new(new_oid);
+        let _copy = UnevictableOID::new(new_oid);
         let dst_path = new_oid.file_path(&dir);
         match self.copy_file(&dst_path, new_oid, len, crc32c) {
             Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
             Err(e) => {
-                if super::nvme::try_unlink(copy, disk_len, "copy") {
-                    super::nvme::decrease_nvme_disk_usage(disk_len);
-                }
+                super::nvme::unlink(new_oid);
+                super::nvme::decrease_nvme_disk_usage(disk_len);
                 valkey_module::logging::log_warning(format!(
                     "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
                     self.object_id
@@ -224,6 +223,8 @@ impl Drop for ObjectFile {
         // Deregistering drops the pool's Arc<ObjectFd>; if no in-flight reader
         // holds a clone, the fd closes at this time.
         let teardown = move || {
+            // Moved in so it outlives drop(): a spawned teardown unlinks later.
+            let _unevictable = unevictable;
             if let Some(pool) = super::FD_POOL.get() {
                 pool.remove(object_id);
             }
@@ -234,7 +235,8 @@ impl Drop for ObjectFile {
             let claimed_by_eviction = super::reclaim::RECLAIM_LIST.remove(&object_id);
             if claimed_by_eviction {
                 // The eviction unlinks the file and credits its bytes.
-            } else if super::nvme::try_unlink(unevictable, disk_len, "teardown") {
+            } else {
+                super::nvme::unlink(object_id);
                 // Release exactly what create added — no stat, so it can't drift.
                 crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
             }

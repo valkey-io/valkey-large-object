@@ -184,12 +184,11 @@ assert_accounting() {
         fail "largeobj_num_objects ($objects) != blob keys across all databases ($blobs)."
     fi
     if [ "$BENCH_MODE" != "Dram" ]; then
-        local files orphaned
+        local files
         files=$(find "$DISK_DIR" -name "*.dat" | wc -l)
-        orphaned=$(info_field largeobj largeobj_disk_orphaned_files)
-        echo "  Object files: $files, orphaned: ${orphaned:-<missing>}"
-        if [ "$files" -ne $(( objects + ${orphaned:-0} )) ]; then
-            fail "$files object files in $DISK_DIR != $objects objects + ${orphaned:-0} orphaned."
+        echo "  Object files: $files"
+        if [ "$files" -ne "${objects:-0}" ]; then
+            fail "$files object files in $DISK_DIR != $objects objects."
         fi
     fi
 }
