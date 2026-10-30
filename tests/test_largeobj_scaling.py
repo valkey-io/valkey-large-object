@@ -690,6 +690,7 @@ class TieredBudget(Budget):
         return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET}"
                 f" disk-staging-size {2 * self.BUDGET} segment-size {2 * self.BUDGET}"
                 f" max-object-size {self.BUDGET} max-promote-size {self.BUDGET}"
+                f" chunk-size 4194304"
                 f" scaling-poll-ms {self.POLL_MS} bench-mode no direct-io no")
 
     def new_client(self, policy='allkeys-lru'):
@@ -964,7 +965,7 @@ class TestTieredEvictionMixed(TieredBudget):
         set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
         stop = time.time() + self.SECONDS
         failures = []
-        expected_errors = ('disk-maxmemory', 'failed to copy', 'no such key')
+        expected_errors = ('disk-maxmemory', 'failed to copy', 'no such key', 'pending disk requests')
 
         def worker(n):
             c = self.server.get_new_client()

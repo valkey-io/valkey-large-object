@@ -39,7 +39,7 @@ define_errors! {
 
     // OOM — matches the standard Valkey OOM error prefix so clients can
     // distinguish memory exhaustion from other errors programmatically.
-    // The INFO metric counters (dram_pool_exhausted, disk_staging_buffer_exhausted,
+    // The INFO metric counters (dram_pool_exhausted, disk_staging_queue_full,
     // disk_capacity_exceeded) tell the operator which resource was exhausted.
     ERR_OOM => "OOM command not allowed when used memory > 'maxmemory'.",
     ERR_OOM_DISK => "OOM command not allowed when used disk space > 'largeobj.disk-maxmemory'.",
@@ -53,7 +53,7 @@ define_errors! {
     ERR_CRC_MISMATCH => "ERR CRC mismatch after transfer",
 
     // Streaming Errors
-    ERR_DISK_STAGING_EXHAUSTED => "ERR disk staging buffer pool exhausted",
+    ERR_TOO_MANY_DISK_REQUESTS => "ERR too many pending disk requests",
     ERR_SET_VALUE => "ERR failed to set key",
 
     // Config Validation Errors
@@ -62,8 +62,9 @@ define_errors! {
     ERR_SEGMENT_GE_MAX_OBJ => "ERR largeobj.segment-size is insufficient for largeobj.max-object-size",
     ERR_SEGMENT_GE_PROMOTE => "ERR largeobj.segment-size is insufficient for largeobj.max-promote-size",
     ERR_STAGING_GE_SEGMENT => "ERR largeobj.disk-staging-size must be >= largeobj.segment-size",
-    ERR_SEGMENT_GE_CHUNK => "ERR largeobj.segment-size must be >= largeobj.chunk-size",
+    ERR_SEGMENT_GE_CHUNK => "ERR largeobj.segment-size is insufficient for largeobj.chunk-size",
     ERR_MAX_BUF_GE_MIN_BUF => "ERR largeobj.max-buffers-per-op must be >= largeobj.min-buffers-per-op",
+    ERR_STAGING_FITS_WINDOW => "ERR largeobj.disk-staging-size must be >= largeobj.min-buffers-per-op * largeobj.chunk-size",
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

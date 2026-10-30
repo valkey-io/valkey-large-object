@@ -3,10 +3,25 @@ import glob
 import time
 import resource
 import threading
+import subprocess
+import collections
 import pytest
 from valkey import ResponseError, Valkey
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
 from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
+
+
+# One advertised client memory address: the fabric address to HELLO with, plus the
+# (rkey, addr, len) triple that BLOB.RDMA_GET / BLOB.RDMA_SET carries per address.
+Region = collections.namedtuple('Region', 'address rkey addr len')
+
+
+def address_args(regions):
+    """The addresses as the EFA commands carry them: a (rkey, addr, len) triple each."""
+    args = []
+    for region in regions:
+        args += [region.rkey, region.addr, region.len]
+    return args
 
 
 class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
@@ -1691,6 +1706,288 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
         self.set_objects(client, 80)
         self.get_objects(client, 80)
         assert self.fd_stat(client, 'fd_cache_entries') == 72
+
+
+# ─── NVMe Staging Queue ──────────────────────────────────────────────────────
+
+# Payload size for staging queue tests: 512 KiB uses 2 × 256 KiB staging buffers.
+STAGING_PAYLOAD_LEN = 524288
+STAGING_PATTERN = bytes(i % 256 for i in range(STAGING_PAYLOAD_LEN))
+
+
+class TestStagingQueueRdma(ValkeyLargeObjTestCaseBase):
+    """NVMe staging queue via RDMA: queueing, depth metrics, and QueueFull rejection.
+
+    RDMA/EFA requests use async alloc_window_cancellable which queues when staging
+    is full. TCP uses sync alloc_window which fails immediately (tested separately).
+
+    Config: 1 MiB staging pool (1 segment), chunk-size 256 KiB, max/min-buffers 2.
+    Each SET of 512 KiB holds 2 × 256 KiB = 512 KiB of staging, so 2 SETs fill the pool.
+    test-pause-before-finalize-set-ms 3000 holds staging buffers for 3s after
+    the NVMe write completes but before commit, creating a deterministic window
+    where additional RDMA requests must queue for buffers.
+    disk-staging-queue-capacity 2: the 3rd and 4th RDMA requests queue; the 5th is
+    rejected with ERR too many pending disk requests."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 1048576"
+            f" segment-size 1048576"
+            f" max-promote-size 0"
+            f" bench-mode no"
+            f" direct-io no"
+            f" chunk-size 262144"
+            f" max-buffers-per-op 2"
+            f" min-buffers-per-op 2"
+            f" disk-staging-queue-capacity 2"
+            f" test-pause-before-finalize-set-ms 3000"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def start_target(self, *flags, split=None):
+        """Launch the passive peer and return it with the regions it advertised."""
+        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
+        command = [target, '127.0.0.1', '--read', *flags]
+        if split is not None:
+            total_size = sum(split)
+            command.append(f'--size={total_size}')
+            command.append('--split=' + ','.join(str(size) for size in split))
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        regions = []
+        for _ in range(1 if split is None else len(split)):
+            line = process.stdout.readline()
+            assert line.startswith('advertisement: '), line
+            address, rkey, remote_addr, length = line.split()[1:]
+            regions.append(Region(address, int(rkey), int(remote_addr), int(length)))
+        return process, regions
+
+    def _background_rdma_set(self, client, key, regions):
+        """Launch an RDMA SET in a background thread, return (thread, result, error)."""
+        result = [None]
+        error = [None]
+
+        def run():
+            try:
+                result[0] = client.execute_command(
+                    'BLOB.RDMA_SET', key, STAGING_PAYLOAD_LEN, *address_args(regions))
+            except Exception as e:
+                error[0] = e
+
+        t = threading.Thread(target=run)
+        t.start()
+        return t, result, error
+
+    def test_rdma_staging_queue_depth_under_pressure(self):
+        """Two RDMA SETs fill the staging pool; a third queues for buffers.
+        Assert queue depth == 1 while all three are in flight, then drains to 0."""
+        # Start 3 fabric targets (one per RDMA SET).
+        targets = []
+        all_regions = []
+        for _ in range(3):
+            process, regions = self.start_target(split=[STAGING_PAYLOAD_LEN])
+            targets.append(process)
+            all_regions.append(regions)
+
+        try:
+            # Each SET needs its own client with its own RDMA session.
+            clients = [self.server.get_new_client() for _ in range(3)]
+            observer = self.server.get_new_client()
+
+            # Establish RDMA sessions.
+            for i, (client, regions) in enumerate(zip(clients, all_regions)):
+                client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+
+            # Launch 2 RDMA SETs to fill the staging pool.
+            threads, results, errors = [], [], []
+            for i in range(2):
+                t, r, e = self._background_rdma_set(clients[i], f'q{i}', all_regions[i])
+                threads.append(t)
+                results.append(r)
+                errors.append(e)
+            # Wait for both to reach the pause window (buffers held).
+            time.sleep(1.0)
+
+            # Launch a 3rd RDMA SET — staging is full, so it queues.
+            t3, r3, e3 = self._background_rdma_set(clients[2], 'q2', all_regions[2])
+            threads.append(t3)
+            results.append(r3)
+            errors.append(e3)
+            time.sleep(0.5)
+
+            # While the first two hold buffers and the third is queued:
+            info = observer.info('largeobj_disk_staging')
+            assert info['largeobj_disk_staging_queue_depth'] == 1
+
+            # Wait for all to complete (pause expires, buffers freed, queued request proceeds).
+            for t in threads:
+                t.join(timeout=15)
+            assert not any(t.is_alive() for t in threads), "RDMA SET threads did not finish"
+            for i, (r, e) in enumerate(zip(results, errors)):
+                assert e[0] is None, f"RDMA SET q{i} raised: {e[0]}"
+                assert r[0] == b'OK', f"RDMA SET q{i} returned {r[0]}"
+
+            # Queue should have drained.
+            wait_for_equal(
+                lambda: observer.info('largeobj_disk_staging')['largeobj_disk_staging_queue_depth'], 0
+            )
+
+            # Waiting is not an error — the queue_full counter must not have incremented.
+            assert observer.info('largeobj_error_metrics')['largeobj_disk_staging_queue_full'] == 0
+
+            # All objects readable.
+            for i in range(3):
+                assert observer.execute_command('BLOB.TCP_GET', f'q{i}') == STAGING_PATTERN
+        finally:
+            for p in targets:
+                p.kill()
+
+    def test_rdma_staging_queue_full_rejection(self):
+        """With queue capacity 2, the 5th concurrent RDMA SET is rejected.
+        Two SETs hold staging buffers (paused), two queue, the fifth overflows."""
+        # Start 5 fabric targets.
+        targets = []
+        all_regions = []
+        for _ in range(5):
+            process, regions = self.start_target(split=[STAGING_PAYLOAD_LEN])
+            targets.append(process)
+            all_regions.append(regions)
+
+        try:
+            # Each SET needs its own client with its own RDMA session.
+            clients = [self.server.get_new_client() for _ in range(5)]
+            observer = self.server.get_new_client()
+
+            # Establish RDMA sessions.
+            for client, regions in zip(clients, all_regions):
+                client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+
+            # Fill staging pool (2 RDMA SETs holding buffers) + fill queue (2 more waiting).
+            threads, results, errors = [], [], []
+            for i in range(2):
+                t, r, e = self._background_rdma_set(clients[i], f'fill{i}', all_regions[i])
+                threads.append(t)
+                results.append(r)
+                errors.append(e)
+            time.sleep(1.0)
+            for i in range(2, 4):
+                t, r, e = self._background_rdma_set(clients[i], f'fill{i}', all_regions[i])
+                threads.append(t)
+                results.append(r)
+                errors.append(e)
+            time.sleep(0.5)
+
+            # The 5th RDMA SET should be rejected — queue is at capacity.
+            with pytest.raises(ResponseError, match='too many pending disk requests'):
+                clients[4].execute_command(
+                    'BLOB.RDMA_SET', 'overflow', STAGING_PAYLOAD_LEN, *address_args(all_regions[4]))
+
+            # Verify the error counter incremented.
+            info = observer.info('largeobj_error_metrics')
+            assert info['largeobj_disk_staging_queue_full'] == 1
+
+            # Let everything drain.
+            for t in threads:
+                t.join(timeout=15)
+            assert not any(t.is_alive() for t in threads), "RDMA SET threads did not finish"
+            for i, (r, e) in enumerate(zip(results, errors)):
+                assert e[0] is None, f"RDMA SET fill{i} raised: {e[0]}"
+                assert r[0] == b'OK', f"RDMA SET fill{i} returned {r[0]}"
+            # The first 4 should succeed (2 immediate + 2 queued).
+        finally:
+            for p in targets:
+                p.kill()
+
+
+class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
+    """GATE TEST: a client disconnect cancels its queued staging waiter. Valkey
+    fires the module client-disconnect event even for a client blocked inside the
+    module, so the disconnect handler cancels the queued request. The request
+    leaves the queue without allocating, never wedging the FIFO behind it.
+
+    Config: 1 MiB staging (1 segment), 512 KiB objects hold the full pool.
+    test-pause-before-finalize-set-ms 3000 keeps the holder's buffers locked.
+    The pause is immutable so ALL SETs pause, but the contender is disconnected
+    while still queued (before it gets buffers), so it never reaches the pause."""
+
+    OBJ = 524288  # 512 KiB
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 1048576"
+            f" segment-size 1048576"
+            f" max-promote-size 0"
+            f" bench-mode no"
+            f" direct-io no"
+            f" chunk-size 262144"
+            f" max-buffers-per-op 2"
+            f" min-buffers-per-op 2"
+            f" disk-staging-queue-capacity 1024"
+            f" test-pause-before-finalize-set-ms 3000"
+            f" fabric-provider Emulated"
+        )
+
+    def test_disconnect_cancels_queued_waiter(self):
+        """A hard-disconnect while a SET is queued for staging buffers must
+        cancel the queued request, leave the FIFO unwedged, and never commit
+        the cancelled key."""
+        client = self.server.get_new_client()
+        contender = self.server.get_new_client()
+
+        # Fill the staging pool with two SETs that pause holding buffers.
+        holders = []
+        for i in range(2):
+            h = self.server.get_new_client()
+            t = threading.Thread(
+                target=h.execute_command,
+                args=('BLOB.TCP_SET', f'holder{i}', b'H' * self.OBJ)
+            )
+            t.start()
+            holders.append((h, t))
+        time.sleep(1.0)  # both holders have their windows and are paused
+
+        # The contender's SET queues behind the full pool.
+        err = [None]
+        def contender_set():
+            try:
+                contender.execute_command('BLOB.TCP_SET', 'contender', b'C' * self.OBJ)
+            except Exception as e:
+                err[0] = e
+        ct = threading.Thread(target=contender_set)
+        ct.start()
+        time.sleep(0.5)  # contender is now queued
+
+        # Hard-disconnect the contender while it is blocked in the module.
+        contender.connection_pool.disconnect()
+        ct.join(timeout=10)
+        assert not ct.is_alive(), "contender thread did not finish after disconnect"
+
+        # The holders' SETs still complete normally (they pause 3s then commit).
+        for _, t in holders:
+            t.join(timeout=10)
+            assert not t.is_alive(), "holder SET did not finish"
+        for i in range(2):
+            assert client.execute_command('BLOB.TCP_GET', f'holder{i}') == b'H' * self.OBJ
+
+        # The cancelled waiter never committed its key.
+        assert client.execute_command('EXISTS', 'contender') == 0
+
+        # The FIFO is not wedged: a fresh SET on a healthy client succeeds.
+        # It will also pause (immutable config), so allow time for it.
+        fresh = self.server.get_new_client()
+        t_fresh = threading.Thread(
+            target=lambda: fresh.execute_command('BLOB.TCP_SET', 'after', b'A' * self.OBJ)
+        )
+        t_fresh.start()
+        t_fresh.join(timeout=10)
+        assert not t_fresh.is_alive(), "fresh SET did not finish"
+        assert client.execute_command('BLOB.TCP_GET', 'after') == b'A' * self.OBJ
 
 
 class TestTieredPromotionFailureRace(ValkeyLargeObjTestCaseBase):

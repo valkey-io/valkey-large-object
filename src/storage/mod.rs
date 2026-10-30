@@ -38,7 +38,7 @@ pub use nvme::{
 
 pub use dram_pool::DRAMPool;
 pub use fd_pool::FdPool;
-pub use nvme_pool::NVMePool;
+pub use nvme_pool::{AllocOutcome, NVMePool};
 
 /// O_DIRECT / io_uring alignment requirement (XFS default block size).
 /// Both buffer address and I/O length must be multiples of this.
@@ -139,6 +139,14 @@ pub fn get_fd_pool() -> &'static FdPool {
     FD_POOL.get().expect("FdPool not initialized")
 }
 
+/// Cancel any NVMe staging buffer waiters for a disconnecting client.
+/// No-op when the NVMe pool is absent (Dram mode).
+pub fn cancel_staging_waiters(client_id: u64) {
+    if let Some(pool) = NVME_POOL.get() {
+        pool.cancel_client(client_id);
+    }
+}
+
 // ─── Initialization ──────────────────────────────────────────────────────────
 
 /// Initialize storage layer: validate config, create pools, spawn the io_uring
@@ -182,7 +190,11 @@ pub fn init(
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.
     let nvme_pool = if mode == crate::OperatingMode::Tiered {
-        Some(NVMePool::new(nvme_segments, seg_size))
+        Some(NVMePool::new(
+            nvme_segments,
+            seg_size,
+            crate::disk_staging_queue_capacity(),
+        ))
     } else {
         None
     };

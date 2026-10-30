@@ -320,7 +320,6 @@ impl SegmentPool {
     }
 
     /// Allocate up to `count` uniform buffers of `chunk_size` each, requiring at
-    /// Allocate up to `count` uniform buffers of `chunk_size` each, requiring at
     /// least `min_required`. All-or-nothing when `min_required == count`.
     ///
     /// Each iteration walks the non-draining segments in LEAST-LOADED-first

@@ -275,6 +275,8 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
             ["disk-staging-size", &*CFG_DISK_STAGING_SIZE, DEFAULT_DISK_STAGING_SIZE, MIN_DISK_STAGING_SIZE, MAX_DISK_STAGING_SIZE,
              ConfigurationFlags::IMMUTABLE | ConfigurationFlags::MEMORY, None, None],
+            ["disk-staging-queue-capacity", &*CFG_DISK_STAGING_QUEUE_CAPACITY, DEFAULT_DISK_STAGING_QUEUE_CAPACITY, MIN_DISK_STAGING_QUEUE_CAPACITY, MAX_DISK_STAGING_QUEUE_CAPACITY,
+             ConfigurationFlags::IMMUTABLE, None, None],
             ["disk-maxmemory", &*CFG_DISK_MAXMEMORY, DEFAULT_DISK_MAXMEMORY, MIN_DISK_MAXMEMORY, MAX_DISK_MAXMEMORY,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["worker-threads", &*CFG_WORKER_THREADS, DEFAULT_WORKER_THREADS, MIN_WORKER_THREADS, MAX_WORKER_THREADS,

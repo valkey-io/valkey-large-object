@@ -273,6 +273,7 @@ pub fn execute_get(
         }
         _ => {
             // Async — block client, dispatch to tokio.
+            let client_id = ctx.get_client_id();
             let thread_ctx = BlockedRequest::new(ctx);
             match mode {
                 OperatingMode::Dram => {
@@ -281,7 +282,9 @@ pub fn execute_get(
                 OperatingMode::Tiered => {
                     let file =
                         file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
-                    cmd_get_tiered(object_id, obj_len, crc32c, file, transport, thread_ctx);
+                    cmd_get_tiered(
+                        client_id, object_id, obj_len, crc32c, file, transport, thread_ctx,
+                    );
                 }
             }
             EngineResult::Async
@@ -353,6 +356,7 @@ fn cmd_get_dram_efa(
 /// `file` pins the object's `ObjectFile` (existence) for the whole GET operation; the
 /// open fd is a separate `Arc<ObjectFd>` obtained via `ensure_open`.
 fn cmd_get_tiered(
+    client_id: u64,
     object_id: ObjectId,
     obj_len: u64,
     crc32c: Crc,
@@ -360,12 +364,15 @@ fn cmd_get_tiered(
     transport: Transport,
     thread_ctx: BlockedRequest,
 ) {
-    // We do not allow the eviction of files that are inflight.
-    let unevictable = storage::UnevictableOID::new(object_id);
+    // Touch eviction candidates so recently-accessed objects rank higher.
     storage::eviction_candidates::touch(object_id);
     let dram_pool = storage::get_dram_pool();
     let cache = dram_pool.tiered_cache();
     // ─── DRAMPool hit ────────────────────────────────────────────────────
+    // Pin the object: try_serve_dram_hit borrows the Arc, the promotion
+    // path moves it into the async task, the NVMe fallback lets it drop
+    // when cmd_get_tiered returns (queued requests are eviction-eligible).
+    let unevictable = storage::UnevictableOID::new(object_id);
     let (transport, thread_ctx) = match try_serve_dram_hit(
         dram_pool,
         &object_id,
@@ -461,18 +468,71 @@ fn cmd_get_tiered(
     let nvme_pool = storage::get_nvme_pool();
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
-    let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
-        Some(bufs) => bufs,
-        None => {
+    let get_info = GetObjectInfo {
+        object_id,
+        obj_len,
+        crc32c,
+    };
+    crate::runtime_handle().spawn(async move {
+        cmd_get_tiered_nvme_queueing(
+            client_id,
+            get_info,
+            file,
+            transport,
+            thread_ctx,
+            nvme_pool,
+            max_buffers,
+            min_buffers,
+        )
+        .await;
+    });
+}
+
+/// NVMe staging allocation + dispatch for Tiered GET: allocate staging buffers
+/// (with queueing), open the file, and stream the object to the client.
+/// Symmetric with `cmd_set_tiered_nvme_queueing`.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_get_tiered_nvme_queueing(
+    client_id: u64,
+    get_info: GetObjectInfo,
+    file: Arc<ObjectFile>,
+    transport: Transport,
+    thread_ctx: BlockedRequest,
+    nvme_pool: &'static storage::NVMePool,
+    max_buffers: usize,
+    min_buffers: usize,
+) {
+    let obj_len = get_info.obj_len;
+    let object_id = get_info.object_id;
+    // Allocate staging buffers with queueing support.
+    let buffers = match nvme_pool
+        .alloc_window_cancellable(client_id, obj_len as usize, max_buffers, min_buffers)
+        .await
+    {
+        storage::nvme_pool::AllocOutcome::Got(bufs) => bufs,
+        storage::nvme_pool::AllocOutcome::Cancelled => {
+            // Client disconnected while waiting — nothing to reply to.
+            return;
+        }
+        storage::nvme_pool::AllocOutcome::QueueFull => {
             reply_err(
                 &thread_ctx,
-                &info::DISK_STAGING_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
+                &info::DISK_STAGING_QUEUE_FULL,
+                ValkeyError::Str(errors::ERR_TOO_MANY_DISK_REQUESTS),
             );
             return;
         }
     };
     let stream_ctx = storage::StreamingContext::new(buffers);
+    // Pin the oid before checking the reclaim list so claim_victim cannot race
+    // between the check and the pin. If eviction already claimed the oid, the
+    // pin is harmless and the reclaim check below returns Null; if it hasn't,
+    // the live Arc<UnevictableOID> makes claim_victim skip this oid.
+    let unevictable = storage::UnevictableOID::new(object_id);
+    if storage::reclaim::RECLAIM_LIST.contains(&object_id) {
+        thread_ctx.reply(Ok(ValkeyValue::Null));
+        return;
+    }
     let fd_pool = storage::get_fd_pool();
     let fd = match file.ensure_open(fd_pool, &crate::disk_dir()) {
         Some(fd) => fd,
@@ -487,32 +547,25 @@ fn cmd_get_tiered(
     };
     let raw_fd = fd.as_raw_fd();
     let batch_width = stream_ctx.buffers.len();
-    let get_info = GetObjectInfo {
-        object_id,
-        obj_len,
-        crc32c,
-    };
     let nvme_pool = storage::get_nvme_pool();
     let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
-    crate::runtime_handle().spawn(async move {
-        // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
-        // open fd are held alive for the read's duration. No promotion → no cache,
-        // source reads straight from the NVMe pool window.
-        // Drops before the captured thread_ctx (see the promotion path).
-        let _keep_alive = (file, fd, unevictable);
-        cmd_get_tiered_run(
-            get_info,
-            &stream_ctx.buffers,
-            crate::stream::Pool::Nvme(nvme_pool),
-            None,
-            raw_fd,
-            batch_width,
-            chunk_iter,
-            &thread_ctx,
-            target,
-        )
-        .await;
-    });
+    // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
+    // open fd are held alive for the read's duration. No promotion → no cache,
+    // source reads straight from the NVMe pool window.
+    // Drops before the captured thread_ctx (see the promotion path).
+    let _keep_alive = (file, fd, unevictable);
+    cmd_get_tiered_run(
+        get_info,
+        &stream_ctx.buffers,
+        crate::stream::Pool::Nvme(nvme_pool),
+        None,
+        raw_fd,
+        batch_width,
+        chunk_iter,
+        &thread_ctx,
+        target,
+    )
+    .await;
 }
 
 /// The per-transport variant of a GET's target — the ONLY thing that differs
@@ -628,9 +681,11 @@ pub fn execute_set_tcp(
     if crate::operating_mode() == OperatingMode::Dram {
         return EngineResult::Sync(cmd_set_dram_tcp(ctx, key_name, obj_len, data, object_id));
     }
+    let client_id = ctx.get_client_id();
     let thread_ctx = BlockedRequest::new(ctx);
     let key_name_bytes = key_name.as_slice().to_vec();
     cmd_set_tiered(
+        client_id,
         key_name_bytes,
         obj_len,
         DataSource::Tcp(data.to_vec()),
@@ -655,6 +710,7 @@ pub fn execute_set_rdma(
     // ordering by arrival, not completion. Used for version checks on async paths.
     let object_id = ObjectId::next();
     // Async — block client, dispatch to tokio.
+    let client_id = ctx.get_client_id();
     let thread_ctx = BlockedRequest::new(ctx);
     let key_name_bytes = key_name.as_slice().to_vec();
     match mode {
@@ -670,6 +726,7 @@ pub fn execute_set_rdma(
         }
         OperatingMode::Tiered => {
             cmd_set_tiered(
+                client_id,
                 key_name_bytes,
                 obj_len,
                 data_source,
@@ -862,7 +919,16 @@ fn cmd_set_dram_efa(
 // ─── Tiered SET ──────────────────────────────────────────────────────────────
 
 /// Tiered SET: streaming batch write to NVMe via NVMePool buffer window.
+///
+/// TCP and EFA take different allocation paths:
+/// - **TCP**: Immediate allocation, fail fast if staging full. Queueing is
+///   disabled because the `data.to_vec()` copy happens before spawn, and queued
+///   requests would hold those `Vec`s until they reach the head — up to
+///   `queue_capacity` copies × `max_object_size` bytes, far exceeding staging.
+/// - **EFA**: Async allocation with FIFO queueing. No payload copy exists (data
+///   transfers via RDMA), so queueing only holds lightweight metadata.
 fn cmd_set_tiered(
+    client_id: u64,
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -873,28 +939,28 @@ fn cmd_set_tiered(
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
     let nvme_pool = storage::get_nvme_pool();
-    let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
-        Some(bufs) => bufs,
-        None => {
-            reply_err(
-                &thread_ctx,
-                &info::DISK_STAGING_BUFFER_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
-            );
-            return;
-        }
-    };
-    let stream_ctx = storage::StreamingContext::new(buffers);
     let chunk_size = crate::chunk_size();
-    let batch_width = stream_ctx.buffers.len();
-    // We do not allow the eviction of the new file until it is committed, nor of
-    // the one it replaces.
-    let unevictable = (
-        storage::UnevictableOID::new(object_id),
-        old_oid.map(storage::UnevictableOID::new),
-    );
+
     match data_source {
         DataSource::Tcp(data) => {
+            // TCP: immediate allocation, no queueing. Defers to queued EFA requests.
+            let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
+                Some(bufs) => bufs,
+                None => {
+                    reply_err(
+                        &thread_ctx,
+                        &info::DISK_STAGING_QUEUE_FULL,
+                        ValkeyError::Str(errors::ERR_TOO_MANY_DISK_REQUESTS),
+                    );
+                    return;
+                }
+            };
+            let stream_ctx = storage::StreamingContext::new(buffers);
+            let batch_width = stream_ctx.buffers.len();
+            let unevictable = (
+                storage::UnevictableOID::new(object_id),
+                old_oid.map(storage::UnevictableOID::new),
+            );
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
             crate::runtime_handle().spawn(async move {
                 let _unevictable = unevictable;
@@ -919,26 +985,91 @@ fn cmd_set_tiered(
             addrs,
             client_crc,
         } => {
-            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs));
+            // EFA: async allocation with FIFO queueing.
             crate::runtime_handle().spawn(async move {
-                let _unevictable = unevictable;
-                let set_info = SetObjectInfo {
-                    object_id,
-                    obj_len,
+                cmd_set_tiered_nvme_queueing(
+                    client_id,
                     key_name,
+                    obj_len,
+                    session,
+                    addrs,
                     client_crc,
-                };
-                cmd_set_tiered_run(
-                    set_info,
-                    stream_ctx,
-                    chunk_iter,
                     thread_ctx,
-                    SetSource::Efa(session),
+                    object_id,
+                    old_oid,
+                    nvme_pool,
+                    max_buffers,
+                    min_buffers,
+                    chunk_size,
                 )
                 .await;
             });
         }
     }
+}
+
+/// NVMe staging allocation with FIFO queueing for Tiered SET (EFA path only).
+///
+/// EFA has no payload copy (data transfers via RDMA), so queueing only holds
+/// lightweight metadata. Symmetric with `cmd_get_tiered_nvme_queueing`.
+#[allow(clippy::too_many_arguments)]
+async fn cmd_set_tiered_nvme_queueing(
+    client_id: u64,
+    key_name: Vec<u8>,
+    obj_len: u64,
+    session: Arc<Session>,
+    addrs: Vec<storage::ClientEFAAddress>,
+    client_crc: Option<u32>,
+    thread_ctx: BlockedRequest,
+    object_id: ObjectId,
+    old_oid: Option<ObjectId>,
+    nvme_pool: &'static storage::NVMePool,
+    max_buffers: usize,
+    min_buffers: usize,
+    chunk_size: usize,
+) {
+    // Async allocation: may wait for buffers to become available.
+    let buffers = match nvme_pool
+        .alloc_window_cancellable(client_id, obj_len as usize, max_buffers, min_buffers)
+        .await
+    {
+        storage::AllocOutcome::Got(bufs) => bufs,
+        storage::AllocOutcome::Cancelled => {
+            // Client disconnected while waiting — silently drop.
+            return;
+        }
+        storage::AllocOutcome::QueueFull => {
+            reply_err(
+                &thread_ctx,
+                &info::DISK_STAGING_QUEUE_FULL,
+                ValkeyError::Str(errors::ERR_TOO_MANY_DISK_REQUESTS),
+            );
+            return;
+        }
+    };
+    let stream_ctx = storage::StreamingContext::new(buffers);
+    let batch_width = stream_ctx.buffers.len();
+    // We do not allow the eviction of the new file until it is committed, nor of
+    // the one it replaces.
+    let _unevictable = (
+        storage::UnevictableOID::new(object_id),
+        old_oid.map(storage::UnevictableOID::new),
+    );
+    let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs));
+    let set_info = SetObjectInfo {
+        object_id,
+        obj_len,
+        key_name,
+        client_crc,
+    };
+    cmd_set_tiered_run(
+        set_info,
+        stream_ctx,
+        chunk_iter,
+        thread_ctx,
+        SetSource::Efa(session),
+    )
+    .await;
 }
 
 /// The per-transport variant of a Tiered NVMe SET — the ONLY thing that differs

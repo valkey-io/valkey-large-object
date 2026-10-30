@@ -16,7 +16,7 @@
 //!
 //! `--split=<size1>,<size2>[,...]` registers N separate allocations of the given sizes instead of
 //! one buffer, each with its own registration and so its own rkey, and advertises one line per
-//! region. The sizes must sum to `BUFFER_LEN` and may be unequal (`--split=1024,3072`). Regions
+//! region. The sizes must sum to `buffer_len` (or `--size=N`) and may be unequal (`--split=1024,3072`). Regions
 //! are advertised in registration order, which is the order the object's bytes span them.
 //!
 //! `--efa` opens the `efa-direct` fabric instead of tcp loopback. There a target must hold the
@@ -40,7 +40,8 @@ use dma_libfabric::sys::{
 };
 use dma_libfabric_protocol::{checksum, decode_hex, encode_hex};
 
-const BUFFER_LEN: usize = 4096;
+/// Default buffer length when `--size=N` is not specified; the original hardcoded value.
+const DEFAULT_BUFFER_LEN: usize = 4096;
 
 /// Position-dependent payload: cycling 0x00..0xFF so that byte-ordering across multi-region
 /// splits is verified, not just fill. Must match the Python test's PATTERN.
@@ -97,10 +98,10 @@ fn check(code: i32, what: &str) -> Result<(), String> {
 }
 
 /// The region sizes to register, from a `--split=a,b,...` spec; absent, one whole-buffer
-/// region. The sizes must sum to `BUFFER_LEN`, since the object is exactly that long.
-fn region_sizes(split: Option<&str>) -> Result<Vec<usize>, String> {
+/// region. The sizes must sum to `buffer_len`, since the object is exactly that long.
+fn region_sizes(split: Option<&str>, buffer_len: usize) -> Result<Vec<usize>, String> {
     let Some(spec) = split else {
-        return Ok(vec![BUFFER_LEN]);
+        return Ok(vec![buffer_len]);
     };
     let mut sizes = Vec::new();
     for field in spec.split(',') {
@@ -117,9 +118,9 @@ fn region_sizes(split: Option<&str>) -> Result<Vec<usize>, String> {
         return Err("--split: at least one region size is required".to_string());
     }
     let total: usize = sizes.iter().sum();
-    if BUFFER_LEN != total {
+    if buffer_len != total {
         return Err(format!(
-            "--split: sizes total {total}, must total BUFFER_LEN {BUFFER_LEN}"
+            "--split: sizes total {total}, must total buffer_len {buffer_len}"
         ));
     }
     Ok(sizes)
@@ -133,7 +134,13 @@ fn main() -> Result<(), String> {
     let serve_read = flags.iter().any(|flag| "--read" == flag);
     let use_efa = flags.iter().any(|flag| "--efa" == flag);
     let split = flags.iter().find_map(|flag| flag.strip_prefix("--split="));
-    let sizes = region_sizes(split)?;
+    // `--size=N` sets the buffer length (default 4096); --split sizes must sum to this.
+    let buffer_len: usize = flags
+        .iter()
+        .find_map(|flag| flag.strip_prefix("--size="))
+        .map(|s| s.parse().expect("--size requires a number"))
+        .unwrap_or(DEFAULT_BUFFER_LEN);
+    let sizes = region_sizes(split, buffer_len)?;
     let mut arguments = positional.into_iter();
     // An EFA endpoint binds to the device and advertises its own fabric address, so there is no
     // source to pin — the first positional is the initiator's address instead.
@@ -269,7 +276,7 @@ fn main() -> Result<(), String> {
     // Remote-accessible, unlike the initiator's local-only operands. Prefilled when the initiator is
     // the one fetching it. One allocation per region, all allocated before the first registration
     // because a registration holds a raw pointer into its buffer.
-    let pattern = generate_pattern(BUFFER_LEN);
+    let pattern = generate_pattern(buffer_len);
     let buffers: Vec<Vec<u8>> = if serve_read {
         // Prefill each region with its slice of the position-dependent pattern.
         let mut offset = 0;
@@ -369,13 +376,13 @@ fn main() -> Result<(), String> {
     let contents = |buffers: &[Vec<u8>]| -> Vec<u8> { buffers.concat() };
     if serve_read {
         println!(
-            "serving {BUFFER_LEN} bytes (cycling 0x00..0xFF) across {} region(s) for a remote read, crc {:#010x} — the initiator verifies",
+            "serving {buffer_len} bytes (cycling 0x00..0xFF) across {} region(s) for a remote read, crc {:#010x} — the initiator verifies",
             advertisements.len(),
             checksum(&contents(&buffers))
         );
     } else {
         println!(
-            "waiting for a transfer into {BUFFER_LEN} bytes across {} region(s)...",
+            "waiting for a transfer into {buffer_len} bytes across {} region(s)...",
             advertisements.len()
         );
     }
@@ -415,7 +422,7 @@ fn main() -> Result<(), String> {
         if landed {
             // The CRC the initiator also prints, so the pair cross-checks.
             println!(
-                "received {BUFFER_LEN} bytes, crc {:#010x} — payload verified",
+                "received {buffer_len} bytes, crc {:#010x} — payload verified",
                 checksum(&contents(&buffers))
             );
             return Ok(());
