@@ -14,8 +14,9 @@ libc = "0.2"
 crc-fast = "1"
 io-uring = "0.7"
 crossbeam-channel = "0.5"
-dma-libfabric = { git = "https://github.com/momentohq/vdma.git", rev = "72c3a088fcfd111f21d96cfa43c05ea5bd40ae18" }
-dma-libfabric-protocol = { git = "https://github.com/momentohq/vdma.git", rev = "72c3a088fcfd111f21d96cfa43c05ea5bd40ae18" }
+dma-libfabric = { version = "0.1.0" }
+dma-libfabric-protocol = { version = "0.1.0" }
+ofi-libfabric-sys = { version = "0.2", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 indexmap = "2"
 hashlink = "0.12"
@@ -54,4 +55,4 @@ debug = 2
 default = ["min-valkey-compatibility-version-8-0"]
 enable-system-alloc = ["valkey-module/enable-system-alloc", "valkey-module/test-shims"]
 min-valkey-compatibility-version-8-0 = []
-test-harness = []
+test-harness = ["dep:ofi-libfabric-sys"]

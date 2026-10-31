@@ -34,7 +34,17 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev build-essential pkg-config libfabric-dev
+          sudo apt-get install -y clang libclang-dev build-essential pkg-config
+
+      - name: Install libfabric (EFA installer)
+        env:
+          EFA_INSTALLER_VERSION: 1.51.0
+        run: |
+          curl -sSfO "https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz"
+          tar xf "aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz"
+          (cd aws-efa-installer && sudo ./efa_installer.sh -y --skip-kmod --skip-limit-conf --no-verify)
+          rm -rf aws-efa-installer "aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz"
+          sudo ln -s /opt/amazon/efa/lib/pkgconfig/libfabric.pc /usr/lib/aarch64-linux-gnu/pkgconfig/libfabric.pc
 
       # dma-libfabric probes libfabric through pkg-config. Check reachability early.
       - name: Check libfabric
