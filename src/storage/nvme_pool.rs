@@ -100,8 +100,8 @@ impl NVMePool {
         max_buffers: usize,
         min_buffers: usize,
     ) -> AllocOutcome {
-        // Step 1: Fast path — allocate without locking or queue accounting.
-        if let Some(buffers) = self.pool.alloc_window(size, max_buffers, min_buffers) {
+        // Step 1: Fast path — allocate if staging is free and nobody is queued.
+        if let Some(buffers) = self.alloc_window(size, max_buffers, min_buffers) {
             return AllocOutcome::Got(buffers);
         }
         // Step 2: Staging full — count ourselves as a waiter and cap-check.
