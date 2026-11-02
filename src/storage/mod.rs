@@ -31,7 +31,7 @@ pub use object_file::{ObjectFile, UnevictableOID};
 
 // Re-exports from nvme.rs
 pub use nvme::{
-    object_disk_len, open_nvme_file_for_write, read_and_verify_file_header,
+    object_disk_len, open_nvme_file_for_write, probe_disk_dir, read_and_verify_file_header,
     validate_and_clean_disk_dir, write_file_header, FileHeader, FILE_HEADER_MAGIC,
     FILE_HEADER_SIZE, FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN,
 };
