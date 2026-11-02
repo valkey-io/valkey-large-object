@@ -1904,17 +1904,15 @@ class TestStagingQueueRdma(ValkeyLargeObjTestCaseBase):
 
 
 class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
-    """GATE TEST: a client disconnect cancels its queued staging waiter. Valkey
-    fires the module client-disconnect event even for a client blocked inside the
-    module, so the disconnect handler cancels the queued request. The request
-    leaves the queue without allocating, never wedging the FIFO behind it.
+    """GATE TEST: a client disconnect cancels its queued RDMA staging waiter.
+    Valkey fires the module client-disconnect event even for a client blocked
+    inside the module, so the disconnect handler cancels the queued request.
+    The request leaves the queue without allocating, never wedging the FIFO.
 
     Config: 1 MiB staging (1 segment), 512 KiB objects hold the full pool.
     test-pause-before-finalize-set-ms 3000 keeps the holder's buffers locked.
-    The pause is immutable so ALL SETs pause, but the contender is disconnected
-    while still queued (before it gets buffers), so it never reaches the pause."""
-
-    OBJ = 524288  # 512 KiB
+    The contender uses RDMA SET so it enters alloc_window_cancellable and
+    actually queues (TCP SET uses sync alloc_window which fails immediately)."""
 
     def get_module_args(self, data_dir, direct_io):
         return (
@@ -1931,63 +1929,117 @@ class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
             f" disk-staging-queue-capacity 1024"
             f" test-pause-before-finalize-set-ms 3000"
             f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
         )
+
+    def start_target(self, *flags, split=None):
+        """Launch the passive peer and return it with the regions it advertised."""
+        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
+        command = [target, '127.0.0.1', '--read', *flags]
+        if split is not None:
+            total_size = sum(split)
+            command.append(f'--size={total_size}')
+            command.append('--split=' + ','.join(str(size) for size in split))
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        regions = []
+        for _ in range(1 if split is None else len(split)):
+            line = process.stdout.readline()
+            assert line.startswith('advertisement: '), line
+            address, rkey, remote_addr, length = line.split()[1:]
+            regions.append(Region(address, int(rkey), int(remote_addr), int(length)))
+        return process, regions
 
     def test_disconnect_cancels_queued_waiter(self):
-        """A hard-disconnect while a SET is queued for staging buffers must
-        cancel the queued request, leave the FIFO unwedged, and never commit
-        the cancelled key."""
-        client = self.server.get_new_client()
-        contender = self.server.get_new_client()
+        """A hard-disconnect while an RDMA SET is queued for staging buffers
+        must cancel the queued request, leave the FIFO unwedged, and never
+        commit the cancelled key."""
+        # Start fabric targets: one for the contender, one for the follow-up.
+        targets = []
+        all_regions = []
+        for _ in range(2):
+            process, regions = self.start_target(split=[STAGING_PAYLOAD_LEN])
+            targets.append(process)
+            all_regions.append(regions)
 
-        # Fill the staging pool with two SETs that pause holding buffers.
-        holders = []
-        for i in range(2):
-            h = self.server.get_new_client()
-            t = threading.Thread(
-                target=h.execute_command,
-                args=('BLOB.TCP_SET', f'holder{i}', b'H' * self.OBJ)
+        try:
+            observer = self.server.get_new_client()
+            contender = self.server.get_new_client()
+            contender.execute_command('BLOB.RDMA_HELLO', all_regions[0][0].address)
+
+            # Fill the staging pool with two TCP SETs that pause holding buffers.
+            holders = []
+            for i in range(2):
+                h = self.server.get_new_client()
+                t = threading.Thread(
+                    target=h.execute_command,
+                    args=('BLOB.TCP_SET', f'holder{i}', b'H' * STAGING_PAYLOAD_LEN)
+                )
+                t.start()
+                holders.append((h, t))
+            time.sleep(1.0)  # both holders have their windows and are paused
+
+            # The contender's RDMA SET queues via alloc_window_cancellable.
+            result = [None]
+            error = [None]
+            def contender_set():
+                try:
+                    result[0] = contender.execute_command(
+                        'BLOB.RDMA_SET', 'contender', STAGING_PAYLOAD_LEN,
+                        *address_args(all_regions[0]))
+                except Exception as e:
+                    error[0] = e
+            ct = threading.Thread(target=contender_set)
+            ct.start()
+            time.sleep(0.5)
+
+            # The contender must be in the staging queue.
+            info = observer.info('largeobj_disk_staging')
+            assert info['largeobj_disk_staging_queue_depth'] == 1
+
+            # Hard-disconnect the contender while it is queued.
+            contender.connection_pool.disconnect()
+            ct.join(timeout=10)
+            assert not ct.is_alive(), "contender thread did not finish after disconnect"
+
+            # Queue depth must drain to 0 after cancellation.
+            wait_for_equal(
+                lambda: observer.info('largeobj_disk_staging')['largeobj_disk_staging_queue_depth'], 0
             )
-            t.start()
-            holders.append((h, t))
-        time.sleep(1.0)  # both holders have their windows and are paused
 
-        # The contender's SET queues behind the full pool.
-        err = [None]
-        def contender_set():
-            try:
-                contender.execute_command('BLOB.TCP_SET', 'contender', b'C' * self.OBJ)
-            except Exception as e:
-                err[0] = e
-        ct = threading.Thread(target=contender_set)
-        ct.start()
-        time.sleep(0.5)  # contender is now queued
+            # The holders' SETs still complete normally (they pause 3s then commit).
+            for _, t in holders:
+                t.join(timeout=10)
+                assert not t.is_alive(), "holder SET did not finish"
+            for i in range(2):
+                assert observer.execute_command('BLOB.TCP_GET', f'holder{i}') == b'H' * STAGING_PAYLOAD_LEN
 
-        # Hard-disconnect the contender while it is blocked in the module.
-        contender.connection_pool.disconnect()
-        ct.join(timeout=10)
-        assert not ct.is_alive(), "contender thread did not finish after disconnect"
+            # The cancelled waiter never committed its key.
+            assert observer.execute_command('EXISTS', 'contender') == 0
 
-        # The holders' SETs still complete normally (they pause 3s then commit).
-        for _, t in holders:
-            t.join(timeout=10)
-            assert not t.is_alive(), "holder SET did not finish"
-        for i in range(2):
-            assert client.execute_command('BLOB.TCP_GET', f'holder{i}') == b'H' * self.OBJ
-
-        # The cancelled waiter never committed its key.
-        assert client.execute_command('EXISTS', 'contender') == 0
-
-        # The FIFO is not wedged: a fresh SET on a healthy client succeeds.
-        # It will also pause (immutable config), so allow time for it.
-        fresh = self.server.get_new_client()
-        t_fresh = threading.Thread(
-            target=lambda: fresh.execute_command('BLOB.TCP_SET', 'after', b'A' * self.OBJ)
-        )
-        t_fresh.start()
-        t_fresh.join(timeout=10)
-        assert not t_fresh.is_alive(), "fresh SET did not finish"
-        assert client.execute_command('BLOB.TCP_GET', 'after') == b'A' * self.OBJ
+            # The FIFO is not wedged: a fresh RDMA SET on a healthy client succeeds.
+            fresh = self.server.get_new_client()
+            fresh.execute_command('BLOB.RDMA_HELLO', all_regions[1][0].address)
+            fresh_result = [None]
+            fresh_error = [None]
+            def fresh_set():
+                try:
+                    fresh_result[0] = fresh.execute_command(
+                        'BLOB.RDMA_SET', 'after', STAGING_PAYLOAD_LEN,
+                        *address_args(all_regions[1]))
+                except Exception as e:
+                    fresh_error[0] = e
+            t_fresh = threading.Thread(target=fresh_set)
+            t_fresh.start()
+            t_fresh.join(timeout=10)
+            assert not t_fresh.is_alive(), "fresh RDMA SET did not finish"
+            assert fresh_error[0] is None, f"fresh RDMA SET raised: {fresh_error[0]}"
+            assert fresh_result[0] == b'OK', f"fresh RDMA SET returned {fresh_result[0]}"
+            assert observer.execute_command('BLOB.TCP_GET', 'after') == STAGING_PATTERN
+        finally:
+            for p in targets:
+                p.kill()
 
 
 class TestTieredPromotionFailureRace(ValkeyLargeObjTestCaseBase):
