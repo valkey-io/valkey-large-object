@@ -17,6 +17,7 @@ pub static DISK_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static RDMA_READ_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static RDMA_WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
 pub static DRAM_POOL_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
+pub static DISK_STAGING_BUFFER_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 pub static DISK_STAGING_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
 pub static DISK_CAPACITY_EXCEEDED: AtomicU64 = AtomicU64::new(0);
 pub static SET_FINALIZE_STALE: AtomicU64 = AtomicU64::new(0);
@@ -359,6 +360,10 @@ fn error_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "dram_pool_exhausted",
             DRAM_POOL_EXHAUSTED.load(Ordering::Relaxed) as i64,
+        )?
+        .field(
+            "disk_staging_buffer_exhausted",
+            DISK_STAGING_BUFFER_EXHAUSTED.load(Ordering::Relaxed) as i64,
         )?
         .field(
             "disk_staging_queue_full",

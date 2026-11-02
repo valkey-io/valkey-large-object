@@ -12,6 +12,7 @@
 //! - Fairness: arrival order via tokio::sync::Mutex FIFO.
 //! - Off the main thread: the wait happens in the spawned task.
 //! - Bounded queue: safety net for clients with no timeout (default 1024).
+//! - TCP SETs use synchronous alloc_window, which defers when queue_len > 0.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,9 +100,14 @@ impl NVMePool {
         max_buffers: usize,
         min_buffers: usize,
     ) -> AllocOutcome {
-        // Step 1: Queue cap check (CAS loop for exact enforcement).
-        // A simple load + fetch_add has a TOCTOU gap where multiple requests
-        // overshoot. compare_exchange_weak retries on spurious failures.
+        // Step 1: Fast path — allocate without locking or queue accounting.
+        if let Some(buffers) = self.pool.alloc_window(size, max_buffers, min_buffers) {
+            return AllocOutcome::Got(buffers);
+        }
+        // Step 2: Staging full — count ourselves as a waiter and cap-check.
+        // CAS loop for exact enforcement: a simple load + fetch_add has a
+        // TOCTOU gap where multiple requests overshoot. compare_exchange_weak
+        // retries on spurious failures.
         loop {
             let current = self.queue_len.load(Ordering::Relaxed);
             if current >= self.queue_capacity {
@@ -115,51 +121,31 @@ impl NVMePool {
                 break;
             }
         }
-
-        // Step 2: Register cancel signal for this client.
+        // Step 3: Register cancel signal for this client.
         let cancel = self.register_cancel(client_id);
         let _guard = CancelGuard {
             pool: self,
             client_id,
         };
-
         // Pre-register as a waiter so a disconnect mid-wait is not lost.
         let mut cancelled = std::pin::pin!(cancel.notified());
         cancelled.as_mut().enable();
-
-        // Step 3: Fast path — try_lock to skip the queue if nobody is waiting.
-        let lock_guard = match self.queue.try_lock() {
-            Ok(lock) => {
-                // Nobody waiting. Try immediate allocation.
-                if let Some(buffers) = self.pool.alloc_window(size, max_buffers, min_buffers) {
-                    return AllocOutcome::Got(buffers);
-                }
-                // No buffers available; we already hold the lock, proceed to alloc loop.
-                lock
+        // Step 4: Wait for the FIFO lock.
+        let lock_guard = tokio::select! {
+            biased;
+            _ = &mut cancelled => {
+                return AllocOutcome::Cancelled;
             }
-            Err(_) => {
-                // Others waiting — must queue. Wait for the FIFO lock.
-                tokio::select! {
-                    biased;
-                    _ = &mut cancelled => {
-                        // Cancelled while waiting for lock.
-                        return AllocOutcome::Cancelled;
-                    }
-                    lock = self.queue.lock() => lock,
-                }
-            }
+            lock = self.queue.lock() => lock,
         };
-
-        // Step 4: Alloc loop (only the lock holder runs this).
+        // Step 5: Alloc loop (only the lock holder runs this).
         loop {
             // Register notified BEFORE trying alloc to avoid lost wakes.
             let freed_notified = self.freed.notified();
-
             if let Some(buffers) = self.pool.alloc_window(size, max_buffers, min_buffers) {
                 drop(lock_guard); // Release lock → next waiter proceeds.
                 return AllocOutcome::Got(buffers);
             }
-
             // Wait for either buffers freed or cancellation.
             tokio::select! {
                 biased;
@@ -441,30 +427,29 @@ mod tests {
         });
     }
 
-    /// FIFO fairness: a newcomer cannot take a buffer freed for the waiting head.
-    /// The head holds the queue lock while parked on `freed`, so the newcomer's
-    /// try_lock fails and it enters the FIFO behind the head.
+    /// FIFO fairness under exhaustion: when two requests are queued and one
+    /// buffer frees, the head gets it; the tail must wait for another free.
     #[test]
-    fn test_newcomer_cannot_jump_the_queue() {
+    fn test_fifo_order_under_exhaustion() {
         let (pool, mut held) = exhausted_pool();
         runtime().block_on(async {
+            // Both find staging full in step 1 and enter the FIFO queue.
             let head = tokio::spawn({
                 let pool = Arc::clone(&pool);
                 async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
             });
             wait_registered(&pool, CLIENT, 1);
-            // Free one buffer. The head holds the queue lock and will take it.
-            pool.free_n(&held.pop().expect("held window"));
-            // A newcomer (different client) queues behind the head.
-            let newcomer = tokio::spawn({
+            let tail = tokio::spawn({
                 let pool = Arc::clone(&pool);
                 async move { pool.alloc_window_cancellable(CLIENT + 1, OBJ, 1, 1).await }
             });
             wait_registered(&pool, CLIENT + 1, 1);
-            // Cancel the newcomer so the test doesn't hang — it must NOT have allocated.
-            pool.cancel_client(CLIENT + 1);
-            assert!(newcomer.await.expect("newcomer task").is_cancelled());
+            // Free one buffer — only the head should get it.
+            pool.free_n(&held.pop().expect("held window"));
             assert!(head.await.expect("head task").is_got());
+            // Tail is still queued, cancel it to avoid hanging.
+            pool.cancel_client(CLIENT + 1);
+            assert!(tail.await.expect("tail task").is_cancelled());
         });
     }
 

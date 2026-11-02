@@ -949,7 +949,7 @@ fn cmd_set_tiered(
                 None => {
                     reply_err(
                         &thread_ctx,
-                        &info::DISK_STAGING_QUEUE_FULL,
+                        &info::DISK_STAGING_BUFFER_EXHAUSTED,
                         ValkeyError::Str(errors::ERR_TOO_MANY_DISK_REQUESTS),
                     );
                     return;
