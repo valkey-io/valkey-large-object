@@ -23,7 +23,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use valkey_module::{NotifyEvent, ValkeyError, ValkeyValue, VALKEY_OK};
+use valkey_module::{raw, NotifyEvent, ValkeyError, ValkeyValue, VALKEY_OK};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
@@ -114,16 +114,33 @@ pub fn inflight_requests() -> u64 {
 
 /// An async GET or SET, over TCP or RDMA. Its client stays blocked until this drops, and
 /// `commandstats` counts the time in between toward the command.
-pub(crate) struct BlockedRequest(valkey_module::ThreadSafeContext<valkey_module::BlockedClient>);
+pub(crate) struct BlockedRequest {
+    thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    /// The client's selected db when it blocked.
+    db: i32,
+}
 
 impl BlockedRequest {
     fn new(ctx: &valkey_module::Context) -> Self {
         INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
         let mut blocked_client = ctx.block_client();
         blocked_client.measure_time_start();
-        Self(valkey_module::ThreadSafeContext::with_blocked_client(
-            blocked_client,
-        ))
+        // SAFETY: `ctx` is the live command context, on the main thread.
+        let db = unsafe { raw::RedisModule_GetSelectedDb.unwrap()(ctx.get_raw()) };
+        Self {
+            thread_ctx: valkey_module::ThreadSafeContext::with_blocked_client(blocked_client),
+            db,
+        }
+    }
+
+    /// Lock the server on the client's db. Shadows `ThreadSafeContext::lock`, whose
+    /// guard is a fresh detached context on db 0.
+    pub(crate) fn lock(&self) -> valkey_module::ContextGuard {
+        let guard = self.thread_ctx.lock();
+        // SAFETY: the guard's context is live and holds the server lock. `db` came from
+        // GetSelectedDb and the db count is fixed at startup, so it is in range.
+        unsafe { raw::RedisModule_SelectDb.unwrap()(guard.get_raw(), self.db) };
+        guard
     }
 }
 
@@ -131,7 +148,7 @@ impl std::ops::Deref for BlockedRequest {
     type Target = valkey_module::ThreadSafeContext<valkey_module::BlockedClient>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.thread_ctx
     }
 }
 
