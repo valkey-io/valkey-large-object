@@ -29,7 +29,8 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::time::{Duration, Instant};
 
-use dma_libfabric::sys::{
+use dma_libfabric_protocol::{checksum, decode_hex, encode_hex};
+use ofi_libfabric_sys::bindgen::{
     fi_addr_t, fi_allocinfo, fi_av_attr, fi_av_insert, fi_av_open, fi_av_type_FI_AV_MAP, fi_close,
     fi_cq_attr, fi_cq_entry, fi_cq_format_FI_CQ_FORMAT_CONTEXT, fi_cq_open, fi_cq_read, fi_domain,
     fi_enable, fi_endpoint, fi_ep_bind, fi_ep_type_FI_EP_RDM, fi_fabric, fi_freeinfo, fi_getinfo,
@@ -38,7 +39,6 @@ use dma_libfabric::sys::{
     FI_MSG, FI_READ, FI_RECV, FI_REMOTE_READ, FI_REMOTE_WRITE, FI_RMA, FI_SOURCE, FI_TRANSMIT,
     FI_WRITE,
 };
-use dma_libfabric_protocol::{checksum, decode_hex, encode_hex};
 
 const BUFFER_LEN: usize = 4096;
 
