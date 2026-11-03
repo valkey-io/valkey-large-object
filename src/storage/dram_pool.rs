@@ -588,8 +588,8 @@ impl DRAMPool {
     /// Build, register and publish one segment, then clear the `expanding` flag the caller set.
     /// Allocation and `fi_mr_reg` touch no pool state and no Valkey API, so this runs
     /// on any thread while the pool keeps serving; only `publish` takes the pool lock. The
-    /// allocator cannot see the segment before it is registered. Returns whether it was published.
-    fn add_segment(&self) -> bool {
+    /// allocator cannot see the segment before it is registered.
+    fn add_segment(&self) {
         assert!(
             self.expanding.load(Ordering::Acquire),
             "add_segment: the caller must set `expanding` first"
@@ -597,17 +597,18 @@ impl DRAMPool {
         let segment = Segment::new(self.pool.segment_size);
         // Register the new segment with EFA (fatal on failure — see efa_register_segment).
         crate::efa_register_segment(segment.slice());
-        let published = self.pool.publish(segment).is_some();
-        if published {
-            self.expand_count.fetch_add(1, Ordering::Relaxed);
-            // Rebuild + re-register the DRAM ring's fixed-buffer table so the new
-            // segment joins the fixed path (no-op in Dram mode). The iovecs table rebuild runs
-            // on the DRAM poller only; the NVMe ring is untouched and keeps serving.
-            super::uring::submit_reregister(super::uring::PoolType::Dram);
-        }
+        // `may_expand` checked `MAX_SEGMENTS`, only one expand runs at a time, and nothing else
+        // adds segments, so the pool cannot have filled up since.
+        self.pool
+            .publish(segment)
+            .expect("add_segment: the pool is at MAX_SEGMENTS, which may_expand ruled out");
+        self.expand_count.fetch_add(1, Ordering::Relaxed);
+        // Rebuild + re-register the DRAM ring's fixed-buffer table so the new
+        // segment joins the fixed path (no-op in Dram mode). The iovecs table rebuild runs
+        // on the DRAM poller only; the NVMe ring is untouched and keeps serving.
+        super::uring::submit_reregister(super::uring::PoolType::Dram);
         self.expanding.store(false, Ordering::Release);
         self.pool.notify_space_available();
-        published
     }
 
     /// Grow the pool by one segment in the background and return at once, gated by the
@@ -644,7 +645,8 @@ impl DRAMPool {
         }
         // This caller stalls for the whole expand.
         self.alloc_wait_count.fetch_add(1, Ordering::Relaxed);
-        self.add_segment()
+        self.add_segment();
+        true
     }
 
     pub fn try_shrink(&self) -> bool {
