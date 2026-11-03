@@ -771,19 +771,14 @@ pub fn execute_set_tcp(
 /// worker reads it in place. The refcount is not atomic, so off the main thread it
 /// is released under the GIL (the main thread already holds it). Never drop one
 /// while already holding the GIL: the lock is not reentrant.
-///
-/// The byte pointer is resolved by `pin`, not at construction: once the module
-/// retains an arg, the command dispatcher may realloc it (trimStringObjectIfNeeded)
-/// after the handler returns, which happens under the GIL. A worker that takes the
-/// GIL before its first read sees the final pointer; nothing moves it afterwards.
 pub struct TcpPayload {
+    /// The retained arg robj; the core refcount (bumped by `safe_clone`) keeps it alive.
+    /// `new` trims it, so the dispatcher's post-command trim is a no-op and the bytes never move.
     value: Option<valkey_module::ValkeyString>,
-    ptr: std::sync::atomic::AtomicPtr<u8>,
-    len: usize,
     main_thread: std::thread::ThreadId,
 }
 
-// SAFETY: the bytes are immutable once pinned; the refcount is only touched
+// SAFETY: the bytes are immutable after `new`; the refcount is only touched
 // on the main thread (retain) or under the GIL (release).
 unsafe impl Send for TcpPayload {}
 // SAFETY: `&TcpPayload` only exposes the immutable bytes.
@@ -791,44 +786,42 @@ unsafe impl Sync for TcpPayload {}
 
 impl TcpPayload {
     fn new(ctx: &valkey_module::Context, value: &valkey_module::ValkeyString) -> Self {
+        let value = value.safe_clone(ctx);
+        // SAFETY: main thread, GIL held, not shared with a worker yet.
+        unsafe { raw::RedisModule_TrimStringAllocation.unwrap()(value.inner) };
         Self {
-            len: value.as_slice().len(),
-            ptr: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
-            value: Some(value.safe_clone(ctx)),
+            value: Some(value),
             main_thread: std::thread::current().id(),
         }
     }
 
-    /// Resolve the byte pointer. Must be called under the GIL before the first deref.
-    fn pin(&self, _gil: &valkey_module::ContextGuard) {
-        let bytes = self
-            .value
-            .as_ref()
-            .expect("TcpPayload pinned after drop")
-            .as_slice();
-        debug_assert_eq!(bytes.len(), self.len);
-        self.ptr.store(bytes.as_ptr() as *mut u8, Ordering::Release);
+    /// Release the string inside a lock the caller already holds, saving `Drop` a GIL round trip.
+    fn release(mut self, _gil: &valkey_module::ContextGuard) {
+        drop(self.value.take());
     }
 }
 
 impl std::ops::Deref for TcpPayload {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        let ptr = self.ptr.load(Ordering::Acquire);
-        assert!(!ptr.is_null(), "TcpPayload deref before pin");
-        // SAFETY: pinned under the GIL after the dispatcher's trim; `value` keeps
-        // the string alive and nothing mutates it until drop.
-        unsafe { std::slice::from_raw_parts(ptr, self.len) }
+        self.value
+            .as_ref()
+            .expect("TcpPayload used after release")
+            .as_slice()
     }
 }
 
 impl Drop for TcpPayload {
     fn drop(&mut self) {
+        // Already released under the commit's lock; only error paths get here with a value.
+        let Some(value) = self.value.take() else {
+            return;
+        };
         if std::thread::current().id() == self.main_thread {
-            drop(self.value.take());
+            drop(value);
         } else {
             let _gil = valkey_module::ThreadSafeContext::new().lock();
-            drop(self.value.take());
+            drop(value);
         }
     }
 }
@@ -1207,8 +1200,6 @@ async fn cmd_set_tiered_run(
     // The one per-transport branch: build the source + choose the object-CRC rule.
     let result = match &variant {
         SetSource::Tcp(data) => {
-            // Under the GIL, so the dispatcher's post-command trim has run.
-            data.pin(&thread_ctx.lock());
             let source = crate::stream::Source::TcpInline {
                 data,
                 buffers: &stream_ctx.buffers,
@@ -1273,7 +1264,14 @@ async fn cmd_set_tiered_run(
         object_id, disk_len
     );
     let lo_value = LoValue::new(object_id, obj_len, crc, Some(object_file));
-    let outcome = commit_lo_value(&thread_ctx.lock(), &key_name, object_id, lo_value);
+    let outcome = {
+        let gil = thread_ctx.lock();
+        let outcome = commit_lo_value(&gil, &key_name, object_id, lo_value);
+        if let SetSource::Tcp(data) = variant {
+            data.release(&gil);
+        }
+        outcome
+    };
     match outcome {
         Ok(CommitOutcome::ValueSet) => {
             thread_ctx.reply(VALKEY_OK);
