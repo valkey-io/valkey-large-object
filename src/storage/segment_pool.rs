@@ -59,10 +59,12 @@ pub struct SegmentPool {
     /// Which pool (ring) this is — routes reregister to the correct io_uring
     /// engine, since each pool has its own ring + registered-buffer table.
     pool_id: super::uring::PoolType,
-    /// The turn for `wait_for`: waiters take it in arrival order (tokio's mutex is fair).
-    turn: tokio::sync::Mutex<()>,
-    /// Wakes the waiter holding the turn: buffers were freed, or the owner called `wake`.
-    wake: tokio::sync::Notify,
+    /// The waiting line for `wait_for`. tokio's mutex hands the lock out in arrival order, and
+    /// whoever holds it is at the front of the line: the only waiter that tries to allocate.
+    queue: tokio::sync::Mutex<()>,
+    /// Signalled when room may have appeared: `free_n` does it, and so does the owner through
+    /// `notify_room_changed` (a new segment, say). Wakes the waiter at the front of the line.
+    room_changed: tokio::sync::Notify,
 }
 
 impl SegmentPool {
@@ -90,8 +92,8 @@ impl SegmentPool {
             state: RwLock::new(SegmentState { slots }),
             segment_size,
             pool_id,
-            turn: tokio::sync::Mutex::new(()),
-            wake: tokio::sync::Notify::new(),
+            queue: tokio::sync::Mutex::new(()),
+            room_changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -471,27 +473,29 @@ impl SegmentPool {
             }
             seg.dec_ref();
         }
-        self.wake.notify_waiters();
+        self.room_changed.notify_waiters();
     }
 
-    /// Wake the waiter in `wait_for`. `free_n` already does; the owner calls it for any other
-    /// event that can end a wait.
-    pub fn wake(&self) {
-        self.wake.notify_waiters();
+    /// Tell the waiter at the front of the line that room may have appeared. `free_n` already
+    /// does; the owner calls it for any other event that can end a wait.
+    pub fn notify_room_changed(&self) {
+        self.room_changed.notify_waiters();
     }
 
-    /// Run `attempt` until it is ready, waiting for a `wake` between attempts. Waiters take
-    /// turns in arrival order; only the one holding the turn attempts, so a wake does not
-    /// stampede. Dropping the future leaves the queue. `attempt` returns `Ready(Some(t))` when
-    /// it got what it needed, `Ready(None)` to give up, and `Pending` to wait.
+    /// Run `attempt` until it is ready, waiting for `room_changed` between attempts. Waiters
+    /// queue in arrival order and only the one at the front attempts, so a notification does
+    /// not wake a crowd. Dropping the future leaves the queue. `attempt` returns
+    /// `Ready(Some(t))` when it got what it needed, `Ready(None)` to give up, and `Pending` to
+    /// wait. It runs once per notification, so it cannot notice anything else (a client
+    /// disconnect, say) while pending: cancel from outside by dropping the future.
     pub async fn wait_for<T>(&self, mut attempt: impl FnMut() -> Poll<Option<T>>) -> Option<T> {
-        let _turn = self.turn.lock().await;
+        let _at_front = self.queue.lock().await;
         loop {
-            // Created before the attempt: a wake in between is not lost.
-            let woken = self.wake.notified();
+            // Created before the attempt: a notification in between is not lost.
+            let changed = self.room_changed.notified();
             match attempt() {
                 Poll::Ready(result) => return result,
-                Poll::Pending => woken.await,
+                Poll::Pending => changed.await,
             }
         }
     }
@@ -1248,7 +1252,7 @@ mod tests {
                 .await
             }
         });
-        // The waiter's attempt failed and it is waiting, so only a wake can resume it.
+        // The waiter's attempt failed and it is waiting, so only `room_changed` can resume it.
         while attempts.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             std::thread::yield_now();
         }
@@ -1257,7 +1261,7 @@ mod tests {
         pool.free_n(&held.pop().expect("held window"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !waiter.is_finished() {
-            assert!(std::time::Instant::now() < deadline, "waiter never woke");
+            assert!(std::time::Instant::now() < deadline, "waiter never resumed");
             std::thread::yield_now();
         }
     }

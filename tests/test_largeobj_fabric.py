@@ -509,3 +509,19 @@ class TestLargeObjFabricDramGrowWait(ValkeyLargeObjTestCaseBase):
         # How many objects a segment holds depends on the allocator, but 12 never fit in one.
         assert info['largeobj_dram_segments'] > 1
         assert info['largeobj_dram_alloc_waits'] > 0
+
+    def test_sets_evict_when_the_pool_cannot_expand(self):
+        client = self.server.get_new_client()
+        # Hold the pool to its one segment, and let the module evict.
+        client.config_set('largeobj.max-rdma-registered-bytes', 16384)
+        client.config_set('maxmemory', 10 * 1024 ** 3)
+        client.config_set('maxmemory-policy', 'allkeys-lru')
+
+        # One at a time: a SET that finds the pool full can only evict objects already committed.
+        for i in range(12):
+            assert self.set_over_efa(f'key{i}') == b'OK'
+
+        info = info_largeobj(client)
+        assert info['largeobj_dram_segments'] == 1
+        assert info['largeobj_evictions'] > 0
+        assert info['largeobj_dram_pool_exhausted'] == 0

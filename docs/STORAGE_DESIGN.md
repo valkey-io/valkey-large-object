@@ -1020,7 +1020,7 @@ and ranks by decayed LFU score, not by `maxmemory-policy`.
 
 **Detection:**
 
-- **Dram expand:** reactive (EFA SET alloc-miss → the SET's task starts or joins the background grow and waits for it; TCP SET alloc-miss → expand inline + retry, OOM if an expand is already running) and proactive (cron, utilization > watermark).
+- **Dram expand:** reactive (EFA SET alloc-miss → the SET's task starts or joins the background grow and waits for it; TCP SET alloc-miss → expand inline + retry; if an expand is already running or the pool cannot expand, evict when `maxmemory-policy` allows it, and OOM only if that frees too little) and proactive (cron, utilization > watermark).
 - **Tiered expand:** proactive (cron) and on promotion. Tiered SETs write to NVMe; the DRAM pool fills only by GET promotion. A promotion that finds the pool full starts the background grow and is skipped: that GET is served from NVMe, and a later GET promotes into the new segment. If the pool cannot grow, the promotion reclaims cold cached copies (§4.4).
 - **Shrink (Tiered only):** proactive only (cron observes server memory pressure; nothing "fails" to trigger it).
 
@@ -1035,7 +1035,7 @@ Expansion adds one `segment-size` segment (≤1GiB, §2).
 
 | Trigger | Action |
 |---------|--------|
-| DRAMPool allocation fails (no segment has room) — Dram SET path | EFA SET: start the background grow (or join the running one) and wait for it in the SET's task, then retry the alloc; evict, then OOM, only when the pool cannot grow. TCP SET: add a segment inline, then retry; rejected (OOM) if an expand is already running |
+| DRAMPool allocation fails (no segment has room) — Dram SET path | EFA SET: start the background grow (or join the running one) and wait for it in the SET's task, then retry the alloc; evict, then OOM, only when the pool cannot grow. TCP SET: add a segment inline, then retry. If an expand is already running or the pool cannot expand, evict up to 16 objects when `maxmemory-policy` allows it (`maxmemory` set and not `noeviction`); OOM if eviction is not allowed or the object still does not fit |
 | Pool utilization > `scaling-expand-watermark` (cron) | Start adding a segment in the background |
 
 Both are gated by the server ceiling: an expand that would push `used_memory` past
@@ -1045,7 +1045,8 @@ so the pool never grows into memory the shrink would immediately take back. With
 that would take EFA-registered segment bytes past `max-rdma-registered-bytes` is
 refused the same way, since the EFA device limits how much memory can be registered
 and a failed `fi_mr_reg` is fatal. In Dram mode a refused
-reactive expand rejects the `BLOB.TCP_SET` / `BLOB.RDMA_SET` (OOM); in Tiered mode the cache stops growing,
+reactive expand sends the `BLOB.TCP_SET` / `BLOB.RDMA_SET` to eviction, and it is rejected (OOM)
+only if eviction is not allowed or frees too little; in Tiered mode the cache stops growing,
 and a promotion that finds no room is skipped (the GET reads NVMe).
 
 **Why both rows exist.** Adding a segment costs one EFA registration, which pins the
@@ -1053,9 +1054,11 @@ whole segment (tens of milliseconds at 256MB). The proactive row pays it on a bl
 thread while the pool keeps serving, so a later alloc finds the segment ready. The
 alloc-fail row is for a burst that outruns the cron. An EFA SET that misses starts the same
 background grow (or joins the one registering) and waits for it in its task, so the main thread
-keeps serving. A TCP SET has no task to wait in: it stalls for the registration itself, and
-is rejected (OOM) if the cron's expand is still registering. `dram_alloc_waits` counts
-each SET that waited, either way.
+keeps serving. A TCP SET has no task to wait in: it stalls for the registration itself. If
+the cron's expand is still registering, it does not wait for it but evicts when
+`maxmemory-policy` allows (up to 16 objects), and is rejected (OOM) only if eviction is not
+allowed or the object still does not fit. `dram_alloc_waits` counts each SET that waited,
+either way.
 Tiered has no reactive row: promotion never blocks the GET on pool-full, it just
 serves from NVMe.
 

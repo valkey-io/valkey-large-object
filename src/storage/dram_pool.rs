@@ -108,9 +108,9 @@ pub struct DRAMPool {
     objects: RwLock<ObjectMaps>,
     /// Cumulative count of successful expand operations since module load.
     pub expand_count: AtomicU64,
-    /// Cumulative count of allocs that missed and went on to wait for a grow: in
-    /// `alloc_exact_await_expand`, or by growing the pool inline in `grow_inline`. Once per
-    /// request, however many grows it waits for.
+    /// Cumulative count of requests that waited for an expand: a SET task in
+    /// `alloc_exact_await_expand` (once, however many expands it waits for), or a caller that
+    /// expanded the pool inline in `grow_inline`.
     pub alloc_wait_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
     pub shrink_count: AtomicU64,
@@ -202,28 +202,48 @@ impl DRAMPool {
     /// Wait for room for `obj_len` in a SET task: join the grow that is running, or start one.
     /// Returns None once the pool cannot grow (watermark, RDMA limit, `MAX_SEGMENTS`).
     ///
-    /// Waiting SETs take turns in arrival order (`SegmentPool::wait_for`). When the one
-    /// holding the turn has its room, the next usually finds room in the same new segment and
+    /// Waiting SETs queue in arrival order (`SegmentPool::wait_for`). When the one at the
+    /// front has its room, the next usually finds room in the same new segment and
     /// needs no grow of its own. A SET that still finds the room taken (by a SET that fit
     /// without waiting) waits for the next grow. Each round ends with room, a grow that added a
     /// segment, or a refusal, so the wait ends. An admitted object fits an empty segment
     /// (`max-object-size` is validated against `segment-size`), so a fresh segment always has
     /// room for it.
+    ///
+    /// The wait lasts at most one expand, so it is not cancelled when the client disconnects.
+    /// Dropping the future leaves the queue; the expand itself runs on regardless.
     pub async fn alloc_exact_await_expand(
         &self,
         obj_len: u64,
     ) -> Option<Vec<super::context::SegmentBuffer>> {
-        self.alloc_wait_count.fetch_add(1, Ordering::Relaxed);
+        let mut counted = false;
         self.pool
-            .wait_for(|| match self.pool.alloc_exact(obj_len as usize) {
-                Some(bufs) => Poll::Ready(Some(bufs)),
-                // A grow is running or just started: wait for it. Null ctx is accepted by the
-                // memory watermark check.
-                None if self.grow_in_background(&valkey_module::Context::dummy()) => Poll::Pending,
-                // The pool cannot grow. A grow may have just ended: one last try.
-                None => Poll::Ready(self.pool.alloc_exact(obj_len as usize)),
+            .wait_for(|| {
+                let attempt = self.alloc_or_start_expand(obj_len);
+                // Count the request once, however many expands it waits for.
+                if attempt.is_pending() && !std::mem::replace(&mut counted, true) {
+                    self.alloc_wait_count.fetch_add(1, Ordering::Relaxed);
+                }
+                attempt
             })
             .await
+    }
+
+    /// One attempt for `alloc_exact_await_expand`, answering `wait_for`:
+    /// - `Ready(Some(bufs))`: there is room.
+    /// - `Pending`: no room, and an expand is running (or just started here). Wait for it.
+    /// - `Ready(None)`: no room, and the pool may not expand.
+    fn alloc_or_start_expand(&self, obj_len: u64) -> Poll<Option<Vec<SegmentBuffer>>> {
+        if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
+            return Poll::Ready(Some(bufs));
+        }
+        // Null ctx is accepted by the memory watermark check.
+        if self.grow_in_background(&valkey_module::Context::dummy()) {
+            return Poll::Pending;
+        }
+        // The pool may not expand, but room can have appeared since the miss above: a free
+        // from another thread, or the cron's expand (the queue does not serialize that one).
+        Poll::Ready(self.pool.alloc_exact(obj_len as usize))
     }
 
     /// Evict `EVICT_BATCH` victims from the eviction candidates, try the allocation, and
@@ -554,29 +574,18 @@ impl DRAMPool {
         self.pool.release_all_releasable();
     }
 
-    /// Reserve the one grow slot, if no grow is running and the pool may grow.
-    /// Needs `ctx` (reads server memory), so it runs on the caller's thread. On true the
-    /// caller must run `add_segment`, which releases the reservation.
-    fn try_reserve_segment(&self, ctx: &valkey_module::Context) -> bool {
-        if self.expanding.swap(true, Ordering::AcqRel) {
-            return false;
-        }
+    /// Whether the pool may take another segment. Needs `ctx` (reads server memory), so it
+    /// runs on the caller's thread.
+    fn may_expand(&self, ctx: &valkey_module::Context) -> bool {
         // Server-wide OOM guard: never grow into memory the shrink path would
         // immediately reclaim. No-op when the server has no maxmemory configured.
         // Past the EFA registration limit fi_mr_reg fails, which is fatal.
-        if crate::would_cross_memory_watermark(ctx, self.pool.segment_size as u64)
+        !(crate::would_cross_memory_watermark(ctx, self.pool.segment_size as u64)
             || super::would_exceed_rdma_limit(self.pool.segment_size as u64)
-            || self.pool.segment_counts().0 >= super::MAX_SEGMENTS
-        {
-            self.expanding.store(false, Ordering::Release);
-            // A SET that joined this reservation as a running grow must not wait for a grow that never runs.
-            self.pool.wake();
-            return false;
-        }
-        true
+            || self.pool.segment_counts().0 >= super::MAX_SEGMENTS)
     }
 
-    /// Build, register and publish one segment, then release the reservation from `try_reserve_segment`.
+    /// Build, register and publish one segment, then clear the `expanding` flag the caller set.
     /// Allocation and `fi_mr_reg` touch no pool state and no Valkey API, so this runs
     /// on any thread while the pool keeps serving; only `publish` takes the pool lock. The
     /// allocator cannot see the segment before it is registered. Returns whether it was published.
@@ -593,7 +602,7 @@ impl DRAMPool {
             super::uring::submit_reregister(super::uring::PoolType::Dram);
         }
         self.expanding.store(false, Ordering::Release);
-        self.pool.wake();
+        self.pool.notify_room_changed();
         published
     }
 
@@ -602,45 +611,38 @@ impl DRAMPool {
     /// `maxmemory` configured (0), there is no ceiling and the pool grows on demand — the
     /// same unbounded behavior as core Valkey with `maxmemory 0`.
     ///
-    /// Returns whether a grow is now running: true if this call started one or one was already
-    /// running, false if the watermark or the RDMA limit refused.
+    /// Returns whether an expand is now running: true if this call started one or one was already
+    /// running, false if the pool may not expand (watermark, RDMA limit, `MAX_SEGMENTS`).
     pub fn grow_in_background(&self, ctx: &valkey_module::Context) -> bool {
-        if self.try_reserve_segment(ctx) {
-            crate::runtime_handle().spawn_blocking(|| {
-                super::get_dram_pool().add_segment();
-            });
-            return true;
+        // Join the expand that is running. Only an expand that really runs ever sets the
+        // flag, so a caller that sees it set can wait for the wake that ends it.
+        if !self.expanding.load(Ordering::Acquire) {
+            if !self.may_expand(ctx) {
+                return false;
+            }
+            // Lost the race to another caller: that one runs the expand, this one joins it.
+            if !self.expanding.swap(true, Ordering::AcqRel) {
+                crate::runtime_handle().spawn_blocking(|| {
+                    super::get_dram_pool().add_segment();
+                });
+            }
         }
-        // Refused, or a grow already running (the flag is still set).
-        self.expanding.load(Ordering::Acquire)
+        true
     }
 
-    /// Grow the pool by one segment on the caller's thread: the last resort for an alloc that
-    /// missed with no segment ready. The caller stalls for the whole registration. Returns
-    /// false, without growing, if the watermark or the RDMA limit refused or a grow is already
-    /// running. Counted in `alloc_wait_count`.
+    /// Grow the pool by one segment on the caller's thread: the last resort for a caller that
+    /// cannot wait (Dram TCP SET, COPY). The caller stalls for the whole registration. Returns
+    /// false, without growing, if the pool may not expand or an expand is already running (not
+    /// waited for). Counted in `alloc_wait_count`.
     fn grow_inline(&self, ctx: &valkey_module::Context) -> bool {
-        if !self.try_reserve_segment(ctx) {
+        if !self.may_expand(ctx) || self.expanding.swap(true, Ordering::AcqRel) {
             return false;
         }
-        let grew = self.add_segment();
-        if grew {
-            self.alloc_wait_count.fetch_add(1, Ordering::Relaxed);
-        }
-        grew
+        // This caller stalls for the whole expand.
+        self.alloc_wait_count.fetch_add(1, Ordering::Relaxed);
+        self.add_segment()
     }
 
-    /// Tiered only: mark the segment with the least cached bytes draining and drop its
-    /// cached copies. The data persists on NVMe and GETs fall back, so no key is touched.
-    /// Dram has no shrink: it would delete the segment's keys whatever the policy says.
-    ///
-    /// Victim selection: the non-draining segment with the fewest allocated bytes.
-    /// Uses the per-segment `allocated_bytes` counter — O(segments), no HashMap scan.
-    ///
-    /// Removing the objects drops the map's Arcs, so the segment releases as soon
-    /// as in-flight readers drop theirs.
-    ///
-    /// Returns true if a victim was selected, false if nothing to shrink.
     pub fn try_shrink(&self) -> bool {
         assert!(
             crate::operating_mode() == crate::OperatingMode::Tiered,
