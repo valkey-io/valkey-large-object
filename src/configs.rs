@@ -80,11 +80,11 @@ pub const DEFAULT_SCALING_POLL_MS: i64 = 2500;
 pub const MIN_SCALING_POLL_MS: i64 = 1_000;
 pub const MAX_SCALING_POLL_MS: i64 = 60_000;
 // reaper-scan-budget-us
-pub const DEFAULT_REAPER_SCAN_BUDGET_US: i64 = 1000;
+pub const DEFAULT_REAPER_SCAN_BUDGET_US: i64 = 2000;
 pub const MIN_REAPER_SCAN_BUDGET_US: i64 = 100;
 pub const MAX_REAPER_SCAN_BUDGET_US: i64 = 100_000;
 // reaper-poll-ms
-pub const DEFAULT_REAPER_POLL_MS: i64 = 100;
+pub const DEFAULT_REAPER_POLL_MS: i64 = 35;
 pub const MIN_REAPER_POLL_MS: i64 = 10;
 pub const MAX_REAPER_POLL_MS: i64 = 60_000;
 // smartlog-poll-secs
