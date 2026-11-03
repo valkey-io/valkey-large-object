@@ -76,7 +76,7 @@ impl FdPool {
     }
 
     fn hit(entry: &FdEntry) -> Arc<ObjectFd> {
-        entry.stats.touch(now_minutes(), crate::blob_decay_time());
+        entry.stats.touch(now_minutes(), crate::lfu_decay_minutes());
         Arc::clone(&entry.fd)
     }
 
@@ -105,13 +105,13 @@ impl FdPool {
         }
 
         let now_min = now_minutes();
-        let decay_time = crate::blob_decay_time();
+        let decay_minutes = crate::lfu_decay_minutes();
         // Make room before opening, so the cap counts the new entry. Removing an
         // entry only drops the map's ref: a reader still holding a clone keeps the
         // fd open until its read finishes, then it closes. Lowering the cap shrinks
         // the pool at once (`shrink_to`), so this evicts one entry at most.
         while fds.len() >= cap {
-            self.evict_one(&mut fds, now_min, decay_time);
+            self.evict_one(&mut fds, now_min, decay_minutes);
         }
 
         let fd = Arc::new(open_read_fd(object_id, dir)?);
@@ -164,12 +164,12 @@ impl FdPool {
     /// `remove`: an in-flight reader's clone keeps its fd open until the read finishes.
     pub fn shrink_to(&self, cap: usize) {
         let now_min = now_minutes();
-        let decay_time = crate::blob_decay_time();
+        let decay_minutes = crate::lfu_decay_minutes();
         let evicted: Vec<FdEntry> = {
             let mut fds = self.fds.write().expect("FdPool.fds lock unavailable");
             let over = fds.len().saturating_sub(cap);
             (0..over)
-                .map(|_| self.evict_one(&mut fds, now_min, decay_time))
+                .map(|_| self.evict_one(&mut fds, now_min, decay_minutes))
                 .collect()
         };
         // Drop outside the lock, as in `remove`.
@@ -181,10 +181,10 @@ impl FdPool {
         &self,
         fds: &mut OIDIndexedMap<FdEntry>,
         now_min: u16,
-        decay_time: u64,
+        decay_minutes: u64,
     ) -> FdEntry {
         let (_, entry) = reclaim_one(fds, crate::victim_sample_size(), |e| {
-            Some(e.stats.decayed_counter(now_min, decay_time))
+            Some(e.stats.decayed_counter(now_min, decay_minutes))
         })
         .expect("a non-empty map always yields a victim");
         self.evictions.fetch_add(1, Ordering::Relaxed);

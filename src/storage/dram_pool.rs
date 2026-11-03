@@ -80,12 +80,12 @@ impl ObjectMaps {
         seg: usize,
         samples: usize,
         now_min: u16,
-        decay_time: u64,
+        decay_minutes: u64,
     ) -> Option<(ObjectId, Arc<ObjectContext>)> {
         let ids = self.by_segment.get_mut(seg)?;
         let victim = sample_victim(&*ids, samples, |oid| {
             let ctx = self.all.get(oid)?;
-            (Arc::strong_count(ctx) == 1).then(|| ctx.stats.decayed_counter(now_min, decay_time))
+            (Arc::strong_count(ctx) == 1).then(|| ctx.stats.decayed_counter(now_min, decay_minutes))
         })?;
         let oid = ids.swap_remove_index(victim)?;
         Some((oid, self.all.swap_remove(&oid)?))
@@ -434,7 +434,7 @@ impl DRAMPool {
     ) -> Option<Vec<(ObjectId, Arc<ObjectContext>)>> {
         let samples = crate::victim_sample_size();
         let now_min = now_minutes();
-        let decay_time = crate::blob_decay_time();
+        let decay_minutes = crate::lfu_decay_minutes();
         let mut objects = self
             .objects
             .write()
@@ -442,7 +442,7 @@ impl DRAMPool {
         let mut victims = Vec::new();
         let mut freed = 0usize;
         while freed < need && victims.len() < RECLAIM_MAX_VICTIMS {
-            let Some((oid, ctx)) = objects.take_victim(seg, samples, now_min, decay_time) else {
+            let Some((oid, ctx)) = objects.take_victim(seg, samples, now_min, decay_minutes) else {
                 break;
             };
             freed += ctx.buffers.iter().map(|b| b.len as usize).sum::<usize>();

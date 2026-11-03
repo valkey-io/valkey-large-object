@@ -91,7 +91,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `reaper-scan-budget-us` | 1000 | Yes | Microseconds per tick for deleting evicted keys. Min 100, max 100000. |
 | `victim-sample-size` | 5 | Yes | Entries sampled per victim search (eviction, DRAM cache drop, fd close); the lowest LFU score goes. Min 1, max 64. |
 | `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Min 1, max 255. |
-| `blob-decay-time` | 1 | Yes | Minutes per one-point decay of the LFU score used to rank DRAM objects and fds for eviction. 0 = no decay. Max 65535. |
+| `lfu-decay-minutes` | 1 | Yes | Minutes per one-point decay of the LFU score used to rank DRAM objects and fds for eviction. 0 = no decay. Max 65535. |
 | `max-cached-fds` | 16384 | Yes | Tiered: how many read fds to keep cached. 0..1048576; 0 caches nothing. The fd cache max entries is the smaller of this and the fd limit minus `2 x maxclients + 128`; a larger value is clamped with a warning. |
 | `fd-reserve` | Lenient | Immutable | Tiered: what happens when the open-file limit is below `2 x maxclients + 128` (module start plus the command reserve). `Lenient` loads with object-file fd placement and the fd cache off; `Strict` also needs `max-cached-fds` to fit (`2 x maxclients + 128 + max-cached-fds`): it refuses to load otherwise, rejects a `CONFIG SET max-cached-fds` that does not fit, and aborts the server on a `CONFIG SET maxclients` that breaks the reserve or squeezes the cache. See `docs/OBJECT_FD_PLACEMENT_DESIGN.md`. |
 | `smartlog-poll-secs` | 60 | Immutable | NVMe SMART poll interval in seconds. 0 = disabled. Max 86400. |
