@@ -1144,6 +1144,19 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', 'three_key') == payload
         assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'dram'
 
+    def test_lfu_decay_minutes_config(self):
+        """lfu-decay-minutes defaults to 1, is runtime mutable (0 disables
+        decay), and is bounded at 65535."""
+        client = self.server.get_new_client()
+        name = 'largeobj.lfu-decay-minutes'
+        assert client.config_get(name) == {name: '1'}
+        client.config_set(name, 0)
+        assert client.config_get(name) == {name: '0'}
+        client.config_set(name, 65535)
+        assert client.config_get(name) == {name: '65535'}
+        with pytest.raises(ResponseError):
+            client.config_set(name, 65536)
+
 
 # ─── Inline reclaim ────────────────────────────────────────────────────────
 
@@ -1169,7 +1182,7 @@ class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" max-promote-size 262144"
             f" promote-min-hits 1"
-            f" blob-decay-time 0"
+            f" lfu-decay-minutes 0"
             f" chunk-size 65536"
             f" bench-mode no"
             f" direct-io no"
@@ -1246,7 +1259,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" max-promote-size 262144"
             f" promote-min-hits 1"
-            f" blob-decay-time 0"
+            f" lfu-decay-minutes 0"
             f" scaling-expand-watermark 95"
             f" chunk-size 65536"
             f" bench-mode no"
@@ -1316,7 +1329,7 @@ class TestLargeObjTieredFdCap(ValkeyLargeObjTestCaseBase):
             f" segment-size 1048576"
             f" max-promote-size 983040"
             f" promote-min-hits 255"
-            f" blob-decay-time 0"
+            f" lfu-decay-minutes 0"
             f" max-cached-fds 2"
             f" chunk-size 65536"
             f" bench-mode no"

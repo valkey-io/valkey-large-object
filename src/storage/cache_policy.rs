@@ -66,14 +66,14 @@ impl AccessStats {
     }
 
     /// Counter after applying decay for the minutes elapsed since the last
-    /// decay. This is what reclaim ranks by. `decay_time == 0` disables decay.
-    pub fn decayed_counter(&self, now_min: u16, decay_time: u64) -> u8 {
+    /// decay. This is what reclaim ranks by. `decay_minutes == 0` disables decay.
+    pub fn decayed_counter(&self, now_min: u16, decay_minutes: u64) -> u8 {
         let raw = self.0.load(Ordering::Relaxed);
         Self::decay(
             (raw & COUNTER_MASK) as u8,
             ((raw >> MINUTES_SHIFT) & MINUTES_MASK) as u16,
             now_min,
-            decay_time,
+            decay_minutes,
         )
     }
 
@@ -82,8 +82,8 @@ impl AccessStats {
     ///
     /// A plain store, not a CAS. Two racing touches may lose one increment,
     /// which is acceptable for an approximate counter and matches Valkey.
-    pub fn touch(&self, now_min: u16, decay_time: u64) {
-        let counter = self.decayed_counter(now_min, decay_time);
+    pub fn touch(&self, now_min: u16, decay_minutes: u64) {
+        let counter = self.decayed_counter(now_min, decay_minutes);
         let r: f64 = rand::rng().random_range(0.0..1.0);
         let counter = Self::log_incr(counter, r);
         self.0
@@ -94,13 +94,13 @@ impl AccessStats {
         ((now_min as u32) << MINUTES_SHIFT) | counter as u32
     }
 
-    /// One point off per `decay_time` minutes since `last_min`, on a 16-bit
-    /// wrapping clock. `decay_time == 0` disables decay.
-    fn decay(counter: u8, last_min: u16, now_min: u16, decay_time: u64) -> u8 {
-        if decay_time == 0 {
+    /// One point off for every `decay_minutes` minutes elapsed since `last_min`,
+    /// on a 16-bit wrapping clock. `decay_minutes == 0` disables decay.
+    fn decay(counter: u8, last_min: u16, now_min: u16, decay_minutes: u64) -> u8 {
+        if decay_minutes == 0 {
             return counter;
         }
-        let periods = now_min.wrapping_sub(last_min) as u64 / decay_time;
+        let periods = now_min.wrapping_sub(last_min) as u64 / decay_minutes;
         counter.saturating_sub(periods.min(u8::MAX as u64) as u8)
     }
 
@@ -218,7 +218,7 @@ impl CacheStats {
     /// Record a GET served from the cache: touch the object's LFU score and
     /// count the hit. Atomic only; no lock needed.
     pub fn record_hit(&self, stats: &AccessStats) {
-        stats.touch(now_minutes(), crate::blob_decay_time());
+        stats.touch(now_minutes(), crate::lfu_decay_minutes());
         self.hits.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -333,11 +333,11 @@ mod tests {
     fn decay_subtracts_one_per_period() {
         let s = AccessStats::new(0);
         s.set(LFU_INIT_VAL + 20, 10);
-        // 7 minutes later at decay_time 1: minus 7.
+        // 7 minutes later at decay_minutes 1: minus 7.
         assert_eq!(s.decayed_counter(17, 1), LFU_INIT_VAL + 13);
-        // decay_time 5: 7/5 = 1 period.
+        // decay_minutes 5: 7/5 = 1 period.
         assert_eq!(s.decayed_counter(17, 5), LFU_INIT_VAL + 19);
-        // decay_time 0 turns decay off.
+        // decay_minutes 0 turns decay off.
         assert_eq!(s.decayed_counter(5000, 0), LFU_INIT_VAL + 20);
         // Saturates at zero; elapsed beyond 255 periods must not wrap the u8.
         assert_eq!(s.decayed_counter(u16::MAX, 1), 0);

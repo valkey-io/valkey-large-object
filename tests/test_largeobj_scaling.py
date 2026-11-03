@@ -560,6 +560,40 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         return (TIERED_ARGS.format(data_dir=data_dir)
                 + " fabric-interfaces lo")
 
+    def test_string_configs_read_back(self):
+        """The string configs are registered as ValkeyGILGuard<ValkeyString> and mirrored into
+        Rust-side state by their set handler: CONFIG GET returns what was loaded, every time,
+        and the module is using it (the fabric came up on `lo`)."""
+        client = self.server.get_new_client()
+        for _ in range(3):
+            assert client.config_get('largeobj.fabric-interfaces') == {
+                'largeobj.fabric-interfaces': 'lo'}
+            assert client.config_get('largeobj.disk-dir') == {
+                'largeobj.disk-dir': self.data_dir}
+        assert self.server.verify_string_in_logfile('fabric service 0 rdma address')
+
+    @pytest.mark.skip_for_asan
+    @pytest.mark.parametrize('name', ['disk-dir', 'fabric-interfaces'])
+    def test_string_config_rejects_invalid_utf8(self, name):
+        """A string config set outside the module arguments (as `largeobj.<name>`, the way a
+        config file does) that is not valid UTF-8 fails the load. A lossy copy would make the
+        value the module uses differ from what CONFIG GET reports."""
+        testdir = os.path.abspath(os.path.join(self.testdir, f'bad-utf8-{name}'))
+        os.makedirs(testdir, exist_ok=True)
+        data_dir = os.path.join(testdir, 'nvme')
+        module_args = TIERED_ARGS.format(data_dir=data_dir)
+        if name == 'disk-dir':
+            module_args = module_args.replace(f' disk-dir {data_dir}', '')
+        server, _ = self.create_server(
+            testdir=testdir,
+            server_path=self.server.valkey_path,
+            args={'loadmodule': f"{os.environ['MODULE_PATH']} {module_args}",
+                  f'largeobj.{name}': 'bad\udcffvalue'},  # \udcff is the byte 0xff
+            connect_client=False)
+        wait_for_true(lambda: server.server.poll() is not None)
+        assert server.server.returncode != 0
+        assert server.verify_string_in_logfile("Couldn't parse as UTF-8 string")
+
     def test_shrink_releases_efa_registered_expanded_segment(self):
         client = self.server.get_new_client()
         expand_before = info_largeobj(client)['largeobj_dram_scaling_expands']
@@ -636,7 +670,7 @@ OBJECT_FILE = re.compile(r'^[0-9a-f]{16}\.dat$')
 
 class Budget(ValkeyLargeObjTestCaseBase):
     """A node whose only room is `BUDGET` bytes: past it, a write succeeds only by evicting.
-    `POLL_MS` keeps the scaling cron away, so victims' keys stay on the reclaim list."""
+    `POLL_MS` keeps both cron ticks away, so victims' keys stay on the reclaim list."""
 
     POLL_MS = 60_000
 
@@ -659,7 +693,8 @@ class DramBudget(Budget):
 
     def get_module_args(self, data_dir, direct_io):
         return (f"operating-mode Dram segment-size {self.BUDGET} max-object-size {self.BUDGET - 64 * 1024}"
-                f" chunk-size 65536 scaling-poll-ms {self.POLL_MS} bench-mode no direct-io no")
+                f" chunk-size 65536 scaling-poll-ms {self.POLL_MS} reaper-poll-ms {self.POLL_MS}"
+                f" bench-mode no direct-io no")
 
     def new_client(self, policy='allkeys-lru'):
         client = self.server.get_new_client()
@@ -690,7 +725,8 @@ class TieredBudget(Budget):
         return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET}"
                 f" disk-staging-size {2 * self.BUDGET} segment-size {2 * self.BUDGET}"
                 f" max-object-size {self.BUDGET} max-promote-size {self.BUDGET}"
-                f" scaling-poll-ms {self.POLL_MS} bench-mode no direct-io no")
+                f" scaling-poll-ms {self.POLL_MS} reaper-poll-ms {self.POLL_MS}"
+                f" bench-mode no direct-io no")
 
     def new_client(self, policy='allkeys-lru'):
         """No server maxmemory: Tiered eviction does not need one, and core never evicts, so

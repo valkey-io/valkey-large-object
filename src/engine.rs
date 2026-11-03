@@ -125,6 +125,8 @@ pub(crate) struct BlockedRequest {
     /// Thread-safe context bound to `bc`; replies through it are queued for the client.
     ctx: *mut raw::RedisModuleCtx,
     pending_reply: std::sync::Mutex<Option<ReplyString>>,
+    /// The client's selected db when it blocked.
+    db: i32,
 }
 
 // SAFETY: the raw handles are only used through thread-safe module APIs.
@@ -136,6 +138,7 @@ impl BlockedRequest {
         INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
         // SAFETY: called on the main thread inside a command, as BlockClient requires.
         unsafe {
+            let db = raw::RedisModule_GetSelectedDb.unwrap()(ctx.ctx);
             let bc = raw::RedisModule_BlockClient.unwrap()(
                 ctx.ctx,
                 Some(unblock_reply_callback),
@@ -149,6 +152,7 @@ impl BlockedRequest {
                 bc,
                 ctx: tsc,
                 pending_reply: std::sync::Mutex::new(None),
+                db,
             }
         }
     }
@@ -158,9 +162,14 @@ impl BlockedRequest {
         valkey_module::Context::new(self.ctx).reply(r)
     }
 
-    /// Take the GIL (same global lock as a client-bound thread-safe context).
+    /// Lock the server on the client's db. The guard is a fresh detached context,
+    /// which starts on db 0.
     pub(crate) fn lock(&self) -> valkey_module::ContextGuard {
-        valkey_module::ThreadSafeContext::new().lock()
+        let guard = valkey_module::ThreadSafeContext::new().lock();
+        // SAFETY: the guard's context is live and holds the server lock. `db` came from
+        // GetSelectedDb and the db count is fixed at startup, so it is in range.
+        unsafe { raw::RedisModule_SelectDb.unwrap()(guard.get_raw(), self.db) };
+        guard
     }
 
     /// Hand `s` to the main thread, which replies with it when the client unblocks,
