@@ -125,9 +125,11 @@ impl BlockedRequest {
         INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
         let mut blocked_client = ctx.block_client();
         blocked_client.measure_time_start();
+        // SAFETY: `ctx` is the live command context, on the main thread.
+        let db = unsafe { raw::RedisModule_GetSelectedDb.unwrap()(ctx.get_raw()) };
         Self {
             thread_ctx: valkey_module::ThreadSafeContext::with_blocked_client(blocked_client),
-            db: unsafe { raw::RedisModule_GetSelectedDb.unwrap()(ctx.get_raw()) },
+            db,
         }
     }
 
@@ -135,6 +137,8 @@ impl BlockedRequest {
     /// guard is a fresh detached context on db 0.
     pub(crate) fn lock(&self) -> valkey_module::ContextGuard {
         let guard = self.thread_ctx.lock();
+        // SAFETY: the guard's context is live and holds the server lock. `db` came from
+        // GetSelectedDb and the db count is fixed at startup, so it is in range.
         unsafe { raw::RedisModule_SelectDb.unwrap()(guard.get_raw(), self.db) };
         guard
     }
