@@ -35,6 +35,7 @@
 use std::alloc::Layout;
 use std::ptr::NonNull;
 use std::sync::RwLock;
+use std::task::Poll;
 
 use allocator_api2::alloc::Allocator;
 
@@ -58,6 +59,10 @@ pub struct SegmentPool {
     /// Which pool (ring) this is — routes reregister to the correct io_uring
     /// engine, since each pool has its own ring + registered-buffer table.
     pool_id: super::uring::PoolType,
+    /// The turn for `wait_for`: waiters take it in arrival order (tokio's mutex is fair).
+    turn: tokio::sync::Mutex<()>,
+    /// Wakes the waiter holding the turn: buffers were freed, or the owner called `wake`.
+    wake: tokio::sync::Notify,
 }
 
 impl SegmentPool {
@@ -85,6 +90,8 @@ impl SegmentPool {
             state: RwLock::new(SegmentState { slots }),
             segment_size,
             pool_id,
+            turn: tokio::sync::Mutex::new(()),
+            wake: tokio::sync::Notify::new(),
         }
     }
 
@@ -463,6 +470,29 @@ impl SegmentPool {
                 self.mirror_counters(seg, &talc);
             }
             seg.dec_ref();
+        }
+        self.wake.notify_waiters();
+    }
+
+    /// Wake the waiter in `wait_for`. `free_n` already does; the owner calls it for any other
+    /// event that can end a wait.
+    pub fn wake(&self) {
+        self.wake.notify_waiters();
+    }
+
+    /// Run `attempt` until it is ready, waiting for a `wake` between attempts. Waiters take
+    /// turns in arrival order; only the one holding the turn attempts, so a wake does not
+    /// stampede. Dropping the future leaves the queue. `attempt` returns `Ready(Some(t))` when
+    /// it got what it needed, `Ready(None)` to give up, and `Pending` to wait.
+    pub async fn wait_for<T>(&self, mut attempt: impl FnMut() -> Poll<Option<T>>) -> Option<T> {
+        let _turn = self.turn.lock().await;
+        loop {
+            // Created before the attempt: a wake in between is not lost.
+            let woken = self.wake.notified();
+            match attempt() {
+                Poll::Ready(result) => return result,
+                Poll::Pending => woken.await,
+            }
         }
     }
 
@@ -1201,5 +1231,69 @@ mod tests {
         pool.release_all_releasable();
         assert_eq!(pool.segment_counts().0, 1);
         assert_eq!(pool.publish(Segment::new(1 << 20)), Some(1));
+    }
+
+    // ─── wait_for ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wait_for_serves_waiters_in_arrival_order_as_buffers_free() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
+        let pool = Arc::new(SegmentPool::new(
+            1,
+            65536,
+            super::super::uring::PoolType::Dram,
+        ));
+        let mut held = Vec::new();
+        while let Some(bufs) = pool.alloc_exact(1000) {
+            held.push(bufs);
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("test runtime");
+        let wait = |pool: &Arc<SegmentPool>| {
+            let pool = Arc::clone(pool);
+            runtime.spawn(async move {
+                pool.wait_for(|| match pool.alloc_exact(1000) {
+                    Some(bufs) => Poll::Ready(Some(bufs)),
+                    None => Poll::Pending,
+                })
+                .await
+            })
+        };
+        let until = |what: &str, mut done: Box<dyn FnMut() -> bool>| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        let first = wait(&pool);
+        until("first never took the turn", {
+            let pool = Arc::clone(&pool);
+            Box::new(move || pool.turn.try_lock().is_err())
+        });
+        let second = wait(&pool);
+        std::thread::sleep(Duration::from_millis(50)); // second queues behind first
+
+        pool.free_n(&held.pop().expect("held window"));
+        until("first never woke", {
+            let first = first.abort_handle();
+            Box::new(move || first.is_finished())
+        });
+        assert!(
+            !second.is_finished(),
+            "second must wait for its own buffers"
+        );
+
+        pool.free_n(&held.pop().expect("held window"));
+        until("second never woke", {
+            let second = second.abort_handle();
+            Box::new(move || second.is_finished())
+        });
     }
 }

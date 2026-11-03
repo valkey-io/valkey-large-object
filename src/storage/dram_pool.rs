@@ -24,6 +24,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::task::Poll;
 
 use super::cache_policy::{
     now_minutes, sample_victim, OIDIndexedMap, OIDIndexedSet, TieredCache, RECLAIM_MAX_SEGMENTS,
@@ -115,10 +116,6 @@ pub struct DRAMPool {
     /// True while a grow runs. Only one runs at a time: the RDMA registration limit counts
     /// published segments only, so two concurrent grows could each pass it and together exceed it.
     expanding: AtomicBool,
-    /// Wakes the SETs waiting in `alloc_exact_await_expand` each time a grow ends, published or not.
-    grown: tokio::sync::Notify,
-    /// The turn for `alloc_exact_await_expand`: SETs waiting for room take it in arrival order.
-    turn: tokio::sync::Mutex<()>,
     /// Admission filter and cache stats. `Some` in Tiered mode, `None` in Dram
     /// mode where the DRAMPool is the data, not a cache.
     pub cache: Option<TieredCache>,
@@ -133,8 +130,6 @@ impl DRAMPool {
             alloc_wait_count: AtomicU64::new(0),
             shrink_count: AtomicU64::new(0),
             expanding: AtomicBool::new(false),
-            grown: tokio::sync::Notify::const_new(),
-            turn: tokio::sync::Mutex::const_new(()),
             cache,
         }
     }
@@ -223,32 +218,28 @@ impl DRAMPool {
     /// Wait for room for `obj_len` in a SET task: join the grow that is running, or start one.
     /// Returns None once the pool cannot grow (watermark, RDMA limit, `MAX_SEGMENTS`).
     ///
-    /// Waiting SETs take turns in arrival order (tokio's mutex is fair). The one holding the
-    /// turn waits for the grow; when it has its room and leaves, the next usually finds room in
-    /// the same new segment and needs no grow of its own. The loop covers a SET that still
-    /// finds the room taken (by a SET that fit without waiting): it waits for the next grow.
-    /// Each round ends with room, a grow that added a segment, or a refusal, so the loop ends.
-    /// An admitted object fits an empty segment (`max-object-size` is validated against
-    /// `segment-size`), so a fresh segment always has room for it.
+    /// Waiting SETs take turns in arrival order (`SegmentPool::wait_for`). When the one
+    /// holding the turn has its room, the next usually finds room in the same new segment and
+    /// needs no grow of its own. A SET that still finds the room taken (by a SET that fit
+    /// without waiting) waits for the next grow. Each round ends with room, a grow that added a
+    /// segment, or a refusal, so the wait ends. An admitted object fits an empty segment
+    /// (`max-object-size` is validated against `segment-size`), so a fresh segment always has
+    /// room for it.
     pub async fn alloc_exact_await_expand(
         &self,
         obj_len: u64,
     ) -> Option<Vec<super::context::SegmentBuffer>> {
         self.alloc_wait_count.fetch_add(1, Ordering::Relaxed);
-        let _turn = self.turn.lock().await;
-        loop {
-            // Created before the alloc: a grow that ends in between still wakes this wait.
-            let grown = self.grown.notified();
-            if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
-                return Some(bufs);
-            }
-            // Null ctx is accepted by the memory watermark check.
-            if !self.start_expand(&valkey_module::Context::dummy()) {
+        self.pool
+            .wait_for(|| match self.pool.alloc_exact(obj_len as usize) {
+                Some(bufs) => Poll::Ready(Some(bufs)),
+                // A grow is running or just started: wait for it. Null ctx is accepted by the
+                // memory watermark check.
+                None if self.start_expand(&valkey_module::Context::dummy()) => Poll::Pending,
                 // The pool cannot grow. A grow may have just ended: one last try.
-                return self.pool.alloc_exact(obj_len as usize);
-            }
-            grown.await;
-        }
+                None => Poll::Ready(self.pool.alloc_exact(obj_len as usize)),
+            })
+            .await
     }
 
     /// Evict `EVICT_BATCH` victims from the eviction candidates, try the allocation, and
@@ -592,7 +583,7 @@ impl DRAMPool {
         {
             self.expanding.store(false, Ordering::Release);
             // A SET that joined this claim as a running grow must not wait for a grow that never runs.
-            self.grown.notify_waiters();
+            self.pool.wake();
             return false;
         }
         true
@@ -615,7 +606,7 @@ impl DRAMPool {
             super::uring::submit_reregister(super::uring::PoolType::Dram);
         }
         self.expanding.store(false, Ordering::Release);
-        self.grown.notify_waiters();
+        self.pool.wake();
         published
     }
 
