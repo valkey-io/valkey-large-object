@@ -775,11 +775,11 @@ fn cmd_set_dram_efa(
                     Some(bufs) => bufs,
                     None => {
                         // Pool full. Wait for a grow; if the pool cannot grow, evict (under the server lock).
-                        let room = match dram_pool.alloc_exact_await_expand(obj_len).await {
+                        let got = match dram_pool.alloc_exact_await_expand(obj_len).await {
                             Some(bufs) => Some(bufs),
                             None => dram_pool.alloc_exact_evict(&thread_ctx.lock(), obj_len),
                         };
-                        let Some(bufs) = room else {
+                        let Some(bufs) = got else {
                             reply_err(
                                 &thread_ctx,
                                 &info::DRAM_POOL_EXHAUSTED,

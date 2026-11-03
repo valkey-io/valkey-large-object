@@ -590,6 +590,10 @@ impl DRAMPool {
     /// on any thread while the pool keeps serving; only `publish` takes the pool lock. The
     /// allocator cannot see the segment before it is registered. Returns whether it was published.
     fn add_segment(&self) -> bool {
+        assert!(
+            self.expanding.load(Ordering::Acquire),
+            "add_segment: the caller must set `expanding` first"
+        );
         let segment = Segment::new(self.pool.segment_size);
         // Register the new segment with EFA (fatal on failure — see efa_register_segment).
         crate::efa_register_segment(segment.slice());
@@ -602,7 +606,7 @@ impl DRAMPool {
             super::uring::submit_reregister(super::uring::PoolType::Dram);
         }
         self.expanding.store(false, Ordering::Release);
-        self.pool.notify_room_changed();
+        self.pool.notify_space_available();
         published
     }
 

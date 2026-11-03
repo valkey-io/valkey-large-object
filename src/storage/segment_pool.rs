@@ -62,9 +62,9 @@ pub struct SegmentPool {
     /// The waiting line for `wait_for`. tokio's mutex hands the lock out in arrival order, and
     /// whoever holds it is at the front of the line: the only waiter that tries to allocate.
     queue: tokio::sync::Mutex<()>,
-    /// Signalled when room may have appeared: `free_n` does it, and so does the owner through
-    /// `notify_room_changed` (a new segment, say). Wakes the waiter at the front of the line.
-    room_changed: tokio::sync::Notify,
+    /// Signalled when space may be available: `free_n` does it, and so does the owner through
+    /// `notify_space_available` (a new segment, say). Wakes the waiter at the front of the line.
+    space_available: tokio::sync::Notify,
 }
 
 impl SegmentPool {
@@ -93,7 +93,7 @@ impl SegmentPool {
             segment_size,
             pool_id,
             queue: tokio::sync::Mutex::new(()),
-            room_changed: tokio::sync::Notify::new(),
+            space_available: tokio::sync::Notify::new(),
         }
     }
 
@@ -473,16 +473,16 @@ impl SegmentPool {
             }
             seg.dec_ref();
         }
-        self.room_changed.notify_waiters();
+        self.space_available.notify_waiters();
     }
 
-    /// Tell the waiter at the front of the line that room may have appeared. `free_n` already
+    /// Tell the waiter at the front of the line that space may be available. `free_n` already
     /// does; the owner calls it for any other event that can end a wait.
-    pub fn notify_room_changed(&self) {
-        self.room_changed.notify_waiters();
+    pub fn notify_space_available(&self) {
+        self.space_available.notify_waiters();
     }
 
-    /// Run `attempt` until it is ready, waiting for `room_changed` between attempts. Waiters
+    /// Run `attempt` until it is ready, waiting for `space_available` between attempts. Waiters
     /// queue in arrival order and only the one at the front attempts, so a notification does
     /// not wake a crowd. Dropping the future leaves the queue. `attempt` returns
     /// `Ready(Some(t))` when it got what it needed, `Ready(None)` to give up, and `Pending` to
@@ -492,10 +492,10 @@ impl SegmentPool {
         let _at_front = self.queue.lock().await;
         loop {
             // Created before the attempt: a notification in between is not lost.
-            let changed = self.room_changed.notified();
+            let available = self.space_available.notified();
             match attempt() {
                 Poll::Ready(result) => return result,
-                Poll::Pending => changed.await,
+                Poll::Pending => available.await,
             }
         }
     }
@@ -1252,7 +1252,7 @@ mod tests {
                 .await
             }
         });
-        // The waiter's attempt failed and it is waiting, so only `room_changed` can resume it.
+        // The waiter's attempt failed and it is waiting, so only `space_available` can resume it.
         while attempts.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             std::thread::yield_now();
         }
