@@ -47,7 +47,7 @@ Four runtime-mutable configs:
 
 | Config | Default | Range | Meaning |
 |---|---|---|---|
-| `tiered-decay-time` | 1 | 0..=65535 | Minutes per one-point counter decay. 0 disables decay (pure LFU). Same semantics as core `lfu-decay-time`. |
+| `lfu-decay-minutes` | 1 | 0..=65535 | Minutes per one-point counter decay. 0 disables decay (pure LFU). Same semantics as core `lfu-decay-time`. |
 | `promote-min-hits` | 2 | 1..=255 | Misses an object must accumulate before a GET promotes it. 1 promotes on the first GET. |
 | `reclaim-sample-size` | 5 | 1..=64 | Entries sampled per reclaim round. Same idea as core's `maxmemory-samples`. |
 | `max-cached-fds` | 16384 | 0..=1048576 | How many read fds to keep cached; 0 caches nothing. The fd cache max entries is the smaller of this and what the fd limit allows: the module range (the fd numbers past the core range) minus a command reserve of `maxclients` numbers. Under `fd-reserve Lenient` a larger value is clamped with a warning, at load and on `CONFIG SET`; under `Strict` it must fit (load refuses, `CONFIG SET` is rejected). When the open-file limit does not cover the command reserve, the fd cache is off under `fd-reserve Lenient`. `INFO largeobj_fd` shows it (`fd_cache_max_entries`). See `OBJECT_FD_PLACEMENT_DESIGN.md`. |
@@ -73,8 +73,8 @@ bits 8..24   last_decr_min  minute (from now_minutes) of the last decay, wraps a
 
 Operations, all on `AccessStats` in `src/storage/cache_policy.rs`:
 
-1. `touch(now_min, decay_time)`: decay the counter for the elapsed minutes, then increment with probability `p = 1 / ((counter - INIT) * LFU_LOG_FACTOR + 1)`, then store with `now_min` stamped in. At `INIT` the probability is 1, so one touch always outranks an untouched entry. Two racing touches can lose one increment, as in Valkey.
-2. `decayed_counter(now_min, decay_time)`: the counter minus `elapsed / decay_time` periods, saturating at 0. Reclaim ranks by this. It never writes back. `decay_time = 0` disables decay.
+1. `touch(now_min, decay_minutes)`: decay the counter for the elapsed minutes, then increment with probability `p = 1 / ((counter - INIT) * LFU_LOG_FACTOR + 1)`, then store with `now_min` stamped in. At `INIT` the probability is 1, so one touch always outranks an untouched entry. Two racing touches can lose one increment, as in Valkey.
+2. `decayed_counter(now_min, decay_minutes)`: the counter minus `elapsed / decay_minutes` periods, saturating at 0. Reclaim ranks by this. It never writes back. `decay_minutes = 0` disables decay.
 3. `new(now_min)`: counter at `LFU_INIT_VAL`, stamped now. A fresh entry ranks below any entry that has been hit and above one that has fully decayed, as in Valkey.
 
 `now_minutes()` counts minutes since its first call, wrapping at 16 bits; elapsed time uses `wrapping_sub`, so the wrap is harmless unless an entry goes untouched for more than 45 days, when it looks recent again. Callers read it once per operation and pass it down.
