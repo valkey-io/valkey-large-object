@@ -116,7 +116,7 @@ A GET that finds a `Filling` entry (another GET is promoting the same object) sk
 `DRAMPool::try_promote_object` allocates (all-or-nothing) before taking the write lock. When that fails:
 
 ```
-buffers = alloc_exact_or_expand(obj_len)
+buffers = alloc_exact(obj_len)  // full: start a background grow and skip, else make_room_for
     or make_room_for(obj_len)               // None: caller falls back to NVMe
 ```
 

@@ -189,7 +189,7 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             dram.expand_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
-            "dram_scaling_alloc_waits",
+            "dram_alloc_waits",
             dram.alloc_wait_count
                 .load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
@@ -257,6 +257,8 @@ fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "disk_staging_uring_registered_segments",
             nvme.io_uring_registered_count() as i64,
         )?
+        // Requests that waited for staging buffers. Placeholder until staging queueing lands.
+        .field("disk_staging_alloc_waits", 0_i64)?
         .build_section()?
         .build_info()
         .map(|_| ())

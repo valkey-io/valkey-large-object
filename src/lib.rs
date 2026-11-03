@@ -87,7 +87,7 @@ pub fn is_main_thread() -> bool {
 /// Register a segment with EFA on every fabric service; no-op when no fabric is up. A failure is
 /// fatal and panics: an unregistered segment can't be served over EFA (the per-transfer fallback
 /// fails the same way) and the failure isn't transient, so a retry won't help. Single owner of
-/// this fatal-on-failure policy — startup and `try_expand` both call it.
+/// this fatal-on-failure policy — startup and `add_segment` both call it.
 pub fn efa_register_segment(slice: &'static [u8]) {
     let Some(fabric) = transport::fabric::fabric() else {
         return; // TCP-only: no fabric, nothing to register.

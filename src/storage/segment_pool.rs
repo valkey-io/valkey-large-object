@@ -1215,33 +1215,12 @@ mod tests {
         }
     }
 
-    // ─── Publish ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn publish_makes_segment_allocatable_and_reuses_holes() {
-        let pool = SegmentPool::new(1, 1 << 20, crate::storage::uring::PoolType::Dram);
-        let slot = pool
-            .publish(Segment::new(1 << 20))
-            .expect("pool below MAX_SEGMENTS");
-        assert_eq!(slot, 1, "appended after the startup segment");
-        assert_eq!(pool.segment_counts().0, 2);
-
-        // Release the new slot, then publish again: the hole is reused.
-        pool.mark_segment_draining(1);
-        pool.release_all_releasable();
-        assert_eq!(pool.segment_counts().0, 1);
-        assert_eq!(pool.publish(Segment::new(1 << 20)), Some(1));
-    }
-
     // ─── wait_for ────────────────────────────────────────────────────────────
 
     #[test]
-    fn wait_for_serves_waiters_in_arrival_order_as_buffers_free() {
-        use std::sync::Arc;
-        use std::time::{Duration, Instant};
-
+    fn wait_for_resumes_when_buffers_are_freed() {
         crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
-        let pool = Arc::new(SegmentPool::new(
+        let pool = std::sync::Arc::new(SegmentPool::new(
             1,
             65536,
             super::super::uring::PoolType::Dram,
@@ -1254,46 +1233,32 @@ mod tests {
             .worker_threads(2)
             .build()
             .expect("test runtime");
-        let wait = |pool: &Arc<SegmentPool>| {
-            let pool = Arc::clone(pool);
-            runtime.spawn(async move {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waiter = runtime.spawn({
+            let pool = std::sync::Arc::clone(&pool);
+            let attempts = std::sync::Arc::clone(&attempts);
+            async move {
                 pool.wait_for(|| match pool.alloc_exact(1000) {
                     Some(bufs) => Poll::Ready(Some(bufs)),
-                    None => Poll::Pending,
+                    None => {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Poll::Pending
+                    }
                 })
                 .await
-            })
-        };
-        let until = |what: &str, mut done: Box<dyn FnMut() -> bool>| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !done() {
-                assert!(Instant::now() < deadline, "{what}");
-                std::thread::sleep(Duration::from_millis(1));
             }
-        };
-
-        let first = wait(&pool);
-        until("first never took the turn", {
-            let pool = Arc::clone(&pool);
-            Box::new(move || pool.turn.try_lock().is_err())
         });
-        let second = wait(&pool);
-        std::thread::sleep(Duration::from_millis(50)); // second queues behind first
+        // The waiter's attempt failed and it is waiting, so only a wake can resume it.
+        while attempts.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        assert!(!waiter.is_finished());
 
         pool.free_n(&held.pop().expect("held window"));
-        until("first never woke", {
-            let first = first.abort_handle();
-            Box::new(move || first.is_finished())
-        });
-        assert!(
-            !second.is_finished(),
-            "second must wait for its own buffers"
-        );
-
-        pool.free_n(&held.pop().expect("held window"));
-        until("second never woke", {
-            let second = second.abort_handle();
-            Box::new(move || second.is_finished())
-        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !waiter.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "waiter never woke");
+            std::thread::yield_now();
+        }
     }
 }

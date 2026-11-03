@@ -1021,7 +1021,7 @@ and ranks by decayed LFU score, not by `maxmemory-policy`.
 **Detection:**
 
 - **Dram expand:** reactive (EFA SET alloc-miss → the SET's task starts or joins the background grow and waits for it; TCP SET alloc-miss → expand inline + retry, OOM if an expand is already running) and proactive (cron, utilization > watermark).
-- **Tiered expand:** proactive only (cron). Tiered SETs write to NVMe; the DRAM pool fills only by GET promotion, which returns None on pool-full and serves from NVMe — no inline expand on the GET path.
+- **Tiered expand:** proactive (cron) and on promotion. Tiered SETs write to NVMe; the DRAM pool fills only by GET promotion. A promotion that finds the pool full starts the background grow and is skipped: that GET is served from NVMe, and a later GET promotes into the new segment. If the pool cannot grow, the promotion reclaims cold cached copies (§4.4).
 - **Shrink (Tiered only):** proactive only (cron observes server memory pressure; nothing "fails" to trigger it).
 
 **Startup allocation.** The DRAMPool starts with **one** segment and grows on demand
@@ -1054,7 +1054,7 @@ thread while the pool keeps serving, so a later alloc finds the segment ready. T
 alloc-fail row is for a burst that outruns the cron. An EFA SET that misses starts the same
 background grow (or joins the one registering) and waits for it in its task, so the main thread
 keeps serving. A TCP SET has no task to wait in: it stalls for the registration itself, and
-is rejected (OOM) if the cron's expand is still registering. `dram_scaling_alloc_waits` counts
+is rejected (OOM) if the cron's expand is still registering. `dram_alloc_waits` counts
 each SET that waited, either way.
 Tiered has no reactive row: promotion never blocks the GET on pool-full, it just
 serves from NVMe.
