@@ -462,7 +462,12 @@ pub fn would_cross_memory_watermark(ctx: &Context, extra_bytes: u64) -> bool {
     if crate::storage::scaling::in_shrink_cooldown() {
         return true;
     }
-    let ceiling = (maxmemory as f64 * (scaling_shrink_watermark() - EXPAND_HEADROOM)) as u64;
+    let headroom = if operating_mode() == OperatingMode::Tiered {
+        EXPAND_HEADROOM
+    } else {
+        0.0
+    };
+    let ceiling = (maxmemory as f64 * (scaling_shrink_watermark() - headroom)) as u64;
     used.saturating_add(extra_bytes) >= ceiling
 }
 
