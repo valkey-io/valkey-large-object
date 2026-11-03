@@ -184,6 +184,21 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         finally:
             process.kill()
 
+    def test_set_lands_in_selected_db(self):
+        """RDMA_SET commits off the main thread, on the client's selected db."""
+        process, regions = self.start_target('--read')
+        try:
+            client = self.server.get_new_client()
+            client.execute_command('SELECT', 1)
+            client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            assert client.execute_command(
+                'BLOB.RDMA_SET', 'key', TARGET_LEN, *address_args(regions)) == b'OK'
+            assert client.execute_command('BLOB.TCP_GET', 'key') == PATTERN
+            client.execute_command('SELECT', 0)
+            assert client.execute_command('DBSIZE') == 0
+        finally:
+            process.kill()
+
     def test_set_with_matching_crc_succeeds(self):
         """RDMA_SET with a correct CRC token succeeds and the stored CRC matches."""
         expected_crc = crc32c.crc32c(PATTERN)
