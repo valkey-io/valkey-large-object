@@ -1,4 +1,5 @@
 import binascii
+from concurrent.futures import ThreadPoolExecutor
 import collections
 import crc32c
 import os
@@ -463,3 +464,73 @@ class TestLargeObjEfaPartialFailure(ValkeyLargeObjTestCaseBase):
             assert after['largeobj_rdma_write_bytes'] - write_bytes_before == regions[0].len
         finally:
             process.kill()
+
+
+# ─── DRAM EFA SET waiting for the pool to grow ───────────────────────────────
+
+
+class TestLargeObjFabricDramGrowWait(ValkeyLargeObjTestCaseBase):
+    """A Dram RDMA_SET that finds the pool full waits for a grow in its task instead of
+    growing the pool on the main thread."""
+
+    def get_module_args(self, data_dir, direct_io):
+        # A 16KB segment holds one 4KB object (allocations are 4KB-aligned), so every SET
+        # after the first needs a new segment.
+        return (
+            f"operating-mode Dram"
+            f" segment-size 16384"
+            f" max-object-size {TARGET_LEN}"
+            f" chunk-size 4096"
+            # The scaling cron fires at most once a minute, so only a SET can start the grow.
+            f" scaling-poll-ms 60000"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def test_set_waits_for_the_grow_instead_of_growing_inline(self):
+        client = self.server.get_new_client()
+        before = info_largeobj(client)
+        assert before['largeobj_dram_segments'] == 1
+
+        # Fill the first segment; the SET that finds it full must wait for the new one.
+        for i in range(8):
+            process, regions = TestLargeObjFabricTransfer.start_target(self, '--read')
+            try:
+                # One HELLO per connection.
+                sender = self.server.get_new_client()
+                sender.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+                assert sender.execute_command(
+                    'BLOB.RDMA_SET', f'key{i}', TARGET_LEN, *address_args(regions)) == b'OK'
+                assert client.execute_command('BLOB.TCP_GET', f'key{i}') == PATTERN
+            finally:
+                process.kill()
+
+        after = info_largeobj(client)
+        assert after['largeobj_dram_segments'] == 8
+        assert after['largeobj_dram_scaling_expands'] == 7
+        # Each grow was started by one SET, which waited for it.
+        assert after['largeobj_dram_scaling_alloc_waits'] == after['largeobj_dram_scaling_expands']
+
+    def set_over_efa(self, key):
+        """One RDMA_SET of TARGET_LEN bytes from a fresh target, on its own connection."""
+        process, regions = TestLargeObjFabricTransfer.start_target(self, '--read')
+        try:
+            sender = self.server.get_new_client()
+            sender.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            return sender.execute_command('BLOB.RDMA_SET', key, TARGET_LEN, *address_args(regions))
+        finally:
+            process.kill()
+
+    def test_concurrent_sets_all_wait_for_room_and_succeed(self):
+        count = 12
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            replies = list(pool.map(self.set_over_efa, [f'key{i}' for i in range(count)]))
+        assert replies == [b'OK'] * count
+
+        client = self.server.get_new_client()
+        for i in range(count):
+            assert client.execute_command('BLOB.TCP_GET', f'key{i}') == PATTERN
+        info = info_largeobj(client)
+        # Waiting SETs take turns: no grow adds a segment that no SET needed.
+        assert info['largeobj_dram_segments'] == count
+        assert info['largeobj_dram_scaling_expands'] == count - 1

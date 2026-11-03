@@ -189,6 +189,11 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             dram.expand_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?
         .field(
+            "dram_scaling_alloc_waits",
+            dram.alloc_wait_count
+                .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        )?
+        .field(
             "dram_scaling_shrinks",
             dram.shrink_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
         )?

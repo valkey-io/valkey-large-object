@@ -468,27 +468,16 @@ impl SegmentPool {
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
 
-    /// Add a new segment in the first empty slot (else append), with its own
-    /// fresh talc allocator. Its `iovec_index` is a placeholder until the
-    /// post-expand dense rebuild assigns the real one; it is unregistered until
-    /// then, so the placeholder never reaches the kernel.
+    /// Add `seg`, already built and registered, in the first empty slot (else append). Its
+    /// `iovec_index` is a placeholder until the post-expand dense rebuild assigns the real
+    /// one; it is unregistered with io_uring until then, so the placeholder never reaches the
+    /// kernel.
     ///
-    /// Called from the main event-loop thread only (scaling cron or reactive expand).
-    ///
-    /// Returns `(slot_idx, segment_slice)` on success. The slice is `'static` (segment memory
-    /// is stable for the module's lifetime) so the caller can register it with the transport
-    /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if this pool
-    /// already has `MAX_SEGMENTS` segments.
-    pub fn expand(&self) -> Option<(u16, &'static [u8])> {
-        let mut seg = Segment::new(self.segment_size);
-        // Segment memory is stable for the module's lifetime (never freed until
-        // the segment is released, and a segment is not released while a
-        // registration references it). SAFETY: base/size describe the just-
-        // allocated backing buffer.
-        let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(seg.base, seg.size) };
-
+    /// Cheap: no allocation or registration happens here, so any thread may call it. Returns
+    /// the slot index, or `None` if this pool already has `MAX_SEGMENTS` segments (`seg` drops,
+    /// deregistering and freeing it).
+    pub fn publish(&self, mut seg: Segment) -> Option<u16> {
         let mut st = self.state.write().expect("state lock unavailable");
-        // On None, `seg` drops here and nothing enters `slots`.
         let segment_count = st.slots.iter().flatten().count();
         if segment_count >= super::MAX_SEGMENTS {
             return None;
@@ -505,7 +494,7 @@ impl SegmentPool {
             }
         };
 
-        Some((slot as u16, slice))
+        Some(slot as u16)
     }
 
     /// Select the least-loaded non-draining segment as a shrink candidate.
@@ -1194,5 +1183,23 @@ mod tests {
                 w.join().expect("worker panicked");
             }
         }
+    }
+
+    // ─── Publish ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn publish_makes_segment_allocatable_and_reuses_holes() {
+        let pool = SegmentPool::new(1, 1 << 20, crate::storage::uring::PoolType::Dram);
+        let slot = pool
+            .publish(Segment::new(1 << 20))
+            .expect("pool below MAX_SEGMENTS");
+        assert_eq!(slot, 1, "appended after the startup segment");
+        assert_eq!(pool.segment_counts().0, 2);
+
+        // Release the new slot, then publish again: the hole is reused.
+        pool.mark_segment_draining(1);
+        pool.release_all_releasable();
+        assert_eq!(pool.segment_counts().0, 1);
+        assert_eq!(pool.publish(Segment::new(1 << 20)), Some(1));
     }
 }

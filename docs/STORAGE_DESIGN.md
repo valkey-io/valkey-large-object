@@ -1020,7 +1020,7 @@ and ranks by decayed LFU score, not by `maxmemory-policy`.
 
 **Detection:**
 
-- **Dram expand:** reactive (SET alloc-miss → expand + retry inline) and proactive (cron, utilization > watermark).
+- **Dram expand:** reactive (EFA SET alloc-miss → the SET's task starts or joins the background grow and waits for it; TCP SET alloc-miss → expand inline + retry, OOM if an expand is already running) and proactive (cron, utilization > watermark).
 - **Tiered expand:** proactive only (cron). Tiered SETs write to NVMe; the DRAM pool fills only by GET promotion, which returns None on pool-full and serves from NVMe — no inline expand on the GET path.
 - **Shrink (Tiered only):** proactive only (cron observes server memory pressure; nothing "fails" to trigger it).
 
@@ -1035,8 +1035,8 @@ Expansion adds one `segment-size` segment (≤1GiB, §2).
 
 | Trigger | Action |
 |---------|--------|
-| DRAMPool allocation fails (no segment has room) — Dram SET path | Add a segment immediately, then retry the alloc |
-| Pool utilization > `scaling-expand-watermark` (cron) | Add a segment proactively |
+| DRAMPool allocation fails (no segment has room) — Dram SET path | EFA SET: start the background grow (or join the running one) and wait for it in the SET's task, then retry the alloc; evict, then OOM, only when the pool cannot grow. TCP SET: add a segment inline, then retry; rejected (OOM) if an expand is already running |
+| Pool utilization > `scaling-expand-watermark` (cron) | Start adding a segment in the background |
 
 Both are gated by the server ceiling: an expand that would push `used_memory` past
 `scaling-shrink-watermark` × `maxmemory` is refused (`would_cross_memory_watermark`),
@@ -1048,11 +1048,16 @@ and a failed `fi_mr_reg` is fatal. In Dram mode a refused
 reactive expand rejects the `BLOB.TCP_SET` / `BLOB.RDMA_SET` (OOM); in Tiered mode the cache stops growing,
 and a promotion that finds no room is skipped (the GET reads NVMe).
 
-**Why Dram is reactive-primary.** The alloc-fail row grows *because* a request just
-needed space. That is acceptable because growth is cheap and safe — add a segment,
-retry, continue; the cost is one stalled alloc, nothing is lost. The watermark row is
-the proactive complement that removes even that stall. Tiered has no reactive row:
-promotion never blocks the GET on pool-full, it just serves from NVMe.
+**Why both rows exist.** Adding a segment costs one EFA registration, which pins the
+whole segment (tens of milliseconds at 256MB). The proactive row pays it on a blocking
+thread while the pool keeps serving, so a later alloc finds the segment ready. The
+alloc-fail row is for a burst that outruns the cron. An EFA SET that misses starts the same
+background grow (or joins the one registering) and waits for it in its task, so the main thread
+keeps serving. A TCP SET has no task to wait in: it stalls for the registration itself, and
+is rejected (OOM) if the cron's expand is still registering. `dram_scaling_alloc_waits` counts
+each SET that waited, either way.
+Tiered has no reactive row: promotion never blocks the GET on pool-full, it just
+serves from NVMe.
 
 The proactive expand is skipped on a tick where a shrink is still unfinished (§8.3).
 
@@ -1096,17 +1101,25 @@ Recency is not considered yet; the LFU score only moves on Tiered GET hits.
 
 ### 8.4 How Expansion Works
 
+Only one expand runs at a time (the RDMA limit check counts published segments, so two
+at once could pass it together). The caller claims the expand and checks the `maxmemory`
+and RDMA limits on its own thread, since they read server memory. Steps 1-3 then run on
+a blocking thread (background expand) or on the caller (alloc-fail), and touch no pool
+lock and no Valkey API.
+
 1. **Allocate** a new segment (`alloc_zeroed`, ≤1GiB). Counted in `used_memory`.
 2. **Create the segment's talc:** the new `Segment` owns its own `Talc` and `claim`s
    exactly `[base, base+size)`.
 3. **Register with EFA** (`fi_mr_reg` for this segment only, both modes, if a fabric
    is up). Existing MRs are untouched.
-4. **Re-register with io_uring** — **Tiered only** (Dram mode has no io_uring
+4. **Publish:** take the pool's state lock, put the segment in a slot, and clear the running-expand
+   flag. The allocator cannot see the segment before this, so it is always registered.
+5. **Re-register with io_uring** — **Tiered only** (Dram mode has no io_uring
    engine). `submit_reregister(Dram)` asks the DRAM ring to rebuild its whole table
    (§8.6).
 
-The new segment is usable for allocation immediately. Until the rebuild marks it
-registered, its I/O goes non-fixed (plain Read/Write).
+The new segment is usable for allocation as soon as it is published. Until the rebuild
+marks it registered, its I/O goes non-fixed (plain Read/Write).
 
 ### 8.5 How Shrinking Works
 
@@ -1377,7 +1390,7 @@ Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a 
 | NVMePool allocators | one `Mutex<Talc>` **per segment** (inside each `Segment`) | Mutex (per segment) | Tokio (alloc for all Tiered I/O — SET and GET miss), Arc Drop from any thread (free on StreamingContext drop) |
 | FdPool | `OIDIndexedMap<FdEntry>` (entry = `Arc<ObjectFd>` + LFU `AccessStats`) | `RwLock` | Main (remove via ObjectFile::Drop on DEL/free), tokio (get_or_open lazily on first GET; LFU eviction takes the write lock to remove a cold entry). SET does NOT use FdPool — it opens a private fd. |
 | NVMe disk-usage counter | `AtomicU64` (NVME_DISK_USAGE) | lock-free atomic | Tokio (reserve on SET/COPY), any thread (decrement on ObjectFile::Drop / error rollback) |
-| Segment registry | `Mutex<SegmentState { slots: Vec<Option<Segment>> }>` (per pool) | Mutex | All threads take it briefly to reach a segment (alloc picker, free, buffer_ptr, iovec lookup). Slots are mutated only by expand/release on the main thread; the Tiered DRAM ring's poller rewrites `iovecs` and each segment's `iovec_index` during a rebuild (§8.6). Each segment's `refcount`/`allocated_bytes`/`draining` are atomics; its talc is a separate per-segment Mutex. |
+| Segment registry | `Mutex<SegmentState { slots: Vec<Option<Segment>> }>` (per pool) | Mutex | All threads take it briefly to reach a segment (alloc picker, free, buffer_ptr, iovec lookup). Slots are mutated by publish (the expand's last step, on any thread) and by release (main thread); the Tiered DRAM ring's poller rewrites `iovecs` and each segment's `iovec_index` during a rebuild (§8.6). Each segment's `refcount`/`allocated_bytes`/`draining` are atomics; its talc is a separate per-segment Mutex. |
 | Reclaim list | `RECLAIM_LIST: LazyLock<ReclaimList>` (`HashSet<ObjectId>` behind a `Mutex`) | Mutex | Main (add on eviction; `contains` on BLOB.TCP_GET/BLOB.RDMA_GET/INFO/COPY; cron scan + remove; INFO), BIO (`lo_free` → `remove_object` removes), tokio (refused EFA commit → `remove_object`). Lock order: reclaim list before `DRAMPool.objects`. All readers run on the main thread, so a RwLock would buy nothing. |
 | Reclaim scan cursor | `thread_local! RECLAIM_SCAN` (db + `KeysCursor`) | none (main thread only) | Scaling cron |
 
@@ -1490,7 +1503,7 @@ this section owns the semantics.
 | `max-buffers-per-op` / `min-buffers-per-op` | 8 / 2 | 2 / 1 | 64 / 64 | Live | Streaming pipeline depth (detail: §7.3.6) |
 | `worker-threads` | `2` | `1` | `32` | Immutable | tokio worker threads |
 | `scaling-poll-ms` | `5000` | `1000` | `60000` | Live | Scaling cron interval: how often it checks utilization and memory pressure |
-| `scaling-expand-watermark` | `80` | `50` | `95` | Live | Pool utilization % above which the cron adds a segment proactively |
+| `scaling-expand-watermark` | `80` | `50` | `95` | Live | Pool utilization % above which the cron adds a segment in the background |
 | `scaling-shrink-watermark` | `90` | `50` | `95` | Live | Server `used_memory / maxmemory` % above which the cron shrinks a segment; also the ceiling expand may not cross |
 | `max-rdma-registered-bytes` | `380GB` | `0` (no limit) | i64::MAX | Live | With a fabric up, EFA-registered segment bytes (DRAM pool + staging) expand may not cross |
 | `reclaim-poll-ms` | `100` | `10` | `60000` | Live | Cron interval while the reclaim list is non-empty (evicted-key cleanup); `scaling-poll-ms` resumes once it is empty |

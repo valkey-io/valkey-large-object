@@ -2,7 +2,7 @@
 //!
 //! Called on a configurable timer from the Valkey main event-loop thread.
 //! Handles: draining completion, deleting the keys of evicted objects, proactive
-//! expand, proactive shrink (Tiered only).
+//! expand (started in the background), proactive shrink (Tiered only).
 
 use valkey_module::Context;
 
@@ -18,7 +18,8 @@ use super::get_dram_pool;
 ///    While reclaim-list keys remain, the cron re-arms at `reaper-poll-ms`
 ///    instead of `scaling-poll-ms`, so cleanup runs in short, frequent slices.
 /// 3. Proactive expand: if pool utilization exceeds the expand watermark,
-///    add a segment before the hot path stalls on segment creation.
+///    start adding a segment in the background before the hot path misses.
+///    The segment joins the pool once registered, not within this tick.
 /// 4. Proactive shrink: if server memory pressure exceeds the shrink watermark,
 ///    drop the least-used segment's cached copies (Tiered only; data stays on NVMe).
 pub fn scaling_cron(ctx: &Context) {
@@ -44,10 +45,10 @@ pub fn scaling_cron(ctx: &Context) {
     // 3. Proactive expand: grow before the pool fills so promotions don't
     //    stall on segment creation + EFA registration on the hot path.
     let util = pool.utilization_ratio();
-    let expanded = util > expand_watermark && pool.try_expand(ctx).is_some();
+    let expanded = util > expand_watermark && pool.start_expand(ctx);
     if expanded {
         ctx.log_notice(&format!(
-            "largeobj: scaling — pool utilization {:.1}% > {:.0}%, added one DRAM segment",
+            "largeobj: scaling — pool utilization {:.1}% > {:.0}%, adding one DRAM segment",
             util * 100.0,
             expand_watermark * 100.0
         ));
@@ -66,7 +67,7 @@ pub fn scaling_cron(ctx: &Context) {
     // Expand takes priority within a tick: expand and shrink read different
     // denominators (module utilization vs server memory), so both can cross on
     // the same tick, and firing both would add a segment then immediately drain
-    // one — pure churn. Gated on expand-SUCCEEDED, not merely wanted, so a pool
+    // one — pure churn. Gated on a grow RUNNING, not merely wanted, so a pool
     // that can't grow still shrinks under pressure.
     if expanded {
         rearm_scaling_cron(ctx, poll_ms);

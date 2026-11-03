@@ -149,6 +149,8 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
 
         after = info_largeobj(client)
         assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands'] + 1
+        # The SET grew the pool inline, so it is counted as an alloc that waited.
+        assert after['largeobj_dram_scaling_alloc_waits'] == before['largeobj_dram_scaling_alloc_waits'] + 1
         assert after['largeobj_dram_segments'] == 2
         # Dram mode has no io_uring ring, so nothing is ever io_uring-registered.
         assert after['largeobj_dram_uring_registered_segments'] == 0
@@ -269,6 +271,8 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
             lambda: info_largeobj(client)['largeobj_dram_scaling_expands'] > expand_before,
             timeout=self.EXPAND_TIMEOUT_S,
         )
+        # The cron's expand ran in the background: no SET waited for it.
+        assert info_largeobj(client)['largeobj_dram_scaling_alloc_waits'] == 0
 
         # The next 600KB object doesn't fit the first segment, so it must land in
         # the cron's new one. Raising the watermark to 95 (~59% used after it)
