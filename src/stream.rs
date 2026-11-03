@@ -224,11 +224,12 @@ impl Target<'_> {
 
     /// GET reply after the loop: collected bytes, or obj_len in bench mode.
     /// Only valid on `TcpReply`; the EFA GET reply is [obj_len, crc32c] built by the caller.
-    pub fn into_reply(self, obj_len: u64) -> crate::engine::TcpGetReply {
+    pub fn into_reply(self, obj_len: u64) -> crate::engine::GetReply {
         match self {
             Target::TcpReply { reply } => match reply {
-                Some(s) => crate::engine::TcpGetReply::Str(s),
-                None => crate::engine::TcpGetReply::Value(ValkeyValue::Integer(obj_len as i64)),
+                Some(s) => crate::engine::GetReply::Str(s),
+                // Bench mode: no string was allocated, reply with the length only.
+                None => crate::engine::GetReply::Value(ValkeyValue::Integer(obj_len as i64)),
             },
             _ => unreachable!("into_reply is only called on the TcpReply GET target"),
         }

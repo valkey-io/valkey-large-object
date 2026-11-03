@@ -117,12 +117,14 @@ pub fn inflight_requests() -> u64 {
 ///
 /// Built on the raw blocked-client API (not `valkey_module::BlockedClient`) so a
 /// TCP GET can hand its value back as a string object that the main thread replies
-/// with on unblock; Valkey then sends it without copying (`reply_string`).
+/// with on unblock; Valkey then sends it without copying (`reply_on_unblock`).
+/// A reply from a worker goes to a fake client, which Valkey never sends by reference,
+/// and the SDK's `BlockedClient` registers no reply callback to avoid that.
 pub(crate) struct BlockedRequest {
     bc: *mut raw::RedisModuleBlockedClient,
     /// Thread-safe context bound to `bc`; replies through it are queued for the client.
     ctx: *mut raw::RedisModuleCtx,
-    bulk: std::sync::Mutex<Option<ReplyString>>,
+    pending_reply: std::sync::Mutex<Option<ReplyString>>,
 }
 
 // SAFETY: the raw handles are only used through thread-safe module APIs.
@@ -136,9 +138,9 @@ impl BlockedRequest {
         unsafe {
             let bc = raw::RedisModule_BlockClient.unwrap()(
                 ctx.ctx,
-                Some(bulk_reply_callback),
+                Some(unblock_reply_callback),
                 None,
-                Some(bulk_free_callback),
+                Some(unblock_free_callback),
                 0,
             );
             raw::RedisModule_BlockedClientMeasureTimeStart.unwrap()(bc);
@@ -146,7 +148,7 @@ impl BlockedRequest {
             Self {
                 bc,
                 ctx: tsc,
-                bulk: std::sync::Mutex::new(None),
+                pending_reply: std::sync::Mutex::new(None),
             }
         }
     }
@@ -161,18 +163,22 @@ impl BlockedRequest {
         valkey_module::ThreadSafeContext::new().lock()
     }
 
-    /// Reply with `s` from the main thread on unblock, which lets Valkey reference
-    /// the string in the client's output instead of copying it.
-    pub(crate) fn reply_string(&self, s: ReplyString) {
-        *self.bulk.lock().expect("bulk lock poisoned") = Some(s);
+    /// Hand `s` to the main thread, which replies with it when the client unblocks,
+    /// so Valkey references the string instead of copying it.
+    pub(crate) fn reply_on_unblock(&self, s: ReplyString) {
+        *self
+            .pending_reply
+            .lock()
+            .expect("pending_reply lock poisoned") = Some(s);
     }
 
-    pub(crate) fn send(&self, r: TcpGetReply) {
+    /// Reply to a GET: a small value right away, or the object bytes on unblock.
+    pub(crate) fn reply_get(&self, r: GetReply) {
         match r {
-            TcpGetReply::Value(v) => {
+            GetReply::Value(v) => {
                 self.reply(Ok(v));
             }
-            TcpGetReply::Str(s) => self.reply_string(s),
+            GetReply::Str(s) => self.reply_on_unblock(s),
         }
     }
 }
@@ -180,7 +186,12 @@ impl BlockedRequest {
 impl Drop for BlockedRequest {
     fn drop(&mut self) {
         INFLIGHT_REQUESTS.fetch_sub(1, Ordering::Relaxed);
-        let privdata = match self.bulk.get_mut().expect("bulk lock poisoned").take() {
+        let privdata = match self
+            .pending_reply
+            .get_mut()
+            .expect("pending_reply lock poisoned")
+            .take()
+        {
             Some(s) => Box::into_raw(Box::new(s)) as *mut std::os::raw::c_void,
             None => std::ptr::null_mut(),
         };
@@ -194,7 +205,7 @@ impl Drop for BlockedRequest {
 }
 
 /// Main thread, on unblock: reply with the stashed string, if any.
-unsafe extern "C" fn bulk_reply_callback(
+unsafe extern "C" fn unblock_reply_callback(
     ctx: *mut raw::RedisModuleCtx,
     _argv: *mut *mut raw::RedisModuleString,
     _argc: std::os::raw::c_int,
@@ -207,7 +218,7 @@ unsafe extern "C" fn bulk_reply_callback(
 }
 
 /// Main thread: free the stashed string (the reply holds its own reference).
-unsafe extern "C" fn bulk_free_callback(
+unsafe extern "C" fn unblock_free_callback(
     _ctx: *mut raw::RedisModuleCtx,
     privdata: *mut std::os::raw::c_void,
 ) {
@@ -215,7 +226,7 @@ unsafe extern "C" fn bulk_free_callback(
 }
 
 /// A TCP GET reply: a plain value, or the object bytes in a `ReplyString`.
-pub(crate) enum TcpGetReply {
+pub(crate) enum GetReply {
     Value(ValkeyValue),
     Str(ReplyString),
 }
@@ -234,6 +245,8 @@ unsafe impl Sync for ReplyString {}
 
 impl ReplyString {
     pub(crate) fn with_len(len: usize) -> Self {
+        // A NULL ctx means no auto-memory: the module owns this one reference (no
+        // RetainString needed) and must free it, which `Drop` does.
         // SAFETY: a NULL-context string is a plain allocation (zero-filled sds).
         unsafe {
             let inner =
@@ -723,14 +736,14 @@ async fn cmd_get_tiered_run(
                 .map(|target_err| {
                     (
                         target_err,
-                        TcpGetReply::Value(efa_get_reply(obj_len, crc32c_expected)),
+                        GetReply::Value(efa_get_reply(obj_len, crc32c_expected)),
                     )
                 })
         }
     };
     match outcome {
         Ok((Some(e), _)) => crate::stream::reply_stream_err(thread_ctx, e), // promotion continue-filling
-        Ok((None, reply)) => thread_ctx.send(reply),
+        Ok((None, reply)) => thread_ctx.reply_get(reply),
         Err(e) => crate::stream::reply_stream_err(thread_ctx, e),
     }
 }
@@ -1331,7 +1344,7 @@ fn cmd_get_from_dram(
                         let slice = unsafe { std::slice::from_raw_parts(ptr, chunk.user_data_len) };
                         out.write_at(chunk.index as usize * chunk_size, slice);
                     }
-                    thread_ctx.reply_string(out);
+                    thread_ctx.reply_on_unblock(out);
                 });
             }
         }
