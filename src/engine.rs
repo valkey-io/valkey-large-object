@@ -41,10 +41,10 @@ use crate::OperatingMode;
 // clone of that state for the whole operation.
 //
 // Must pin `Arc<ObjectContext>` (owns the DRAM buffer; its Drop frees it):
-//   - Every DRAM serve that transfers a map-resident object — `cmd_get_from_dram`'s
-//     EFA path, and the promotion serve in `cmd_get_tiered` / `cmd_get_tiered_run`. (TCP
-//     serves copy synchronously with no await via `collect_dram_bytes`, so no pin
-//     is needed.)
+//   - Every DRAM serve that transfers a map-resident object — `cmd_get_from_dram`
+//     (TCP and EFA, both on a worker), and the promotion serve in `cmd_get_tiered` /
+//     `cmd_get_tiered_run`. (The sync Dram TCP GET, `cmd_get_dram_tcp`, copies on the
+//     main thread with no await, so no pin is needed.)
 //   - The promotion read, whose target buffer lives in the Filling `ObjectContext`
 //     already inserted in the map — the task moves that Arc in for the read.
 //   NOT needed on SET: the buffer is private until `set_value` + `insert_object`
@@ -1115,9 +1115,9 @@ async fn cmd_set_tiered_run(
 
 // ─── Serve from DRAMPool ─────────────────────────────────────────────────────
 
-/// Serve a Ready ObjectContext from DRAMPool. TCP accumulates into Vec;
+/// Serve a Ready ObjectContext from DRAMPool. TCP copies into a Vec on a worker;
 /// EFA writes per-chunk to client GPU (parallelized).
-/// On the EFA path, `obj_ctx` and `file` are pinned for the async transfer's duration.
+/// On both paths, `obj_ctx` and `file` are pinned for the async transfer's duration.
 fn cmd_get_from_dram(
     dram_pool: &storage::DRAMPool,
     obj_ctx: &Arc<ObjectContext>,
@@ -1137,14 +1137,25 @@ fn cmd_get_from_dram(
             if crate::bench_mode() {
                 thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
             } else {
-                let mut chunk_iter =
-                    ChunkIterator::new(obj_len, crate::chunk_size(), obj_ctx.buffers.len(), None);
-                thread_ctx.reply(Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-                    dram_pool,
-                    obj_ctx,
-                    obj_len,
-                    &mut chunk_iter,
-                ))));
+                // Copy and reply on a worker, as the NVMe path does, so a hit does not
+                // hold the main thread for the whole value copy.
+                let obj_ctx = obj_ctx.clone();
+                crate::runtime_handle().spawn(async move {
+                    let _keep_alive = (&obj_ctx, file);
+                    let mut chunk_iter = ChunkIterator::new(
+                        obj_len,
+                        crate::chunk_size(),
+                        obj_ctx.buffers.len(),
+                        None,
+                    );
+                    let data = collect_dram_bytes(
+                        storage::get_dram_pool(),
+                        &obj_ctx,
+                        obj_len,
+                        &mut chunk_iter,
+                    );
+                    thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+                });
             }
         }
         Transport::Efa { session, addrs } => {
