@@ -33,7 +33,7 @@ SEGMENT_SIZE="67108864"      # 64MB
 MAX_OBJECT_SIZE="58720256"   # 56MB — must be >= largest SIZES entry (50MB) and fit segment-size (64MB, minus talc overhead)
 NVME_MAXMEMORY="107374182400"    # 100GB
 NVME_STAGING_SIZE="67108864"      # 64MB
-WORKER_THREADS=2
+WORKER_THREADS=4
 IO_THREADS=8                      # Valkey io-threads (network read/write offload)
 SERVER_CPUS="0-15"                # taskset for valkey-server
 BENCH_CPUS="16-63"                # taskset for valkey-benchmark
@@ -73,7 +73,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --maxmemory <BYTES>        Server maxmemory; DRAM pool scales toward it (default: 34359738368 = 32GB)"
             echo "  --segment-size <BYTES>     Segment size in bytes (default: 67108864 = 64MB)"
             echo "  --disk-maxmemory <BYTES>   Disk budget in bytes (default: 107374182400 = 100GB)"
-            echo "  --worker-threads <N>       Tokio threads (default: 2)"
+            echo "  --worker-threads <N>       Tokio threads (default: 4)"
             echo "  --workload <NAME>          get (default) or bench/workloads/<NAME>.sh; --workload <NAME> --help for its options"
             echo ""
             echo "Modes:"

@@ -68,7 +68,7 @@ pub const DEFAULT_DISK_MAXMEMORY: i64 = 0; // unlimited
 pub const MIN_DISK_MAXMEMORY: i64 = 0;
 pub const MAX_DISK_MAXMEMORY: i64 = i64::MAX;
 // worker-threads
-pub const DEFAULT_WORKER_THREADS: i64 = 2;
+pub const DEFAULT_WORKER_THREADS: i64 = 4;
 pub const MIN_WORKER_THREADS: i64 = 1;
 pub const MAX_WORKER_THREADS: i64 = 32;
 // max-promote-size

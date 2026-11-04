@@ -1504,7 +1504,7 @@ this section owns the semantics.
 | `max-object-size` | `512MB` | `1` | i64::MAX | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
 | `chunk-size` | `1MB` | `4096` | `256MB` | Immutable | I/O chunk / allocation unit (detail: §7.2) |
 | `max-buffers-per-op` / `min-buffers-per-op` | 64 / 2 | 2 / 1 | 1024 / 1024 | Live | Streaming pipeline depth (detail: §7.3.6) |
-| `worker-threads` | `2` | `1` | `32` | Immutable | tokio worker threads |
+| `worker-threads` | `4` | `1` | `32` | Immutable | tokio worker threads |
 | `scaling-poll-ms` | `5000` | `1000` | `60000` | Live | Scaling cron interval: how often it checks utilization and memory pressure |
 | `scaling-expand-watermark` | `80` | `50` | `95` | Live | Pool utilization % above which the cron adds a segment in the background |
 | `scaling-shrink-watermark` | `90` | `50` | `95` | Live | Server `used_memory / maxmemory` % above which the cron shrinks a segment; also the ceiling expand may not cross |

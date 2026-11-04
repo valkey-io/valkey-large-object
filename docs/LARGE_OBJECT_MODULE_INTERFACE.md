@@ -161,7 +161,7 @@ async fn efa_write_to_client(session: Arc<Session>, buf_ptr: usize, len, rkey, r
 | `disk-maxmemory` | 10gb | Max disk usage |
 | `disk-staging-size` | 64mb | Single NVMe staging segment (DRAM) |
 | `max-promote-size` | 256mb | Max object size for DRAMPool promotion. 0 = disable. |
-| `worker-threads` | 2 | Tokio runtime thread count |
+| `worker-threads` | 4 | Tokio runtime thread count |
 | `direct-io` | yes | O_DIRECT for NVMe files |
 
 ---
