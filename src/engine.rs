@@ -43,8 +43,7 @@ use crate::OperatingMode;
 // Must pin `Arc<ObjectContext>` (owns the DRAM buffer; its Drop frees it):
 //   - Every DRAM serve that transfers a map-resident object — `cmd_get_from_dram`
 //     (TCP and EFA, both on a worker), and the promotion serve in `cmd_get_tiered` /
-//     `cmd_get_tiered_run`. (The sync Dram TCP GET, `cmd_get_dram_tcp`, copies on the
-//     main thread with no await, so no pin is needed.)
+//     `cmd_get_tiered_run`.
 //   - The promotion read, whose target buffer lives in the Filling `ObjectContext`
 //     already inserted in the map — the task moves that Arc in for the read.
 //   NOT needed on SET: the buffer is private until `set_value` + `insert_object`
@@ -282,65 +281,25 @@ pub fn execute_get(
     file: Option<Arc<ObjectFile>>,
     transport: Transport,
 ) -> EngineResult {
-    let mode = crate::operating_mode();
-    match (mode, &transport) {
-        (OperatingMode::Dram, Transport::Tcp) => {
-            // Fully sync — serve from DRAMPool, return directly.
-            EngineResult::Sync(cmd_get_dram_tcp(object_id, obj_len))
+    // Always async — block client, dispatch to tokio.
+    let thread_ctx = BlockedRequest::new(ctx);
+    match crate::operating_mode() {
+        OperatingMode::Dram => {
+            cmd_get_dram(object_id, obj_len, crc32c, transport, thread_ctx);
         }
-        _ => {
-            // Async — block client, dispatch to tokio.
-            let thread_ctx = BlockedRequest::new(ctx);
-            match mode {
-                OperatingMode::Dram => {
-                    cmd_get_dram_efa(object_id, obj_len, crc32c, transport, thread_ctx);
-                }
-                OperatingMode::Tiered => {
-                    let file =
-                        file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
-                    cmd_get_tiered(object_id, obj_len, crc32c, file, transport, thread_ctx);
-                }
-            }
-            EngineResult::Async
+        OperatingMode::Tiered => {
+            let file = file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
+            cmd_get_tiered(object_id, obj_len, crc32c, file, transport, thread_ctx);
         }
     }
+    EngineResult::Async
 }
 
-// ─── DRAM-only TCP GET ────────────────────────────────────────────
+// ─── DRAM-only GET ────────────────────────────────────────────────
 
-/// Sync DRAM-only TCP GET: serve object data directly from DRAMPool.
-/// Multi-buffer: collect_dram_bytes iterates all buffers, copying up to obj_len total.
-fn cmd_get_dram_tcp(object_id: ObjectId, obj_len: u64) -> Result<ValkeyValue, ValkeyError> {
-    let dram_pool = storage::get_dram_pool();
-    match dram_pool.get_object(&object_id) {
-        Some(obj_ctx) if obj_ctx.is_ready() => {
-            // Eviction ranks by use, as for a Tiered cache hit.
-            storage::eviction_candidates::touch(object_id);
-            if crate::bench_mode() {
-                Ok(ValkeyValue::Integer(obj_len as i64))
-            } else {
-                let mut chunk_iter =
-                    ChunkIterator::new(obj_len, crate::chunk_size(), obj_ctx.buffers.len(), None);
-                Ok(ValkeyValue::StringBuffer(collect_dram_bytes(
-                    dram_pool,
-                    &obj_ctx,
-                    obj_len,
-                    &mut chunk_iter,
-                )))
-            }
-        }
-        Some(_) => {
-            panic!("DRAM-only GET: object in Filling state — only Tiered promotion creates Filling objects")
-        }
-        None => panic!("DRAM-only GET: LoValue exists but ObjectContext missing — logic bug"),
-    }
-}
-
-// ─── DRAM-only EFA GET ────────────────────────────────────────────
-
-/// DRAM-only EFA GET: object MUST be in DRAMPool. If not found → key doesn't exist
+/// DRAM-only GET (TCP or EFA): object MUST be in DRAMPool. If not found → key doesn't exist
 /// (shouldn't happen — LoValue exists implies ObjectContext exists in DRAM-only mode).
-fn cmd_get_dram_efa(
+fn cmd_get_dram(
     object_id: ObjectId,
     obj_len: u64,
     crc32c: Crc,
