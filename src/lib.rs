@@ -87,7 +87,7 @@ pub fn is_main_thread() -> bool {
 /// Register a segment with EFA on every fabric service; no-op when no fabric is up. A failure is
 /// fatal and panics: an unregistered segment can't be served over EFA (the per-transfer fallback
 /// fails the same way) and the failure isn't transient, so a retry won't help. Single owner of
-/// this fatal-on-failure policy — startup and `try_expand` both call it.
+/// this fatal-on-failure policy — startup and `add_segment` both call it.
 pub fn efa_register_segment(slice: &'static [u8]) {
     let Some(fabric) = transport::fabric::fabric() else {
         return; // TCP-only: no fabric, nothing to register.
@@ -309,7 +309,7 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["scaling-shrink-watermark", &*CFG_SCALING_SHRINK_WATERMARK, DEFAULT_SCALING_SHRINK_WATERMARK, MIN_SCALING_SHRINK_WATERMARK, MAX_SCALING_SHRINK_WATERMARK,
              ConfigurationFlags::DEFAULT, None, None],
-            ["blob-decay-time", &*CFG_BLOB_DECAY_TIME, DEFAULT_BLOB_DECAY_TIME, MIN_BLOB_DECAY_TIME, MAX_BLOB_DECAY_TIME,
+            ["lfu-decay-minutes", &*CFG_LFU_DECAY_MINUTES, DEFAULT_LFU_DECAY_MINUTES, MIN_LFU_DECAY_MINUTES, MAX_LFU_DECAY_MINUTES,
              ConfigurationFlags::DEFAULT, None, None],
             ["promote-min-hits", &*CFG_PROMOTE_MIN_HITS, DEFAULT_PROMOTE_MIN_HITS, MIN_PROMOTE_MIN_HITS, MAX_PROMOTE_MIN_HITS,
              ConfigurationFlags::DEFAULT, None, None],
@@ -325,8 +325,8 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, None],
         ],
         string: [
-            ["disk-dir", &*CFG_DISK_DIR, "", ConfigurationFlags::IMMUTABLE, None],
-            ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None],
+            ["disk-dir", &*CFG_DISK_DIR, "", ConfigurationFlags::IMMUTABLE, None, Some(Box::new(on_string_config_set))],
+            ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None, Some(Box::new(on_string_config_set))],
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],

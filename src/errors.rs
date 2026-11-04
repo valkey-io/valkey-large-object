@@ -36,6 +36,7 @@ define_errors! {
     ERR_RDMA_SESSION_EXISTS => "ERR RDMA session already established",
     ERR_INVALID_INFO_FIELD => "ERR invalid information field",
     ERR_MODULE_DISABLED => "DISABLED largeobj module is disabled",
+    ERR_DENY_BLOCKING => "ERR command not allowed in MULTI, scripts or module calls",
 
     // OOM — matches the standard Valkey OOM error prefix so clients can
     // distinguish memory exhaustion from other errors programmatically.

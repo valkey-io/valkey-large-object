@@ -30,6 +30,18 @@ fn check_module_enabled(ctx: &Context) -> Result<(), ValkeyError> {
     Ok(())
 }
 
+/// Reject GET/SET where the client cannot block: MULTI, scripts, RM_Call without
+/// `K`. Uniform across modes and cache state, though some paths reply sync.
+fn check_may_block(ctx: &Context) -> Result<(), ValkeyError> {
+    if ctx
+        .get_flags()
+        .intersects(ContextFlags::DENY_BLOCKING | ContextFlags::LUA)
+    {
+        return Err(ValkeyError::Str(errors::ERR_DENY_BLOCKING));
+    }
+    Ok(())
+}
+
 /// The RDMA session the client previously established with BLOB.RDMA_HELLO.
 fn efa_session(ctx: &Context) -> Result<Arc<Session>, ValkeyError> {
     session::lookup(ctx.get_client_id()).ok_or(ValkeyError::Str(errors::ERR_NO_RDMA_SESSION))
@@ -162,6 +174,7 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 pub fn lo_tcp_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     check_module_enabled(ctx)?;
+    check_may_block(ctx)?;
     if args.len() != 2 {
         return Err(ValkeyError::WrongArity);
     }
@@ -193,6 +206,7 @@ pub fn lo_tcp_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 pub fn lo_rdma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     check_module_enabled(ctx)?;
+    check_may_block(ctx)?;
     // At least: cmd + key + one (rkey, addr, len) triple = 5 args.
     // Incomplete triples are caught by parse_efa_addresses with a clearer error.
     if args.len() < 5 {
@@ -230,6 +244,7 @@ pub fn lo_rdma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     check_module_enabled(ctx)?;
+    check_may_block(ctx)?;
     if args.len() != 3 {
         return Err(ValkeyError::WrongArity);
     }
@@ -269,6 +284,7 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     check_module_enabled(ctx)?;
+    check_may_block(ctx)?;
     // At least: cmd + key + total_len + one (rkey, addr, len) triple = 6 args.
     // Incomplete triples are caught by parse_efa_addresses with a clearer error.
     if args.len() < 6 {

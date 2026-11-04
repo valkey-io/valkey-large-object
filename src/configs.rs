@@ -1,9 +1,11 @@
 use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
+use valkey_module::configuration::ConfigurationContext;
 use valkey_module::enum_configuration;
 use valkey_module::Context;
 use valkey_module::ContextFlags;
+use valkey_module::{ValkeyError, ValkeyGILGuard, ValkeyString};
 use valkey_module_macros::config_changed_event_handler;
 
 use crate::errors;
@@ -78,21 +80,21 @@ pub const DEFAULT_SCALING_POLL_MS: i64 = 2500;
 pub const MIN_SCALING_POLL_MS: i64 = 1_000;
 pub const MAX_SCALING_POLL_MS: i64 = 60_000;
 // reaper-scan-budget-us
-pub const DEFAULT_REAPER_SCAN_BUDGET_US: i64 = 1000;
+pub const DEFAULT_REAPER_SCAN_BUDGET_US: i64 = 2000;
 pub const MIN_REAPER_SCAN_BUDGET_US: i64 = 100;
 pub const MAX_REAPER_SCAN_BUDGET_US: i64 = 100_000;
 // reaper-poll-ms
-pub const DEFAULT_REAPER_POLL_MS: i64 = 100;
+pub const DEFAULT_REAPER_POLL_MS: i64 = 35;
 pub const MIN_REAPER_POLL_MS: i64 = 10;
 pub const MAX_REAPER_POLL_MS: i64 = 60_000;
 // smartlog-poll-secs
 pub const DEFAULT_SMARTLOG_POLL_SECS: i64 = 60;
 pub const MIN_SMARTLOG_POLL_SECS: i64 = 0;
 pub const MAX_SMARTLOG_POLL_SECS: i64 = 86_400;
-// blob-decay-time
-pub const DEFAULT_BLOB_DECAY_TIME: i64 = 1;
-pub const MIN_BLOB_DECAY_TIME: i64 = 0;
-pub const MAX_BLOB_DECAY_TIME: i64 = 65_535;
+// lfu-decay-minutes
+pub const DEFAULT_LFU_DECAY_MINUTES: i64 = 1;
+pub const MIN_LFU_DECAY_MINUTES: i64 = 0;
+pub const MAX_LFU_DECAY_MINUTES: i64 = 65_535;
 // promote-min-hits
 pub const DEFAULT_PROMOTE_MIN_HITS: i64 = 2;
 pub const MIN_PROMOTE_MIN_HITS: i64 = 1;
@@ -114,18 +116,18 @@ pub const DEFAULT_SCALING_SHRINK_WATERMARK: i64 = 90; // stored as percent
 pub const MIN_SCALING_SHRINK_WATERMARK: i64 = 50;
 pub const MAX_SCALING_SHRINK_WATERMARK: i64 = 95;
 // chunk-size
-pub const DEFAULT_CHUNK_SIZE: i64 = 8 * 1024 * 1024; // 8 MiB
+pub const DEFAULT_CHUNK_SIZE: i64 = 1024 * 1024; // 1 MiB
 pub const MIN_CHUNK_SIZE: i64 = 4096;
 pub const MAX_CHUNK_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
 
 // max-buffers-per-op
-pub const DEFAULT_MAX_BUFFERS_PER_OP: i64 = 8;
+pub const DEFAULT_MAX_BUFFERS_PER_OP: i64 = 64;
 pub const MIN_MAX_BUFFERS_PER_OP: i64 = 2;
-pub const MAX_MAX_BUFFERS_PER_OP: i64 = 64;
+pub const MAX_MAX_BUFFERS_PER_OP: i64 = 1024;
 // min-buffers-per-op
 pub const DEFAULT_MIN_BUFFERS_PER_OP: i64 = 2;
 pub const MIN_MIN_BUFFERS_PER_OP: i64 = 1;
-pub const MAX_MIN_BUFFERS_PER_OP: i64 = 64;
+pub const MAX_MIN_BUFFERS_PER_OP: i64 = 1024;
 // disk-staging-queue-capacity
 pub const DEFAULT_DISK_STAGING_QUEUE_CAPACITY: i64 = 1024;
 pub const MIN_DISK_STAGING_QUEUE_CAPACITY: i64 = 1;
@@ -166,7 +168,12 @@ pub const MAX_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS: i64 = 60_000;
 
 lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
-    pub static ref CFG_DISK_DIR: Mutex<String> = Mutex::new(String::new());
+    /// String configs are registered as a `ValkeyGILGuard<ValkeyString>`, the type whose
+    /// `CONFIG GET` path the crate does not leak. `on_string_config_set` copies the value
+    /// into `DISK_DIR`, which is what the rest of the module reads.
+    pub static ref CFG_DISK_DIR: ValkeyGILGuard<ValkeyString> =
+        ValkeyGILGuard::new(ValkeyString::create(None, ""));
+    static ref DISK_DIR: Mutex<String> = Mutex::new(String::new());
 
     /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 1GiB.
     /// Used in Tiered mode for read/write staging. Split into uniform
@@ -208,8 +215,9 @@ lazy_static::lazy_static! {
     /// Immutable after load — the poller either starts at init or not at all.
     pub static ref CFG_SMARTLOG_POLL_SECS: AtomicI64 = AtomicI64::new(DEFAULT_SMARTLOG_POLL_SECS);
 
-    /// LFU counter decay: minutes per one-point decrement. 0 disables decay.
-    pub static ref CFG_BLOB_DECAY_TIME: AtomicI64 = AtomicI64::new(DEFAULT_BLOB_DECAY_TIME);
+    /// LFU score decay for ranking DRAM objects and cached fds for eviction:
+    /// minutes per one-point decrement. 0 disables decay.
+    pub static ref CFG_LFU_DECAY_MINUTES: AtomicI64 = AtomicI64::new(DEFAULT_LFU_DECAY_MINUTES);
 
     /// How many misses an object must accumulate in the admission filter before a GET
     /// promotes it into DRAMPool. Default: 2.
@@ -273,7 +281,10 @@ lazy_static::lazy_static! {
     pub static ref CFG_FABRIC_PROVIDER: Mutex<FabricProvider> = Mutex::new(FabricProvider::EfaDirect);
 
     /// Comma-separated fabric domains to open a service on. Default: All domains.
-    pub static ref CFG_FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
+    /// Registered like `CFG_DISK_DIR`; the module reads `FABRIC_INTERFACES`.
+    pub static ref CFG_FABRIC_INTERFACES: ValkeyGILGuard<ValkeyString> =
+        ValkeyGILGuard::new(ValkeyString::create(None, ""));
+    static ref FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
 
     /// Transfers each fabric service keeps in flight. Default: the crate's provider-derived default.
     pub static ref CFG_FABRIC_MAX_IN_FLIGHT: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_MAX_IN_FLIGHT);
@@ -351,10 +362,25 @@ pub static MODULE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
 pub fn disk_dir() -> String {
-    CFG_DISK_DIR
-        .lock()
-        .expect("CFG_DISK_DIR lock unavailable")
-        .clone()
+    DISK_DIR.lock().expect("DISK_DIR lock unavailable").clone()
+}
+
+/// Set handler for the string configs: copies the new value out of the Valkey-owned
+/// string into the Rust-side `Mutex<String>` the accessors read.
+pub fn on_string_config_set(
+    config_ctx: &ConfigurationContext,
+    name: &str,
+    val: &'static ValkeyGILGuard<ValkeyString>,
+) -> Result<(), ValkeyError> {
+    // Reject invalid UTF-8: a lossy copy would make the mirror differ from what CONFIG GET reports.
+    let value = val.lock(config_ctx).try_as_str()?.to_owned();
+    let mirror = match name {
+        "disk-dir" => &*DISK_DIR,
+        "fabric-interfaces" => &*FABRIC_INTERFACES,
+        _ => return Err(ValkeyError::Str("Unknown configuration parameter")),
+    };
+    *mirror.lock().expect("string config lock unavailable") = value;
+    Ok(())
 }
 
 pub fn nvme_staging_size() -> usize {
@@ -402,8 +428,8 @@ pub fn smartlog_poll_secs() -> u64 {
     CFG_SMARTLOG_POLL_SECS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
-pub fn blob_decay_time() -> u64 {
-    CFG_BLOB_DECAY_TIME.load(std::sync::atomic::Ordering::Relaxed) as u64
+pub fn lfu_decay_minutes() -> u64 {
+    CFG_LFU_DECAY_MINUTES.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn promote_min_hits() -> u8 {
@@ -535,9 +561,9 @@ pub fn fabric_provider() -> FabricProvider {
 }
 
 pub fn fabric_interfaces() -> Vec<String> {
-    CFG_FABRIC_INTERFACES
+    FABRIC_INTERFACES
         .lock()
-        .expect("CFG_FABRIC_INTERFACES lock unavailable")
+        .expect("FABRIC_INTERFACES lock unavailable")
         .split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())

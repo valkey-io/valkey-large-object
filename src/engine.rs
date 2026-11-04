@@ -23,7 +23,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use valkey_module::{NotifyEvent, ValkeyError, ValkeyValue, VALKEY_OK};
+use valkey_module::{raw, NotifyEvent, ValkeyError, ValkeyValue, VALKEY_OK};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 use crate::errors;
@@ -114,16 +114,33 @@ pub fn inflight_requests() -> u64 {
 
 /// An async GET or SET, over TCP or RDMA. Its client stays blocked until this drops, and
 /// `commandstats` counts the time in between toward the command.
-pub(crate) struct BlockedRequest(valkey_module::ThreadSafeContext<valkey_module::BlockedClient>);
+pub(crate) struct BlockedRequest {
+    thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    /// The client's selected db when it blocked.
+    db: i32,
+}
 
 impl BlockedRequest {
     fn new(ctx: &valkey_module::Context) -> Self {
         INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
         let mut blocked_client = ctx.block_client();
         blocked_client.measure_time_start();
-        Self(valkey_module::ThreadSafeContext::with_blocked_client(
-            blocked_client,
-        ))
+        // SAFETY: `ctx` is the live command context, on the main thread.
+        let db = unsafe { raw::RedisModule_GetSelectedDb.unwrap()(ctx.get_raw()) };
+        Self {
+            thread_ctx: valkey_module::ThreadSafeContext::with_blocked_client(blocked_client),
+            db,
+        }
+    }
+
+    /// Lock the server on the client's db. Shadows `ThreadSafeContext::lock`, whose
+    /// guard is a fresh detached context on db 0.
+    pub(crate) fn lock(&self) -> valkey_module::ContextGuard {
+        let guard = self.thread_ctx.lock();
+        // SAFETY: the guard's context is live and holds the server lock. `db` came from
+        // GetSelectedDb and the db count is fixed at startup, so it is in range.
+        unsafe { raw::RedisModule_SelectDb.unwrap()(guard.get_raw(), self.db) };
+        guard
     }
 }
 
@@ -131,7 +148,7 @@ impl std::ops::Deref for BlockedRequest {
     type Target = valkey_module::ThreadSafeContext<valkey_module::BlockedClient>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.thread_ctx
     }
 }
 
@@ -716,14 +733,7 @@ pub fn execute_set_rdma(
     let key_name_bytes = key_name.as_slice().to_vec();
     match mode {
         OperatingMode::Dram => {
-            cmd_set_dram_efa(
-                ctx,
-                key_name_bytes,
-                obj_len,
-                data_source,
-                thread_ctx,
-                object_id,
-            );
+            cmd_set_dram_efa(key_name_bytes, obj_len, data_source, thread_ctx, object_id);
         }
         OperatingMode::Tiered => {
             cmd_set_tiered(
@@ -813,7 +823,6 @@ pub enum DataSource {
 
 /// DRAM-only EFA SET: chunked alloc in DRAMPool, parallel EFA read + post-hoc CRC, create LoValue.
 fn cmd_set_dram_efa(
-    ctx: &valkey_module::Context,
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -825,18 +834,8 @@ fn cmd_set_dram_efa(
     // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
-    // DRAMPool::alloc_exact_expand_evict: all-or-nothing; expands, then evicts.
-    let buffers = match dram_pool.alloc_exact_expand_evict(ctx, obj_len) {
-        Some(bufs) => bufs,
-        None => {
-            reply_err(
-                &thread_ctx,
-                &info::DRAM_POOL_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_OOM),
-            );
-            return;
-        }
-    };
+    // `None`: the pool is full. The task below waits for a grow, or evicts if the pool cannot grow.
+    let buffers = dram_pool.alloc_exact(obj_len);
     match data_source {
         DataSource::Tcp(_) => unreachable!("Dram+TCP SET routed to sync path"),
         DataSource::Efa {
@@ -847,6 +846,25 @@ fn cmd_set_dram_efa(
             // EFA SET: parallel reads into all buffers, then sequential CRC pass.
             crate::runtime_handle().spawn(async move {
                 let dram_pool = storage::get_dram_pool();
+                let buffers = match buffers {
+                    Some(bufs) => bufs,
+                    None => {
+                        // Pool full. Wait for a grow; if the pool cannot grow, evict (under the server lock).
+                        let got = match dram_pool.alloc_exact_await_expand(obj_len).await {
+                            Some(bufs) => Some(bufs),
+                            None => dram_pool.alloc_exact_evict(&thread_ctx.lock(), obj_len),
+                        };
+                        let Some(bufs) = got else {
+                            reply_err(
+                                &thread_ctx,
+                                &info::DRAM_POOL_EXHAUSTED,
+                                ValkeyError::Str(errors::ERR_OOM),
+                            );
+                            return;
+                        };
+                        bufs
+                    }
+                };
                 let chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(addrs));
                 // Dram EFA SET: EFA-read every chunk into the DRAM buffers via the
