@@ -1740,7 +1740,7 @@ class TestTieredFdPlacement(ValkeyLargeObjTestCaseBase):
 
 # Payload size for staging queue tests: 512 KiB uses 2 × 256 KiB staging buffers.
 STAGING_PAYLOAD_LEN = 524288
-STAGING_PATTERN = bytes(i % 256 for i in range(STAGING_PAYLOAD_LEN))
+STAGING_PATTERN = position_pattern(STAGING_PAYLOAD_LEN)
 
 
 class TestStagingQueueRdma(ValkeyLargeObjTestCaseBase):
@@ -1753,9 +1753,7 @@ class TestStagingQueueRdma(ValkeyLargeObjTestCaseBase):
     Each SET of 512 KiB holds 2 × 256 KiB = 512 KiB of staging, so 2 SETs fill the pool.
     test-pause-before-finalize-set-ms 3000 holds staging buffers for 3s after
     the NVMe write completes but before commit, creating a deterministic window
-    where additional RDMA requests must queue for buffers.
-    disk-staging-queue-capacity 2: the 3rd and 4th RDMA requests queue; the 5th is
-    rejected with ERR too many pending disk requests."""
+    where additional RDMA requests must queue for buffers."""
 
     def get_module_args(self, data_dir, direct_io):
         return (
@@ -1769,7 +1767,6 @@ class TestStagingQueueRdma(ValkeyLargeObjTestCaseBase):
             f" chunk-size 262144"
             f" max-buffers-per-op 2"
             f" min-buffers-per-op 2"
-            f" disk-staging-queue-capacity 2"
             f" test-pause-before-finalize-set-ms 3000"
             f" fabric-provider Emulated"
             f" fabric-interfaces lo"
@@ -1781,7 +1778,7 @@ class TestStagingQueueRdma(ValkeyLargeObjTestCaseBase):
         command = [target, '127.0.0.1', '--read', *flags]
         if split is not None:
             total_size = sum(split)
-            command.append(f'--size={total_size}')
+            command.append(f'--len={total_size}')
             command.append('--split=' + ','.join(str(size) for size in split))
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -1899,7 +1896,6 @@ class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
             f" chunk-size 262144"
             f" max-buffers-per-op 2"
             f" min-buffers-per-op 2"
-            f" disk-staging-queue-capacity 1024"
             f" test-pause-before-finalize-set-ms 3000"
             f" fabric-provider Emulated"
             f" fabric-interfaces lo"
@@ -1911,7 +1907,7 @@ class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
         command = [target, '127.0.0.1', '--read', *flags]
         if split is not None:
             total_size = sum(split)
-            command.append(f'--size={total_size}')
+            command.append(f'--len={total_size}')
             command.append('--split=' + ','.join(str(size) for size in split))
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
