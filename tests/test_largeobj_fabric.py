@@ -525,6 +525,28 @@ class TestLargeObjFabricDramGrowWait(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_dram_segments'] > 1
         assert info['largeobj_dram_alloc_waits'] > 0
 
+    def test_concurrent_tcp_sets_wait_for_the_grow_and_succeed(self):
+        # A TCP SET that finds the pool full while a grow runs blocks its client and copies from
+        # its held argument once there is room. Each payload differs, so a mixed-up copy shows.
+        count = 12
+        payloads = {f'key{i}': bytes([i + 1]) * TARGET_LEN for i in range(count)}
+
+        def tcp_set(item):
+            key, payload = item
+            return self.server.get_new_client().execute_command('BLOB.TCP_SET', key, payload)
+
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            replies = list(pool.map(tcp_set, payloads.items()))
+        assert replies == [b'OK'] * count
+
+        client = self.server.get_new_client()
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.TCP_GET', key) == payload
+        info = info_largeobj(client)
+        assert info['largeobj_dram_segments'] > 1
+        # Only a SET that waited for a grow is counted: a TCP SET no longer grows the pool itself.
+        assert info['largeobj_dram_alloc_waits'] > 0
+
     def test_sets_evict_when_the_pool_cannot_expand(self):
         client = self.server.get_new_client()
         # Hold the pool to its one segment, and let the module evict.

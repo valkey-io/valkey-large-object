@@ -153,7 +153,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
 
         after = info_largeobj(client)
         assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands'] + 1
-        # The SET grew the pool inline, so it is counted as an alloc that waited.
+        # The SET waited for the grow, so it is counted as an alloc that waited.
         assert after['largeobj_dram_alloc_waits'] == before['largeobj_dram_alloc_waits'] + 1
         assert after['largeobj_dram_segments'] == 2
         # Dram mode has no io_uring ring, so nothing is ever io_uring-registered.
