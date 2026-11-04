@@ -92,16 +92,6 @@ struct SetObjectInfo {
     client_crc: Option<u32>,
 }
 
-// ─── Engine Result ────────────────────────────────────────────────────────────
-
-/// Result of an engine dispatch. Command handler matches on this.
-pub enum EngineResult {
-    /// Sync path completed — return this value directly to Valkey.
-    Sync(Result<ValkeyValue, ValkeyError>),
-    /// Async path — client is blocked, reply will come from tokio task.
-    Async,
-}
-
 // ─── Blocked Request ─────────────────────────────────────────────────────────
 
 /// INFO `inflight_requests`: `BlockedRequest::new` counts a request in, its `Drop` counts it out.
@@ -271,8 +261,8 @@ pub(crate) const EVENT_UPDATE: &str = "largeobj.update";
 // GET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Execute BLOB.TCP_GET / BLOB.RDMA_GET with mode + transport routing.
-/// Engine owns all routing decisions. Command handler just matches EngineResult.
+/// Execute BLOB.TCP_GET / BLOB.RDMA_GET with mode + transport routing. Always async:
+/// blocks the client and dispatches to tokio; the reply comes from the task.
 pub fn execute_get(
     ctx: &valkey_module::Context,
     object_id: ObjectId,
@@ -280,8 +270,7 @@ pub fn execute_get(
     crc32c: Crc,
     file: Option<Arc<ObjectFile>>,
     transport: Transport,
-) -> EngineResult {
-    // Always async — block client, dispatch to tokio.
+) {
     let thread_ctx = BlockedRequest::new(ctx);
     match crate::operating_mode() {
         OperatingMode::Dram => {
@@ -292,7 +281,6 @@ pub fn execute_get(
             cmd_get_tiered(object_id, obj_len, crc32c, file, transport, thread_ctx);
         }
     }
-    EngineResult::Async
 }
 
 // ─── DRAM-only GET ────────────────────────────────────────────────
@@ -598,7 +586,7 @@ pub fn execute_set_tcp(
     obj_len: u64,
     data: &[u8],
     old_oid: Option<ObjectId>,
-) -> EngineResult {
+) {
     execute_set(
         ctx,
         key_name,
@@ -616,7 +604,7 @@ pub fn execute_set(
     obj_len: u64,
     data_source: DataSource,
     old_oid: Option<ObjectId>,
-) -> EngineResult {
+) {
     let mode = crate::operating_mode();
     // Assign object_id at command dispatch time (main thread) — establishes
     // ordering by arrival, not completion. Used for version checks on async paths.
@@ -639,7 +627,6 @@ pub fn execute_set(
             );
         }
     }
-    EngineResult::Async
 }
 
 pub enum DataSource {
