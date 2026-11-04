@@ -98,6 +98,15 @@ impl Segment {
         }
     }
 
+    /// The segment's memory as a `'static` slice, for registering it with the transport layer
+    /// (EFA `fi_mr_reg`). `Segment::drop` deregisters before it frees, so no registration
+    /// outlives the memory.
+    pub fn slice(&self) -> &'static [u8] {
+        // SAFETY: base/size describe the backing buffer allocated in `new`, which stays
+        // allocated until this Segment drops.
+        unsafe { std::slice::from_raw_parts(self.base, self.size) }
+    }
+
     /// Whether this segment's buffer is registered in the io_uring kernel table — see the field's doc.
     pub fn is_io_uring_registered(&self) -> bool {
         self.io_uring_registered.load(Ordering::Relaxed)

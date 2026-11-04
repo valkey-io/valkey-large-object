@@ -1,5 +1,5 @@
 import os
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, position_pattern
 from valkeytestframework.util.waiters import wait_for_equal
 
 
@@ -26,9 +26,9 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         """A graceful SHUTDOWN deletes every object file from disk-dir, whether
         it was left by a SET or partially cleared by an async DEL."""
         client = self.server.get_new_client()
-        client.execute_command("BLOB.TCP_SET", "a", b"A" * 4096)
-        client.execute_command("BLOB.TCP_SET", "b", b"B" * 4096)
-        client.execute_command("BLOB.TCP_SET", "c", b"C" * 4096)
+        client.execute_command("BLOB.TCP_SET", "a", position_pattern(4096, "A"))
+        client.execute_command("BLOB.TCP_SET", "b", position_pattern(4096, "B"))
+        client.execute_command("BLOB.TCP_SET", "c", position_pattern(4096, "C"))
         # DEL frees asynchronously (BIO thread); wait for completion.
         client.execute_command("DEL", "b")
         wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
@@ -78,7 +78,7 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         """End-to-end: data written before a restart does not linger."""
         client = self.server.get_new_client()
         for i in range(3):
-            client.execute_command("BLOB.TCP_SET", f"rk{i}", b"Z" * 4096)
+            client.execute_command("BLOB.TCP_SET", f"rk{i}", position_pattern(4096, "Z"))
         assert len(self._object_files()) == 3
 
         # restart() = graceful exit (handler purges) + fresh start (startup purge).
@@ -87,5 +87,5 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         assert self._object_files() == [], "object files lingered across restart"
         # A fresh server can still serve new writes.
         client = self.server.get_new_client()
-        assert client.execute_command("BLOB.TCP_SET", "after", b"Q" * 4096) == b"OK"
+        assert client.execute_command("BLOB.TCP_SET", "after", position_pattern(4096, "Q")) == b"OK"
         assert len(self._object_files()) == 1

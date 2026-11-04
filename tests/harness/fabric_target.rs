@@ -14,10 +14,12 @@
 //! `BLOB.RDMA_SET key <len> 1 <rkey> <remote-addr> <len>` instead. This holds the buffers open and lets
 //! the initiator do the verifying.
 //!
+//! `--len=<bytes>` sets the object length (default 4096).
+//!
 //! `--split=<size1>,<size2>[,...]` registers N separate allocations of the given sizes instead of
 //! one buffer, each with its own registration and so its own rkey, and advertises one line per
-//! region. The sizes must sum to `BUFFER_LEN` and may be unequal (`--split=1024,3072`). Regions
-//! are advertised in registration order, which is the order the object's bytes span them.
+//! region. The sizes must sum to the object length and may be unequal (`--split=1024,3072`).
+//! Regions are advertised in registration order, which is the order the object's bytes span them.
 //!
 //! `--efa` opens the `efa-direct` fabric instead of tcp loopback. There a target must hold the
 //! initiator's address before it can be RMA'd against, so it takes one as its only positional.
@@ -27,6 +29,8 @@
 use std::ffi::CString;
 use std::os::raw::c_void;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dma_libfabric_protocol::{checksum, decode_hex, encode_hex};
@@ -40,12 +44,17 @@ use ofi_libfabric_sys::bindgen::{
     FI_WRITE,
 };
 
-const BUFFER_LEN: usize = 4096;
+const DEFAULT_LEN: usize = 4096;
 
-/// Position-dependent payload: cycling 0x00..0xFF so that byte-ordering across multi-region
-/// splits is verified, not just fill. Must match the Python test's PATTERN.
+/// Each 4-byte word holds its own index, little-endian, so every position differs: bytes that
+/// land at the wrong offset (a misplaced chunk or region) cannot match. Must match
+/// `position_pattern` in tests/valkey_largeobj_test_case.py.
 fn generate_pattern(len: usize) -> Vec<u8> {
-    (0..len).map(|i| (i % 256) as u8).collect()
+    let mut pattern: Vec<u8> = (0..len.div_ceil(4) as u32)
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    pattern.truncate(len);
+    pattern
 }
 
 /// Everything opened, closed on drop in reverse construction order.
@@ -97,10 +106,10 @@ fn check(code: i32, what: &str) -> Result<(), String> {
 }
 
 /// The region sizes to register, from a `--split=a,b,...` spec; absent, one whole-buffer
-/// region. The sizes must sum to `BUFFER_LEN`, since the object is exactly that long.
-fn region_sizes(split: Option<&str>) -> Result<Vec<usize>, String> {
+/// region. The sizes must sum to `len`, since the object is exactly that long.
+fn region_sizes(split: Option<&str>, len: usize) -> Result<Vec<usize>, String> {
     let Some(spec) = split else {
-        return Ok(vec![BUFFER_LEN]);
+        return Ok(vec![len]);
     };
     let mut sizes = Vec::new();
     for field in spec.split(',') {
@@ -117,9 +126,9 @@ fn region_sizes(split: Option<&str>) -> Result<Vec<usize>, String> {
         return Err("--split: at least one region size is required".to_string());
     }
     let total: usize = sizes.iter().sum();
-    if BUFFER_LEN != total {
+    if len != total {
         return Err(format!(
-            "--split: sizes total {total}, must total BUFFER_LEN {BUFFER_LEN}"
+            "--split: sizes total {total}, must total the object length {len}"
         ));
     }
     Ok(sizes)
@@ -132,8 +141,15 @@ fn main() -> Result<(), String> {
     // Serve the buffer for a remote read rather than wait for a remote write.
     let serve_read = flags.iter().any(|flag| "--read" == flag);
     let use_efa = flags.iter().any(|flag| "--efa" == flag);
+    let len = match flags.iter().find_map(|flag| flag.strip_prefix("--len=")) {
+        Some(len) => match len.parse::<usize>() {
+            Ok(len) if len > 0 => len,
+            _ => return Err(format!("--len: {len:?} is not a size > 0")),
+        },
+        None => DEFAULT_LEN,
+    };
     let split = flags.iter().find_map(|flag| flag.strip_prefix("--split="));
-    let sizes = region_sizes(split)?;
+    let sizes = region_sizes(split, len)?;
     let mut arguments = positional.into_iter();
     // An EFA endpoint binds to the device and advertises its own fabric address, so there is no
     // source to pin — the first positional is the initiator's address instead.
@@ -269,7 +285,7 @@ fn main() -> Result<(), String> {
     // Remote-accessible, unlike the initiator's local-only operands. Prefilled when the initiator is
     // the one fetching it. One allocation per region, all allocated before the first registration
     // because a registration holds a raw pointer into its buffer.
-    let pattern = generate_pattern(BUFFER_LEN);
+    let pattern = generate_pattern(len);
     let buffers: Vec<Vec<u8>> = if serve_read {
         // Prefill each region with its slice of the position-dependent pattern.
         let mut offset = 0;
@@ -369,19 +385,31 @@ fn main() -> Result<(), String> {
     let contents = |buffers: &[Vec<u8>]| -> Vec<u8> { buffers.concat() };
     if serve_read {
         println!(
-            "serving {BUFFER_LEN} bytes (cycling 0x00..0xFF) across {} region(s) for a remote read, crc {:#010x} — the initiator verifies",
+            "serving {len} bytes (position pattern) across {} region(s) for a remote read, crc {:#010x} — the initiator verifies",
             advertisements.len(),
             checksum(&contents(&buffers))
         );
     } else {
         println!(
-            "waiting for a transfer into {BUFFER_LEN} bytes across {} region(s)...",
+            "waiting for a transfer into {len} bytes across {} region(s)...",
             advertisements.len()
         );
     }
 
     // Under FI_PROGRESS_MANUAL nothing services the inbound RMA unless the queue is polled, and the
     // write raises no completion here — so poll for progress, watch the buffers for arrival.
+    // Polling is also what acknowledges the initiator's writes, so once the payload is verified
+    // keep polling until stdin closes: the test closes it after its command has replied.
+    // Exiting at once could drop acknowledgements and fail the initiator's last writes.
+    let stdin_closed = Arc::new(AtomicBool::new(false));
+    {
+        let stdin_closed = Arc::clone(&stdin_closed);
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+            stdin_closed.store(true, Ordering::Relaxed);
+        });
+    }
+    let mut verified = false;
     let deadline = Instant::now() + Duration::from_secs(300);
     while Instant::now() < deadline {
         // SAFETY: a one-entry read into an owned value; the queue is live until `target` drops.
@@ -396,6 +424,13 @@ fn main() -> Result<(), String> {
         // A read leaves nothing behind here, so there is no arrival to watch for: hold the buffers
         // open and keep polling until the window closes.
         if serve_read {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        if verified {
+            if stdin_closed.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             std::thread::sleep(Duration::from_millis(1));
             continue;
         }
@@ -415,14 +450,15 @@ fn main() -> Result<(), String> {
         if landed {
             // The CRC the initiator also prints, so the pair cross-checks.
             println!(
-                "received {BUFFER_LEN} bytes, crc {:#010x} — payload verified",
+                "received {len} bytes, crc {:#010x} — payload verified",
                 checksum(&contents(&buffers))
             );
-            return Ok(());
+            verified = true;
+            continue;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
-    if serve_read {
+    if serve_read || verified {
         return Ok(());
     }
     Err("timed out waiting for a transfer".into())
