@@ -198,9 +198,11 @@ impl Source<'_> {
 /// (TCP) or fi_write to the client (EFA); SET consumes to storage — WriteFixed to
 /// NVMe (Tiered) or a no-op (DRAM, bytes already landed in the pool buffer).
 pub enum Target<'a> {
-    /// Accumulate chunk bytes into the reply buffer (GET TCP); bench = size only.
+    /// Copy each chunk to its offset in the reply buffer (GET TCP); bench = size only.
+    /// Chunks complete in any order, so the reply is filled by offset, not appended;
+    /// `filled` counts the bytes written so `into_reply` can set the length safely.
     TcpReply {
-        reply: std::sync::Mutex<Vec<u8>>,
+        reply: std::sync::Mutex<(Vec<u8>, usize)>,
         bench: bool,
     },
     /// fi_write each ready chunk to the client (GET EFA).
@@ -218,11 +220,14 @@ impl Target<'_> {
     /// GET TCP reply constructor.
     pub fn tcp_reply(obj_len: u64, bench: bool) -> Self {
         Target::TcpReply {
-            reply: std::sync::Mutex::new(if bench {
-                Vec::new()
-            } else {
-                Vec::with_capacity(obj_len as usize)
-            }),
+            reply: std::sync::Mutex::new((
+                if bench {
+                    Vec::new()
+                } else {
+                    Vec::with_capacity(obj_len as usize)
+                },
+                0,
+            )),
             bench,
         }
     }
@@ -235,7 +240,12 @@ impl Target<'_> {
                 if bench {
                     ValkeyValue::Integer(obj_len as i64)
                 } else {
-                    ValkeyValue::StringBuffer(reply.into_inner().expect("reply lock poisoned"))
+                    let (mut data, filled) = reply.into_inner().expect("reply lock poisoned");
+                    assert_eq!(filled as u64, obj_len, "TCP GET reply not fully filled");
+                    // SAFETY: every chunk was copied to its own offset, and together they
+                    // cover all `obj_len` bytes of the capacity reserved in `tcp_reply`.
+                    unsafe { data.set_len(filled) };
+                    ValkeyValue::StringBuffer(data)
                 }
             }
             _ => unreachable!("into_reply is only called on the TcpReply GET target"),
@@ -252,14 +262,23 @@ impl Target<'_> {
         match self {
             Target::TcpReply { reply, bench } => {
                 if !*bench {
-                    // SAFETY: buffer holds `chunk.user_data_len` bytes the source just produced.
-                    let slice = unsafe {
-                        std::slice::from_raw_parts(buf_ptr as *mut u8, chunk.user_data_len)
-                    };
-                    reply
-                        .lock()
-                        .expect("reply lock poisoned")
-                        .extend_from_slice(slice);
+                    let offset = chunk.index as usize * chunk_size;
+                    let mut guard = reply.lock().expect("reply lock poisoned");
+                    let (data, filled) = &mut *guard;
+                    assert!(
+                        offset + chunk.user_data_len <= data.capacity(),
+                        "TCP GET chunk past the reply buffer"
+                    );
+                    // SAFETY: the source buffer holds `chunk.user_data_len` bytes it just
+                    // produced, and the destination range is inside the reserved capacity.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            buf_ptr as *const u8,
+                            data.as_mut_ptr().add(offset),
+                            chunk.user_data_len,
+                        );
+                    }
+                    *filled += chunk.user_data_len;
                 }
                 Ok(())
             }
