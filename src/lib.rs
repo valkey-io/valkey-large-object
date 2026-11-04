@@ -149,6 +149,14 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
+    // The module only registers host memory. libfabric's default initializes every HMEM
+    // interface it finds, so on a GPU node it starts CUDA and holds GPU memory; GPU
+    // workloads (vLLM) then kill the server. Default to host memory only, keeping an
+    // operator's explicit FI_HMEM. Set before the tokio runtime and fabric spawn threads.
+    if std::env::var_os("FI_HMEM").is_none() {
+        std::env::set_var("FI_HMEM", "system");
+    }
+
     // Step 0: Create tokio runtime as a local. Set in OnceLock only after all init succeeds.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads())
