@@ -539,7 +539,11 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
 
         client.config_set('maxmemory', 0)
-        promote(client, ['tshrink_0'])
+        # At zero segments the wait above passes trivially (0 == 0), possibly before the
+        # last re-register finishes; a GET in that window skips promotion. Retry the GET.
+        wait_for_true(lambda: client.execute_command('BLOB.TCP_GET', 'tshrink_0') is not None
+                      and info_largeobj(client)['largeobj_dram_objects'] == 1,
+                      timeout=self.TIMEOUT_S)
         regrown = info_largeobj(client)
         assert regrown['largeobj_dram_scaling_expands'] == shrunk['largeobj_dram_scaling_expands'] + 1
         assert regrown['largeobj_dram_segments'] == 1
