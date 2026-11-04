@@ -1115,9 +1115,9 @@ async fn cmd_set_tiered_run(
 
 // ─── Serve from DRAMPool ─────────────────────────────────────────────────────
 
-/// Serve a Ready ObjectContext from DRAMPool on a worker, through the streaming
-/// driver: TCP copies each chunk into the reply, EFA writes it to the client GPU.
-/// `obj_ctx` and `file` are pinned for the async transfer's duration.
+/// Serve a Ready ObjectContext from DRAMPool. TCP copies into a Vec on a worker;
+/// EFA writes per-chunk to client GPU (parallelized).
+/// On both paths, `obj_ctx` and `file` are pinned for the async transfer's duration.
 fn cmd_get_from_dram(
     dram_pool: &storage::DRAMPool,
     obj_ctx: &Arc<ObjectContext>,
@@ -1132,46 +1132,64 @@ fn cmd_get_from_dram(
     if let Some(cache) = &dram_pool.cache {
         cache.stats.record_hit(&obj_ctx.stats);
     }
-    // Write every DRAM buffer to the client via the ONE streaming driver
-    // (source=DRAM resident, target=TCP reply or EFA client), on a worker.
-    let obj_ctx = obj_ctx.clone();
-    crate::runtime_handle().spawn(async move {
-        let _keep_alive = (&obj_ctx, file);
-        let dram_pool = storage::get_dram_pool();
-        let (chunk_iter, target) =
-            cmd_get_transport_parts(transport, obj_len, obj_ctx.buffers.len());
-        let job = crate::stream::StreamJob::for_dram(
-            obj_len,
-            crate::chunk_size(),
-            crc32c,
-            obj_ctx.buffers.len(),
-        );
-        let source = crate::stream::Source::DramResident {
-            buffers: &obj_ctx.buffers,
-            pool: crate::stream::Pool::Dram(dram_pool),
-        };
-        // A DRAM serve has no progress hook, so a target error surfaces as Err.
-        let outcome = match target {
-            GetTarget::Tcp => {
-                let tgt = crate::stream::Target::tcp_reply(obj_len, crate::bench_mode());
-                crate::stream::run_get(&job, chunk_iter, &source, &tgt, None)
-                    .await
-                    .map(|_| tgt.into_reply(obj_len))
+    match transport {
+        Transport::Tcp => {
+            if crate::bench_mode() {
+                thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+            } else {
+                // Copy and reply on a worker, as the NVMe path does, so a hit does not
+                // hold the main thread for the whole value copy.
+                let obj_ctx = obj_ctx.clone();
+                crate::runtime_handle().spawn(async move {
+                    let _keep_alive = (&obj_ctx, file);
+                    let mut chunk_iter = ChunkIterator::new(
+                        obj_len,
+                        crate::chunk_size(),
+                        obj_ctx.buffers.len(),
+                        None,
+                    );
+                    let data = collect_dram_bytes(
+                        storage::get_dram_pool(),
+                        &obj_ctx,
+                        obj_len,
+                        &mut chunk_iter,
+                    );
+                    thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+                });
             }
-            GetTarget::Efa(session) => {
-                let tgt = crate::stream::Target::EfaWrite { session };
-                crate::stream::run_get(&job, chunk_iter, &source, &tgt, None)
-                    .await
-                    .map(|_| efa_get_reply(obj_len, crc32c))
-            }
-        };
-        match outcome {
-            Ok(reply) => {
-                thread_ctx.reply(Ok(reply));
-            }
-            Err(e) => crate::stream::reply_stream_err(&thread_ctx, e),
         }
-    });
+        Transport::Efa { session, addrs } => {
+            // EFA: write every DRAM buffer to the client via the ONE streaming
+            // driver (source=DRAM resident, target=EFA client).
+            let obj_ctx = obj_ctx.clone();
+            crate::runtime_handle().spawn(async move {
+                let _keep_alive = (&obj_ctx, file);
+                let dram_pool = storage::get_dram_pool();
+                let chunk_size = crate::chunk_size();
+                let chunk_iter =
+                    ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(addrs));
+                let job = crate::stream::StreamJob::for_dram(
+                    obj_len,
+                    chunk_size,
+                    crc32c,
+                    obj_ctx.buffers.len(),
+                );
+                let source = crate::stream::Source::DramResident {
+                    buffers: &obj_ctx.buffers,
+                    pool: crate::stream::Pool::Dram(dram_pool),
+                };
+                let target = crate::stream::Target::EfaWrite { session };
+                match crate::stream::run_get(&job, chunk_iter, &source, &target, None).await {
+                    // [obj_len, crc32c] on clean success; a Dram GET has no progress
+                    // hook, so a target error already surfaced as Err below.
+                    Ok(_) => {
+                        thread_ctx.reply(Ok(efa_get_reply(obj_len, crc32c)));
+                    }
+                    Err(e) => crate::stream::reply_stream_err(&thread_ctx, e),
+                }
+            });
+        }
+    }
 }
 
 // ─── Coalesced Waiter Registration ───────────────────────────────────────────
@@ -1257,8 +1275,8 @@ fn serve_filling_or_became_ready(
 }
 
 /// Coalesced waiter: wait for the promotion leader to finish, then serve via the
-/// standard DRAM path. Transport-agnostic — cmd_get_from_dram handles both TCP and
-/// EFA (run_get with Source::DramResident + Target::TcpReply / Target::EfaWrite).
+/// standard DRAM path. Transport-agnostic — cmd_get_from_dram handles both TCP
+/// (collect_dram_bytes) and EFA (run_get with Source::DramResident + Target::EfaWrite).
 async fn serve_coalesced_waiter(
     obj_ctx: Arc<ObjectContext>,
     rx: tokio::sync::watch::Receiver<bool>,
