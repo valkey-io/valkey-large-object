@@ -5,7 +5,16 @@ import resource
 import threading
 import pytest
 from valkey import ResponseError, Valkey
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
+from valkey_largeobj_test_case import (
+    MIB,
+    ORDER_CHUNK_SIZE,
+    ORDER_OBJECT_LEN,
+    ValkeyLargeObjTestCaseBase,
+    assert_bytes_equal,
+    chunk_order_module_args,
+    info_largeobj,
+    position_pattern,
+)
 from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 
 
@@ -1814,77 +1823,47 @@ class TestTieredPromotionFailureRace(ValkeyLargeObjTestCaseBase):
 
 
 # ─── TCP GET chunk order ─────────────────────────────────────────────────
+# A GET reads an object's chunks concurrently, and disk reads complete in any order.
+# The reply must still hold every chunk at its own offset.
 
-
-def _numbered_chunks(num_chunks, chunk_size, tail):
-    """Payload whose every chunk differs, so a reordered reply cannot compare equal."""
-    return b''.join(i.to_bytes(4, 'big') * (chunk_size // 4) for i in range(num_chunks)) + b'T' * tail
-
-
-def _assert_same_chunks(result, payload, chunk_size):
-    # pytest.fail, not assert: pytest's diff of two large byte strings never finishes.
-    if len(result) != len(payload):
-        pytest.fail(f"length {len(result)} != {len(payload)}")
-    for i in range(0, len(payload), chunk_size):
-        if result[i:i + chunk_size] != payload[i:i + chunk_size]:
-            pytest.fail(
-                f"chunk {i // chunk_size} holds chunk {int.from_bytes(result[i:i + 4], 'big')}"
-            )
-
-
-ORDER_CHUNK = 65536
-ORDER_CHUNKS = 64
-
-
-def _chunk_order_args(data_dir, direct_io, max_promote_size):
-    # O_DIRECT (the harness default) so disk reads can complete out of submit order,
-    # as they do on a real device; page-cache reads come back in order.
-    return (
-        f"operating-mode Tiered"
-        f" disk-dir {data_dir}"
-        f" disk-staging-size 16777216"
-        f" segment-size 16777216"
-        f" promote-min-hits 1"
-        f" max-promote-size {max_promote_size}"
-        f" max-object-size 8388608"
-        f" bench-mode no"
-        f" direct-io {direct_io}"
-        f" chunk-size {ORDER_CHUNK}"
-        f" fabric-provider Emulated"
-    )
+# Reordering depends on I/O timing, so each test repeats the GET. Before the fix, every
+# repetition returned misplaced chunks.
+ORDER_REPEATS = 10
 
 
 class TestTieredTcpGetChunkOrder(ValkeyLargeObjTestCaseBase):
-    """A multi-chunk TCP GET returns chunks in object order, whatever order the
-    disk reads complete in. Promotion reads every chunk in one window."""
+    """With promotion: the first GET reads every chunk from disk in one window while
+    copying the object into DRAM; the second is served from DRAM."""
 
     def get_module_args(self, data_dir, direct_io):
-        return _chunk_order_args(data_dir, direct_io, 8388608)
+        return chunk_order_module_args(data_dir, direct_io, max_promote_size=8 * MIB)
 
-    def test_get_from_disk_and_after_promotion_keeps_chunk_order(self):
+    def test_get_keeps_chunk_order_while_promoting(self):
         client = self.server.get_new_client()
-        payload = _numbered_chunks(ORDER_CHUNKS, ORDER_CHUNK, 1)
-        for i in range(10):
+        payload = position_pattern(ORDER_OBJECT_LEN)
+        for i in range(ORDER_REPEATS):
             key = f'ordered{i}'
             client.execute_command('BLOB.TCP_SET', key, payload)
-            # First GET reads from disk while promoting; the second is served from DRAM.
-            _assert_same_chunks(client.execute_command('BLOB.TCP_GET', key), payload, ORDER_CHUNK)
+            assert client.execute_command('BLOB.INFO', key, 'TIER') == b'disk'
+            reply = client.execute_command('BLOB.TCP_GET', key)
+            assert_bytes_equal(reply, payload, ORDER_CHUNK_SIZE)
             assert client.execute_command('BLOB.INFO', key, 'TIER') == b'dram'
-            _assert_same_chunks(client.execute_command('BLOB.TCP_GET', key), payload, ORDER_CHUNK)
+            reply = client.execute_command('BLOB.TCP_GET', key)
+            assert_bytes_equal(reply, payload, ORDER_CHUNK_SIZE)
 
 
-class TestTieredTcpGetChunkOrderNoPromotion(ValkeyLargeObjTestCaseBase):
-    """Same on the streaming disk path: no promotion, a window of staging
-    buffers is reused across batches."""
+class TestTieredTcpGetChunkOrderStreamed(ValkeyLargeObjTestCaseBase):
+    """Without promotion: every GET streams from disk through a small window of staging
+    buffers, reused batch after batch."""
 
     def get_module_args(self, data_dir, direct_io):
-        return _chunk_order_args(data_dir, direct_io, 0)
+        return chunk_order_module_args(data_dir, direct_io, max_promote_size=0)
 
     def test_streamed_get_keeps_chunk_order(self):
         client = self.server.get_new_client()
-        payload = _numbered_chunks(ORDER_CHUNKS, ORDER_CHUNK, 1)
+        payload = position_pattern(ORDER_OBJECT_LEN)
         client.execute_command('BLOB.TCP_SET', 'ordered', payload)
-        for _ in range(10):
-            _assert_same_chunks(
-                client.execute_command('BLOB.TCP_GET', 'ordered'), payload, ORDER_CHUNK
-            )
+        for _ in range(ORDER_REPEATS):
+            reply = client.execute_command('BLOB.TCP_GET', 'ordered')
+            assert_bytes_equal(reply, payload, ORDER_CHUNK_SIZE)
+        assert client.execute_command('BLOB.INFO', 'ordered', 'TIER') == b'disk'

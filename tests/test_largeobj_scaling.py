@@ -27,7 +27,7 @@ from contextlib import contextmanager
 import pytest
 from valkey import OutOfMemoryError, ResponseError
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
 
 # 900KB in a 1MB segment: one object of this size fills a segment by itself.
 SEGMENT_FILLING_SIZE = 900 * 1024
@@ -199,8 +199,8 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         expands = lambda: info_largeobj(client)['largeobj_dram_scaling_expands']
         efa_len = 4096
-        # fabric_target --read serves 0x00..0xFF repeating (its generate_pattern()).
-        efa_payload = bytes(i % 256 for i in range(efa_len))
+        # What fabric_target --read serves (its generate_pattern()).
+        efa_payload = position_pattern(efa_len)
         small = b'F' * efa_len
         start = expands()
 
