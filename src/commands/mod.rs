@@ -323,7 +323,7 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         client_crc,
     };
     // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set_rdma(ctx, &args[1], obj_len, data_source, old_oid) {
+    match engine::execute_set(ctx, &args[1], obj_len, data_source, old_oid) {
         engine::EngineResult::Sync(result) => result,
         engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
     }
