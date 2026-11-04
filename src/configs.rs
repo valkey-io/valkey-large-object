@@ -123,11 +123,11 @@ pub const MAX_CHUNK_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
 // max-buffers-per-op
 pub const DEFAULT_MAX_BUFFERS_PER_OP: i64 = 64;
 pub const MIN_MAX_BUFFERS_PER_OP: i64 = 2;
-pub const MAX_MAX_BUFFERS_PER_OP: i64 = 64;
+pub const MAX_MAX_BUFFERS_PER_OP: i64 = 1024;
 // min-buffers-per-op
 pub const DEFAULT_MIN_BUFFERS_PER_OP: i64 = 2;
 pub const MIN_MIN_BUFFERS_PER_OP: i64 = 1;
-pub const MAX_MIN_BUFFERS_PER_OP: i64 = 64;
+pub const MAX_MIN_BUFFERS_PER_OP: i64 = 1024;
 // max-object-size
 pub const DEFAULT_MAX_OBJECT_SIZE: i64 = 512 * 1024 * 1024; // 512 MiB
 pub const MIN_MAX_OBJECT_SIZE: i64 = 1;

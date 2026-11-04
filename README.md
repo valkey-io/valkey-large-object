@@ -81,8 +81,8 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `max-object-size` | 512mb | Yes | Maximum allowed object size for BLOB.TCP_SET / BLOB.RDMA_SET. Min 1 byte. |
 | `max-promote-size` | 256mb | Yes | Max object size for NVMe→DRAM promotion. 0 = disable promotion. |
 | `chunk-size` | 1mb | Immutable | Chunk size for multi-buffer streaming I/O. Min 4kb, max 256mb. |
-| `max-buffers-per-op` | 64 | Yes | Max buffers per streaming operation. Min 2, max 64. |
-| `min-buffers-per-op` | 2 | Yes | Min buffers to start a streaming operation. Min 1, max 64. |
+| `max-buffers-per-op` | 64 | Yes | Max buffers per streaming operation. Min 2, max 1024. |
+| `min-buffers-per-op` | 2 | Yes | Min buffers to start a streaming operation. Min 1, max 1024. |
 | `scaling-poll-ms` | 2500 | Yes | Scaling cron poll interval in milliseconds. Min 1000, max 60000. |
 | `scaling-expand-watermark` | 80 | Yes | Percent utilization to trigger proactive segment expansion. Min 50, max 95. |
 | `scaling-shrink-watermark` | 90 | Yes | Percent used_memory/maxmemory to trigger DRAM segment eviction. Min 50, max 95. |

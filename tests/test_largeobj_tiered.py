@@ -1811,3 +1811,68 @@ class TestTieredPromotionFailureRace(ValkeyLargeObjTestCaseBase):
             f"got {errors_after - errors_before} "
             f"(before={errors_before} after={errors_after})"
         )
+
+
+# ─── max-buffers-per-op at its cap ───────────────────────────────────────
+
+WIDE_CHUNK = 4096
+WIDE_BUFFERS = 1024  # MAX_MAX_BUFFERS_PER_OP
+
+
+def _wide_module_args(data_dir, direct_io, max_promote_size):
+    # 16 MiB staging holds 4096 chunk buffers, so a GET or SET gets its full
+    # 1024-buffer window: far more SQEs per op than the 256-entry io_uring ring.
+    return (
+        f"operating-mode Tiered"
+        f" disk-dir {data_dir}"
+        f" disk-staging-size 16777216"
+        f" segment-size 16777216"
+        f" promote-min-hits 1"
+        f" max-promote-size {max_promote_size}"
+        f" max-object-size 8388608"
+        f" bench-mode no"
+        f" direct-io {direct_io}"
+        f" chunk-size {WIDE_CHUNK}"
+        f" max-buffers-per-op {WIDE_BUFFERS}"
+        f" fabric-provider Emulated"
+    )
+
+
+# One more chunk than the window, so the op needs a second batch. Every chunk differs.
+WIDE_PAYLOAD = b''.join(
+    i.to_bytes(4, 'big') * (WIDE_CHUNK // 4) for i in range(WIDE_BUFFERS + 1)
+)
+
+
+class TestTieredMaxBuffersPerOpAtCap(ValkeyLargeObjTestCaseBase):
+    """A 1024-buffer window: SET writes every chunk and promotion reads every chunk back."""
+
+    def get_module_args(self, data_dir, direct_io):
+        # Exactly the payload: 4 KiB chunks pay heavy per-chunk allocator overhead,
+        # so a much larger promote size would not fit the segment.
+        return _wide_module_args(data_dir, direct_io, len(WIDE_PAYLOAD))
+
+    def test_set_and_promote_with_full_window(self):
+        client = self.server.get_new_client()
+        assert client.execute_command('BLOB.TCP_SET', 'wide', WIDE_PAYLOAD) == b'OK'
+        # The promoting GET's own reply is not byte-checked: TCP GETs read from disk
+        # can reorder chunks until the chunk-order fix lands. The DRAM copy can't.
+        client.execute_command('BLOB.TCP_GET', 'wide')
+        assert client.execute_command('BLOB.INFO', 'wide', 'TIER') == b'dram'
+        # pytest.fail, not assert: pytest's diff of two large byte strings never finishes.
+        if client.execute_command('BLOB.TCP_GET', 'wide') != WIDE_PAYLOAD:
+            pytest.fail("DRAM copy differs from the payload")
+
+
+class TestTieredMaxBuffersPerOpAtCapNoPromotion(ValkeyLargeObjTestCaseBase):
+    """A 1024-buffer window on the streaming disk path completes without I/O errors."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return _wide_module_args(data_dir, direct_io, 0)
+
+    def test_streamed_get_with_full_window(self):
+        client = self.server.get_new_client()
+        assert client.execute_command('BLOB.TCP_SET', 'wide', WIDE_PAYLOAD) == b'OK'
+        for _ in range(5):
+            assert len(client.execute_command('BLOB.TCP_GET', 'wide')) == len(WIDE_PAYLOAD)
+        assert client.execute_command('BLOB.INFO', 'wide', 'TIER') == b'disk'
