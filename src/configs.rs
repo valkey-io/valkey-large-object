@@ -116,12 +116,12 @@ pub const DEFAULT_SCALING_SHRINK_WATERMARK: i64 = 90; // stored as percent
 pub const MIN_SCALING_SHRINK_WATERMARK: i64 = 50;
 pub const MAX_SCALING_SHRINK_WATERMARK: i64 = 95;
 // chunk-size
-pub const DEFAULT_CHUNK_SIZE: i64 = 8 * 1024 * 1024; // 8 MiB
+pub const DEFAULT_CHUNK_SIZE: i64 = 1024 * 1024; // 1 MiB
 pub const MIN_CHUNK_SIZE: i64 = 4096;
 pub const MAX_CHUNK_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
 
 // max-buffers-per-op
-pub const DEFAULT_MAX_BUFFERS_PER_OP: i64 = 8;
+pub const DEFAULT_MAX_BUFFERS_PER_OP: i64 = 64;
 pub const MIN_MAX_BUFFERS_PER_OP: i64 = 2;
 pub const MAX_MAX_BUFFERS_PER_OP: i64 = 64;
 // min-buffers-per-op
