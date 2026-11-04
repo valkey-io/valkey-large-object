@@ -190,11 +190,10 @@ pub fn init(
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.
     let nvme_pool = if mode == crate::OperatingMode::Tiered {
-        Some(NVMePool::new(
-            nvme_segments,
-            seg_size,
-            crate::disk_staging_queue_capacity(),
-        ))
+        // Queue overhead limit = staging size (1:1 ratio). This bounds the memory
+        // used by TCP SET payloads waiting in the queue. EFA (overhead=0) is unbounded.
+        let queue_overhead_limit = crate::nvme_staging_size() as u64;
+        Some(NVMePool::new(nvme_segments, seg_size, queue_overhead_limit))
     } else {
         None
     };

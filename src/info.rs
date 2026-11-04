@@ -254,6 +254,10 @@ fn disk_staging_section(ctx: &InfoContext) -> ValkeyResult<()> {
             nvme.io_uring_registered_count() as i64,
         )?
         .field("disk_staging_queue_depth", nvme.queue_len() as i64)?
+        .field(
+            "disk_staging_queue_overhead_bytes",
+            nvme.queue_overhead() as i64,
+        )?
         .build_section()?
         .build_info()
         .map(|_| ())

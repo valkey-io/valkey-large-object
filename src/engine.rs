@@ -505,8 +505,9 @@ async fn cmd_get_tiered_nvme_queueing(
     let obj_len = get_info.obj_len;
     let object_id = get_info.object_id;
     // Allocate staging buffers with queueing support.
+    // GET has no payload copy — data reads directly from NVMe to client.
     let buffers = match nvme_pool
-        .alloc_window_cancellable(client_id, obj_len as usize, max_buffers, min_buffers)
+        .alloc_window_cancellable(client_id, obj_len as usize, max_buffers, min_buffers, 0)
         .await
     {
         storage::nvme_pool::AllocOutcome::Got(bufs) => bufs,
@@ -514,7 +515,7 @@ async fn cmd_get_tiered_nvme_queueing(
             // Client disconnected while waiting — nothing to reply to.
             return;
         }
-        storage::nvme_pool::AllocOutcome::QueueFull => {
+        storage::nvme_pool::AllocOutcome::OverheadLimitExceeded => {
             reply_err(
                 &thread_ctx,
                 &info::DISK_STAGING_QUEUE_FULL,
@@ -920,13 +921,13 @@ fn cmd_set_dram_efa(
 
 /// Tiered SET: streaming batch write to NVMe via NVMePool buffer window.
 ///
-/// TCP and EFA take different allocation paths:
-/// - **TCP**: Immediate allocation, fail fast if staging full. Queueing is
-///   disabled because the `data.to_vec()` copy happens before spawn, and queued
-///   requests would hold those `Vec`s until they reach the head — up to
-///   `queue_capacity` copies × `max_object_size` bytes, far exceeding staging.
-/// - **EFA**: Async allocation with FIFO queueing. No payload copy exists (data
-///   transfers via RDMA), so queueing only holds lightweight metadata.
+/// Both TCP SET and EFA SET use async allocation with FIFO queueing, but the queue
+/// admission is bounded by memory overhead, not entry count:
+/// - **TCP SET**: Contributes `obj_len` bytes overhead while queued (the inline
+///   `Vec<u8>` payload copy). Rejected with `OverheadLimitExceeded` when overhead
+///   limit exceeded.
+/// - **EFA SET**: Contributes 0 bytes overhead (data transfers via RDMA).
+///   Always admitted to the queue; waits for buffers if staging is full.
 fn cmd_set_tiered(
     client_id: u64,
     key_name: Vec<u8>,
@@ -941,85 +942,39 @@ fn cmd_set_tiered(
     let nvme_pool = storage::get_nvme_pool();
     let chunk_size = crate::chunk_size();
 
-    match data_source {
-        DataSource::Tcp(data) => {
-            // TCP: immediate allocation, no queueing. Defers to queued EFA requests.
-            let buffers = match nvme_pool.alloc_window(obj_len as usize, max_buffers, min_buffers) {
-                Some(bufs) => bufs,
-                None => {
-                    reply_err(
-                        &thread_ctx,
-                        &info::DISK_STAGING_BUFFER_EXHAUSTED,
-                        ValkeyError::Str(errors::ERR_TOO_MANY_DISK_REQUESTS),
-                    );
-                    return;
-                }
-            };
-            let stream_ctx = storage::StreamingContext::new(buffers);
-            let batch_width = stream_ctx.buffers.len();
-            let unevictable = (
-                storage::UnevictableOID::new(object_id),
-                old_oid.map(storage::UnevictableOID::new),
-            );
-            let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
-            crate::runtime_handle().spawn(async move {
-                let _unevictable = unevictable;
-                let set_info = SetObjectInfo {
-                    object_id,
-                    obj_len,
-                    key_name,
-                    client_crc: None,
-                };
-                cmd_set_tiered_run(
-                    set_info,
-                    stream_ctx,
-                    chunk_iter,
-                    thread_ctx,
-                    SetSource::Tcp(data),
-                )
-                .await;
-            });
-        }
-        DataSource::Efa {
-            session,
-            addrs,
-            client_crc,
-        } => {
-            // EFA: async allocation with FIFO queueing.
-            crate::runtime_handle().spawn(async move {
-                cmd_set_tiered_nvme_queueing(
-                    client_id,
-                    key_name,
-                    obj_len,
-                    session,
-                    addrs,
-                    client_crc,
-                    thread_ctx,
-                    object_id,
-                    old_oid,
-                    nvme_pool,
-                    max_buffers,
-                    min_buffers,
-                    chunk_size,
-                )
-                .await;
-            });
-        }
-    }
+    crate::runtime_handle().spawn(async move {
+        cmd_set_tiered_nvme_queueing(
+            client_id,
+            key_name,
+            obj_len,
+            data_source,
+            thread_ctx,
+            object_id,
+            old_oid,
+            nvme_pool,
+            max_buffers,
+            min_buffers,
+            chunk_size,
+        )
+        .await;
+    });
 }
 
-/// NVMe staging allocation with FIFO queueing for Tiered SET (EFA path only).
+/// NVMe staging allocation with FIFO queueing for Tiered SET.
 ///
-/// EFA has no payload copy (data transfers via RDMA), so queueing only holds
-/// lightweight metadata. Symmetric with `cmd_get_tiered_nvme_queueing`.
+/// Queue admission is bounded by memory overhead from TCP SET payloads:
+/// - **TCP SET**: Contributes `obj_len` bytes overhead (the inline `Vec<u8>`).
+///   Rejected with `OverheadLimitExceeded` when overhead limit exceeded.
+/// - **EFA SET**: Contributes 0 bytes overhead (data transfers via RDMA).
+///   Always admitted to the queue; waits for buffers if staging is full.
+///
+/// Symmetric with `cmd_get_tiered_nvme_queueing`.
 #[allow(clippy::too_many_arguments)]
 async fn cmd_set_tiered_nvme_queueing(
     client_id: u64,
     key_name: Vec<u8>,
     obj_len: u64,
-    session: Arc<Session>,
-    addrs: Vec<storage::ClientEFAAddress>,
-    client_crc: Option<u32>,
+    data_source: DataSource,
     thread_ctx: BlockedRequest,
     object_id: ObjectId,
     old_oid: Option<ObjectId>,
@@ -1028,9 +983,26 @@ async fn cmd_set_tiered_nvme_queueing(
     min_buffers: usize,
     chunk_size: usize,
 ) {
+    // Extract source-specific fields: overhead, client addrs, CRC, and SetSource.
+    // TCP contributes obj_len bytes overhead (inline payload); EFA contributes 0.
+    let (overhead_bytes, addrs, client_crc, set_source) = match data_source {
+        DataSource::Tcp(data) => (obj_len as usize, None, None, SetSource::Tcp(data)),
+        DataSource::Efa {
+            session,
+            addrs,
+            client_crc,
+        } => (0, Some(addrs), client_crc, SetSource::Efa(session)),
+    };
+
     // Async allocation: may wait for buffers to become available.
     let buffers = match nvme_pool
-        .alloc_window_cancellable(client_id, obj_len as usize, max_buffers, min_buffers)
+        .alloc_window_cancellable(
+            client_id,
+            obj_len as usize,
+            max_buffers,
+            min_buffers,
+            overhead_bytes,
+        )
         .await
     {
         storage::AllocOutcome::Got(bufs) => bufs,
@@ -1038,7 +1010,7 @@ async fn cmd_set_tiered_nvme_queueing(
             // Client disconnected while waiting — silently drop.
             return;
         }
-        storage::AllocOutcome::QueueFull => {
+        storage::AllocOutcome::OverheadLimitExceeded => {
             reply_err(
                 &thread_ctx,
                 &info::DISK_STAGING_QUEUE_FULL,
@@ -1055,21 +1027,14 @@ async fn cmd_set_tiered_nvme_queueing(
         storage::UnevictableOID::new(object_id),
         old_oid.map(storage::UnevictableOID::new),
     );
-    let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs));
+    let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, addrs);
     let set_info = SetObjectInfo {
         object_id,
         obj_len,
         key_name,
         client_crc,
     };
-    cmd_set_tiered_run(
-        set_info,
-        stream_ctx,
-        chunk_iter,
-        thread_ctx,
-        SetSource::Efa(session),
-    )
-    .await;
+    cmd_set_tiered_run(set_info, stream_ctx, chunk_iter, thread_ctx, set_source).await;
 }
 
 /// The per-transport variant of a Tiered NVMe SET — the ONLY thing that differs

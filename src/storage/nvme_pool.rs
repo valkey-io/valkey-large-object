@@ -11,8 +11,10 @@
 //! - No module timeout: the client's own timeout bounds the wait.
 //! - Fairness: arrival order via tokio::sync::Mutex FIFO.
 //! - Off the main thread: the wait happens in the spawned task.
-//! - Bounded queue: safety net for clients with no timeout (default 1024).
-//! - TCP SETs use synchronous alloc_window, which defers when queue_len > 0.
+//! - Bounded by memory overhead: TCP SETs contribute their payload size to
+//!   queue_overhead; EFA SETs and all GETs contribute 0 (no inline payload).
+//!   Admission is rejected when overhead would exceed queue_overhead_limit
+//!   (derived from disk-staging-size, ~1:1 ratio).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,8 +29,8 @@ pub enum AllocOutcome {
     Got(Vec<SegmentBuffer>),
     /// The client disconnected while queued — nothing to reply to.
     Cancelled,
-    /// Queue is at capacity — reject to apply backpressure.
-    QueueFull,
+    /// Queue overhead limit exceeded — reject to apply backpressure.
+    OverheadLimitExceeded,
 }
 
 pub struct NVMePool {
@@ -43,21 +45,24 @@ pub struct NVMePool {
     /// The usize is the number of live waiters for this client; the entry is
     /// removed when it reaches zero.
     cancels: Mutex<HashMap<u64, (Arc<tokio::sync::Notify>, usize)>>,
-    /// Current number of waiters in the queue. Also the INFO metric.
+    /// Current number of waiters in the queue. Observability metric only.
     queue_len: AtomicU64,
-    /// Maximum queue depth. Rejects with QueueFull above this.
-    queue_capacity: u64,
+    /// Current memory overhead from queued TCP payloads (bytes). Admission gate.
+    queue_overhead: AtomicU64,
+    /// Maximum allowed queue overhead. Derived from disk-staging-size (1:1 ratio).
+    queue_overhead_limit: u64,
 }
 
 impl NVMePool {
-    pub fn new(segment_count: usize, segment_size: usize, queue_capacity: u64) -> Self {
+    pub fn new(segment_count: usize, segment_size: usize, queue_overhead_limit: u64) -> Self {
         Self {
             pool: SegmentPool::new(segment_count, segment_size, super::uring::PoolType::Nvme),
             freed: tokio::sync::Notify::new(),
             queue: tokio::sync::Mutex::new(()),
             cancels: Mutex::new(HashMap::new()),
             queue_len: AtomicU64::new(0),
-            queue_capacity,
+            queue_overhead: AtomicU64::new(0),
+            queue_overhead_limit,
         }
     }
 
@@ -66,66 +71,66 @@ impl NVMePool {
         self.queue_len.load(Ordering::Relaxed)
     }
 
+    /// Current queue overhead in bytes (from queued TCP payloads). Used by INFO.
+    pub fn queue_overhead(&self) -> u64 {
+        self.queue_overhead.load(Ordering::Relaxed)
+    }
+
     /// Free multiple buffers and notify waiting allocators.
     pub fn free_n(&self, buffers: &[SegmentBuffer]) {
         self.pool.free_n(buffers);
         self.freed.notify_waiters();
     }
 
-    /// Synchronous allocation without queueing. Returns `None` if staging is full
-    /// or if async requests are queued (FIFO fairness).
-    pub fn alloc_window(
-        &self,
-        size: usize,
-        max_buffers: usize,
-        min_buffers: usize,
-    ) -> Option<Vec<SegmentBuffer>> {
-        // Respect FIFO fairness: if async requests are queued, don't let sync
-        // callers jump ahead. This prevents TCP from starving queued EFA requests.
-        if self.queue_len.load(Ordering::Relaxed) > 0 {
-            return None;
-        }
-        self.pool.alloc_window(size, max_buffers, min_buffers)
-    }
-
     /// Async allocation with FIFO queueing and cancellation support.
     ///
     /// If staging is full, the request waits in a FIFO queue until buffers free up.
-    /// A client disconnect cancels the wait. If the queue itself is full, rejects
-    /// immediately with `QueueFull`.
+    /// A client disconnect cancels the wait.
+    ///
+    /// `overhead_bytes` is the memory footprint this request adds to the queue while
+    /// waiting (TCP: obj_len for the inline Vec<u8> payload; EFA: 0 since data
+    /// transfers via RDMA). If accepting this request would push `queue_overhead`
+    /// above `queue_overhead_limit`, rejects immediately with `OverheadLimitExceeded`.
     pub async fn alloc_window_cancellable(
         &self,
         client_id: u64,
         size: usize,
         max_buffers: usize,
         min_buffers: usize,
+        overhead_bytes: usize,
     ) -> AllocOutcome {
         // Step 1: Fast path — allocate if staging is free and nobody is queued.
-        if let Some(buffers) = self.alloc_window(size, max_buffers, min_buffers) {
-            return AllocOutcome::Got(buffers);
+        if self.queue_len.load(Ordering::Relaxed) == 0 {
+            if let Some(buffers) = self.pool.alloc_window(size, max_buffers, min_buffers) {
+                return AllocOutcome::Got(buffers);
+            }
         }
-        // Step 2: Staging full — count ourselves as a waiter and cap-check.
-        // CAS loop for exact enforcement: a simple load + fetch_add has a
-        // TOCTOU gap where multiple requests overshoot. compare_exchange_weak
-        // retries on spurious failures.
+        // Step 2: Staging full — check overhead limit and register as waiter.
+        // CAS loop for exact enforcement: avoids TOCTOU gaps where multiple
+        // requests overshoot the limit.
+        let overhead_bytes_u64 = overhead_bytes as u64;
         loop {
-            let current = self.queue_len.load(Ordering::Relaxed);
-            if current >= self.queue_capacity {
-                return AllocOutcome::QueueFull;
+            let current = self.queue_overhead.load(Ordering::Relaxed);
+            let new_overhead = current.saturating_add(overhead_bytes_u64);
+            if new_overhead > self.queue_overhead_limit && overhead_bytes > 0 {
+                return AllocOutcome::OverheadLimitExceeded;
             }
             if self
-                .queue_len
-                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .queue_overhead
+                .compare_exchange_weak(current, new_overhead, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 break;
             }
         }
+        // Increment queue_len for observability.
+        self.queue_len.fetch_add(1, Ordering::Relaxed);
         // Step 3: Register cancel signal for this client.
         let cancel = self.register_cancel(client_id);
         let _guard = CancelGuard {
             pool: self,
             client_id,
+            overhead_bytes: overhead_bytes_u64,
         };
         // Pre-register as a waiter so a disconnect mid-wait is not lost.
         let mut cancelled = std::pin::pin!(cancel.notified());
@@ -260,18 +265,22 @@ impl NVMePool {
     }
 }
 
-/// RAII guard that decrements queue_len and cleans up cancel registry on drop.
-/// Covers both the success path (guard drops when the function returns with
-/// buffers) and the cancellation path (guard drops when the function returns
-/// Cancelled). No explicit disarm needed — Drop always fires exactly once.
+/// RAII guard that decrements queue_len, queue_overhead and cleans up cancel
+/// registry on drop. Covers both the success path (guard drops when the function
+/// returns with buffers) and the cancellation path (guard drops when the function
+/// returns Cancelled). No explicit disarm needed — Drop always fires exactly once.
 struct CancelGuard<'a> {
     pool: &'a NVMePool,
     client_id: u64,
+    overhead_bytes: u64,
 }
 
 impl Drop for CancelGuard<'_> {
     fn drop(&mut self) {
         self.pool.queue_len.fetch_sub(1, Ordering::Relaxed);
+        self.pool
+            .queue_overhead
+            .fetch_sub(self.overhead_bytes, Ordering::Relaxed);
         self.pool.unregister_cancel(self.client_id);
     }
 }
@@ -293,11 +302,15 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             matches!(self, AllocOutcome::Cancelled)
         }
+        fn is_overhead_limit_exceeded(&self) -> bool {
+            matches!(self, AllocOutcome::OverheadLimitExceeded)
+        }
     }
 
     /// A one-segment pool with every buffer allocated, plus the windows holding it full.
+    /// Uses a large overhead limit (1 MiB) so tests can focus on staging exhaustion.
     fn exhausted_pool() -> (Arc<NVMePool>, Vec<Vec<SegmentBuffer>>) {
-        let pool = Arc::new(NVMePool::new(1, 65536, 1024));
+        let pool = Arc::new(NVMePool::new(1, 65536, 1024 * 1024));
         let mut held = Vec::new();
         while let Some(window) = pool.pool.alloc_window(OBJ, 1, 1) {
             held.push(window);
@@ -372,7 +385,7 @@ mod tests {
         runtime().block_on(async {
             let waiter = tokio::spawn({
                 let pool = Arc::clone(&pool);
-                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1, 0).await }
             });
             wait_registered(&pool, CLIENT, 1);
             pool.free_n(&held.pop().expect("held window"));
@@ -389,7 +402,7 @@ mod tests {
         runtime().block_on(async {
             let waiter = tokio::spawn({
                 let pool = Arc::clone(&pool);
-                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1, 0).await }
             });
             wait_registered(&pool, CLIENT, 1);
             pool.cancel_client(CLIENT);
@@ -408,13 +421,16 @@ mod tests {
             // Head enters the queue, acquires the FIFO lock, parks on freed/cancelled.
             let head = tokio::spawn({
                 let pool = Arc::clone(&pool);
-                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1, 0).await }
             });
             wait_registered(&pool, CLIENT, 1);
             // Tail queues behind the head, waiting to acquire the lock.
             let tail = tokio::spawn({
                 let pool = Arc::clone(&pool);
-                async move { pool.alloc_window_cancellable(CLIENT + 1, OBJ, 1, 1).await }
+                async move {
+                    pool.alloc_window_cancellable(CLIENT + 1, OBJ, 1, 1, 0)
+                        .await
+                }
             });
             wait_registered(&pool, CLIENT + 1, 1);
             // Cancel the head. Its lock_guard drops, tail acquires the lock.
@@ -436,12 +452,15 @@ mod tests {
             // Both find staging full in step 1 and enter the FIFO queue.
             let head = tokio::spawn({
                 let pool = Arc::clone(&pool);
-                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1, 0).await }
             });
             wait_registered(&pool, CLIENT, 1);
             let tail = tokio::spawn({
                 let pool = Arc::clone(&pool);
-                async move { pool.alloc_window_cancellable(CLIENT + 1, OBJ, 1, 1).await }
+                async move {
+                    pool.alloc_window_cancellable(CLIENT + 1, OBJ, 1, 1, 0)
+                        .await
+                }
             });
             wait_registered(&pool, CLIENT + 1, 1);
             // Free one buffer — only the head should get it.
@@ -453,49 +472,194 @@ mod tests {
         });
     }
 
-    // ─── Sync vs Async allocation path tests ─────────────────────────────
+    // ─── Overhead limit tests ────────────────────────────────────────────
 
-    /// Sync `alloc_window` returns `None` immediately when staging is full.
-    ///
-    /// This is the path TCP uses — fail fast without queueing, because TCP
-    /// holds an inline `Vec<u8>` copy that would consume unbounded memory if
-    /// queued requests accumulated.
+    /// When queue overhead would exceed the limit, TCP requests are rejected.
     #[test]
-    fn test_sync_alloc_returns_none_when_full() {
-        let (pool, _held) = exhausted_pool();
-        // Sync path: returns None immediately, does not block or queue.
-        let result = pool.alloc_window(OBJ, 1, 1);
-        assert!(result.is_none(), "sync alloc should return None when full");
-        // No waiters registered — sync path never touches the queue.
-        assert_eq!(pool.queue_len(), 0);
-        assert!(pool.cancels.lock().unwrap().is_empty());
-    }
-
-    /// Sync and async paths respect FIFO fairness: a sync alloc fails when
-    /// async requests are queued, preventing starvation.
-    #[test]
-    fn test_sync_alloc_respects_queued_waiters() {
-        let (pool, mut held) = exhausted_pool();
+    fn test_overhead_limit_rejects_when_exceeded() {
+        // Create pool with a tiny overhead limit (500 bytes).
+        let pool = Arc::new(NVMePool::new(1, 65536, 500));
+        // Exhaust the staging pool.
+        let mut held = Vec::new();
+        while let Some(window) = pool.pool.alloc_window(OBJ, 1, 1) {
+            held.push(window);
+        }
         runtime().block_on(async {
-            // An async waiter queues up.
-            let waiter = tokio::spawn({
+            // First TCP request with 400 byte overhead should queue.
+            let waiter1 = tokio::spawn({
                 let pool = Arc::clone(&pool);
-                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1).await }
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1, 400).await }
             });
             wait_registered(&pool, CLIENT, 1);
+            assert_eq!(pool.queue_overhead(), 400);
 
-            // Free one buffer.
-            pool.free_n(&held.pop().expect("held window"));
-
-            // Sync alloc MUST fail — it cannot jump ahead of the queued waiter.
-            let sync_result = pool.alloc_window(OBJ, 1, 1);
+            // Second TCP request with 200 byte overhead would push total to 600 > 500.
+            // Should be rejected immediately.
+            let result = pool
+                .alloc_window_cancellable(CLIENT + 1, OBJ, 1, 1, 200)
+                .await;
             assert!(
-                sync_result.is_none(),
-                "sync alloc must fail when async requests are queued"
+                result.is_overhead_limit_exceeded(),
+                "should reject when overhead limit exceeded"
             );
+            // Overhead unchanged — rejected request didn't add to it.
+            assert_eq!(pool.queue_overhead(), 400);
 
-            // The queued waiter gets the buffer.
+            // Clean up: free a buffer so the first waiter completes.
+            pool.free_n(&held.pop().expect("held window"));
+            assert!(waiter1.await.expect("waiter task").is_got());
+            assert_eq!(pool.queue_overhead(), 0);
+        });
+    }
+
+    /// EFA requests (overhead_bytes=0) are never rejected by overhead limit,
+    /// even when the limit is already reached.
+    #[test]
+    fn test_efa_ignores_overhead_limit() {
+        // Create pool with small overhead limit (500 bytes).
+        let pool = Arc::new(NVMePool::new(1, 65536, 500));
+        // Exhaust the staging pool.
+        let mut held = Vec::new();
+        while let Some(window) = pool.pool.alloc_window(OBJ, 1, 1) {
+            held.push(window);
+        }
+        runtime().block_on(async {
+            // First: TCP request pushes overhead to the limit.
+            let tcp_waiter = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1, 500).await }
+            });
+            wait_registered(&pool, CLIENT, 1);
+            assert_eq!(pool.queue_overhead(), 500);
+
+            // EFA request (overhead=0) should still queue even though limit is reached.
+            // This exercises the `&& overhead_bytes > 0` guard.
+            let efa_waiter = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move {
+                    pool.alloc_window_cancellable(CLIENT + 1, OBJ, 1, 1, 0)
+                        .await
+                }
+            });
+            wait_registered(&pool, CLIENT + 1, 1);
+            assert_eq!(pool.queue_overhead(), 500); // unchanged
+            assert_eq!(pool.queue_len(), 2);
+
+            // Free buffers so both complete.
+            pool.free_n(&held.pop().expect("held window"));
+            assert!(tcp_waiter.await.expect("tcp waiter").is_got());
+            pool.free_n(&held.pop().expect("held window"));
+            assert!(efa_waiter.await.expect("efa waiter").is_got());
+        });
+    }
+
+    /// Overhead is correctly decremented when a request completes successfully.
+    #[test]
+    fn test_overhead_decrements_on_completion() {
+        let pool = Arc::new(NVMePool::new(1, 65536, 10000));
+        // Exhaust staging.
+        let mut held = Vec::new();
+        while let Some(window) = pool.pool.alloc_window(OBJ, 1, 1) {
+            held.push(window);
+        }
+        runtime().block_on(async {
+            // TCP request with 500 byte overhead.
+            let waiter = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1, 500).await }
+            });
+            wait_registered(&pool, CLIENT, 1);
+            assert_eq!(pool.queue_overhead(), 500);
+
+            // Free a buffer — waiter completes, overhead decrements.
+            pool.free_n(&held.pop().expect("held window"));
             assert!(waiter.await.expect("waiter task").is_got());
+            assert_eq!(pool.queue_overhead(), 0);
+        });
+    }
+
+    /// Overhead is correctly decremented when a request is cancelled.
+    #[test]
+    fn test_overhead_decrements_on_cancellation() {
+        let pool = Arc::new(NVMePool::new(1, 65536, 10000));
+        // Exhaust staging.
+        let mut held = Vec::new();
+        while let Some(window) = pool.pool.alloc_window(OBJ, 1, 1) {
+            held.push(window);
+        }
+        let _ = held; // silence unused warning
+        runtime().block_on(async {
+            // TCP request with 500 byte overhead.
+            let waiter = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1, 500).await }
+            });
+            wait_registered(&pool, CLIENT, 1);
+            assert_eq!(pool.queue_overhead(), 500);
+
+            // Cancel the client — overhead decrements.
+            pool.cancel_client(CLIENT);
+            assert!(waiter.await.expect("waiter task").is_cancelled());
+            assert_eq!(pool.queue_overhead(), 0);
+        });
+    }
+
+    /// Mixed TCP and EFA requests: overhead only tracks TCP.
+    #[test]
+    fn test_mixed_tcp_efa_overhead_accounting() {
+        let pool = Arc::new(NVMePool::new(1, 65536, 10000));
+        // Exhaust staging.
+        let mut held = Vec::new();
+        while let Some(window) = pool.pool.alloc_window(OBJ, 1, 1) {
+            held.push(window);
+        }
+        runtime().block_on(async {
+            // First: TCP with 300 byte overhead.
+            let tcp_waiter = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move { pool.alloc_window_cancellable(CLIENT, OBJ, 1, 1, 300).await }
+            });
+            wait_registered(&pool, CLIENT, 1);
+            assert_eq!(pool.queue_overhead(), 300);
+            assert_eq!(pool.queue_len(), 1);
+
+            // Second: EFA with 0 overhead queues behind TCP.
+            let efa_waiter = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move {
+                    pool.alloc_window_cancellable(CLIENT + 1, OBJ, 1, 1, 0)
+                        .await
+                }
+            });
+            wait_registered(&pool, CLIENT + 1, 1);
+            // Overhead unchanged — EFA doesn't add.
+            assert_eq!(pool.queue_overhead(), 300);
+            assert_eq!(pool.queue_len(), 2);
+
+            // Third: TCP with 200 byte overhead.
+            let tcp_waiter2 = tokio::spawn({
+                let pool = Arc::clone(&pool);
+                async move {
+                    pool.alloc_window_cancellable(CLIENT + 2, OBJ, 1, 1, 200)
+                        .await
+                }
+            });
+            wait_registered(&pool, CLIENT + 2, 1);
+            assert_eq!(pool.queue_overhead(), 500);
+            assert_eq!(pool.queue_len(), 3);
+
+            // Free buffers one at a time — FIFO order.
+            pool.free_n(&held.pop().expect("held window"));
+            assert!(tcp_waiter.await.expect("tcp waiter").is_got());
+            assert_eq!(pool.queue_overhead(), 200); // 300 decremented
+
+            pool.free_n(&held.pop().expect("held window"));
+            assert!(efa_waiter.await.expect("efa waiter").is_got());
+            assert_eq!(pool.queue_overhead(), 200); // EFA had 0
+
+            pool.free_n(&held.pop().expect("held window"));
+            assert!(tcp_waiter2.await.expect("tcp waiter 2").is_got());
+            assert_eq!(pool.queue_overhead(), 0);
         });
     }
 }

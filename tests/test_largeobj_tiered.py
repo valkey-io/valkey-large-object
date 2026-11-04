@@ -1846,61 +1846,6 @@ class TestStagingQueueRdma(ValkeyLargeObjTestCaseBase):
             for p in targets:
                 p.kill()
 
-    def test_rdma_staging_queue_full_rejection(self):
-        """With queue capacity 2, the 5th concurrent RDMA SET is rejected.
-        Two SETs hold staging buffers (paused), two queue, the fifth overflows."""
-        # Start 5 fabric targets.
-        targets = []
-        all_regions = []
-        for _ in range(5):
-            process, regions = self.start_target(split=[STAGING_PAYLOAD_LEN])
-            targets.append(process)
-            all_regions.append(regions)
-
-        try:
-            # Each SET needs its own client with its own RDMA session.
-            clients = [self.server.get_new_client() for _ in range(5)]
-            observer = self.server.get_new_client()
-
-            # Establish RDMA sessions.
-            for client, regions in zip(clients, all_regions):
-                client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
-
-            # Fill staging pool (2 RDMA SETs holding buffers) + fill queue (2 more waiting).
-            threads, results, errors = [], [], []
-            for i in range(2):
-                t, r, e = self._background_rdma_set(clients[i], f'fill{i}', all_regions[i])
-                threads.append(t)
-                results.append(r)
-                errors.append(e)
-            time.sleep(1.0)
-            for i in range(2, 4):
-                t, r, e = self._background_rdma_set(clients[i], f'fill{i}', all_regions[i])
-                threads.append(t)
-                results.append(r)
-                errors.append(e)
-            time.sleep(0.5)
-
-            # The 5th RDMA SET should be rejected — queue is at capacity.
-            with pytest.raises(ResponseError, match='too many pending disk requests'):
-                clients[4].execute_command(
-                    'BLOB.RDMA_SET', 'overflow', STAGING_PAYLOAD_LEN, *address_args(all_regions[4]))
-
-            # Verify the error counter incremented.
-            info = observer.info('largeobj_error_metrics')
-            assert info['largeobj_disk_staging_queue_full'] == 1
-
-            # Let everything drain.
-            for t in threads:
-                t.join(timeout=15)
-            assert not any(t.is_alive() for t in threads), "RDMA SET threads did not finish"
-            for i, (r, e) in enumerate(zip(results, errors)):
-                assert e[0] is None, f"RDMA SET fill{i} raised: {e[0]}"
-                assert r[0] == b'OK', f"RDMA SET fill{i} returned {r[0]}"
-            # The first 4 should succeed (2 immediate + 2 queued).
-        finally:
-            for p in targets:
-                p.kill()
 
 
 class TestStagingDisconnectCancels(ValkeyLargeObjTestCaseBase):
