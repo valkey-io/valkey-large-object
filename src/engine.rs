@@ -676,14 +676,7 @@ pub fn execute_set_rdma(
     let key_name_bytes = key_name.as_slice().to_vec();
     match mode {
         OperatingMode::Dram => {
-            cmd_set_dram_efa(
-                ctx,
-                key_name_bytes,
-                obj_len,
-                data_source,
-                thread_ctx,
-                object_id,
-            );
+            cmd_set_dram_efa(key_name_bytes, obj_len, data_source, thread_ctx, object_id);
         }
         OperatingMode::Tiered => {
             cmd_set_tiered(
@@ -772,7 +765,6 @@ pub enum DataSource {
 
 /// DRAM-only EFA SET: chunked alloc in DRAMPool, parallel EFA read + post-hoc CRC, create LoValue.
 fn cmd_set_dram_efa(
-    ctx: &valkey_module::Context,
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -784,18 +776,8 @@ fn cmd_set_dram_efa(
     // Overwriting a key is safe: the winning commit's set_value fires lo_free on the
     // replaced LoValue, dropping its Arc<ObjectContext> (the DRAMPool entry). Dram mode
     // has no file, so there is no fd or .dat to tear down here.
-    // DRAMPool::alloc_exact_expand_evict: all-or-nothing; expands, then evicts.
-    let buffers = match dram_pool.alloc_exact_expand_evict(ctx, obj_len) {
-        Some(bufs) => bufs,
-        None => {
-            reply_err(
-                &thread_ctx,
-                &info::DRAM_POOL_EXHAUSTED,
-                ValkeyError::Str(errors::ERR_OOM),
-            );
-            return;
-        }
-    };
+    // `None`: the pool is full. The task below waits for a grow, or evicts if the pool cannot grow.
+    let buffers = dram_pool.alloc_exact(obj_len);
     match data_source {
         DataSource::Tcp(_) => unreachable!("Dram+TCP SET routed to sync path"),
         DataSource::Efa {
@@ -806,6 +788,25 @@ fn cmd_set_dram_efa(
             // EFA SET: parallel reads into all buffers, then sequential CRC pass.
             crate::runtime_handle().spawn(async move {
                 let dram_pool = storage::get_dram_pool();
+                let buffers = match buffers {
+                    Some(bufs) => bufs,
+                    None => {
+                        // Pool full. Wait for a grow; if the pool cannot grow, evict (under the server lock).
+                        let got = match dram_pool.alloc_exact_await_expand(obj_len).await {
+                            Some(bufs) => Some(bufs),
+                            None => dram_pool.alloc_exact_evict(&thread_ctx.lock(), obj_len),
+                        };
+                        let Some(bufs) = got else {
+                            reply_err(
+                                &thread_ctx,
+                                &info::DRAM_POOL_EXHAUSTED,
+                                ValkeyError::Str(errors::ERR_OOM),
+                            );
+                            return;
+                        };
+                        bufs
+                    }
+                };
                 let chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(addrs));
                 // Dram EFA SET: EFA-read every chunk into the DRAM buffers via the

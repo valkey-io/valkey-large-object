@@ -35,6 +35,7 @@
 use std::alloc::Layout;
 use std::ptr::NonNull;
 use std::sync::RwLock;
+use std::task::Poll;
 
 use allocator_api2::alloc::Allocator;
 
@@ -58,6 +59,12 @@ pub struct SegmentPool {
     /// Which pool (ring) this is — routes reregister to the correct io_uring
     /// engine, since each pool has its own ring + registered-buffer table.
     pool_id: super::uring::PoolType,
+    /// The waiting line for `wait_for`. tokio's mutex hands the lock out in arrival order, and
+    /// whoever holds it is at the front of the line: the only waiter that tries to allocate.
+    queue: tokio::sync::Mutex<()>,
+    /// Signalled when space may be available: `free_n` does it, and so does the owner through
+    /// `notify_space_available` (a new segment, say). Wakes the waiter at the front of the line.
+    space_available: tokio::sync::Notify,
 }
 
 impl SegmentPool {
@@ -85,6 +92,8 @@ impl SegmentPool {
             state: RwLock::new(SegmentState { slots }),
             segment_size,
             pool_id,
+            queue: tokio::sync::Mutex::new(()),
+            space_available: tokio::sync::Notify::new(),
         }
     }
 
@@ -464,31 +473,45 @@ impl SegmentPool {
             }
             seg.dec_ref();
         }
+        self.space_available.notify_waiters();
+    }
+
+    /// Tell the waiter at the front of the line that space may be available. `free_n` already
+    /// does; the owner calls it for any other event that can end a wait.
+    pub fn notify_space_available(&self) {
+        self.space_available.notify_waiters();
+    }
+
+    /// Run `attempt` until it is ready, waiting for `space_available` between attempts. Waiters
+    /// queue in arrival order and only the one at the front attempts, so a notification does
+    /// not wake a crowd. Dropping the future leaves the queue. `attempt` returns
+    /// `Ready(Some(t))` when it got what it needed, `Ready(None)` to give up, and `Pending` to
+    /// wait. It runs once per notification, so it cannot notice anything else (a client
+    /// disconnect, say) while pending: cancel from outside by dropping the future.
+    pub async fn wait_for<T>(&self, mut attempt: impl FnMut() -> Poll<Option<T>>) -> Option<T> {
+        let _at_front = self.queue.lock().await;
+        loop {
+            // Created before the attempt: a notification in between is not lost.
+            let available = self.space_available.notified();
+            match attempt() {
+                Poll::Ready(result) => return result,
+                Poll::Pending => available.await,
+            }
+        }
     }
 
     // ─── Expand / Shrink ─────────────────────────────────────────────────────
 
-    /// Add a new segment in the first empty slot (else append), with its own
-    /// fresh talc allocator. Its `iovec_index` is a placeholder until the
-    /// post-expand dense rebuild assigns the real one; it is unregistered until
-    /// then, so the placeholder never reaches the kernel.
+    /// Add `seg`, already built and registered, in the first empty slot (else append). Its
+    /// `iovec_index` is a placeholder until the post-expand dense rebuild assigns the real
+    /// one; it is unregistered with io_uring until then, so the placeholder never reaches the
+    /// kernel.
     ///
-    /// Called from the main event-loop thread only (scaling cron or reactive expand).
-    ///
-    /// Returns `(slot_idx, segment_slice)` on success. The slice is `'static` (segment memory
-    /// is stable for the module's lifetime) so the caller can register it with the transport
-    /// layer (EFA `fi_mr_reg` / io_uring) without a reverse lookup. Returns `None` if this pool
-    /// already has `MAX_SEGMENTS` segments.
-    pub fn expand(&self) -> Option<(u16, &'static [u8])> {
-        let mut seg = Segment::new(self.segment_size);
-        // Segment memory is stable for the module's lifetime (never freed until
-        // the segment is released, and a segment is not released while a
-        // registration references it). SAFETY: base/size describe the just-
-        // allocated backing buffer.
-        let slice: &'static [u8] = unsafe { std::slice::from_raw_parts(seg.base, seg.size) };
-
+    /// Cheap: no allocation or registration happens here, so any thread may call it. Returns
+    /// the slot index, or `None` if this pool already has `MAX_SEGMENTS` segments (`seg` drops,
+    /// deregistering and freeing it).
+    pub fn publish(&self, mut seg: Segment) -> Option<u16> {
         let mut st = self.state.write().expect("state lock unavailable");
-        // On None, `seg` drops here and nothing enters `slots`.
         let segment_count = st.slots.iter().flatten().count();
         if segment_count >= super::MAX_SEGMENTS {
             return None;
@@ -505,7 +528,7 @@ impl SegmentPool {
             }
         };
 
-        Some((slot as u16, slice))
+        Some(slot as u16)
     }
 
     /// Select the least-loaded non-draining segment as a shrink candidate.
@@ -1193,6 +1216,53 @@ mod tests {
             for w in workers {
                 w.join().expect("worker panicked");
             }
+        }
+    }
+
+    // ─── wait_for ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wait_for_resumes_when_buffers_are_freed() {
+        crate::CFG_CHUNK_SIZE.store(4096, std::sync::atomic::Ordering::Relaxed);
+        let pool = std::sync::Arc::new(SegmentPool::new(
+            1,
+            65536,
+            super::super::uring::PoolType::Dram,
+        ));
+        let mut held = Vec::new();
+        while let Some(bufs) = pool.alloc_exact(1000) {
+            held.push(bufs);
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("test runtime");
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let waiter = runtime.spawn({
+            let pool = std::sync::Arc::clone(&pool);
+            let attempts = std::sync::Arc::clone(&attempts);
+            async move {
+                pool.wait_for(|| match pool.alloc_exact(1000) {
+                    Some(bufs) => Poll::Ready(Some(bufs)),
+                    None => {
+                        attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Poll::Pending
+                    }
+                })
+                .await
+            }
+        });
+        // The waiter's attempt failed and it is waiting, so only `space_available` can resume it.
+        while attempts.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        assert!(!waiter.is_finished());
+
+        pool.free_n(&held.pop().expect("held window"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !waiter.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "waiter never resumed");
+            std::thread::yield_now();
         }
     }
 }
