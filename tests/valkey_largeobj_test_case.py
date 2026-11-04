@@ -1,7 +1,9 @@
+import array
 import os
 import errno
 import functools
 import glob
+import sys
 import tempfile
 import pytest
 from valkeytestframework.valkey_test_case import ValkeyTestCase
@@ -26,19 +28,34 @@ def direct_io_supported(directory):
         os.unlink(path)
 
 
-def position_pattern(length):
-    """`length` bytes where each 4-byte word holds its own index, little-endian, so every
-    position differs: bytes returned at the wrong offset cannot compare equal. Matches
+_TAG_STRIDE = 0x9E3779B1  # odd, so distinct tags give distinct offsets mod 2**32
+
+
+def position_pattern(length, tag=0):
+    """`length` bytes of 4-byte little-endian words, word i = i + tag * _TAG_STRIDE (mod 2**32).
+
+    Every position differs, so bytes returned at the wrong offset cannot compare equal; and
+    two different tags differ at every word, so objects written with different tags (an
+    overwrite, one key per tag) cannot be mistaken for each other. `tag` is an int, or a
+    one-character str standing for its code point ('A' == 65). Tag 0 matches
     `generate_pattern` in tests/harness/fabric_target.rs."""
+    if isinstance(tag, str):
+        tag = ord(tag)
     words = (length + 3) // 4
-    return b''.join(word.to_bytes(4, 'little') for word in range(words))[:length]
+    start = tag * _TAG_STRIDE % 2**32
+    end = start + words
+    pattern = array.array('I', range(start, min(end, 2**32)))
+    pattern.extend(range(0, max(end - 2**32, 0)))
+    if sys.byteorder == 'big':
+        pattern.byteswap()
+    return pattern.tobytes()[:length]
 
 
 def assert_bytes_equal(actual, expected, chunk_size):
     """Fail at the first `chunk_size` piece of `actual` that differs from `expected`.
 
-    For a `position_pattern` payload the message names the chunk whose bytes are there
-    instead. Not `assert actual == expected`: pytest's diff of two large byte strings
+    For an untagged `position_pattern` payload the message names the chunk whose bytes are
+    there instead. Not `assert actual == expected`: pytest's diff of two large byte strings
     does not finish."""
     if len(actual) != len(expected):
         pytest.fail(f"got {len(actual)} bytes, expected {len(expected)}")

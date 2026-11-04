@@ -66,7 +66,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
     def test_efa_get_needs_hello(self):
         """The RDMA arity of BLOB.RDMA_GET is refused until this client has a session."""
         client = self.server.get_new_client()
-        client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
+        client.execute_command('BLOB.TCP_SET', 'key', position_pattern(4096, 'A'))
         self.verify_error_response(
             client, 'BLOB.RDMA_GET key 999 0 4096', 'no RDMA session (call BLOB.RDMA_HELLO first)')
 
@@ -76,7 +76,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         RDMA_SET: >=6 args (key + total_len + at least one triplet). Incomplete triples are refused.
         """
         client = self.server.get_new_client()
-        client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
+        client.execute_command('BLOB.TCP_SET', 'key', position_pattern(4096, 'A'))
         for command in ('BLOB.RDMA_GET key 999',
                         'BLOB.RDMA_GET key 999 0',
                         'BLOB.RDMA_SET key 4096 999',
@@ -107,7 +107,7 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
     def test_hello_reports_unavailable(self):
         client = self.server.get_new_client()
         self.verify_error_response(client, f'BLOB.RDMA_HELLO {PEER_ADDRESS}', 'RDMA provider unavailable on this instance')
-        assert client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'key', position_pattern(4096, 'A')) == b'OK'
 
 # The object fabric_target holds by default: the same position pattern it generates, so a
 # byte landing at the wrong offset in any region fails verification.
@@ -249,7 +249,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
     def test_multi_transfer_mixed_protocol(self):
         """Do mixed sets and gets, read the server value into the client, set it back, and
         read it back in the test"""
-        payload = b'\x5a' * TARGET_LEN
+        payload = position_pattern(TARGET_LEN, 'Z')
         process, regions = start_target('--read')
         try:
             client = self.server.get_new_client()
