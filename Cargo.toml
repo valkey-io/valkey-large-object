@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "BSD-3-Clause"
 description = "Valkey Large Object Module — NVMe + EFA storage for KV cache tensors"
-repository = "https://github.com/KarthikSubbarao/valkey-large-object"
+repository = "https://github.com/valkey-io/valkey-large-object"
 
 [dependencies]
 valkey-module = { version = "0.1.15", features = ["min-valkey-compatibility-version-8-0"] }
