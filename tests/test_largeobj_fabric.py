@@ -1,4 +1,5 @@
 import binascii
+from concurrent.futures import ThreadPoolExecutor
 import collections
 import crc32c
 import os
@@ -555,3 +556,64 @@ class TestFabricTieredGetChunkOrderStreamed(ValkeyLargeObjTestCaseBase):
         for _ in range(ORDER_REPEATS):
             efa_get_verified(self.server, 'ordered')
         assert client.execute_command('BLOB.INFO', 'ordered', 'TIER') == b'disk'
+
+
+# ─── DRAM EFA SET waiting for the pool to grow ───────────────────────────────
+
+
+class TestLargeObjFabricDramGrowWait(ValkeyLargeObjTestCaseBase):
+    """Dram RDMA_SETs that find the pool full wait for a background grow instead of growing
+    the pool on the main thread."""
+
+    def get_module_args(self, data_dir, direct_io):
+        # A 16KB segment holds only a few 4KB objects (allocations are 4KB-aligned), so a
+        # handful of SETs fill the first segment and the rest wait for a grow.
+        return (
+            f"operating-mode Dram"
+            f" segment-size 16384"
+            f" max-object-size {TARGET_LEN}"
+            f" chunk-size 4096"
+            # The scaling cron fires at most once a minute, so only a SET can start a grow.
+            f" scaling-poll-ms 60000"
+            f" fabric-provider Emulated"
+            f" fabric-interfaces lo"
+        )
+
+    def set_over_efa(self, key):
+        process, regions = start_target('--read')
+        try:
+            sender = self.server.get_new_client()
+            sender.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+            return sender.execute_command('BLOB.RDMA_SET', key, TARGET_LEN, *address_args(regions))
+        finally:
+            process.kill()
+
+    def test_concurrent_sets_wait_for_the_grow_and_succeed(self):
+        count = 12
+        with ThreadPoolExecutor(max_workers=count) as pool:
+            replies = list(pool.map(self.set_over_efa, [f'key{i}' for i in range(count)]))
+        assert replies == [b'OK'] * count
+
+        client = self.server.get_new_client()
+        for i in range(count):
+            assert client.execute_command('BLOB.TCP_GET', f'key{i}') == PATTERN
+        info = info_largeobj(client)
+        # How many objects a segment holds depends on the allocator, but 12 never fit in one.
+        assert info['largeobj_dram_segments'] > 1
+        assert info['largeobj_dram_alloc_waits'] > 0
+
+    def test_sets_evict_when_the_pool_cannot_expand(self):
+        client = self.server.get_new_client()
+        # Hold the pool to its one segment, and let the module evict.
+        client.config_set('largeobj.max-rdma-registered-bytes', 16384)
+        client.config_set('maxmemory', 10 * 1024 ** 3)
+        client.config_set('maxmemory-policy', 'allkeys-lru')
+
+        # One at a time: a SET that finds the pool full can only evict objects already committed.
+        for i in range(12):
+            assert self.set_over_efa(f'key{i}') == b'OK'
+
+        info = info_largeobj(client)
+        assert info['largeobj_dram_segments'] == 1
+        assert info['largeobj_evictions'] > 0
+        assert info['largeobj_dram_pool_exhausted'] == 0

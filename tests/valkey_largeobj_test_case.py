@@ -54,6 +54,9 @@ MIB = 1024 * 1024
 # order. 65 chunks, the last one partial.
 ORDER_CHUNK_SIZE = 64 * 1024
 ORDER_OBJECT_LEN = 64 * ORDER_CHUNK_SIZE + 1
+# One segment holds every object a chunk-order test writes (10 of ~4 MiB): a promotion
+# that finds the DRAM pool full is skipped while the pool grows in the background.
+ORDER_SEGMENT_SIZE = 64 * MIB
 
 
 def chunk_order_module_args(data_dir, direct_io, max_promote_size):
@@ -66,8 +69,8 @@ def chunk_order_module_args(data_dir, direct_io, max_promote_size):
     return (
         f"operating-mode Tiered"
         f" disk-dir {data_dir}"
-        f" disk-staging-size {16 * MIB}"
-        f" segment-size {16 * MIB}"
+        f" disk-staging-size {ORDER_SEGMENT_SIZE}"
+        f" segment-size {ORDER_SEGMENT_SIZE}"
         f" promote-min-hits 1"
         f" max-promote-size {max_promote_size}"
         f" max-object-size {8 * MIB}"

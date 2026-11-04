@@ -1278,8 +1278,14 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
 
     def _promote(self, client, key, payload):
         client.execute_command('BLOB.TCP_SET', key, payload)
-        assert client.execute_command('BLOB.TCP_GET', key) == payload
-        assert client.execute_command('BLOB.INFO', key, 'TIER') == b'dram'
+
+        # A GET that finds the pool full is skipped while the pool grows in the background,
+        # so read the key again until it is cached.
+        def cached():
+            assert client.execute_command('BLOB.TCP_GET', key) == payload
+            return client.execute_command('BLOB.INFO', key, 'TIER') == b'dram'
+
+        wait_for_true(cached)
 
     def test_reclaims_only_in_target_segment(self):
         client = self.server.get_new_client()
