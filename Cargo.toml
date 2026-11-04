@@ -17,7 +17,7 @@ crossbeam-channel = "0.5"
 dma-libfabric = { version = "0.1.0" }
 dma-libfabric-protocol = { version = "0.1.0" }
 ofi-libfabric-sys = { version = "0.2", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 indexmap = "2"
 hashlink = "0.12"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }

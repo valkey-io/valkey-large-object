@@ -126,13 +126,16 @@ fn on_client_change(
     subevent: valkey_module::server_events::ClientChangeSubevent,
 ) {
     if subevent == valkey_module::server_events::ClientChangeSubevent::Disconnected {
-        if let Some(_removed) = sessions().remove(&ctx.get_client_id()) {
+        let client_id = ctx.get_client_id();
+        // Cancel any staging-buffer waiters for this client.
+        crate::storage::cancel_staging_waiters(client_id);
+        if let Some(_removed) = sessions().remove(&client_id) {
             ctx.log_debug(&format!(
                 "rdma session terminating for client {}",
-                ctx.get_client_id()
+                client_id
             ));
             if let Some(fabric) = fabric::fabric() {
-                fabric.remove_peer(ctx.get_client_id());
+                fabric.remove_peer(client_id);
             }
         }
     }
