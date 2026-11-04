@@ -631,36 +631,27 @@ async fn cmd_get_tiered_run(
 // SET Engine
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// BLOB.TCP_SET routing. DRAM copies straight from the arg into the segment, with no
-/// intermediate `Vec`, and replies at once unless the pool must grow first. Tiered moves
-/// the bytes to a tokio worker, which cannot borrow the arg, so it owns a copy.
+/// BLOB.TCP_SET routing. Always async, like every SET: the bytes move to a tokio worker,
+/// which cannot borrow the arg, so it owns a copy.
 pub fn execute_set_tcp(
     ctx: &valkey_module::Context,
     key_name: &valkey_module::ValkeyString,
     obj_len: u64,
-    data: &valkey_module::ValkeyString,
+    data: &[u8],
     old_oid: Option<ObjectId>,
 ) -> EngineResult {
-    let object_id = ObjectId::next();
-    if crate::operating_mode() == OperatingMode::Dram {
-        return cmd_set_dram_tcp(ctx, key_name, obj_len, data, object_id);
-    }
-    let thread_ctx = BlockedRequest::new(ctx);
-    let key_name_bytes = key_name.as_slice().to_vec();
-    cmd_set_tiered(
-        key_name_bytes,
+    execute_set(
+        ctx,
+        key_name,
         obj_len,
-        DataSource::Tcp(data.as_slice().to_vec()),
-        thread_ctx,
-        object_id,
+        DataSource::Tcp(data.to_vec()),
         old_oid,
-    );
-    EngineResult::Async
+    )
 }
 
-/// Execute BLOB.RDMA_SET with mode routing. Always async (EFA transfers happen on
-/// a tokio worker); TCP SET is handled by execute_set_tcp.
-pub fn execute_set_rdma(
+/// Execute BLOB.TCP_SET / BLOB.RDMA_SET with mode routing. Always async: the transfer
+/// happens on a tokio worker.
+pub fn execute_set(
     ctx: &valkey_module::Context,
     key_name: &valkey_module::ValkeyString,
     obj_len: u64,
@@ -676,7 +667,7 @@ pub fn execute_set_rdma(
     let key_name_bytes = key_name.as_slice().to_vec();
     match mode {
         OperatingMode::Dram => {
-            cmd_set_dram_efa(key_name_bytes, obj_len, data_source, thread_ctx, object_id);
+            cmd_set_dram(key_name_bytes, obj_len, data_source, thread_ctx, object_id);
         }
         OperatingMode::Tiered => {
             cmd_set_tiered(
@@ -692,193 +683,6 @@ pub fn execute_set_rdma(
     EngineResult::Async
 }
 
-// ─── DRAM-only TCP SET ───────────────────────────────────────────────────────
-
-/// DRAM-only TCP SET: chunked alloc + chunked memcpy + create LoValue.
-///
-/// Replies at once when the object fits, or when the pool is full and cannot grow (it
-/// evicts, or fails). When the pool is full and a grow is running or starts here, the client
-/// blocks and a task waits for the grow, so the main thread never waits for it.
-fn cmd_set_dram_tcp(
-    ctx: &valkey_module::Context,
-    key_name: &valkey_module::ValkeyString,
-    obj_len: u64,
-    arg: &valkey_module::ValkeyString,
-    object_id: ObjectId,
-) -> EngineResult {
-    let dram_pool = storage::get_dram_pool();
-    let buffers = match dram_pool.alloc_exact(obj_len) {
-        Some(bufs) => bufs,
-        None => {
-            if dram_pool.grow_in_background(ctx) {
-                let thread_ctx = BlockedRequest::new(ctx);
-                crate::runtime_handle().spawn(cmd_set_dram_tcp_wait(
-                    HeldArg(arg.safe_clone(ctx)),
-                    key_name.as_slice().to_vec(),
-                    obj_len,
-                    thread_ctx,
-                    object_id,
-                ));
-                return EngineResult::Async;
-            }
-            match dram_pool.alloc_exact_evict(ctx, obj_len) {
-                Some(bufs) => bufs,
-                None => {
-                    info::DRAM_POOL_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-                    return EngineResult::Sync(Err(ValkeyError::Str(errors::ERR_OOM)));
-                }
-            }
-        }
-    };
-    let crc = fill_dram_tcp(dram_pool, &buffers, obj_len, arg.as_slice());
-    // Insert ObjectContext BEFORE set_value so the key is never visible without
-    // its ObjectContext — the same order as the EFA path. On set_value failure,
-    // remove the entry; ObjectContext::Drop returns the buffers to DRAMPool.
-    // (Sync path: single-threaded main thread, our object_id is always the
-    // latest, so no version check is needed — a plain set_value ordered last.)
-    let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
-    dram_pool.insert_object(object_id, obj_ctx);
-    let key = ctx.open_key_writable(key_name);
-    let lo_value = LoValue::new(object_id, obj_len, crc, None);
-    let event = if key.is_empty() {
-        EVENT_CREATE
-    } else {
-        EVENT_UPDATE
-    };
-    if key.set_value(&LO_TYPE, lo_value).is_err() {
-        dram_pool.remove_object(&object_id);
-        info::SET_VALUE_FAILURES.fetch_add(1, Ordering::Relaxed);
-        return EngineResult::Sync(Err(ValkeyError::Str(errors::ERR_SET_VALUE)));
-    }
-    ctx.notify_keyspace_event(NotifyEvent::MODULE, event, key_name);
-    EngineResult::Sync(VALKEY_OK)
-}
-
-/// A TCP SET argument kept alive past the command, for a task. Valkey's string refcount
-/// is not atomic, so it must be freed only under the server lock: use `release`.
-struct HeldArg(valkey_module::ValkeyString);
-
-// SAFETY: the bytes are immutable while we hold a reference (Valkey never edits a shared
-// string), and `release` frees it under the server lock.
-unsafe impl Send for HeldArg {}
-
-impl HeldArg {
-    fn as_slice(&self) -> &[u8] {
-        self.0.as_slice()
-    }
-
-    fn release(self, thread_ctx: &BlockedRequest) {
-        let _lock = thread_ctx.lock();
-        drop(self);
-    }
-}
-
-/// The task of a DRAM TCP SET that found the pool full while it grows: wait for room (or
-/// evict if the pool cannot grow), then fill from the held argument and commit.
-async fn cmd_set_dram_tcp_wait(
-    arg: HeldArg,
-    key_name: Vec<u8>,
-    obj_len: u64,
-    thread_ctx: BlockedRequest,
-    object_id: ObjectId,
-) {
-    let dram_pool = storage::get_dram_pool();
-    let Some(buffers) = alloc_dram_after_miss(&thread_ctx, obj_len).await else {
-        arg.release(&thread_ctx);
-        return;
-    };
-    let crc = fill_dram_tcp(dram_pool, &buffers, obj_len, arg.as_slice());
-    arg.release(&thread_ctx);
-    commit_dram_set(&thread_ctx, &key_name, object_id, obj_len, crc, buffers);
-}
-
-/// Copy a TCP payload into freshly allocated DRAM buffers and return its CRC32C.
-fn fill_dram_tcp(
-    dram_pool: &storage::DRAMPool,
-    buffers: &[storage::SegmentBuffer],
-    obj_len: u64,
-    data: &[u8],
-) -> Crc {
-    let chunk_size = crate::chunk_size();
-    // DRAM-only SET allocates one buffer per chunk (no sliding window), so the
-    // real buffer count is the batch width — the same derivation as the NVMe/EFA
-    // paths, no special-case sentinel needed.
-    let mut chunk_iter = ChunkIterator::new(obj_len, chunk_size, buffers.len(), None);
-    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
-    while let Some(chunk) = chunk_iter.next_chunk() {
-        let src_offset = chunk.index as usize * chunk_size;
-        let src = &data[src_offset..src_offset + chunk.user_data_len];
-        let buf = &buffers[chunk.buffer_idx];
-        let dst = dram_pool.buffer_ptr(buf);
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, chunk.user_data_len) };
-        digest.update(src);
-    }
-    digest.finalize() as Crc
-}
-
-/// Buffers for a DRAM SET task whose first allocation missed: wait for a grow, and if the
-/// pool cannot grow, evict (under the server lock). On `None` the pool is exhausted and the
-/// client has been sent the OOM error.
-async fn alloc_dram_after_miss(
-    thread_ctx: &BlockedRequest,
-    obj_len: u64,
-) -> Option<Vec<storage::SegmentBuffer>> {
-    let dram_pool = storage::get_dram_pool();
-    let got = match dram_pool.alloc_exact_await_expand(obj_len).await {
-        Some(bufs) => Some(bufs),
-        None => dram_pool.alloc_exact_evict(&thread_ctx.lock(), obj_len),
-    };
-    if got.is_none() {
-        reply_err(
-            thread_ctx,
-            &info::DRAM_POOL_EXHAUSTED,
-            ValkeyError::Str(errors::ERR_OOM),
-        );
-    }
-    got
-}
-
-/// Commit a filled DRAM SET from a task and reply: insert the object and set the key under
-/// one server-lock hold, so no shrink lands between. Takes ownership of `buffers`.
-fn commit_dram_set(
-    thread_ctx: &BlockedRequest,
-    key_name: &[u8],
-    object_id: ObjectId,
-    obj_len: u64,
-    crc: Crc,
-    buffers: Vec<storage::SegmentBuffer>,
-) {
-    let dram_pool = storage::get_dram_pool();
-    let lo_value = LoValue::new(object_id, obj_len, crc, None);
-    let outcome = {
-        let ctx = thread_ctx.lock();
-        if dram_pool.is_segment_draining(buffers[0].segment_idx) {
-            // A shrink took the segment during the transfer.
-            dram_pool.free_n(&buffers);
-            Err(ValkeyError::Str(errors::ERR_SET_VALUE))
-        } else {
-            let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
-            dram_pool.insert_object(object_id, obj_ctx);
-            commit_lo_value(&ctx, key_name, object_id, lo_value)
-        }
-    };
-    match outcome {
-        Ok(CommitOutcome::ValueSet) => {
-            thread_ctx.reply(VALKEY_OK);
-        }
-        Ok(CommitOutcome::StaleDiscarded) => {
-            // Stale write — a newer SET already completed.
-            info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
-            dram_pool.remove_object(&object_id);
-            thread_ctx.reply(VALKEY_OK);
-        }
-        Err(e) => {
-            dram_pool.remove_object(&object_id);
-            reply_err(thread_ctx, &info::SET_VALUE_FAILURES, e);
-        }
-    }
-}
-
 pub enum DataSource {
     /// TCP: data is inline bytes from the RESP command args.
     Tcp(Vec<u8>),
@@ -892,10 +696,11 @@ pub enum DataSource {
     },
 }
 
-// ─── DRAM-only EFA SET ───────────────────────────────────────────────────────
+// ─── DRAM-only SET ───────────────────────────────────────────────────────────
 
-/// DRAM-only EFA SET: chunked alloc in DRAMPool, parallel EFA read + post-hoc CRC, create LoValue.
-fn cmd_set_dram_efa(
+/// DRAM-only SET (TCP or EFA): chunked alloc in DRAMPool, move the bytes in through the
+/// streaming driver, create LoValue.
+fn cmd_set_dram(
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
@@ -909,64 +714,116 @@ fn cmd_set_dram_efa(
     // has no file, so there is no fd or .dat to tear down here.
     // `None`: the pool is full. The task below waits for a grow, or evicts if the pool cannot grow.
     let buffers = dram_pool.alloc_exact(obj_len);
-    match data_source {
-        DataSource::Tcp(_) => unreachable!("Dram+TCP SET routed to sync path"),
-        DataSource::Efa {
-            session,
-            addrs,
-            client_crc,
-        } => {
-            // EFA SET: parallel reads into all buffers, then sequential CRC pass.
-            crate::runtime_handle().spawn(async move {
-                let dram_pool = storage::get_dram_pool();
-                let buffers = match buffers {
-                    Some(bufs) => bufs,
-                    // Pool full: wait for a grow, or evict if the pool cannot grow.
-                    None => match alloc_dram_after_miss(&thread_ctx, obj_len).await {
-                        Some(bufs) => bufs,
-                        None => return,
-                    },
+    crate::runtime_handle().spawn(async move {
+        let dram_pool = storage::get_dram_pool();
+        let buffers = match buffers {
+            Some(bufs) => bufs,
+            None => {
+                // Pool full. Wait for a grow; if the pool cannot grow, evict (under the server lock).
+                let got = match dram_pool.alloc_exact_await_expand(obj_len).await {
+                    Some(bufs) => Some(bufs),
+                    None => dram_pool.alloc_exact_evict(&thread_ctx.lock(), obj_len),
                 };
+                let Some(bufs) = got else {
+                    reply_err(
+                        &thread_ctx,
+                        &info::DRAM_POOL_EXHAUSTED,
+                        ValkeyError::Str(errors::ERR_OOM),
+                    );
+                    return;
+                };
+                bufs
+            }
+        };
+        // Move every chunk into the DRAM buffers via the ONE streaming driver
+        // (source=TCP payload or EFA client, target=DRAM resident).
+        let job = crate::stream::StreamJob::for_dram(obj_len, chunk_size, 0, buffers.len());
+        let target = crate::stream::Target::DramResident;
+        // The one per-transport branch: build the source + choose the object-CRC rule.
+        let (result, client_crc) = match data_source {
+            DataSource::Tcp(data) => {
+                let chunk_iter = ChunkIterator::new(obj_len, chunk_size, buffers.len(), None);
+                let source = crate::stream::Source::TcpInline {
+                    data: &data,
+                    buffers: &buffers,
+                    pool: crate::stream::Pool::Dram(dram_pool),
+                };
+                let result = crate::stream::run_set(&job, chunk_iter, &source, &target, |_| {
+                    crc_fast::checksum(crc_fast::CrcAlgorithm::Crc32Iscsi, &data) as u32
+                })
+                .await;
+                (result, None)
+            }
+            DataSource::Efa {
+                session,
+                addrs,
+                client_crc,
+            } => {
                 let chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, buffers.len(), Some(addrs));
-                // Dram EFA SET: EFA-read every chunk into the DRAM buffers via the
-                // ONE streaming driver (source=EFA client, target=DRAM resident).
-                let job = crate::stream::StreamJob::for_dram(obj_len, chunk_size, 0, buffers.len());
                 let source = crate::stream::Source::EfaRead {
                     session,
                     buffers: &buffers,
                     pool: crate::stream::Pool::Dram(dram_pool),
                 };
-                let target = crate::stream::Target::DramResident;
-                let crc = match crate::stream::run_set(&job, chunk_iter, &source, &target, |ci| {
+                let result = crate::stream::run_set(&job, chunk_iter, &source, &target, |ci| {
                     ci.combine_checksums()
                 })
-                .await
-                {
-                    Ok(crc) => crc,
-                    Err(e) => {
-                        crate::stream::reply_stream_err(&thread_ctx, e);
-                        dram_pool.free_n(&buffers);
-                        return;
-                    }
-                };
-                // Optional end-to-end CRC verification: reject before commit
-                // so no corrupted data is persisted.
-                if let Some(expected) = client_crc {
-                    if crc != expected {
-                        reply_err(
-                            &thread_ctx,
-                            &info::CRC_MISMATCH,
-                            ValkeyError::Str(errors::ERR_CRC_MISMATCH),
-                        );
-                        dram_pool.free_n(&buffers);
-                        return;
-                    }
-                }
-                commit_dram_set(&thread_ctx, &key_name, object_id, obj_len, crc, buffers);
-            });
+                .await;
+                (result, client_crc)
+            }
+        };
+        let crc = match result {
+            Ok(crc) => crc,
+            Err(e) => {
+                crate::stream::reply_stream_err(&thread_ctx, e);
+                dram_pool.free_n(&buffers);
+                return;
+            }
+        };
+        // Optional end-to-end CRC verification: reject before commit
+        // so no corrupted data is persisted.
+        if let Some(expected) = client_crc {
+            if crc != expected {
+                reply_err(
+                    &thread_ctx,
+                    &info::CRC_MISMATCH,
+                    ValkeyError::Str(errors::ERR_CRC_MISMATCH),
+                );
+                dram_pool.free_n(&buffers);
+                return;
+            }
         }
-    }
+        let lo_value = LoValue::new(object_id, obj_len, crc, None);
+        // Insert and commit under one server-lock hold, so no shrink lands between.
+        let outcome = {
+            let ctx = thread_ctx.lock();
+            if dram_pool.is_segment_draining(buffers[0].segment_idx) {
+                // A shrink took the segment during the transfer.
+                dram_pool.free_n(&buffers);
+                Err(ValkeyError::Str(errors::ERR_SET_VALUE))
+            } else {
+                let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
+                dram_pool.insert_object(object_id, obj_ctx);
+                commit_lo_value(&ctx, &key_name, object_id, lo_value)
+            }
+        };
+        match outcome {
+            Ok(CommitOutcome::ValueSet) => {
+                thread_ctx.reply(VALKEY_OK);
+            }
+            Ok(CommitOutcome::StaleDiscarded) => {
+                // Stale write — a newer SET already completed.
+                info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
+                dram_pool.remove_object(&object_id);
+                thread_ctx.reply(VALKEY_OK);
+            }
+            Err(e) => {
+                dram_pool.remove_object(&object_id);
+                reply_err(&thread_ctx, &info::SET_VALUE_FAILURES, e);
+            }
+        }
+    });
 }
 
 // ─── Tiered SET ──────────────────────────────────────────────────────────────
