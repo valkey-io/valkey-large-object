@@ -27,7 +27,7 @@ from contextlib import contextmanager
 import pytest
 from valkey import OutOfMemoryError, ResponseError
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
 
 # 900KB in a 1MB segment: one object of this size fills a segment by itself.
 SEGMENT_FILLING_SIZE = 900 * 1024
@@ -88,8 +88,8 @@ def set_policy(client, policy='allkeys-lru'):
 
 
 def set_objects(client, prefix, count, size):
-    """SET `count` objects of `size` bytes, each filled with its own byte; return them by key."""
-    payloads = {f'{prefix}{i}': bytes([i % 251 + 1]) * size for i in range(count)}
+    """SET `count` objects of `size` bytes, each with its own tag; return them by key."""
+    payloads = {f'{prefix}{i}': position_pattern(size, i % 251 + 1) for i in range(count)}
     for key, payload in payloads.items():
         assert client.execute_command('BLOB.TCP_SET', key, payload) == b'OK'
     return payloads
@@ -148,8 +148,8 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         before = info_largeobj(client)
 
-        assert client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE) == b'OK'
-        assert client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'key_a', position_pattern(SEGMENT_FILLING_SIZE, 'A')) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'key_b', position_pattern(SEGMENT_FILLING_SIZE, 'B')) == b'OK'
 
         after = info_largeobj(client)
         assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands'] + 1
@@ -171,14 +171,14 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         after the DEL and takes it.
         """
         client = self.server.get_new_client()
-        src = b'S' * (600 * 1024)
+        src = position_pattern(600 * 1024, 'S')
         assert client.execute_command('BLOB.TCP_SET', 'src', src) == b'OK'
         assert client.execute_command('COPY', 'src', 'dst') == 1
         assert client.execute_command('BLOB.TCP_GET', 'dst') == src
         assert info_largeobj(client)['largeobj_dram_segments'] == 2
         client.execute_command('DEL', 'src')
         wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == 1)
-        assert client.execute_command('BLOB.TCP_SET', 'big', b'B' * (900 * 1024)) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'big', position_pattern(900 * 1024, 'B')) == b'OK'
         assert info_largeobj(client)['largeobj_dram_segments'] == 2, \
             "copy was split across segments, so a 900KB SET needed a third"
 
@@ -186,7 +186,7 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         """Objects spread over expanded segments all read back correctly."""
         client = self.server.get_new_client()
         before = info_largeobj(client)['largeobj_dram_scaling_expands']
-        payloads = {f'key_{i}': bytes([i]) * (800 * 1024) for i in range(4)}
+        payloads = {f'key_{i}': position_pattern(800 * 1024, i) for i in range(4)}
 
         for key, payload in payloads.items():
             client.execute_command('BLOB.TCP_SET', key, payload)
@@ -205,9 +205,9 @@ class TestDramReactiveExpand(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         expands = lambda: info_largeobj(client)['largeobj_dram_scaling_expands']
         efa_len = 4096
-        # fabric_target --read serves 0x00..0xFF repeating (its generate_pattern()).
-        efa_payload = bytes(i % 256 for i in range(efa_len))
-        small = b'F' * efa_len
+        # What fabric_target --read serves (its generate_pattern()).
+        efa_payload = position_pattern(efa_len)
+        small = position_pattern(efa_len, 'F')
         start = expands()
 
         sets = 0
@@ -268,7 +268,7 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         expand_before = info_largeobj(client)['largeobj_dram_scaling_expands']
 
-        assert client.execute_command('BLOB.TCP_SET', 'probe', b'P' * (600 * 1024)) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'probe', position_pattern(600 * 1024, 'P')) == b'OK'
         assert info_largeobj(client)['largeobj_dram_scaling_expands'] == expand_before
 
         wait_for_true(
@@ -283,7 +283,7 @@ class TestDramProactiveExpand(ValkeyLargeObjTestCaseBase):
         # stops cron expands, so any expand from here would be the SET's own.
         client.config_set('largeobj.scaling-expand-watermark', 95)
         expanded = info_largeobj(client)['largeobj_dram_scaling_expands']
-        second = b'S' * (600 * 1024)
+        second = position_pattern(600 * 1024, 'S')
         assert client.execute_command('BLOB.TCP_SET', 'second', second) == b'OK'
         assert info_largeobj(client)['largeobj_dram_scaling_expands'] == expanded
         assert client.execute_command('BLOB.TCP_GET', 'second') == second
@@ -313,7 +313,7 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         not grow. The object is small enough that core's own OOM check passes."""
         client = self.server.get_new_client()
         client.config_set('maxmemory-policy', 'noeviction')
-        client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_a', position_pattern(SEGMENT_FILLING_SIZE, 'A'))
 
         used = int(client.info('memory')['used_memory'])
         # 600KB under maxmemory: core's OOM check lets a 200KB SET through, but
@@ -324,7 +324,7 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         # 200KB does not fit the ~124KB left in the segment, so it needs a new
         # segment, and the module rejects it.
         with pytest.raises(OutOfMemoryError):
-            client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * (200 * 1024))
+            client.execute_command('BLOB.TCP_SET', 'key_b', position_pattern(200 * 1024, 'B'))
         after = info_largeobj(client)
         assert after['largeobj_dram_segments'] == before['largeobj_dram_segments']
         assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands']
@@ -336,16 +336,16 @@ class TestDramServerMaxMemoryCap(ValkeyLargeObjTestCaseBase):
         client.config_set('maxmemory-policy', 'noeviction')
         # The one startup segment is all the limit allows.
         client.config_set('largeobj.max-rdma-registered-bytes', 1048576)
-        client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_a', position_pattern(SEGMENT_FILLING_SIZE, 'A'))
 
         with pytest.raises(OutOfMemoryError):
-            client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * (200 * 1024))
+            client.execute_command('BLOB.TCP_SET', 'key_b', position_pattern(200 * 1024, 'B'))
         info = info_largeobj(client)
         assert info['largeobj_dram_segments'] == 1
         assert info['largeobj_dram_rdma_registered_segments'] == 1
 
         client.config_set('largeobj.max-rdma-registered-bytes', 2 * 1048576)
-        assert client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * (200 * 1024)) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'key_b', position_pattern(200 * 1024, 'B')) == b'OK'
         assert info_largeobj(client)['largeobj_dram_rdma_registered_segments'] == 2
 
 class TestDramNoShrink(ValkeyLargeObjTestCaseBase):
@@ -354,7 +354,7 @@ class TestDramNoShrink(ValkeyLargeObjTestCaseBase):
     """
 
     # One object per segment.
-    PAYLOADS = {f'dshrink_{i}': bytes([i]) * SEGMENT_FILLING_SIZE for i in range(4)}
+    PAYLOADS = {f'dshrink_{i}': position_pattern(SEGMENT_FILLING_SIZE, i) for i in range(4)}
 
     def get_module_args(self, data_dir, direct_io):
         return (
@@ -431,8 +431,8 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
     def test_tiered_expand_on_promotion(self):
         """Promoting an object that fits no segment expands the pool."""
         client = self.server.get_new_client()
-        client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
-        client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_a', position_pattern(SEGMENT_FILLING_SIZE, 'A'))
+        client.execute_command('BLOB.TCP_SET', 'key_b', position_pattern(SEGMENT_FILLING_SIZE, 'B'))
         before = info_largeobj(client)
 
         promote(client, ['key_a', 'key_b'])
@@ -440,8 +440,8 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
         after = info_largeobj(client)
         assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands'] + 1
         assert after['largeobj_dram_segments'] == 2
-        assert client.execute_command('BLOB.TCP_GET', 'key_a') == b'A' * SEGMENT_FILLING_SIZE
-        assert client.execute_command('BLOB.TCP_GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE
+        assert client.execute_command('BLOB.TCP_GET', 'key_a') == position_pattern(SEGMENT_FILLING_SIZE, 'A')
+        assert client.execute_command('BLOB.TCP_GET', 'key_b') == position_pattern(SEGMENT_FILLING_SIZE, 'B')
         # The expanded DRAM segment joins its ring's io_uring table (per-pool).
         wait_uring_registered_matches_segments(client)
         # With the fabric up, every segment of each pool is RDMA-registered, the expanded one too.
@@ -457,11 +457,11 @@ class TestTieredExpand(ValkeyLargeObjTestCaseBase):
         # Staging plus the one startup DRAM segment is all the limit allows.
         registered = info['largeobj_disk_staging_rdma_registered_segments'] + 1
         client.config_set('largeobj.max-rdma-registered-bytes', registered * 1048576)
-        client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
-        client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_a', position_pattern(SEGMENT_FILLING_SIZE, 'A'))
+        client.execute_command('BLOB.TCP_SET', 'key_b', position_pattern(SEGMENT_FILLING_SIZE, 'B'))
 
         promote(client, ['key_a'])
-        assert client.execute_command('BLOB.TCP_GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE
+        assert client.execute_command('BLOB.TCP_GET', 'key_b') == position_pattern(SEGMENT_FILLING_SIZE, 'B')
 
         after = info_largeobj(client)
         assert after['largeobj_dram_objects'] == 1
@@ -474,7 +474,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
     deletes no keys, so it runs under noeviction too."""
 
     TIMEOUT_S = 20
-    PAYLOADS = {f'tshrink_{i}': bytes([i]) * SEGMENT_FILLING_SIZE for i in range(4)}
+    PAYLOADS = {f'tshrink_{i}': position_pattern(SEGMENT_FILLING_SIZE, i) for i in range(4)}
 
     def get_module_args(self, data_dir, direct_io):
         # Expand watermark 95: one segment per cached object and no empty
@@ -608,8 +608,8 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
 
         # Promoting the second ~full-segment object forces a reactive expand, and with the
         # fabric up try_expand EFA-registers that new segment (the path under test).
-        client.execute_command('BLOB.TCP_SET', 'key_a', b'A' * SEGMENT_FILLING_SIZE)
-        client.execute_command('BLOB.TCP_SET', 'key_b', b'B' * SEGMENT_FILLING_SIZE)
+        client.execute_command('BLOB.TCP_SET', 'key_a', position_pattern(SEGMENT_FILLING_SIZE, 'A'))
+        client.execute_command('BLOB.TCP_SET', 'key_b', position_pattern(SEGMENT_FILLING_SIZE, 'B'))
         promote(client, ['key_a', 'key_b'])
 
         expanded = info_largeobj(client)
@@ -639,8 +639,8 @@ class TestTieredShrinkReleasesEfaRegisteredSegment(ValkeyLargeObjTestCaseBase):
         assert (after['largeobj_disk_staging_rdma_registered_segments']
                 == expanded['largeobj_disk_staging_rdma_registered_segments'])
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
-        assert client.execute_command('BLOB.TCP_GET', 'key_a') == b'A' * SEGMENT_FILLING_SIZE
-        assert client.execute_command('BLOB.TCP_GET', 'key_b') == b'B' * SEGMENT_FILLING_SIZE
+        assert client.execute_command('BLOB.TCP_GET', 'key_a') == position_pattern(SEGMENT_FILLING_SIZE, 'A')
+        assert client.execute_command('BLOB.TCP_GET', 'key_b') == position_pattern(SEGMENT_FILLING_SIZE, 'B')
 
 
 # ─── Eviction ─────────────────────────────────────────────────────────────────
@@ -750,11 +750,11 @@ class TieredBudget(Budget):
 
     def first_in_line(self, payloads):
         """The key LRU eviction takes first when none was read: the oldest write (lowest oid),
-        read back from its file's payload byte."""
+        found by its file's first payload word, which differs for every tag."""
         with open(os.path.join(self.data_dir, self.object_files()[0]), 'rb') as f:
             f.seek(4096)
-            byte = f.read(1)[0]
-        return next(key for key, payload in payloads.items() if payload[0] == byte)
+            head = f.read(4)
+        return next(key for key, payload in payloads.items() if payload[:4] == head)
 
     def settle(self, client, live, timeout=10):
         """Every unevictable-list entry removed and every unlink done: the ledger equals the bytes
@@ -787,7 +787,7 @@ class EvictionTests:
     def test_noeviction_refuses_and_destroys_nothing(self):
         client = self.new_client('noeviction')
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
         assert self.evictions(client) == 0
         assert surviving(client, payloads) == payloads
         self.settle(client, self.PER_BUDGET)
@@ -796,7 +796,7 @@ class EvictionTests:
         """A COPY whose only possible victim is its source fails and destroys nothing. Otherwise each
         COPY evicts another key, even when the source is first in line."""
         client = self.new_client()
-        alone = b'A' * int(self.BUDGET * 0.6)
+        alone = position_pattern(int(self.BUDGET * 0.6), 'A')
         assert client.execute_command('BLOB.TCP_SET', 'alone', alone) == b'OK'
         with pytest.raises(ResponseError):
             client.execute_command('COPY', 'alone', 'dst')
@@ -878,7 +878,7 @@ class TestDramEviction(EvictionTests, DramBudget):
         extra = 0
         while self.evictions(client) == 0:
             assert extra < 100, "the segment never filled"
-            assert client.execute_command('BLOB.TCP_SET', f'extra_{extra}', b'N' * self.SMALL) == b'OK'
+            assert client.execute_command('BLOB.TCP_SET', f'extra_{extra}', position_pattern(self.SMALL, 'N')) == b'OK'
             extra += 1
         survivors = surviving(client, payloads)
         assert read in survivors
@@ -897,7 +897,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         """No eviction makes room for more than the cap."""
         client = self.new_client()
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        self.assert_refused(client, 'huge', b'H' * self.BUDGET)
+        self.assert_refused(client, 'huge', position_pattern(self.BUDGET, 'H'))
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 0
         assert info['largeobj_disk_capacity_exceeded'] == 1
@@ -908,21 +908,21 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         full disk evicts, and noeviction refuses."""
         client = self.new_client()
         set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        assert client.execute_command('BLOB.TCP_SET', 'no_maxmemory', b'N' * self.OBJ) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'no_maxmemory', position_pattern(self.OBJ, 'N')) == b'OK'
         used = int(client.info('memory')['used_memory'])
         client.config_set('maxmemory', used + 256 * 1024 * 1024)
-        assert client.execute_command('BLOB.TCP_SET', 'with_maxmemory', b'W' * self.OBJ) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'with_maxmemory', position_pattern(self.OBJ, 'W')) == b'OK'
         assert self.evictions(client) == 2
         client.config_set('maxmemory', 0)
         client.config_set('maxmemory-policy', 'noeviction')
-        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
         assert self.evictions(client) == 2
 
     def test_a_write_that_needs_more_than_16_victims_is_refused_but_they_stay_evicted(self):
         """A claim is never undone."""
         client = self.new_client()
         set_objects(client, 's_', 64, 60 * 1024)  # 64KB on disk each: they fill the budget
-        self.assert_refused(client, 'big', b'B' * int(self.BUDGET * 0.6))
+        self.assert_refused(client, 'big', position_pattern(int(self.BUDGET * 0.6), 'B'))
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 16
         assert info['largeobj_disk_capacity_exceeded'] == 1
@@ -947,12 +947,12 @@ class TestTieredEviction(EvictionTests, TieredBudget):
     #     client = self.new_client()
     #     payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
     #     key = self.first_in_line(payloads) if overwrite else 'slow'
-    #     with paused_set(self.server, client, key, b'S' * self.OBJ) as outcome:
+    #     with paused_set(self.server, client, key, position_pattern(self.OBJ, 'S')) as outcome:
     #         set_objects(client, 'other_', 3 * self.PER_BUDGET, self.OBJ)
     #         if overwrite:
     #             assert client.execute_command('BLOB.TCP_GET', key) == payloads[key]
     #     assert outcome.get('reply') == b'OK', outcome
-    #     assert client.execute_command('BLOB.TCP_GET', key) == b'S' * self.OBJ
+    #     assert client.execute_command('BLOB.TCP_GET', key) == position_pattern(self.OBJ, 'S')
     #     self.settle(client, self.PER_BUDGET - (1 if overwrite else 0))
 
     def test_overlapping_writes_each_evict_only_for_themselves(self):
@@ -967,7 +967,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
             c = self.server.get_new_client()
             for i in range(writes):
                 try:
-                    c.execute_command('BLOB.TCP_SET', f'w{n}_{i}', b'W' * self.OBJ)
+                    c.execute_command('BLOB.TCP_SET', f'w{n}_{i}', position_pattern(self.OBJ, 'W'))
                 except ResponseError as e:
                     errors.append(e)
 
@@ -985,7 +985,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         client = self.new_client()
         client.config_set('largeobj.promote-min-hits', 1)
         promote(client, set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ))
-        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', position_pattern(self.OBJ, 'N')) == b'OK'
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == info['largeobj_pending_evictions'] == 1
         assert info['largeobj_dram_objects'] == self.PER_BUDGET - 1
@@ -1021,7 +1021,8 @@ class TestTieredEvictionMixed(TieredBudget):
                 try:
                     if op < 0.45:
                         version += 1
-                        payload = bytes([n % 200 + 1, version % 256]) * (self.OBJ // 2)
+                        # Unique per worker and version: a stale read cannot match.
+                        payload = position_pattern(self.OBJ, n * 1_000_000 + version)
                         if c.execute_command('BLOB.TCP_SET', key, payload) == b'OK':
                             expected[key] = payload
                     elif op < 0.75:
@@ -1073,9 +1074,9 @@ class EvictionPolicyTests:
         for key in volatile:
             assert client.execute_command('EXPIRE', key, 1000) == 1
         for i in range(len(volatile)):
-            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', position_pattern(self.OBJ, 'N')) == b'OK'
         assert sorted(surviving(client, payloads)) == sorted(persistent)
-        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
         assert self.evictions(client) == len(volatile)
 
     def test_persist_and_copy_carry_the_ttl_into_eviction(self):
@@ -1084,7 +1085,7 @@ class EvictionPolicyTests:
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
         assert client.execute_command('EXPIRE', 'obj_0', 1000) == 1
         assert client.execute_command('PERSIST', 'obj_0') == 1
-        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
 
         client.execute_command('DEL', f'obj_{self.PER_BUDGET - 1}')
         wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
@@ -1092,27 +1093,27 @@ class EvictionPolicyTests:
         assert client.execute_command('EXPIRE', 'obj_1', 1000) == 1
         assert client.execute_command('COPY', 'obj_1', 'copy_1') == 1
         for i in range(2):
-            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', position_pattern(self.OBJ, 'N')) == b'OK'
         survivors = surviving(client, {**payloads, 'copy_1': payloads['obj_1']})
         assert 'obj_1' not in survivors and 'copy_1' not in survivors
         assert len(survivors) == self.PER_BUDGET - 2
-        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
 
     def test_a_policy_change_takes_effect_at_once(self):
         """Nothing has a TTL: volatile-* refuses the write, allkeys-* evicts to take it, and
         switching back refuses again, so each CONFIG SET reached the cached policy."""
         client = self.new_client('volatile-lru')
         set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        self.assert_refused(client, 'refused_1', b'R' * self.OBJ)
+        self.assert_refused(client, 'refused_1', position_pattern(self.OBJ, 'R'))
         client.config_set('maxmemory-policy', 'allkeys-lru')
-        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', position_pattern(self.OBJ, 'N')) == b'OK'
         evicted = self.evictions(client)
         assert evicted >= 1
         client.config_set('maxmemory-policy', 'volatile-lru')
         # Dram evicted a batch, so there is room for more writes; once full, volatile refuses.
         for i in range(self.PER_BUDGET):
             try:
-                client.execute_command('BLOB.TCP_SET', f'filler_{i}', b'F' * self.OBJ)
+                client.execute_command('BLOB.TCP_SET', f'filler_{i}', position_pattern(self.OBJ, 'F'))
             except ResponseError as e:
                 assert self.FULL in str(e)
                 break
@@ -1136,9 +1137,9 @@ class EvictionPolicyTests:
         for key, (command, when) in zip(volatile, variants):
             assert client.execute_command(command, key, when) == 1
         for i in range(len(volatile)):
-            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', position_pattern(self.OBJ, 'N')) == b'OK'
         assert not set(surviving(client, payloads)) & set(volatile)
-        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
         assert self.evictions(client) == len(volatile)
 
     def test_rename_and_move_keep_the_ttl_with_the_object(self):
@@ -1150,11 +1151,11 @@ class EvictionPolicyTests:
         client.execute_command('RENAME', 'obj_0', 'renamed')
         assert client.execute_command('MOVE', 'obj_1', 1) == 1
         for i in range(2):
-            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', position_pattern(self.OBJ, 'N')) == b'OK'
         others = {key: value for key, value in payloads.items() if key not in ('obj_0', 'obj_1')}
         assert surviving(client, others) == others, "a key without a TTL was evicted"
         assert not surviving(client, {'renamed': payloads['obj_0']})
-        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
         assert self.evictions(client) == 2
 
     def test_overwrite_drops_the_ttl(self):
@@ -1163,11 +1164,11 @@ class EvictionPolicyTests:
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
         assert client.execute_command('EXPIRE', 'obj_0', 1000) == 1
         self.free_a_slot(client, f'obj_{self.PER_BUDGET - 1}')
-        assert client.execute_command('BLOB.TCP_SET', 'obj_0', b'O' * self.OBJ) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'obj_0', position_pattern(self.OBJ, 'O')) == b'OK'
         wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
         self.settle(client, self.PER_BUDGET - 1)
-        assert client.execute_command('BLOB.TCP_SET', 'fill', b'F' * self.OBJ) == b'OK'
-        self.assert_refused(client, 'refused', b'R' * self.OBJ)
+        assert client.execute_command('BLOB.TCP_SET', 'fill', position_pattern(self.OBJ, 'F')) == b'OK'
+        self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
         assert self.evictions(client) == 0
 
     def assert_lru_victims(self, client, payloads, lru_order, writes):
@@ -1187,7 +1188,7 @@ class EvictionPolicyTests:
         for key in reversed(keys):
             assert client.execute_command('BLOB.TCP_GET', key) == payloads[key]
         for i in range(2):
-            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', position_pattern(self.OBJ, 'N')) == b'OK'
         self.assert_lru_victims(client, payloads, keys[::-1], 2)
 
     def test_volatile_lru_evicts_the_least_recently_used_key_with_a_ttl(self):
@@ -1198,7 +1199,7 @@ class EvictionPolicyTests:
         for key in keys[1:]:
             assert client.execute_command('EXPIRE', key, 1000) == 1
         assert client.execute_command('BLOB.TCP_GET', keys[1]) == payloads[keys[1]]
-        assert client.execute_command('BLOB.TCP_SET', 'newcomer', b'N' * self.OBJ) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'newcomer', position_pattern(self.OBJ, 'N')) == b'OK'
         self.assert_lru_victims(client, payloads, [keys[2], keys[1]], 1)
         assert keys[0] in surviving(client, payloads), "the key without a TTL was evicted"
 
@@ -1217,7 +1218,7 @@ class EvictionPolicyTests:
         for key in reversed(keys):
             assert client.execute_command('BLOB.TCP_GET', key) == payloads[key]
         for i in range(2):
-            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', b'N' * self.OBJ) == b'OK'
+            assert client.execute_command('BLOB.TCP_SET', f'new_{i}', position_pattern(self.OBJ, 'N')) == b'OK'
         self.assert_lru_victims(client, payloads, keys[:0:-1] if volatile else keys[::-1], 2)
         with open(os.path.join(self.server.cwd, self.server.args['logfile'])) as f:
             assert sum(f'{policy} evicts in' in line for line in f) == 1

@@ -6,7 +6,14 @@ import os
 import pytest
 import subprocess
 from valkey import ResponseError
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
+from valkey_largeobj_test_case import (
+    MIB,
+    ORDER_OBJECT_LEN,
+    ValkeyLargeObjTestCaseBase,
+    chunk_order_module_args,
+    info_largeobj,
+    position_pattern,
+)
 from valkeytestframework.util.waiters import wait_for_equal
 
 
@@ -59,7 +66,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
     def test_efa_get_needs_hello(self):
         """The RDMA arity of BLOB.RDMA_GET is refused until this client has a session."""
         client = self.server.get_new_client()
-        client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
+        client.execute_command('BLOB.TCP_SET', 'key', position_pattern(4096, 'A'))
         self.verify_error_response(
             client, 'BLOB.RDMA_GET key 999 0 4096', 'no RDMA session (call BLOB.RDMA_HELLO first)')
 
@@ -69,7 +76,7 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         RDMA_SET: >=6 args (key + total_len + at least one triplet). Incomplete triples are refused.
         """
         client = self.server.get_new_client()
-        client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096)
+        client.execute_command('BLOB.TCP_SET', 'key', position_pattern(4096, 'A'))
         for command in ('BLOB.RDMA_GET key 999',
                         'BLOB.RDMA_GET key 999 0',
                         'BLOB.RDMA_SET key 4096 999',
@@ -100,13 +107,12 @@ class TestLargeObjFabricUnavailable(ValkeyLargeObjTestCaseBase):
     def test_hello_reports_unavailable(self):
         client = self.server.get_new_client()
         self.verify_error_response(client, f'BLOB.RDMA_HELLO {PEER_ADDRESS}', 'RDMA provider unavailable on this instance')
-        assert client.execute_command('BLOB.TCP_SET', 'key', b'A' * 4096) == b'OK'
+        assert client.execute_command('BLOB.TCP_SET', 'key', position_pattern(4096, 'A')) == b'OK'
 
-# Position-dependent payload for fabric transfers: cycling 0x00..0xFF so that byte-ordering
-# across multi-region splits is verified, not just fill. Must match fabric_target's
-# generate_pattern().
+# The object fabric_target holds by default: the same position pattern it generates, so a
+# byte landing at the wrong offset in any region fails verification.
 TARGET_LEN = 4096
-PATTERN = bytes(i % 256 for i in range(TARGET_LEN))
+PATTERN = position_pattern(TARGET_LEN)
 
 # One advertised client memory address: the fabric address to HELLO with, plus the
 # (rkey, addr, len) triple that BLOB.RDMA_GET / BLOB.RDMA_SET carries per address.
@@ -124,6 +130,34 @@ def address_args(regions):
     return args
 
 
+def start_target(*flags, split=None, object_len=None):
+    """Launch tests/harness/fabric_target, a passive libfabric peer that is the client's
+    buffer, and return it with the regions it advertised.
+
+    `object_len` defaults to TARGET_LEN. `split` is a list of region sizes totalling it;
+    the target then registers one buffer per region, each with its own rkey. Omitted, it
+    registers one whole-buffer region."""
+    target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
+    command = [target, '127.0.0.1', *flags]
+    if object_len is not None:
+        command.append(f'--len={object_len}')
+    if split is not None:
+        command.append('--split=' + ','.join(str(size) for size in split))
+    # stdin piped: after verifying a payload the target keeps acknowledging writes until
+    # stdin closes, which `communicate()` does.
+    process = subprocess.Popen(
+        command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True,
+    )
+    regions = []
+    for _ in range(1 if split is None else len(split)):
+        line = process.stdout.readline()
+        assert line.startswith('advertisement: '), line
+        address, rkey, remote_addr, length = line.split()[1:]
+        regions.append(Region(address, int(rkey), int(remote_addr), int(length)))
+    return process, regions
+
+
 class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
     """Bytes actually move: tests/harness/fabric_target, a passive libfabric peer on tcp loopback, is
     the client's buffer. Its advertisement is what a real client would carry into BLOB.RDMA_HELLO and the
@@ -139,29 +173,8 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             f" fabric-interfaces lo"
         )
 
-    def start_target(self, *flags, split=None):
-        """Launch the passive peer and return it with the regions it advertised.
-
-        `split` is a list of region sizes totalling TARGET_LEN; the target then registers
-        one separate buffer per region, each with its own rkey. Omitted, it registers the
-        single whole-buffer region."""
-        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
-        command = [target, '127.0.0.1', *flags]
-        if split is not None:
-            command.append('--split=' + ','.join(str(size) for size in split))
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        regions = []
-        for _ in range(1 if split is None else len(split)):
-            line = process.stdout.readline()
-            assert line.startswith('advertisement: '), line
-            address, rkey, remote_addr, length = line.split()[1:]
-            regions.append(Region(address, int(rkey), int(remote_addr), int(length)))
-        return process, regions
-
     def test_get_writes_into_the_target(self):
-        process, regions = self.start_target()
+        process, regions = start_target()
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.TCP_SET', 'key', PATTERN)
@@ -175,7 +188,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             process.kill()
 
     def test_set_reads_from_the_target(self):
-        process, regions = self.start_target('--read')
+        process, regions = start_target('--read')
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
@@ -187,7 +200,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
 
     def test_set_lands_in_selected_db(self):
         """RDMA_SET commits off the main thread, on the client's selected db."""
-        process, regions = self.start_target('--read')
+        process, regions = start_target('--read')
         try:
             client = self.server.get_new_client()
             client.execute_command('SELECT', 1)
@@ -203,7 +216,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
     def test_set_with_matching_crc_succeeds(self):
         """RDMA_SET with a correct CRC token succeeds and the stored CRC matches."""
         expected_crc = crc32c.crc32c(PATTERN)
-        process, regions = self.start_target('--read')
+        process, regions = start_target('--read')
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
@@ -218,7 +231,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
     def test_set_with_wrong_crc_is_rejected(self):
         """RDMA_SET with a wrong CRC is rejected and the key is not created."""
         wrong_crc = crc32c.crc32c(PATTERN) ^ 0xDEADBEEF
-        process, regions = self.start_target('--read')
+        process, regions = start_target('--read')
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
@@ -236,8 +249,8 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
     def test_multi_transfer_mixed_protocol(self):
         """Do mixed sets and gets, read the server value into the client, set it back, and
         read it back in the test"""
-        payload = b'\x5a' * TARGET_LEN
-        process, regions = self.start_target('--read')
+        payload = position_pattern(TARGET_LEN, 'Z')
+        process, regions = start_target('--read')
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.TCP_SET', 'key', payload)
@@ -262,7 +275,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         error is returned, then confirm a subsequent transfer still succeeds."""
         payload = PATTERN
         for sizes in ([2048, 2048], [1024, 3072]):
-            process, regions = self.start_target(split=sizes)
+            process, regions = start_target(split=sizes)
             try:
                 assert [region.len for region in regions] == sizes
                 # Separate registrations, so distinct keys — the multi-rkey path.
@@ -277,7 +290,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
             finally:
                 process.kill()
         # SET gathers the object back out of unequal addresses, verified byte for byte.
-        process, regions = self.start_target('--read', split=[1024, 3072])
+        process, regions = start_target('--read', split=[1024, 3072])
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
@@ -294,7 +307,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         obj_len is how the client knows where the object ends. A shortfall is refused
         before any transfer is issued."""
         short_len = 2048
-        process, regions = self.start_target(split=[1024, 3072])
+        process, regions = start_target(split=[1024, 3072])
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
@@ -318,7 +331,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
         """INFO counts the bytes that crossed RDMA: a GET pushes out (writes) and a SET pulls
         in (reads). TCP traffic counts nowhere, finished requests are no longer in flight, and
         the session goes when its connection does."""
-        process, regions = self.start_target('--read', split=[1024, 3072])
+        process, regions = start_target('--read', split=[1024, 3072])
         try:
             client = self.server.get_new_client()
 
@@ -350,7 +363,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
 
     def test_info_rdma_failed_transfer_moves_no_bytes(self):
         """A failed transfer adds no bytes, and its request is no longer in flight."""
-        process, regions = self.start_target()
+        process, regions = start_target()
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.TCP_SET', 'key', PATTERN)
@@ -384,7 +397,7 @@ class TestLargeObjFabricTieredTransfer(TestLargeObjFabricTransfer):
         )
 
     def test_set_over_efa_persists_to_nvme(self):
-        process, regions = self.start_target('--read')
+        process, regions = start_target('--read')
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
@@ -413,7 +426,7 @@ class TestLargeObjFabricTieredPromotedTransfer(TestLargeObjFabricTransfer):
 
     def test_get_over_efa_cold_then_warm_on_one_session(self):
         payload = PATTERN
-        process, regions = self.start_target('--read')
+        process, regions = start_target('--read')
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
@@ -442,28 +455,11 @@ class TestLargeObjEfaPartialFailure(ValkeyLargeObjTestCaseBase):
         base = TestLargeObjFabricTransfer.get_module_args(self, data_dir, direct_io)
         return base + " test-rdma-fail-partial yes"
 
-    def start_target(self, *flags, split=None):
-        """Launch the passive peer and return it with the regions it advertised."""
-        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
-        command = [target, '127.0.0.1', *flags]
-        if split is not None:
-            command.append('--split=' + ','.join(str(size) for size in split))
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        regions = []
-        for _ in range(1 if split is None else len(split)):
-            line = process.stdout.readline()
-            assert line.startswith('advertisement: '), line
-            address, rkey, remote_addr, length = line.split()[1:]
-            regions.append(Region(address, int(rkey), int(remote_addr), int(length)))
-        return process, regions
-
     def test_partial_failure_drains_and_returns_error(self):
         """Inject an error after the first EFA post so the await loop drains
         the already-submitted transfer before returning the error."""
         payload = PATTERN
-        process, regions = self.start_target(split=[2048, 2048])
+        process, regions = start_target(split=[2048, 2048])
         try:
             client = self.server.get_new_client()
             client.execute_command('BLOB.TCP_SET', 'key', payload)
@@ -479,6 +475,70 @@ class TestLargeObjEfaPartialFailure(ValkeyLargeObjTestCaseBase):
             assert after['largeobj_rdma_write_bytes'] - write_bytes_before == regions[0].len
         finally:
             process.kill()
+
+
+# ─── EFA GET chunk order ─────────────────────────────────────────────────
+# A GET reads an object's chunks concurrently, and disk reads complete in any order.
+# Each chunk must still land at its own offset in the client's buffer; fabric_target
+# verifies every byte of the position pattern before it exits.
+
+# Reordering depends on I/O timing, so each test repeats the GET.
+ORDER_REPEATS = 10
+
+
+def efa_get_verified(server, key):
+    """EFA GET `key` (holding the position pattern) into a fresh fabric_target and check
+    that every byte landed at its own offset. A new connection each time: HELLO binds a
+    connection to one peer."""
+    process, regions = start_target(object_len=ORDER_OBJECT_LEN)
+    try:
+        client = server.get_new_client()
+        client.execute_command('BLOB.RDMA_HELLO', regions[0].address)
+        reply = client.execute_command('BLOB.RDMA_GET', key, *address_args(regions))
+        assert reply == [ORDER_OBJECT_LEN, crc32c.crc32c(position_pattern(ORDER_OBJECT_LEN))]
+        # The target exits once the pattern is in place, and never for misplaced bytes.
+        try:
+            output = process.communicate(timeout=30)[0]
+        except subprocess.TimeoutExpired:
+            pytest.fail("fabric_target never saw the expected bytes")
+        assert 'payload verified' in output, output
+    finally:
+        process.kill()
+        process.wait()
+
+
+class TestFabricTieredGetChunkOrder(ValkeyLargeObjTestCaseBase):
+    """With promotion: the first GET reads every chunk from disk in one window while
+    copying the object into DRAM; the second is served from DRAM."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return chunk_order_module_args(data_dir, direct_io, max_promote_size=8 * MIB)
+
+    def test_get_keeps_chunk_order_while_promoting(self):
+        client = self.server.get_new_client()
+        payload = position_pattern(ORDER_OBJECT_LEN)
+        for i in range(ORDER_REPEATS):
+            key = f'ordered{i}'
+            client.execute_command('BLOB.TCP_SET', key, payload)
+            assert client.execute_command('BLOB.INFO', key, 'TIER') == b'disk'
+            efa_get_verified(self.server, key)
+            assert client.execute_command('BLOB.INFO', key, 'TIER') == b'dram'
+            efa_get_verified(self.server, key)
+
+
+class TestFabricTieredGetChunkOrderStreamed(ValkeyLargeObjTestCaseBase):
+    """Without promotion: every GET streams from disk through a small window of staging
+    buffers, reused batch after batch."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return chunk_order_module_args(data_dir, direct_io, max_promote_size=0)
+
+    def test_streamed_get_keeps_chunk_order(self):
+        client = self.server.get_new_client()
+        client.execute_command('BLOB.TCP_SET', 'ordered', position_pattern(ORDER_OBJECT_LEN))
+        for _ in range(ORDER_REPEATS):
+            efa_get_verified(self.server, 'ordered')
+        assert client.execute_command('BLOB.INFO', 'ordered', 'TIER') == b'disk'
 
 
 # ─── DRAM EFA SET waiting for the pool to grow ───────────────────────────────
@@ -503,7 +563,7 @@ class TestLargeObjFabricDramGrowWait(ValkeyLargeObjTestCaseBase):
         )
 
     def set_over_efa(self, key):
-        process, regions = TestLargeObjFabricTransfer.start_target(self, '--read')
+        process, regions = start_target('--read')
         try:
             sender = self.server.get_new_client()
             sender.execute_command('BLOB.RDMA_HELLO', regions[0].address)

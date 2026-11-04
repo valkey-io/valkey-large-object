@@ -11,7 +11,7 @@ import os
 import pytest
 from valkey import ResponseError
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
 
 BLOB_TYPE = 'largeob-k'
 BLOBS = 4
@@ -32,7 +32,7 @@ SLOW_CRON = " scaling-poll-ms 60000 reaper-poll-ms 60000"
 
 def blob(n):
     """A distinct payload spanning several 4KB chunks."""
-    return bytes([n % 250 + 1]) * 3000 + bytes(range(256)) * 30
+    return position_pattern(10680, n)
 
 
 class PersistenceHelpers:
