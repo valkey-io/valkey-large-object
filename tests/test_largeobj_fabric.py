@@ -455,23 +455,6 @@ class TestLargeObjEfaPartialFailure(ValkeyLargeObjTestCaseBase):
         base = TestLargeObjFabricTransfer.get_module_args(self, data_dir, direct_io)
         return base + " test-rdma-fail-partial yes"
 
-    def start_target(self, *flags, split=None):
-        """Launch the passive peer and return it with the regions it advertised."""
-        target = os.path.join(os.path.dirname(os.environ['MODULE_PATH']), 'fabric_target')
-        command = [target, '127.0.0.1', *flags]
-        if split is not None:
-            command.append('--split=' + ','.join(str(size) for size in split))
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
-        regions = []
-        for _ in range(1 if split is None else len(split)):
-            line = process.stdout.readline()
-            assert line.startswith('advertisement: '), line
-            address, rkey, remote_addr, length = line.split()[1:]
-            regions.append(Region(address, int(rkey), int(remote_addr), int(length)))
-        return process, regions
-
     def test_partial_failure_drains_and_returns_error(self):
         """Inject an error after the first EFA post so the await loop drains
         the already-submitted transfer before returning the error."""
