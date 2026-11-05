@@ -192,11 +192,9 @@ pub fn lo_tcp_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let crc32c = lo_value.crc32c;
     // Pin the file to protect it from asynchronous deletion in tiered mode.
     let file = lo_value.file.clone();
-    // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_get(ctx, object_id, obj_len, crc32c, file, Transport::Tcp) {
-        engine::EngineResult::Sync(result) => result,
-        engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
-    }
+    // Always async: the engine blocks the client and replies from a task.
+    engine::execute_get(ctx, object_id, obj_len, crc32c, file, Transport::Tcp);
+    Ok(ValkeyValue::NoReply)
 }
 
 // ─── BLOB.RDMA_GET ─────────────────────────────────────────────────────────────
@@ -231,11 +229,9 @@ pub fn lo_rdma_get(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let addrs = parse_efa_addresses(&args, 2, obj_len)?;
     let session = efa_session(ctx)?;
     let transport = Transport::Efa { session, addrs };
-    // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_get(ctx, object_id, obj_len, crc32c, file, transport) {
-        engine::EngineResult::Sync(result) => result,
-        engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
-    }
+    // Always async: the engine blocks the client and replies from a task.
+    engine::execute_get(ctx, object_id, obj_len, crc32c, file, transport);
+    Ok(ValkeyValue::NoReply)
 }
 
 // ─── BLOB.TCP_SET ──────────────────────────────────────────────────────────────
@@ -268,11 +264,9 @@ pub fn lo_tcp_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         return Err(ValkeyError::Str(errors::ERR_MAX_OBJECT_SIZE_EXCEEDED));
     }
     let data = args[2].as_slice();
-    // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set_tcp(ctx, &args[1], obj_len, data, old_oid) {
-        engine::EngineResult::Sync(result) => result,
-        engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
-    }
+    // Always async: the engine blocks the client and replies from a task.
+    engine::execute_set_tcp(ctx, &args[1], obj_len, data, old_oid);
+    Ok(ValkeyValue::NoReply)
 }
 
 // ─── BLOB.RDMA_SET ─────────────────────────────────────────────────────────────
@@ -322,11 +316,9 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         addrs,
         client_crc,
     };
-    // Dispatch to engine — it decides sync vs async internally.
-    match engine::execute_set_rdma(ctx, &args[1], obj_len, data_source, old_oid) {
-        engine::EngineResult::Sync(result) => result,
-        engine::EngineResult::Async => Ok(ValkeyValue::NoReply),
-    }
+    // Always async: the engine blocks the client and replies from a task.
+    engine::execute_set(ctx, &args[1], obj_len, data_source, old_oid);
+    Ok(ValkeyValue::NoReply)
 }
 
 // ─── BLOB.INFO ─────────────────────────────────────────────────────────────────

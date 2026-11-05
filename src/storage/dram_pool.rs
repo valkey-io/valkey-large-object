@@ -5,12 +5,13 @@
 //! Expand: adds one `segment-size` segment. The slow part (allocation and EFA
 //! registration) runs with no pool lock held, and the segment joins the pool only
 //! once registered. The scaling cron calls `grow_in_background()` when utilization exceeds
-//! the expand watermark, which does this on a blocking thread. A Dram EFA SET whose alloc
-//! misses starts the same background grow (or joins the one running) and waits for it in its
-//! task (`alloc_exact_await_expand`), so the main thread never stalls. A Tiered promotion
-//! that finds the pool full starts the background grow and is skipped. The Dram TCP SET
-//! cannot wait: it calls `grow_inline()`, which grows the pool on the main thread and stalls
-//! for it; if a grow is already running it goes on to eviction instead of waiting.
+//! the expand watermark, which does this on a blocking thread. A Dram SET (EFA or TCP) whose
+//! alloc misses starts the same background grow (or joins the one running) and waits for it
+//! in its task (`alloc_exact_await_expand`), so the main thread never stalls. A Tiered
+//! promotion that finds the pool full starts the background grow and is skipped. COPY cannot
+//! wait (a data type callback cannot block its client): it calls `grow_inline()`, which grows
+//! the pool on the main thread and stalls for it; if a grow is already running it goes on to
+//! eviction instead of waiting.
 //!
 //! Shrink (Tiered only): triggered proactively by the scaling cron when
 //! `used_memory` approaches `maxmemory`. Picks the least-used segment, marks it
@@ -19,7 +20,7 @@
 //! would delete keys whatever the policy.
 //!
 //! Evict (Dram): a SET or COPY into a full arena evicts objects the
-//! `maxmemory-policy` allows (`alloc_exact_expand_evict`), where the server allows
+//! `maxmemory-policy` allows (`alloc_exact_evict`), where the server allows
 //! eviction. The evicted oids go on the reclaim list; their keys read as missing
 //! until the scaling cron deletes them. The freed bytes stay in their segments as holes.
 
@@ -109,7 +110,7 @@ pub struct DRAMPool {
     /// Cumulative count of successful expand operations since module load.
     pub expand_count: AtomicU64,
     /// Cumulative count of requests that waited for an expand: a SET task in
-    /// `alloc_exact_await_expand` (once, however many expands it waits for), or a caller that
+    /// `alloc_exact_await_expand` (once, however many expands it waits for), or a COPY that
     /// expanded the pool inline in `grow_inline`.
     pub alloc_wait_count: AtomicU64,
     /// Cumulative count of successful shrink operations since module load.
@@ -144,7 +145,7 @@ impl DRAMPool {
 
     // ─── Allocator ───────────────────────────────────────────────────────────
 
-    /// Dram mode, main thread only: allocate all buffers for an object. Allocate in the
+    /// Dram mode, main thread only, for COPY: allocate all buffers for an object. Allocate in the
     /// segments that exist; else grow the pool inline (`grow_inline`) and allocate in the
     /// new segment; else evict objects the `maxmemory-policy` allows (`alloc_exact_evict`).
     ///
@@ -636,7 +637,7 @@ impl DRAMPool {
     }
 
     /// Grow the pool by one segment on the caller's thread: the last resort for a caller that
-    /// cannot wait (Dram TCP SET, COPY). The caller stalls for the whole registration. Returns
+    /// cannot wait (COPY). The caller stalls for the whole registration. Returns
     /// false, without growing, if the pool may not expand or an expand is already running (not
     /// waited for). Counted in `alloc_wait_count`.
     fn grow_inline(&self, ctx: &valkey_module::Context) -> bool {

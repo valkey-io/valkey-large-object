@@ -5,7 +5,7 @@
 **One `.so`** — single Valkey module with three internal layers:
 
 - **Data Type** — Valkey keyspace: LoValue struct, commands (BLOB.RDMA_HELLO, BLOB.TCP_GET, BLOB.RDMA_GET, BLOB.TCP_SET, BLOB.RDMA_SET), native DEL free callback, OID generation
-- **Engine** — Routes commands through (OperatingMode × Transport) matrix. Decides sync vs async. Owns the `EngineResult` pattern.
+- **Engine** — Routes commands through (OperatingMode × Transport) matrix. Blocks the client and dispatches every GET/SET to tokio.
 - **Storage** — SegmentPool + talc allocator, DRAMPool, NVMePool, io_uring (ReadFixed/WriteFixed), FdPool
 - **Transport** — EFA/libfabric (callback-based, oneshot bridge to tokio)
 
@@ -71,27 +71,21 @@ Tokio task resumes (rx.await)
 
 ---
 
-## Engine Dispatch (EngineResult)
+## Engine Dispatch
 
-Commands call `engine::execute_get()` / `engine::execute_set()` which return `EngineResult`:
-
-```rust
-pub enum EngineResult {
-    Sync(Result<ValkeyValue, ValkeyError>),  // reply directly, no blocking
-    Async,                                    // client blocked, reply comes from tokio task
-}
-```
+Commands call `engine::execute_get()` / `engine::execute_set_tcp()` / `engine::execute_set()`.
+Every GET and SET is async, in every mode and over every transport: the engine blocks the
+client, dispatches to a tokio task, and the task replies. The command handler returns
+`ValkeyValue::NoReply`.
 
 Routing matrix:
 
-| Mode | Transport | Path |
-|------|-----------|------|
-| Dram + TCP | Sync | `serve_get_dram_tcp` / `serve_set_dram_tcp` — inline on main thread |
-| Dram + EFA | Async | `execute_get_dram_efa` / `execute_set_dram_efa` — tokio task for EFA DMA |
-| Tiered + TCP | Async | `execute_get_tiered` / `execute_set_tiered` — tokio task for NVMe I/O |
-| Tiered + EFA | Async | Same tiered functions — EFA + NVMe both in one tokio task |
+| Mode | GET | SET |
+|------|-----|-----|
+| Dram | `cmd_get_dram` → `cmd_get_from_dram` (TCP copy or EFA write on a worker) | `cmd_set_dram` (TCP or EFA source into the DRAM pool) |
+| Tiered | `cmd_get_tiered` (DRAM hit, promotion, or NVMe read) | `cmd_set_tiered` (TCP or EFA source to NVMe) |
 
-`block_client()` is called ONLY inside the engine when it decides the async path. The command handler never blocks.
+`block_client()` is called ONLY inside the engine. The command handler never blocks.
 
 ---
 
@@ -167,7 +161,7 @@ async fn efa_write_to_client(session: Arc<Session>, buf_ptr: usize, len, rkey, r
 | `disk-maxmemory` | 10gb | Max disk usage |
 | `disk-staging-size` | 64mb | Single NVMe staging segment (DRAM) |
 | `max-promote-size` | 256mb | Max object size for DRAMPool promotion. 0 = disable. |
-| `worker-threads` | 2 | Tokio runtime thread count |
+| `worker-threads` | 4 | Tokio runtime thread count |
 | `direct-io` | yes | O_DIRECT for NVMe files |
 
 ---

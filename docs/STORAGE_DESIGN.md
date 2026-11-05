@@ -730,12 +730,12 @@ Spawn tokio task — alloc N buffers from DRAMPool segment (final storage):
 
 **SET + TCP + DRAM-only mode:**
 ```
-Main thread (synchronous — no tokio task needed):
-  Alloc N buffers from DRAMPool segment
+Main thread: try to alloc N buffers from DRAMPool, copy the payload, BlockedClient
+Tokio task:
+  Alloc missed? Wait for a pool grow (evict if the pool cannot grow)
   for i in 0..N:
-    memcpy(dram_buffers[i], querybuf + i*chunk_size, chunk_len)
-    crc_hasher.update(dram_buffers[i])
-  Verify CRC → create LoValue + ObjectContext{buffers, state=Ready}, reply OK.
+    memcpy(dram_buffers[i], payload + i*chunk_size, chunk_len)
+  crc over the whole payload → create LoValue + ObjectContext{buffers, state=Ready}, reply OK.
 ```
 
 #### 7.3.4 BLOB.TCP_GET / BLOB.RDMA_GET Flows
@@ -1020,7 +1020,7 @@ and ranks by decayed LFU score, not by `maxmemory-policy`.
 
 **Detection:**
 
-- **Dram expand:** reactive (EFA SET alloc-miss → the SET's task starts or joins the background grow and waits for it; TCP SET alloc-miss → expand inline + retry; if an expand is already running or the pool cannot expand, evict when `maxmemory-policy` allows it, and OOM only if that frees too little) and proactive (cron, utilization > watermark).
+- **Dram expand:** reactive (SET alloc-miss, EFA or TCP → the SET's task starts or joins the background grow and waits for it; COPY alloc-miss → expand inline + retry; if the pool cannot expand, or COPY finds an expand already running, evict when `maxmemory-policy` allows it, and OOM only if that frees too little) and proactive (cron, utilization > watermark).
 - **Tiered expand:** proactive (cron) and on promotion. Tiered SETs write to NVMe; the DRAM pool fills only by GET promotion. A promotion that finds the pool full starts the background grow and is skipped: that GET is served from NVMe, and a later GET promotes into the new segment. If the pool cannot grow, the promotion reclaims cold cached copies (§4.4).
 - **Shrink (Tiered only):** proactive only (cron observes server memory pressure; nothing "fails" to trigger it).
 
@@ -1035,7 +1035,7 @@ Expansion adds one `segment-size` segment (≤1GiB, §2).
 
 | Trigger | Action |
 |---------|--------|
-| DRAMPool allocation fails (no segment has room) — Dram SET path | EFA SET: start the background grow (or join the running one) and wait for it in the SET's task, then retry the alloc; evict, then OOM, only when the pool cannot grow. TCP SET: add a segment inline, then retry. If an expand is already running or the pool cannot expand, evict up to 16 objects when `maxmemory-policy` allows it (`maxmemory` set and not `noeviction`); OOM if eviction is not allowed or the object still does not fit |
+| DRAMPool allocation fails (no segment has room) — Dram SET path | SET (EFA or TCP): start the background grow (or join the running one) and wait for it in the SET's task, then retry the alloc; evict, then OOM, only when the pool cannot grow. COPY: add a segment inline, then retry. If the pool cannot expand (or COPY finds an expand already running), evict up to 16 objects when `maxmemory-policy` allows it (`maxmemory` set and not `noeviction`); OOM if eviction is not allowed or the object still does not fit |
 | Pool utilization > `scaling-expand-watermark` (cron) | Start adding a segment in the background |
 
 Both are gated by the server ceiling: an expand that would push `used_memory` past
@@ -1052,13 +1052,13 @@ and a promotion that finds no room is skipped (the GET reads NVMe).
 **Why both rows exist.** Adding a segment costs one EFA registration, which pins the
 whole segment (tens of milliseconds at 256MB). The proactive row pays it on a blocking
 thread while the pool keeps serving, so a later alloc finds the segment ready. The
-alloc-fail row is for a burst that outruns the cron. An EFA SET that misses starts the same
+alloc-fail row is for a burst that outruns the cron. A SET that misses starts the same
 background grow (or joins the one registering) and waits for it in its task, so the main thread
-keeps serving. A TCP SET has no task to wait in: it stalls for the registration itself. If
-the cron's expand is still registering, it does not wait for it but evicts when
+keeps serving. COPY cannot block its client, so it stalls for the registration itself. If the
+cron's expand is still registering, it does not wait for it but evicts when
 `maxmemory-policy` allows (up to 16 objects), and is rejected (OOM) only if eviction is not
-allowed or the object still does not fit. `dram_alloc_waits` counts each SET that waited,
-either way.
+allowed or the object still does not fit. `dram_alloc_waits` counts each SET that waited and
+each COPY that stalled.
 Tiered has no reactive row: promotion never blocks the GET on pool-full, it just
 serves from NVMe.
 
@@ -1372,7 +1372,7 @@ This section describes how shared state is protected, which structures are refco
 | GET → DRAMPool hit | Main thread only | Data already in DRAM. RwLock read + reply inline. Zero I/O. |
 | GET → DRAMPool miss (Tiered mode) | Main → tokio task | Needs NVMePool buffer alloc + NVMe ReadFixed. BlockedClient until read completes. |
 | SET (Tiered mode) | Main → tokio task | Needs NVMePool buffer alloc + NVMe WriteFixed. BlockedClient until write + CRC verified. |
-| SET (DRAM-only mode) | Main thread only | DRAMPool alloc + memcpy from querybuf. Synchronous. No NVMe, no tokio. |
+| SET (DRAM-only mode) | Main → tokio task | First DRAMPool alloc on the main thread; on a miss the task waits for a pool grow (or evicts). memcpy + CRC in the task. BlockedClient until committed. |
 
 Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a non-existent key returns key-not-found, not a cache miss.
 
@@ -1382,7 +1382,7 @@ Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a 
 |---|---|---|
 | All EFA commands (GET and SET, both modes) | Main → tokio task | EFA transport (fi_read/fi_write) is async. Always BlockedClient + tokio task. |
 
-**Summary:** Main thread handles only the synchronous fast paths (DRAM hit over TCP, DRAM-only SET over TCP). Everything involving NVMe I/O or EFA transport goes through tokio.
+**Summary:** Main thread handles only the synchronous fast path (DRAM hit over TCP). Everything involving NVMe I/O or EFA transport goes through tokio.
 
 ### 9.3 Global State and Lock Table
 
@@ -1405,7 +1405,7 @@ its own talc Mutex means allocs/frees on *different* segments proceed in paralle
 only same-segment operations serialize. Hold time ~10-50ns. Negligible contention.
 (See §8.7 for why per-segment talc was chosen over one shared allocator.)
 
-**Consistency with §9.2:** Main thread never allocs from NVMePool (all Tiered I/O goes through tokio). Main thread allocs from DRAMPool only in DRAM-only SET (synchronous path). Main thread frees via Arc Drop in free callback (which may call the owning segment's talc.free if last ref).
+**Consistency with §9.2:** Main thread never allocs from NVMePool (all Tiered I/O goes through tokio). Main thread allocs from DRAMPool only for the first try of a DRAM-only SET, and for COPY. Main thread frees via Arc Drop in free callback (which may call the owning segment's talc.free if last ref).
 
 **NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `disk-maxmemory` and fails the SET if it would exceed the cap (`disk-maxmemory` of 0 = unlimited). Module-driven NVMe eviction (§8.1) frees space instead of failing when `maxmemory-policy` allows it. This is the only increment path in production (a separate `increase_nvme_disk_usage` exists but is test-only). Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The reserved/written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length.
 
@@ -1504,7 +1504,7 @@ this section owns the semantics.
 | `max-object-size` | `512MB` | `1` | i64::MAX | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
 | `chunk-size` | `1MB` | `4096` | `256MB` | Immutable | I/O chunk / allocation unit (detail: §7.2) |
 | `max-buffers-per-op` / `min-buffers-per-op` | 64 / 2 | 2 / 1 | 1024 / 1024 | Live | Streaming pipeline depth (detail: §7.3.6) |
-| `worker-threads` | `2` | `1` | `32` | Immutable | tokio worker threads |
+| `worker-threads` | `4` | `1` | `32` | Immutable | tokio worker threads |
 | `scaling-poll-ms` | `5000` | `1000` | `60000` | Live | Scaling cron interval: how often it checks utilization and memory pressure |
 | `scaling-expand-watermark` | `80` | `50` | `95` | Live | Pool utilization % above which the cron adds a segment in the background |
 | `scaling-shrink-watermark` | `90` | `50` | `95` | Live | Server `used_memory / maxmemory` % above which the cron shrinks a segment; also the ceiling expand may not cross |

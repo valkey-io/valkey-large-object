@@ -124,7 +124,7 @@ Default: 200. Auto-reduced for large objects when staging cap limits concurrency
 | `--dram-maxmemory` | 34359738368 (32GB) | DRAM budget in bytes. |
 | `--segment-size` | 67108864 (64MB) | Segment size in bytes. |
 | `--disk-maxmemory` | 107374182400 (100GB) | NVMe budget in bytes. |
-| `--worker-threads` | 2 | Tokio worker threads. |
+| `--worker-threads` | 4 | Tokio worker threads. |
 | `--workload` | `get` | `get` (built-in BLOB.TCP_GET throughput) or a plugin in `bench/workloads/` (see [Workloads](#workloads)). Flags bench.sh doesn't know are passed to the workload. |
 
 ### Workloads
