@@ -9,7 +9,7 @@ use super::fd_placement::ObjectFd;
 use std::fs::OpenOptions;
 use std::mem::size_of;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -428,17 +428,31 @@ pub async fn read_and_verify_file_header(
 
 /// Open an NVMe file for writing with O_CREAT|O_TRUNC and optionally O_DIRECT.
 /// Returns an `ObjectFd` that closes the file descriptor on drop.
-pub fn open_nvme_file_for_write(file_path: &str) -> Result<ObjectFd, super::StorageError> {
+pub fn open_nvme_file_for_write(
+    file_path: &str,
+    disk_len: u64,
+) -> Result<ObjectFd, super::StorageError> {
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true).mode(0o644);
     if crate::direct_io() {
         opts.custom_flags(libc::O_DIRECT);
     }
-    super::fd_placement::open_object_file(file_path, &opts).map_err(|e| {
-        super::StorageError::IoError {
-            code: e.raw_os_error().unwrap_or(libc::EIO),
+    let io_err = |e: std::io::Error| super::StorageError::IoError {
+        code: e.raw_os_error().unwrap_or(libc::EIO),
+    };
+    let fd = super::fd_placement::open_object_file(file_path, &opts).map_err(io_err)?;
+    // Preallocate the whole object so every O_DIRECT chunk write lands inside EOF. Extending
+    // writes make XFS take the inode IOLOCK exclusive (serializing the object's parallel chunk
+    // writes) and allocate extents inside each write. EOPNOTSUPP keeps extending writes.
+    if unsafe { libc::fallocate(fd.as_raw_fd(), 0, 0, disk_len as libc::off_t) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EOPNOTSUPP) {
+            // Created above; the caller's open-failure path does not unlink.
+            let _ = std::fs::remove_file(file_path);
+            return Err(io_err(e));
         }
-    })
+    }
+    Ok(fd)
 }
 
 /// Write FileHeader to offset 0 of an NVMe file using the given NVMePool buffer.

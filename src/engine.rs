@@ -898,7 +898,7 @@ async fn cmd_set_tiered_run(
     // FdPool not used on SET: this write fd is short-lived and never cached.
     // FdPool caches read fds lazily on first GET via ensure_open.
     let file_path = object_id.file_path(&crate::disk_dir());
-    let fd = match storage::open_nvme_file_for_write(&file_path) {
+    let fd = match storage::open_nvme_file_for_write(&file_path, disk_len) {
         Ok(fd) => fd,
         Err(_e) => {
             nvme::decrease_nvme_disk_usage(disk_len);
@@ -912,20 +912,6 @@ async fn cmd_set_tiered_run(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
-    // Preallocate the whole object so every O_DIRECT chunk write lands inside EOF. Extending
-    // writes make XFS take the inode IOLOCK exclusive (serializing the object's parallel chunk
-    // writes) and allocate extents inside each write. Filesystems without fallocate keep the
-    // extending-write behavior.
-    if unsafe { libc::fallocate(fd.as_raw_fd(), 0, 0, disk_len as libc::off_t) } != 0
-        && std::io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP)
-    {
-        reply_err(
-            &thread_ctx,
-            &info::DISK_WRITE_ERRORS,
-            ValkeyError::Str(errors::ERR_DISK_WRITE),
-        );
-        return;
-    }
     let job = crate::stream::StreamJob::for_nvme_set(
         fd.as_raw_fd(),
         obj_len,
