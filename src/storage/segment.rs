@@ -71,6 +71,16 @@ impl Segment {
         let layout = Layout::from_size_align(size, 4096).expect("invalid segment layout");
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         assert!(!base.is_null(), "segment allocation failed (out of memory)");
+        // A fresh segment's pages are untouched, so `fi_mr_reg` would fault and zero every 4KB
+        // page while pinning, and that runs on the fabric worker thread, which stalls all RDMA
+        // (~180 ms per 1 GiB on i8ge). Faulting the memory in here as huge pages, on the caller's
+        // thread, cuts the later `fi_mr_reg` to ~2 ms. Both calls are hints: if either fails, the
+        // registration still works, it is just slower.
+        // SAFETY: [base, base+size) was just allocated for this segment and nothing else uses it.
+        unsafe {
+            libc::madvise(base.cast(), size, libc::MADV_HUGEPAGE);
+            libc::madvise(base.cast(), size, libc::MADV_POPULATE_WRITE);
+        }
 
         let talc = TalcCell::new(Manual);
         // Safety: memory was just allocated exclusively for this Segment; nothing
