@@ -69,7 +69,7 @@ use std::sync::Arc;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
-use valkey_module::{ValkeyError, ValkeyValue};
+use valkey_module::ValkeyError;
 
 use crate::data_type::ObjectId;
 use crate::storage::{
@@ -234,18 +234,18 @@ impl Target<'_> {
 
     /// GET reply after the loop: collected bytes, or obj_len in bench mode.
     /// Only valid on `TcpReply`; the EFA GET reply is [obj_len, crc32c] built by the caller.
-    pub fn into_reply(self, obj_len: u64) -> ValkeyValue {
+    pub fn into_reply(self, obj_len: u64) -> crate::engine::GetReply {
         match self {
             Target::TcpReply { reply, bench } => {
                 if bench {
-                    ValkeyValue::Integer(obj_len as i64)
+                    crate::engine::GetReply::Len(obj_len)
                 } else {
                     let (mut data, filled) = reply.into_inner().expect("reply lock poisoned");
                     assert_eq!(filled as u64, obj_len, "TCP GET reply not fully filled");
                     // SAFETY: every chunk was copied to its own offset, and together they
                     // cover all `obj_len` bytes of the capacity reserved in `tcp_reply`.
                     unsafe { data.set_len(filled) };
-                    ValkeyValue::StringBuffer(data)
+                    crate::engine::GetReply::Bytes(data)
                 }
             }
             _ => unreachable!("into_reply is only called on the TcpReply GET target"),
@@ -375,10 +375,7 @@ pub enum StreamError {
 /// Map a `StreamError` to its metric + reply string and send the error.
 /// One place, so every path that drives `run_get` / `run_set` reports failures
 /// identically.
-pub(crate) fn reply_stream_err(
-    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
-    e: StreamError,
-) {
+pub(crate) fn reply_stream_err(request: &mut crate::engine::BlockedRequest, e: StreamError) {
     use StreamError::*;
     let (metric, err): (&std::sync::atomic::AtomicU64, &str) = match e {
         NvmeRead => (&crate::info::DISK_READ_ERRORS, crate::errors::ERR_DISK_READ),
@@ -392,7 +389,7 @@ pub(crate) fn reply_stream_err(
             crate::errors::ERR_RDMA_WRITE,
         ),
     };
-    crate::engine::reply_err(thread_ctx, metric, ValkeyError::Str(err));
+    crate::engine::reply_err(request, metric, ValkeyError::Str(err));
 }
 
 /// DRAM-promotion side effects run around the batch loop (GET only). When present,

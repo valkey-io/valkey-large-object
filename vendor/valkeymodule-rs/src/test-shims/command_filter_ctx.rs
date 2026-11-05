@@ -1,0 +1,644 @@
+use crate::{raw, CommandFilterCtx, ValkeyString};
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::ops::Deref;
+use std::ptr::null_mut;
+
+pub(super) fn install() {
+    // SAFETY: `setup_test_shims` calls this once after verifying the real API is uninitialized.
+    unsafe {
+        raw::RedisModule_CommandFilterArgsCount = Some(command_filter_args_count);
+        raw::RedisModule_CommandFilterArgGet = Some(command_filter_arg_get);
+        raw::RedisModule_CommandFilterArgReplace = Some(command_filter_arg_replace);
+        raw::RedisModule_CommandFilterArgInsert = Some(command_filter_arg_insert);
+        raw::RedisModule_CommandFilterArgDelete = Some(command_filter_arg_delete);
+        raw::RedisModule_CommandFilterGetClientId = Some(command_filter_get_client_id);
+    }
+}
+
+const DEFAULT_CLIENT_ID: u64 = 1;
+
+// Tracks live test command-filter context addresses so callbacks can reject foreign or stale
+// pointers before casting them back to `CommandFilterData`. Command-filter callbacks execute
+// synchronously on the creating thread, so the registry is thread-local.
+thread_local! {
+    static TEST_COMMAND_FILTER_CONTEXTS: RefCell<HashSet<usize>> = RefCell::default();
+}
+
+impl CommandFilterCtx {
+    /// Creates a test command-filter context whose API return values can be configured.
+    #[must_use]
+    pub fn test() -> TestCommandFilterCtx {
+        TestCommandFilterCtx::new()
+    }
+}
+
+/// Stores arguments and client state owned by one test command-filter context.
+struct CommandFilterData {
+    args_count: libc::c_int,
+    args: HashMap<libc::c_int, ValkeyString>,
+    client_id: u64,
+}
+
+// Establishes the baseline state used by a newly created test command-filter context.
+impl Default for CommandFilterData {
+    fn default() -> Self {
+        Self {
+            args_count: 0,
+            args: HashMap::new(),
+            client_id: DEFAULT_CLIENT_ID,
+        }
+    }
+}
+
+/// Owns a test-only [`CommandFilterCtx`] that can be used without a running Valkey server.
+pub struct TestCommandFilterCtx {
+    context: CommandFilterCtx,
+    data: Box<CommandFilterData>,
+}
+
+// Constructs test command-filter contexts and configures their callback values.
+impl TestCommandFilterCtx {
+    fn new() -> Self {
+        super::setup_test_shims();
+
+        let mut data = Box::<CommandFilterData>::default();
+        let inner =
+            (data.as_mut() as *mut CommandFilterData).cast::<raw::RedisModuleCommandFilterCtx>();
+        TEST_COMMAND_FILTER_CONTEXTS.with(|contexts| {
+            contexts.borrow_mut().insert(inner as usize);
+        });
+
+        Self {
+            context: CommandFilterCtx::new(inner),
+            data,
+        }
+    }
+
+    /// Returns the opaque context pointer for invoking a command-filter callback in a test.
+    ///
+    /// The pointer remains valid while this test context is alive.
+    /// Invoke callbacks on the thread that created this test context.
+    pub fn as_raw_ctx_ptr(&mut self) -> *mut raw::RedisModuleCommandFilterCtx {
+        (self.data.as_mut() as *mut CommandFilterData).cast()
+    }
+
+    /// Configures the complete argument list and its reported count.
+    pub fn expect_args<T: AsRef<[u8]>>(&mut self, args: &[T]) -> &mut Self {
+        let args_count = libc::c_int::try_from(args.len())
+            .expect("test command-filter argument count must fit in c_int");
+        self.data.args_count = args_count;
+        self.data.args.clear();
+        self.data.args.extend(
+            (0..args_count)
+                .zip(args)
+                .map(|(position, argument)| (position, ValkeyString::test(argument.as_ref()))),
+        );
+        self
+    }
+
+    /// Returns the configured arguments in position order without UTF-8 conversion.
+    #[must_use]
+    pub fn args(&self) -> Vec<&[u8]> {
+        (0..self.data.args_count)
+            .filter_map(|position| self.data.args.get(&position).map(ValkeyString::as_slice))
+            .collect()
+    }
+
+    /// Configures the value returned by [`CommandFilterCtx::args_count`].
+    pub fn expect_args_count(&mut self, args_count: libc::c_int) -> &mut Self {
+        self.data.args_count = args_count;
+        self
+    }
+
+    /// Configures the value returned by [`CommandFilterCtx::arg_get`] for `position`.
+    pub fn expect_arg_get<T: Into<Vec<u8>>>(
+        &mut self,
+        position: libc::c_int,
+        argument: T,
+    ) -> &mut Self {
+        self.data
+            .args
+            .insert(position, ValkeyString::test(argument));
+        self
+    }
+
+    /// Configures the value returned by [`CommandFilterCtx::get_client_id`].
+    pub fn expect_get_client_id(&mut self, client_id: u64) -> &mut Self {
+        self.data.client_id = client_id;
+        self
+    }
+}
+
+impl Deref for TestCommandFilterCtx {
+    type Target = CommandFilterCtx;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
+impl Drop for TestCommandFilterCtx {
+    fn drop(&mut self) {
+        let ctx = (self.data.as_mut() as *mut CommandFilterData)
+            .cast::<raw::RedisModuleCommandFilterCtx>();
+        TEST_COMMAND_FILTER_CONTEXTS.with(|contexts| {
+            contexts.borrow_mut().remove(&(ctx as usize));
+        });
+    }
+}
+
+pub(super) extern "C" fn command_filter_args_count(
+    ctx: *mut raw::RedisModuleCommandFilterCtx,
+) -> libc::c_int {
+    with_data(ctx, |data| data.args_count).unwrap_or(0)
+}
+
+pub(super) extern "C" fn command_filter_arg_get(
+    ctx: *mut raw::RedisModuleCommandFilterCtx,
+    position: libc::c_int,
+) -> *mut raw::RedisModuleString {
+    if position < 0 {
+        return null_mut();
+    }
+
+    with_data(ctx, |data| {
+        data.args
+            .get(&position)
+            .map_or(null_mut(), |argument| argument.inner)
+    })
+    .unwrap_or(null_mut())
+}
+
+pub(super) extern "C" fn command_filter_arg_replace(
+    ctx: *mut raw::RedisModuleCommandFilterCtx,
+    position: libc::c_int,
+    argument: *mut raw::RedisModuleString,
+) -> libc::c_int {
+    if argument.is_null() {
+        return raw::Status::Err as libc::c_int;
+    }
+
+    // `CommandFilterCtx::arg_replace` transfers one retained reference to the callback. Taking
+    // ownership here ensures that reference is released even when the replacement is rejected.
+    let argument = ValkeyString::from_redis_module_string(null_mut(), argument);
+    if position < 0 {
+        return raw::Status::Err as libc::c_int;
+    }
+
+    with_data_mut(ctx, |data| {
+        let Some(current_argument) = data.args.get_mut(&position) else {
+            return raw::Status::Err as libc::c_int;
+        };
+
+        *current_argument = argument;
+        raw::Status::Ok as libc::c_int
+    })
+    .unwrap_or(raw::Status::Err as libc::c_int)
+}
+
+pub(super) extern "C" fn command_filter_arg_insert(
+    ctx: *mut raw::RedisModuleCommandFilterCtx,
+    position: libc::c_int,
+    argument: *mut raw::RedisModuleString,
+) -> libc::c_int {
+    if argument.is_null() {
+        return raw::Status::Err as libc::c_int;
+    }
+
+    // `CommandFilterCtx::arg_insert` transfers one retained reference to the callback. Taking
+    // ownership here ensures that reference is released even when the insertion is rejected.
+    let argument = ValkeyString::from_redis_module_string(null_mut(), argument);
+    if position < 0 {
+        return raw::Status::Err as libc::c_int;
+    }
+
+    with_data_mut(ctx, |data| {
+        if data.args_count < 0 || position > data.args_count || data.args_count == libc::c_int::MAX
+        {
+            return raw::Status::Err as libc::c_int;
+        }
+
+        for current_position in (position..data.args_count).rev() {
+            if let Some(current_argument) = data.args.remove(&current_position) {
+                data.args.insert(current_position + 1, current_argument);
+            }
+        }
+        data.args.insert(position, argument);
+        data.args_count += 1;
+
+        raw::Status::Ok as libc::c_int
+    })
+    .unwrap_or(raw::Status::Err as libc::c_int)
+}
+
+pub(super) extern "C" fn command_filter_arg_delete(
+    ctx: *mut raw::RedisModuleCommandFilterCtx,
+    position: libc::c_int,
+) -> libc::c_int {
+    if position < 0 {
+        return raw::Status::Err as libc::c_int;
+    }
+
+    with_data_mut(ctx, |data| {
+        if position >= data.args_count {
+            return raw::Status::Err as libc::c_int;
+        }
+
+        data.args.remove(&position);
+        for current_position in position + 1..data.args_count {
+            if let Some(current_argument) = data.args.remove(&current_position) {
+                data.args.insert(current_position - 1, current_argument);
+            }
+        }
+        data.args_count -= 1;
+
+        raw::Status::Ok as libc::c_int
+    })
+    .unwrap_or(raw::Status::Err as libc::c_int)
+}
+
+pub(super) extern "C" fn command_filter_get_client_id(
+    ctx: *mut raw::RedisModuleCommandFilterCtx,
+) -> libc::c_ulonglong {
+    with_data(ctx, |data| data.client_id).unwrap_or(DEFAULT_CLIENT_ID)
+}
+
+/// Runs `operation` with shared access to a live test context's backing data.
+///
+/// Returns `None` when `ctx` is null, foreign, or stale.
+fn with_data<T>(
+    ctx: *mut raw::RedisModuleCommandFilterCtx,
+    operation: impl FnOnce(&CommandFilterData) -> T,
+) -> Option<T> {
+    if ctx.is_null()
+        || !TEST_COMMAND_FILTER_CONTEXTS
+            .with(|contexts| contexts.borrow().contains(&(ctx as usize)))
+    {
+        return None;
+    }
+
+    // SAFETY: the registry contains only live `CommandFilterData` allocations, and command-filter
+    // callbacks execute synchronously on one thread.
+    Some(operation(unsafe { &*ctx.cast::<CommandFilterData>() }))
+}
+
+/// Runs `operation` with mutable access to a live test context's backing data.
+///
+/// Returns `None` when `ctx` is null, foreign, or stale.
+fn with_data_mut<T>(
+    ctx: *mut raw::RedisModuleCommandFilterCtx,
+    operation: impl FnOnce(&mut CommandFilterData) -> T,
+) -> Option<T> {
+    if ctx.is_null()
+        || !TEST_COMMAND_FILTER_CONTEXTS
+            .with(|contexts| contexts.borrow().contains(&(ctx as usize)))
+    {
+        return None;
+    }
+
+    // SAFETY: the registry contains only live, uniquely owned `CommandFilterData` allocations,
+    // and command-filter callbacks execute synchronously on one thread.
+    Some(operation(unsafe { &mut *ctx.cast::<CommandFilterData>() }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Status;
+
+    #[test]
+    fn returns_configured_args_count() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_args_count(3);
+
+        assert_eq!(context.args_count(), 3);
+    }
+
+    #[test]
+    fn defaults_args_count_to_zero() {
+        let context = CommandFilterCtx::test();
+
+        assert_eq!(context.args_count(), 0);
+    }
+
+    #[test]
+    fn replaces_configured_args_count() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_args_count(1).expect_args_count(4);
+
+        assert_eq!(context.args_count(), 4);
+    }
+
+    #[test]
+    fn configures_all_arguments_and_count() {
+        let mut context = CommandFilterCtx::test();
+
+        context.expect_args(&["SET", "key", "value"]);
+
+        assert_eq!(context.args_count(), 3);
+        assert_eq!(context.cmd_get_try_as_str(), Ok("SET"));
+        assert_eq!(context.arg_get_try_as_str(1), Ok("key"));
+        assert_eq!(context.arg_get_try_as_str(2), Ok("value"));
+    }
+
+    #[test]
+    fn returns_mutated_arguments_in_order_without_utf8_conversion() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_args(&[b"SET".as_slice(), b"\0\xff", b"old"]);
+
+        context.arg_replace(2, "new");
+        context.arg_insert(3, "tail");
+        context.arg_delete(2);
+
+        assert_eq!(context.args(), vec![b"SET".as_slice(), b"\0\xff", b"tail"]);
+    }
+
+    #[test]
+    fn returns_zero_for_null_context() {
+        assert_eq!(command_filter_args_count(null_mut()), 0);
+    }
+
+    #[test]
+    fn returns_configured_argument() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_arg_get(1, "value");
+
+        assert_eq!(
+            context
+                .arg_get_try_as_str(1)
+                .expect("configured argument should be valid UTF-8"),
+            "value"
+        );
+    }
+
+    #[test]
+    fn returns_configured_command() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_arg_get(0, "set");
+
+        assert_eq!(
+            context
+                .cmd_get_try_as_str()
+                .expect("configured command should be valid UTF-8"),
+            "set"
+        );
+    }
+
+    #[test]
+    fn replaces_configured_argument() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_arg_get(1, "old").expect_arg_get(1, "new");
+
+        assert_eq!(
+            context
+                .arg_get_try_as_str(1)
+                .expect("replacement argument should be valid UTF-8"),
+            "new"
+        );
+    }
+
+    #[test]
+    fn returns_null_for_unconfigured_or_negative_position() {
+        let context = CommandFilterCtx::test();
+
+        assert!(context.arg_get(0).is_null());
+        assert!(context.arg_get(-1).is_null());
+    }
+
+    #[test]
+    fn returns_null_argument_for_null_context() {
+        assert!(command_filter_arg_get(null_mut(), 0).is_null());
+    }
+
+    #[test]
+    fn replaces_argument() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_arg_get(1, "old");
+
+        context.arg_replace(1, "new");
+
+        assert_eq!(
+            context
+                .arg_get_try_as_str(1)
+                .expect("replacement argument should be valid UTF-8"),
+            "new"
+        );
+    }
+
+    #[test]
+    fn rejects_null_argument_or_context() {
+        assert_eq!(
+            command_filter_arg_replace(null_mut(), 0, null_mut()),
+            Status::Err as libc::c_int
+        );
+
+        let argument = ValkeyString::create_and_retain("new");
+        assert_eq!(
+            command_filter_arg_replace(null_mut(), 0, argument.inner),
+            Status::Err as libc::c_int
+        );
+    }
+
+    #[test]
+    fn inserts_argument_and_shifts_later_arguments() {
+        let mut context = CommandFilterCtx::test();
+        context
+            .expect_args_count(3)
+            .expect_arg_get(0, "set")
+            .expect_arg_get(1, "key")
+            .expect_arg_get(2, "value");
+
+        context.arg_insert(1, "new-key");
+
+        assert_eq!(context.args_count(), 4);
+        assert_eq!(context.cmd_get_try_as_str(), Ok("set"));
+        assert_eq!(context.arg_get_try_as_str(1), Ok("new-key"));
+        assert_eq!(context.arg_get_try_as_str(2), Ok("key"));
+        assert_eq!(context.arg_get_try_as_str(3), Ok("value"));
+    }
+
+    #[test]
+    fn appends_argument_at_args_count() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_args_count(1).expect_arg_get(0, "command");
+
+        context.arg_insert(1, "argument");
+
+        assert_eq!(context.args_count(), 2);
+        assert_eq!(context.arg_get_try_as_str(1), Ok("argument"));
+    }
+
+    #[test]
+    fn rejects_insert_outside_argument_bounds() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_args_count(1).expect_arg_get(0, "command");
+
+        context.arg_insert(2, "argument");
+        context.arg_insert(-1, "argument");
+
+        assert_eq!(context.args_count(), 1);
+        assert!(context.arg_get(1).is_null());
+    }
+
+    #[test]
+    fn rejects_insert_with_null_argument_or_context() {
+        assert_eq!(
+            command_filter_arg_insert(null_mut(), 0, null_mut()),
+            Status::Err as libc::c_int
+        );
+
+        let argument = ValkeyString::create_and_retain("new");
+        assert_eq!(
+            command_filter_arg_insert(null_mut(), 0, argument.inner),
+            Status::Err as libc::c_int
+        );
+    }
+
+    #[test]
+    fn deletes_argument_and_shifts_later_arguments() {
+        let mut context = CommandFilterCtx::test();
+        context
+            .expect_args_count(4)
+            .expect_arg_get(0, "set")
+            .expect_arg_get(1, "old-key")
+            .expect_arg_get(2, "new-key")
+            .expect_arg_get(3, "value");
+
+        context.arg_delete(1);
+
+        assert_eq!(context.args_count(), 3);
+        assert_eq!(context.cmd_get_try_as_str(), Ok("set"));
+        assert_eq!(context.arg_get_try_as_str(1), Ok("new-key"));
+        assert_eq!(context.arg_get_try_as_str(2), Ok("value"));
+        assert!(context.arg_get(3).is_null());
+    }
+
+    #[test]
+    fn deletes_command_and_shifts_arguments() {
+        let mut context = CommandFilterCtx::test();
+        context
+            .expect_args_count(2)
+            .expect_arg_get(0, "command")
+            .expect_arg_get(1, "argument");
+
+        context.arg_delete(0);
+
+        assert_eq!(context.args_count(), 1);
+        assert_eq!(context.cmd_get_try_as_str(), Ok("argument"));
+    }
+
+    #[test]
+    fn rejects_delete_outside_argument_bounds() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_args_count(1).expect_arg_get(0, "command");
+
+        context.arg_delete(1);
+        context.arg_delete(-1);
+
+        assert_eq!(context.args_count(), 1);
+        assert_eq!(context.cmd_get_try_as_str(), Ok("command"));
+    }
+
+    #[test]
+    fn rejects_delete_with_null_context() {
+        assert_eq!(
+            command_filter_arg_delete(null_mut(), 0),
+            Status::Err as libc::c_int
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "min-redis-compatibility-version-7-2")]
+    fn returns_configured_client_id() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_get_client_id(42);
+
+        assert_eq!(context.get_client_id(), 42);
+    }
+
+    #[test]
+    #[cfg(feature = "min-redis-compatibility-version-7-2")]
+    fn defaults_client_id_when_no_expectation_is_configured() {
+        let context = CommandFilterCtx::test();
+
+        assert_eq!(context.get_client_id(), DEFAULT_CLIENT_ID);
+    }
+
+    #[test]
+    #[cfg(feature = "min-redis-compatibility-version-7-2")]
+    fn replaces_configured_client_id() {
+        let mut context = CommandFilterCtx::test();
+        context.expect_get_client_id(10).expect_get_client_id(20);
+
+        assert_eq!(context.get_client_id(), 20);
+    }
+
+    #[test]
+    fn exposes_raw_context_pointer_for_command_filter_callbacks() {
+        extern "C" fn replace_argument(ctx: *mut raw::RedisModuleCommandFilterCtx) {
+            CommandFilterCtx::new(ctx).arg_replace(1, "new");
+        }
+
+        let mut context = CommandFilterCtx::test();
+        context.expect_args_count(2).expect_arg_get(1, "old");
+
+        replace_argument(context.as_raw_ctx_ptr());
+
+        assert_eq!(context.arg_get_try_as_str(1), Ok("new"));
+    }
+
+    #[test]
+    fn callbacks_reject_dropped_context() {
+        let stale = {
+            let mut context = CommandFilterCtx::test();
+            context
+                .expect_args_count(1)
+                .expect_arg_get(0, "command")
+                .expect_get_client_id(42);
+            context.as_raw_ctx_ptr()
+        };
+
+        assert_command_filter_callbacks_reject(stale);
+    }
+
+    #[test]
+    fn callbacks_reject_foreign_context() {
+        let mut data = Box::new(CommandFilterData {
+            args_count: 1,
+            args: HashMap::from([(0, ValkeyString::test("command"))]),
+            client_id: 42,
+        });
+        let foreign =
+            (data.as_mut() as *mut CommandFilterData).cast::<raw::RedisModuleCommandFilterCtx>();
+
+        assert_command_filter_callbacks_reject(foreign);
+    }
+
+    #[test]
+    fn callbacks_reject_null_context() {
+        assert_command_filter_callbacks_reject(null_mut());
+    }
+
+    fn assert_command_filter_callbacks_reject(ctx: *mut raw::RedisModuleCommandFilterCtx) {
+        assert_eq!(command_filter_args_count(ctx), 0);
+        assert!(command_filter_arg_get(ctx, 0).is_null());
+
+        let replacement = ValkeyString::test("replacement").take();
+        assert_eq!(
+            command_filter_arg_replace(ctx, 0, replacement),
+            Status::Err as libc::c_int
+        );
+
+        let insertion = ValkeyString::test("insertion").take();
+        assert_eq!(
+            command_filter_arg_insert(ctx, 0, insertion),
+            Status::Err as libc::c_int
+        );
+        assert_eq!(
+            command_filter_arg_delete(ctx, 0),
+            Status::Err as libc::c_int
+        );
+        assert_eq!(command_filter_get_client_id(ctx), DEFAULT_CLIENT_ID);
+    }
+}

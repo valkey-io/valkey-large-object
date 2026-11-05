@@ -90,6 +90,8 @@ struct SetObjectInfo {
     /// When Some, the server compares the post-transfer CRC against this value
     /// and rejects the SET on mismatch.
     client_crc: Option<u32>,
+    /// Held until the commit, on the main thread.
+    unevictable: SetPins,
 }
 
 // ─── Blocked Request ─────────────────────────────────────────────────────────
@@ -102,42 +104,160 @@ pub fn inflight_requests() -> u64 {
 }
 
 /// An async GET or SET, over TCP or RDMA. Its client stays blocked until this drops, and
-/// `commandstats` counts the time in between toward the command.
+/// `commandstats` counts the time in between toward the command. The task records how
+/// the request ends (`reply` or `commit`); the main thread acts on it once this drops
+/// (`complete_on_main`), so the task never takes the server lock to reply or commit.
 pub(crate) struct BlockedRequest {
-    thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    blocked_client: valkey_module::BlockedClient<Completion>,
     /// The client's selected db when it blocked.
+    db: i32,
+}
+
+/// How a request ends, handed from its task to the main thread.
+pub(crate) enum Completion {
+    Reply(Result<GetReply, ValkeyError>),
+    /// A SET whose data is written: commit it, then reply.
+    Commit(PendingCommit),
+}
+
+/// A Tiered SET's new object and the one it replaces, pinned unevictable.
+type SetPins = (
+    Arc<storage::UnevictableOID>,
+    Option<Arc<storage::UnevictableOID>>,
+);
+
+pub(crate) struct PendingCommit {
+    key_name: Vec<u8>,
+    object_id: ObjectId,
+    lo_value: LoValue,
+    /// Dram mode: the buffers holding the object, inserted into the pool at commit.
+    dram_buffers: Option<Vec<storage::SegmentBuffer>>,
+    /// Tiered mode: keeps the new file, and the one it replaces, unevictable until the commit.
+    _unevictable: Option<SetPins>,
+    /// The client's db, for a commit after the client disconnected.
     db: i32,
 }
 
 impl BlockedRequest {
     fn new(ctx: &valkey_module::Context) -> Self {
         INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
-        let mut blocked_client = ctx.block_client();
+        let mut blocked_client =
+            ctx.block_client_with_reply_callback(complete_on_main, Some(complete_disconnected));
         blocked_client.measure_time_start();
         // SAFETY: `ctx` is the live command context, on the main thread.
         let db = unsafe { raw::RedisModule_GetSelectedDb.unwrap()(ctx.get_raw()) };
-        Self {
-            thread_ctx: valkey_module::ThreadSafeContext::with_blocked_client(blocked_client),
-            db,
-        }
+        Self { blocked_client, db }
     }
 
-    /// Lock the server on the client's db. Shadows `ThreadSafeContext::lock`, whose
-    /// guard is a fresh detached context on db 0.
-    pub(crate) fn lock(&self) -> valkey_module::ContextGuard {
-        let guard = self.thread_ctx.lock();
-        // SAFETY: the guard's context is live and holds the server lock. `db` came from
-        // GetSelectedDb and the db count is fixed at startup, so it is in range.
-        unsafe { raw::RedisModule_SelectDb.unwrap()(guard.get_raw(), self.db) };
-        guard
+    /// Reply with `result` once this drops.
+    pub(crate) fn reply(&mut self, result: Result<GetReply, ValkeyError>) {
+        self.complete(Completion::Reply(result));
+    }
+
+    /// Commit the SET once this drops, then reply.
+    fn commit(
+        &mut self,
+        key_name: Vec<u8>,
+        object_id: ObjectId,
+        lo_value: LoValue,
+        dram_buffers: Option<Vec<storage::SegmentBuffer>>,
+        unevictable: Option<SetPins>,
+    ) {
+        let db = self.db;
+        self.complete(Completion::Commit(PendingCommit {
+            key_name,
+            object_id,
+            lo_value,
+            dram_buffers,
+            _unevictable: unevictable,
+            db,
+        }));
+    }
+
+    fn complete(&mut self, completion: Completion) {
+        self.blocked_client
+            .set_blocked_private_data(completion)
+            .expect("BlockedRequest sets a free callback");
     }
 }
 
-impl std::ops::Deref for BlockedRequest {
-    type Target = valkey_module::ThreadSafeContext<valkey_module::BlockedClient>;
+/// The reply callback, on the main thread with the server lock held and the client's
+/// context (on its db).
+fn complete_on_main(
+    ctx: &valkey_module::Context,
+    completion: Option<Completion>,
+) -> valkey_module::ValkeyResult {
+    match completion {
+        Some(Completion::Reply(result)) => result.map(ValkeyValue::from),
+        Some(Completion::Commit(pending)) => finish_commit(ctx, pending),
+        // The task ended without completing, e.g. it panicked.
+        None => Err(ValkeyError::Str(errors::ERR_NO_REPLY)),
+    }
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.thread_ctx
+/// The free callback: the server skipped `complete_on_main` because the client
+/// disconnected while blocked. A written SET still commits, as it would have had the
+/// client stayed. This context has no client to open keys with, so commit on a detached
+/// context on the client's db. It needs no lock: this is the main thread, which holds it.
+fn complete_disconnected(ctx: &valkey_module::Context, completion: Completion) {
+    let Completion::Commit(pending) = completion else {
+        return;
+    };
+    // SAFETY: on the main thread, with the server lock held. `db` came from
+    // GetSelectedDb and the db count is fixed at startup, so it is in range.
+    unsafe {
+        let detached = raw::RedisModule_GetDetachedThreadSafeContext.unwrap()(ctx.get_raw());
+        raw::RedisModule_SelectDb.unwrap()(detached, pending.db);
+        // No client to reply to; finish_commit counts any failure.
+        let _ = finish_commit(&valkey_module::Context::new(detached), pending);
+        raw::RedisModule_FreeThreadSafeContext.unwrap()(detached);
+    }
+}
+
+/// Commit a written SET and return its reply. Main thread, server lock held.
+fn finish_commit(
+    ctx: &valkey_module::Context,
+    pending: PendingCommit,
+) -> valkey_module::ValkeyResult {
+    let PendingCommit {
+        key_name,
+        object_id,
+        lo_value,
+        dram_buffers,
+        ..
+    } = pending;
+    let dram_pool = storage::get_dram_pool();
+    let is_dram = dram_buffers.is_some();
+    let outcome = match dram_buffers {
+        // A shrink took the segment during the transfer.
+        Some(buffers) if dram_pool.is_segment_draining(buffers[0].segment_idx) => {
+            dram_pool.free_n(&buffers);
+            Err(ValkeyError::Str(errors::ERR_SET_VALUE))
+        }
+        Some(buffers) => {
+            dram_pool.insert_object(object_id, Arc::new(ObjectContext::new_ready(buffers)));
+            commit_lo_value(ctx, &key_name, object_id, lo_value)
+        }
+        None => commit_lo_value(ctx, &key_name, object_id, lo_value),
+    };
+    match outcome {
+        Ok(CommitOutcome::ValueSet) => VALKEY_OK,
+        Ok(CommitOutcome::StaleDiscarded) => {
+            // A newer SET already completed. For NVMe, lo_value dropped in commit_lo_value
+            // → ObjectFile drop unlinks + frees budget.
+            info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
+            if is_dram {
+                dram_pool.remove_object(&object_id);
+            }
+            VALKEY_OK
+        }
+        Err(e) => {
+            if is_dram {
+                dram_pool.remove_object(&object_id);
+            }
+            info::SET_VALUE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            Err(e)
+        }
     }
 }
 
@@ -152,12 +272,12 @@ impl Drop for BlockedRequest {
 /// Increment a metric counter and reply with an error.
 /// Consolidates the most common error-reply pattern in the engine.
 pub(crate) fn reply_err(
-    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    request: &mut BlockedRequest,
     metric: &std::sync::atomic::AtomicU64,
     err: ValkeyError,
 ) {
     metric.fetch_add(1, Ordering::Relaxed);
-    thread_ctx.reply(Err(err));
+    request.reply(Err(err));
 }
 
 /// Test hook: pause between NVMe write completion and the commit (`commit_lo_value`) to allow
@@ -207,13 +327,29 @@ fn collect_dram_bytes(
     data
 }
 
-/// The EFA GET success reply: a two-element array `[obj_len, crc32c]`. The regions may
-/// cover more than the object, so `obj_len` is how the client bounds the valid bytes.
-fn efa_get_reply(obj_len: u64, crc32c: Crc) -> ValkeyValue {
-    ValkeyValue::Array(vec![
-        ValkeyValue::Integer(obj_len as i64),
-        ValkeyValue::Integer(crc32c as i64),
-    ])
+/// A GET's success reply. A task builds it; the main thread turns it into the
+/// `ValkeyValue`, which is not `Send`.
+pub(crate) enum GetReply {
+    /// TCP: the object's bytes.
+    Bytes(Vec<u8>),
+    /// TCP in bench mode: the object's length.
+    Len(u64),
+    /// EFA: a two-element array `[obj_len, crc32c]`. The regions may cover more than the
+    /// object, so `obj_len` is how the client bounds the valid bytes.
+    Efa { obj_len: u64, crc32c: Crc },
+}
+
+impl From<GetReply> for ValkeyValue {
+    fn from(reply: GetReply) -> Self {
+        match reply {
+            GetReply::Bytes(data) => ValkeyValue::StringBuffer(data),
+            GetReply::Len(obj_len) => ValkeyValue::Integer(obj_len as i64),
+            GetReply::Efa { obj_len, crc32c } => ValkeyValue::Array(vec![
+                ValkeyValue::Integer(obj_len as i64),
+                ValkeyValue::Integer(crc32c as i64),
+            ]),
+        }
+    }
 }
 
 /// Outcome of `commit_lo_value` — distinguishes a successful write from a stale discard.
@@ -230,7 +366,7 @@ enum CommitOutcome {
 /// own cleanup/metric/reply on each outcome. On `StaleDiscarded`/`Err` the moved-in
 /// `LoValue` drops here; for NVMe that drops its `ObjectFile` → unlink + budget release.
 fn commit_lo_value(
-    ctx: &valkey_module::ContextGuard,
+    ctx: &valkey_module::Context,
     key_name: &[u8],
     object_id: ObjectId,
     lo_value: LoValue,
@@ -262,7 +398,7 @@ pub(crate) const EVENT_UPDATE: &str = "largeobj.update";
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Execute BLOB.TCP_GET / BLOB.RDMA_GET with mode + transport routing. Always async:
-/// blocks the client and dispatches to tokio; the reply comes from the task.
+/// blocks the client and dispatches to tokio; the task builds the reply, the main thread sends it.
 pub fn execute_get(
     ctx: &valkey_module::Context,
     object_id: ObjectId,
@@ -271,14 +407,14 @@ pub fn execute_get(
     file: Option<Arc<ObjectFile>>,
     transport: Transport,
 ) {
-    let thread_ctx = BlockedRequest::new(ctx);
+    let request = BlockedRequest::new(ctx);
     match crate::operating_mode() {
         OperatingMode::Dram => {
-            cmd_get_dram(object_id, obj_len, crc32c, transport, thread_ctx);
+            cmd_get_dram(object_id, obj_len, crc32c, transport, request);
         }
         OperatingMode::Tiered => {
             let file = file.expect("Tiered GET: LoValue.file must be Some (created at commit)");
-            cmd_get_tiered(object_id, obj_len, crc32c, file, transport, thread_ctx);
+            cmd_get_tiered(object_id, obj_len, crc32c, file, transport, request);
         }
     }
 }
@@ -292,7 +428,7 @@ fn cmd_get_dram(
     obj_len: u64,
     crc32c: Crc,
     transport: Transport,
-    thread_ctx: BlockedRequest,
+    request: BlockedRequest,
 ) {
     let dram_pool = storage::get_dram_pool();
     match dram_pool.get_object(&object_id) {
@@ -301,7 +437,7 @@ fn cmd_get_dram(
             storage::eviction_candidates::touch(object_id);
             // Serve from DRAMPool.
             cmd_get_from_dram(
-                dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, None,
+                dram_pool, &obj_ctx, obj_len, crc32c, transport, request, None,
             );
         }
         Some(_) => {
@@ -322,7 +458,7 @@ fn cmd_get_tiered(
     crc32c: Crc,
     file: Arc<ObjectFile>,
     transport: Transport,
-    thread_ctx: BlockedRequest,
+    request: BlockedRequest,
 ) {
     // We do not allow the eviction of files that are inflight.
     let unevictable = storage::UnevictableOID::new(object_id);
@@ -330,13 +466,13 @@ fn cmd_get_tiered(
     let dram_pool = storage::get_dram_pool();
     let cache = dram_pool.tiered_cache();
     // ─── DRAMPool hit ────────────────────────────────────────────────────
-    let (transport, thread_ctx) = match try_serve_dram_hit(
+    let (transport, mut request) = match try_serve_dram_hit(
         dram_pool,
         &object_id,
         obj_len,
         crc32c,
         transport,
-        thread_ctx,
+        request,
         &file,
         &unevictable,
     ) {
@@ -367,7 +503,7 @@ fn cmd_get_tiered(
                 // → ObjectContext::Drop frees the buffer automatically.
                 dram_pool.remove_object(&object_id);
                 reply_err(
-                    &thread_ctx,
+                    &mut request,
                     &info::DISK_READ_ERRORS,
                     ValkeyError::Str(errors::ERR_DISK_READ),
                 );
@@ -387,7 +523,7 @@ fn cmd_get_tiered(
         };
         let (chunk_iter, target) = cmd_get_transport_parts(transport, obj_len, batch_width);
         crate::runtime_handle().spawn(async move {
-            // Drops before the captured thread_ctx: the fd clone is gone before
+            // Drops before the captured request: the fd clone is gone before
             // the client unblocks, so its next GET sees the fd unpinned.
             let _keep_alive = (file, fd, unevictable);
             // Test hook: pause before NVMe reads so concurrent GETs can subscribe.
@@ -410,7 +546,7 @@ fn cmd_get_tiered(
                 raw_fd,
                 max_sqes_per_batch,
                 chunk_iter,
-                &thread_ctx,
+                &mut request,
                 target,
             )
             .await;
@@ -429,7 +565,7 @@ fn cmd_get_tiered(
         Some(bufs) => bufs,
         None => {
             reply_err(
-                &thread_ctx,
+                &mut request,
                 &info::DISK_STAGING_BUFFER_EXHAUSTED,
                 ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
             );
@@ -442,7 +578,7 @@ fn cmd_get_tiered(
         Some(fd) => fd,
         None => {
             reply_err(
-                &thread_ctx,
+                &mut request,
                 &info::DISK_READ_ERRORS,
                 ValkeyError::Str(errors::ERR_DISK_READ),
             );
@@ -462,7 +598,7 @@ fn cmd_get_tiered(
         // StreamingContext owns the NVMe buffers (freed on drop). ObjectFile pin and
         // open fd are held alive for the read's duration. No promotion → no cache,
         // source reads straight from the NVMe pool window.
-        // Drops before the captured thread_ctx (see the promotion path).
+        // Drops before the captured request (see the promotion path).
         let _keep_alive = (file, fd, unevictable);
         cmd_get_tiered_run(
             get_info,
@@ -472,7 +608,7 @@ fn cmd_get_tiered(
             raw_fd,
             batch_width,
             chunk_iter,
-            &thread_ctx,
+            &mut request,
             target,
         )
         .await;
@@ -525,7 +661,7 @@ async fn cmd_get_tiered_run(
     fd: RawFd,
     batch_width: usize,
     chunk_iter: ChunkIterator,
-    thread_ctx: &valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
+    request: &mut BlockedRequest,
     target: GetTarget,
 ) {
     let GetObjectInfo {
@@ -562,15 +698,21 @@ async fn cmd_get_tiered_run(
             };
             crate::stream::run_get(&job, chunk_iter, &source, &tgt, progress)
                 .await
-                .map(|target_err| (target_err, efa_get_reply(obj_len, crc32c_expected)))
+                .map(|target_err| {
+                    let reply = GetReply::Efa {
+                        obj_len,
+                        crc32c: crc32c_expected,
+                    };
+                    (target_err, reply)
+                })
         }
     };
     match outcome {
-        Ok((Some(e), _)) => crate::stream::reply_stream_err(thread_ctx, e), // promotion continue-filling
+        Ok((Some(e), _)) => crate::stream::reply_stream_err(request, e), // promotion continue-filling
         Ok((None, reply)) => {
-            thread_ctx.reply(Ok(reply));
+            request.reply(Ok(reply));
         }
-        Err(e) => crate::stream::reply_stream_err(thread_ctx, e),
+        Err(e) => crate::stream::reply_stream_err(request, e),
     }
 }
 
@@ -610,18 +752,18 @@ pub fn execute_set(
     // ordering by arrival, not completion. Used for version checks on async paths.
     let object_id = ObjectId::next();
     // Async — block client, dispatch to tokio.
-    let thread_ctx = BlockedRequest::new(ctx);
+    let request = BlockedRequest::new(ctx);
     let key_name_bytes = key_name.as_slice().to_vec();
     match mode {
         OperatingMode::Dram => {
-            cmd_set_dram(key_name_bytes, obj_len, data_source, thread_ctx, object_id);
+            cmd_set_dram(key_name_bytes, obj_len, data_source, request, object_id);
         }
         OperatingMode::Tiered => {
             cmd_set_tiered(
                 key_name_bytes,
                 obj_len,
                 data_source,
-                thread_ctx,
+                request,
                 object_id,
                 old_oid,
             );
@@ -650,7 +792,7 @@ fn cmd_set_dram(
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
-    thread_ctx: BlockedRequest,
+    mut request: BlockedRequest,
     object_id: ObjectId,
 ) {
     let dram_pool = storage::get_dram_pool();
@@ -668,11 +810,14 @@ fn cmd_set_dram(
                 // Pool full. Wait for a grow; if the pool cannot grow, evict (under the server lock).
                 let got = match dram_pool.alloc_exact_await_expand(obj_len).await {
                     Some(bufs) => Some(bufs),
-                    None => dram_pool.alloc_exact_evict(&thread_ctx.lock(), obj_len),
+                    None => dram_pool.alloc_exact_evict(
+                        &valkey_module::ThreadSafeContext::new().lock(),
+                        obj_len,
+                    ),
                 };
                 let Some(bufs) = got else {
                     reply_err(
-                        &thread_ctx,
+                        &mut request,
                         &info::DRAM_POOL_EXHAUSTED,
                         ValkeyError::Str(errors::ERR_OOM),
                     );
@@ -722,7 +867,7 @@ fn cmd_set_dram(
         let crc = match result {
             Ok(crc) => crc,
             Err(e) => {
-                crate::stream::reply_stream_err(&thread_ctx, e);
+                crate::stream::reply_stream_err(&mut request, e);
                 dram_pool.free_n(&buffers);
                 return;
             }
@@ -732,7 +877,7 @@ fn cmd_set_dram(
         if let Some(expected) = client_crc {
             if crc != expected {
                 reply_err(
-                    &thread_ctx,
+                    &mut request,
                     &info::CRC_MISMATCH,
                     ValkeyError::Str(errors::ERR_CRC_MISMATCH),
                 );
@@ -741,34 +886,8 @@ fn cmd_set_dram(
             }
         }
         let lo_value = LoValue::new(object_id, obj_len, crc, None);
-        // Insert and commit under one server-lock hold, so no shrink lands between.
-        let outcome = {
-            let ctx = thread_ctx.lock();
-            if dram_pool.is_segment_draining(buffers[0].segment_idx) {
-                // A shrink took the segment during the transfer.
-                dram_pool.free_n(&buffers);
-                Err(ValkeyError::Str(errors::ERR_SET_VALUE))
-            } else {
-                let obj_ctx = Arc::new(ObjectContext::new_ready(buffers));
-                dram_pool.insert_object(object_id, obj_ctx);
-                commit_lo_value(&ctx, &key_name, object_id, lo_value)
-            }
-        };
-        match outcome {
-            Ok(CommitOutcome::ValueSet) => {
-                thread_ctx.reply(VALKEY_OK);
-            }
-            Ok(CommitOutcome::StaleDiscarded) => {
-                // Stale write — a newer SET already completed.
-                info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
-                dram_pool.remove_object(&object_id);
-                thread_ctx.reply(VALKEY_OK);
-            }
-            Err(e) => {
-                dram_pool.remove_object(&object_id);
-                reply_err(&thread_ctx, &info::SET_VALUE_FAILURES, e);
-            }
-        }
+        // The main thread inserts and commits under its one lock hold, so no shrink lands between.
+        request.commit(key_name, object_id, lo_value, Some(buffers), None);
     });
 }
 
@@ -779,7 +898,7 @@ fn cmd_set_tiered(
     key_name: Vec<u8>,
     obj_len: u64,
     data_source: DataSource,
-    thread_ctx: BlockedRequest,
+    mut request: BlockedRequest,
     object_id: ObjectId,
     old_oid: Option<ObjectId>,
 ) {
@@ -790,7 +909,7 @@ fn cmd_set_tiered(
         Some(bufs) => bufs,
         None => {
             reply_err(
-                &thread_ctx,
+                &mut request,
                 &info::DISK_STAGING_BUFFER_EXHAUSTED,
                 ValkeyError::Str(errors::ERR_DISK_STAGING_EXHAUSTED),
             );
@@ -810,18 +929,18 @@ fn cmd_set_tiered(
         DataSource::Tcp(data) => {
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, None);
             crate::runtime_handle().spawn(async move {
-                let _unevictable = unevictable;
                 let set_info = SetObjectInfo {
                     object_id,
                     obj_len,
                     key_name,
                     client_crc: None,
+                    unevictable,
                 };
                 cmd_set_tiered_run(
                     set_info,
                     stream_ctx,
                     chunk_iter,
-                    thread_ctx,
+                    request,
                     SetSource::Tcp(data),
                 )
                 .await;
@@ -834,18 +953,18 @@ fn cmd_set_tiered(
         } => {
             let chunk_iter = ChunkIterator::new(obj_len, chunk_size, batch_width, Some(addrs));
             crate::runtime_handle().spawn(async move {
-                let _unevictable = unevictable;
                 let set_info = SetObjectInfo {
                     object_id,
                     obj_len,
                     key_name,
                     client_crc,
+                    unevictable,
                 };
                 cmd_set_tiered_run(
                     set_info,
                     stream_ctx,
                     chunk_iter,
-                    thread_ctx,
+                    request,
                     SetSource::Efa(session),
                 )
                 .await;
@@ -873,7 +992,7 @@ async fn cmd_set_tiered_run(
     set_info: SetObjectInfo,
     stream_ctx: storage::StreamingContext,
     chunk_iter: ChunkIterator,
-    thread_ctx: BlockedRequest,
+    mut request: BlockedRequest,
     variant: SetSource,
 ) {
     let SetObjectInfo {
@@ -881,6 +1000,7 @@ async fn cmd_set_tiered_run(
         obj_len,
         key_name,
         client_crc,
+        unevictable,
     } = set_info;
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
@@ -889,7 +1009,7 @@ async fn cmd_set_tiered_run(
     let disk_len = storage::object_disk_len(&mut chunk_iter);
     if !nvme::try_reserve_nvme_disk_usage(disk_len) {
         reply_err(
-            &thread_ctx,
+            &mut request,
             &info::DISK_CAPACITY_EXCEEDED,
             ValkeyError::Str(errors::ERR_OOM_DISK),
         );
@@ -903,7 +1023,7 @@ async fn cmd_set_tiered_run(
         Err(_e) => {
             nvme::decrease_nvme_disk_usage(disk_len);
             reply_err(
-                &thread_ctx,
+                &mut request,
                 &info::DISK_WRITE_ERRORS,
                 ValkeyError::Str(errors::ERR_DISK_WRITE),
             );
@@ -953,7 +1073,7 @@ async fn cmd_set_tiered_run(
     let crc = match result {
         Ok(crc) => crc,
         Err(e) => {
-            crate::stream::reply_stream_err(&thread_ctx, e);
+            crate::stream::reply_stream_err(&mut request, e);
             return;
         }
     };
@@ -964,7 +1084,7 @@ async fn cmd_set_tiered_run(
     if let Some(expected) = client_crc {
         if crc != expected {
             reply_err(
-                &thread_ctx,
+                &mut request,
                 &info::CRC_MISMATCH,
                 ValkeyError::Str(errors::ERR_CRC_MISMATCH),
             );
@@ -992,20 +1112,7 @@ async fn cmd_set_tiered_run(
         object_id, disk_len
     );
     let lo_value = LoValue::new(object_id, obj_len, crc, Some(object_file));
-    let outcome = commit_lo_value(&thread_ctx.lock(), &key_name, object_id, lo_value);
-    match outcome {
-        Ok(CommitOutcome::ValueSet) => {
-            thread_ctx.reply(VALKEY_OK);
-        }
-        Ok(CommitOutcome::StaleDiscarded) => {
-            // lo_value dropped in commit_lo_value → ObjectFile drop unlinks + frees budget.
-            info::SET_FINALIZE_STALE.fetch_add(1, Ordering::Relaxed);
-            thread_ctx.reply(VALKEY_OK);
-        }
-        Err(e) => {
-            reply_err(&thread_ctx, &info::SET_VALUE_FAILURES, e);
-        }
-    }
+    request.commit(key_name, object_id, lo_value, None, Some(unevictable));
 }
 
 // ─── Serve from DRAMPool ─────────────────────────────────────────────────────
@@ -1019,7 +1126,7 @@ fn cmd_get_from_dram(
     obj_len: u64,
     crc32c: Crc,
     transport: Transport,
-    thread_ctx: BlockedRequest,
+    mut request: BlockedRequest,
     file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOID>)>,
 ) {
     // Tiered mode: every DRAM serve is a cache hit — record it once here so
@@ -1030,7 +1137,7 @@ fn cmd_get_from_dram(
     match transport {
         Transport::Tcp => {
             if crate::bench_mode() {
-                thread_ctx.reply(Ok(ValkeyValue::Integer(obj_len as i64)));
+                request.reply(Ok(GetReply::Len(obj_len)));
             } else {
                 // Copy and reply on a worker, as the NVMe path does, so a hit does not
                 // hold the main thread for the whole value copy.
@@ -1049,7 +1156,7 @@ fn cmd_get_from_dram(
                         obj_len,
                         &mut chunk_iter,
                     );
-                    thread_ctx.reply(Ok(ValkeyValue::StringBuffer(data)));
+                    request.reply(Ok(GetReply::Bytes(data)));
                 });
             }
         }
@@ -1078,9 +1185,9 @@ fn cmd_get_from_dram(
                     // [obj_len, crc32c] on clean success; a Dram GET has no progress
                     // hook, so a target error already surfaced as Err below.
                     Ok(_) => {
-                        thread_ctx.reply(Ok(efa_get_reply(obj_len, crc32c)));
+                        request.reply(Ok(GetReply::Efa { obj_len, crc32c }));
                     }
-                    Err(e) => crate::stream::reply_stream_err(&thread_ctx, e),
+                    Err(e) => crate::stream::reply_stream_err(&mut request, e),
                 }
             });
         }
@@ -1091,7 +1198,7 @@ fn cmd_get_from_dram(
 
 /// Check DRAMPool for a cached object and serve it if found. Returns None if
 /// the request was served (Ready → DRAM serve, Filling → coalesced waiter).
-/// Returns Some((transport, thread_ctx)) if the object is not in the map,
+/// Returns Some((transport, request)) if the object is not in the map,
 /// giving ownership back to the caller for the next fallback path.
 #[allow(clippy::too_many_arguments)]
 fn try_serve_dram_hit(
@@ -1100,13 +1207,13 @@ fn try_serve_dram_hit(
     obj_len: u64,
     crc32c: Crc,
     transport: Transport,
-    thread_ctx: BlockedRequest,
+    request: BlockedRequest,
     file: &Arc<ObjectFile>,
     unevictable: &Arc<storage::UnevictableOID>,
 ) -> Option<(Transport, BlockedRequest)> {
     let obj_ctx = match dram_pool.get_object(object_id) {
         Some(ctx) => ctx,
-        None => return Some((transport, thread_ctx)), // cache miss — caller continues
+        None => return Some((transport, request)), // cache miss — caller continues
     };
     if obj_ctx.is_ready() {
         cmd_get_from_dram(
@@ -1115,7 +1222,7 @@ fn try_serve_dram_hit(
             obj_len,
             crc32c,
             transport,
-            thread_ctx,
+            request,
             Some((file.clone(), unevictable.clone())),
         );
         return None;
@@ -1126,7 +1233,7 @@ fn try_serve_dram_hit(
         obj_len,
         crc32c,
         transport,
-        thread_ctx,
+        request,
         Some((file.clone(), unevictable.clone())),
     );
     None
@@ -1142,25 +1249,25 @@ fn serve_filling_or_became_ready(
     obj_len: u64,
     crc32c: Crc,
     transport: Transport,
-    thread_ctx: BlockedRequest,
+    mut request: BlockedRequest,
     file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOID>)>,
 ) {
     if let Some(rx) = obj_ctx.subscribe() {
         info::COALESCED_READS.fetch_add(1, Ordering::Relaxed);
         crate::runtime_handle().spawn(async move {
-            serve_coalesced_waiter(obj_ctx, rx, obj_len, crc32c, transport, thread_ctx, file).await;
+            serve_coalesced_waiter(obj_ctx, rx, obj_len, crc32c, transport, request, file).await;
         });
     } else if obj_ctx.is_ready() {
         // subscribe() returned None → transitioned to Ready between checks.
         cmd_get_from_dram(
-            dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, file,
+            dram_pool, &obj_ctx, obj_len, crc32c, transport, request, file,
         );
     } else if obj_ctx.promotion_failure() != storage::PromotionFailureReason::None {
         // subscribe() returned None because the promotion leader failed and
         // dropped the sender (set_promotion_failure) before remove_object ran.
         // The DRAM buffers are half-filled — reply with a disk read error.
         reply_err(
-            &thread_ctx,
+            &mut request,
             &info::DISK_READ_ERRORS,
             ValkeyError::Str(errors::ERR_DISK_READ),
         );
@@ -1178,20 +1285,20 @@ async fn serve_coalesced_waiter(
     obj_len: u64,
     crc32c: Crc,
     transport: Transport,
-    thread_ctx: BlockedRequest,
+    mut request: BlockedRequest,
     file: Option<(Arc<ObjectFile>, Arc<storage::UnevictableOID>)>,
 ) {
     match obj_ctx.await_promotion(rx).await {
         Ok(()) => {
             let dram_pool = storage::get_dram_pool();
             cmd_get_from_dram(
-                dram_pool, &obj_ctx, obj_len, crc32c, transport, thread_ctx, file,
+                dram_pool, &obj_ctx, obj_len, crc32c, transport, request, file,
             );
         }
         Err(_reason) => {
             // Promotion leader failed — reply error without bumping
             // DISK_READ_ERRORS (the leader already counted the real failure).
-            thread_ctx.reply(Err(ValkeyError::Str(errors::ERR_DISK_READ)));
+            request.reply(Err(ValkeyError::Str(errors::ERR_DISK_READ)));
         }
     }
 }

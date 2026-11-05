@@ -56,6 +56,7 @@ define_errors! {
     // Streaming Errors
     ERR_DISK_STAGING_EXHAUSTED => "ERR disk staging buffer pool exhausted",
     ERR_SET_VALUE => "ERR failed to set key",
+    ERR_NO_REPLY => "ERR request ended without a reply",
 
     // Config Validation Errors
     ERR_ZERO_LENGTH_OBJECT => "ERR object length must be > 0",

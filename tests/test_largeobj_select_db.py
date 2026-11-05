@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import socket
 import pytest
 from valkey import ResponseError
 from valkeytestframework.util.waiters import wait_for_equal
@@ -56,3 +57,18 @@ class TestSwapDbDuringSet(ValkeyLargeObjTestCaseBase):
             assert pending_set.result(timeout=10) == b'OK'
         assert client.execute_command('BLOB.TCP_GET', 'blob') == b'x'
         assert admin.execute_command('DBSIZE') == 0
+
+    def test_set_commits_after_client_disconnects(self):
+        """A client that disconnects mid-SET gets no reply, but the SET still commits,
+        to the client's db."""
+        admin = self.server.get_new_client()
+        with socket.create_connection((self.server.bind_ip, self.server.port)) as conn:
+            conn.sendall(b'SELECT 1\r\n')
+            assert conn.recv(16) == b'+OK\r\n'
+            conn.sendall(b'BLOB.TCP_SET blob x\r\n')
+            wait_for_equal(lambda: admin.info('largeobj')['largeobj_inflight_requests'], 1)
+        wait_for_equal(lambda: admin.info('largeobj')['largeobj_inflight_requests'], 0)
+        assert admin.execute_command('DBSIZE') == 0
+        admin.execute_command('SELECT', 1)
+        wait_for_equal(lambda: admin.execute_command('DBSIZE'), 1)
+        assert admin.execute_command('BLOB.TCP_GET', 'blob') == b'x'

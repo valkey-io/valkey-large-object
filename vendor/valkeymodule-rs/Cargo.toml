@@ -1,0 +1,210 @@
+[package]
+name = "valkey-module"
+version = "0.1.15"
+authors = ["Dmitry Polyakovsky <dmitry.polyakovsky@oracle.com>"]
+edition = "2021"
+build = "build.rs"
+description = "A toolkit for building valkey modules in Rust"
+license = "BSD-3-Clause"
+repository = "https://github.com/valkey-io/valkeymodule-rs"
+readme = "README.md"
+keywords = ["valkey", "plugin"]
+categories = ["database", "api-bindings"]
+
+[[example]]
+name = "hello"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "string"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "configuration"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "proc_macro_commands"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "acl"
+crate-type = ["cdylib"]
+required-features = ["min-valkey-compatibility-version-8-0"]
+
+[[example]]
+name = "auth"
+crate-type = ["cdylib"]
+required-features = ["min-redis-compatibility-version-7-2"]
+
+[[example]]
+name = "call"
+crate-type = ["cdylib"]
+required-features = ["min-redis-compatibility-version-7-2"]
+
+[[example]]
+name = "keys_pos"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "lists"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "timer"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "threads"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "block"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "data_type"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "data_type2"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "data_type3"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "load_unload"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "ctx_flags"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "server_events"
+crate-type = ["cdylib"]
+required-features = ["min-redis-compatibility-version-7-2"]
+
+[[example]]
+name = "events"
+crate-type = ["cdylib"]
+required-features = ["min-redis-compatibility-version-7-2"]
+
+[[example]]
+name = "test_helper"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "info_handler_macro"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "info_handler_builder"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "info_handler_struct"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "info_handler_multiple_sections"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "info"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "scan_keys"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "stream"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "response"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "open_key_with_flags"
+crate-type = ["cdylib"]
+required-features = ["min-redis-compatibility-version-7-2"]
+
+[[example]]
+name = "expire"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "client"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "filter1"
+crate-type = ["cdylib"]
+required-features = ["min-redis-compatibility-version-7-2"]
+
+[[example]]
+name = "filter2"
+crate-type = ["cdylib"]
+required-features = ["min-redis-compatibility-version-7-2"]
+
+[[example]]
+name = "preload"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "subcmd"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "crontab"
+crate-type = ["cdylib"]
+
+[dependencies]
+bitflags = "2.8.0"
+libc = "0.2"
+enum-primitive-derive = "^0.1"
+num-traits = "^0.2"
+regex = "1"
+strum_macros = "0.26"
+backtrace = "0.3"
+linkme = "0.3"
+serde = { version = "1", features = ["derive"] }
+nix = "0.26"
+cfg-if = "1"
+valkey-module-macros-internals = { path = "valkeymodule-rs-macros-internals", version = "0.1.15"}
+log = "0.4"
+paste = "1.0.15"
+
+[dev-dependencies]
+anyhow = "1"
+redis = "0.28"
+lazy_static = "1"
+tempfile = "3"
+valkey-module-macros = { path = "valkeymodule-rs-macros", version = "0.1.15" }
+valkey-module = { path = "./", default-features = false }
+cron = "0.15.0"
+chrono = "0.4.41"
+dashmap = "6.1.0"
+
+[build-dependencies]
+bindgen = "0.70"
+cc = "1"
+
+[features]
+default = ["min-redis-compatibility-version-7-0"]
+min-valkey-compatibility-version-9-0 = ["min-valkey-compatibility-version-8-0"]
+min-valkey-compatibility-version-8-0 = ["min-redis-compatibility-version-7-2"]
+min-redis-compatibility-version-7-2 = ["min-redis-compatibility-version-7-0"]
+min-redis-compatibility-version-7-0 = []
+min-redis-compatibility-version-6-2 = []
+min-redis-compatibility-version-6-0 = []
+# this is used to enable System.alloc instead of ValkeyAlloc for tests
+enable-system-alloc = []
+# this enables test shims and selects the system allocator they require
+test-shims = ["enable-system-alloc"]
+# this is to indicate the Module wants to use RedisModule APIs for calls
+use-redismodule-api = []

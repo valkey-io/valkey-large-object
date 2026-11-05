@@ -7,8 +7,8 @@ description = "Valkey Large Object Module — NVMe + EFA storage for KV cache te
 repository = "https://github.com/valkey-io/valkey-large-object"
 
 [dependencies]
-valkey-module = { version = "0.1.15", features = ["min-valkey-compatibility-version-8-0"] }
-valkey-module-macros = "0"
+valkey-module = { path = "vendor/valkeymodule-rs", features = ["min-valkey-compatibility-version-8-0"] }
+valkey-module-macros = { path = "vendor/valkeymodule-rs/valkeymodule-rs-macros" }
 linkme = "0"
 libc = "0.2"
 crc-fast = "1"
