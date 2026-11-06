@@ -609,18 +609,18 @@ mod tests {
     }
 
     #[test]
-    fn test_object_disk_len_unaligned_chunk_size() {
-        // 10000 bytes, chunk_size=5000 → chunks: 5000, 5000.
-        // align_up(5000) = 8192 each. Data total = 16384.
-        let mut iter = super::super::ChunkIterator::new(10000, 5000, 2, None);
-        assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 8192);
+    fn test_object_disk_len_unaligned_value_multi_page_chunk_size() {
+        // 20000 bytes, chunk_size=8192 → chunks: 8192, 8192, 3616.
+        // align_up(3616) = 4096. Data total = 20480.
+        let mut iter = super::super::ChunkIterator::new(20000, 8192, 3, None);
+        assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 8192 + 4096);
     }
 
     #[test]
-    fn test_object_disk_len_unaligned_chunk_size_with_remainder() {
-        // 8193 bytes, chunk_size=5000 → chunks: 5000, 3193.
-        // align_up(5000)=8192, align_up(3193)=4096. Data total = 12288.
-        let mut iter = super::super::ChunkIterator::new(8193, 5000, 2, None);
+    fn test_object_disk_len_value_one_byte_past_a_chunk() {
+        // 8193 bytes, chunk_size=8192 → chunks: 8192, 1.
+        // align_up(1) = 4096. Data total = 12288.
+        let mut iter = super::super::ChunkIterator::new(8193, 8192, 2, None);
         assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 4096);
     }
 
