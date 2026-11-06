@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
@@ -130,12 +130,27 @@ static NVME_ENGINE: OnceLock<UringEngine> = OnceLock::new();
 
 /// True while the DRAM ring's poller is mid-rebuild (re-register window open).
 /// Never set to true by the NVMe poller (fixed-size pool, no re-registers).
-/// The DRAM poller is the single writer; readers outside the poller use
-/// `is_registration_pending` to skip promotion during the window and fall
-/// back to the NVMe streaming path. Relaxed suffices: a stale `false` just
-/// promotes into a window the poller's kill-switch handles; a stale `true`
-/// skips one promotion that would have gone unfixed anyway.
+/// The DRAM poller is the single writer. `begin_promotion` reads it to skip
+/// promotion during the window and fall back to the NVMe streaming path.
 static REGISTRATION_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Promotions from admission until they finish. The rebuild
+/// blocks the DRAM poller for its whole duration (seconds on a large pool, since it
+/// re-pins every segment), so a read submitted or in flight during it waits that long.
+/// The poller rebuilds only when this is 0. Paired with `REGISTRATION_PENDING`, SeqCst
+/// on both: a promotion increments this then reads the flag, and the poller sets the flag
+/// then reads this, so either the promotion sees the flag and backs out, or the poller
+/// sees it and waits for it to finish.
+static ACTIVE_PROMOTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Held by a promotion from admission until it finishes. See `ACTIVE_PROMOTIONS`.
+pub struct PromotionGuard(());
+
+impl Drop for PromotionGuard {
+    fn drop(&mut self) {
+        ACTIVE_PROMOTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Install the engine for `pool`. Panics if already set (init runs once).
 pub fn set_engine(pool: PoolType, engine: UringEngine) {
@@ -218,11 +233,25 @@ pub fn submit_reregister(pool: PoolType) {
     });
 }
 
-/// Whether the DRAM ring is mid-rebuild (iovec table being re-registered).
-/// Callers use this to skip promotion during the window and fall back to the
-/// NVMe streaming path, avoiding unfixed reads.
-pub fn is_registration_pending() -> bool {
-    REGISTRATION_PENDING.load(Ordering::Relaxed)
+/// Start a promotion, or `None` while the DRAM ring's table rebuild is pending and
+/// promote-during-dram-scaling is off: the caller then serves from the NVMe streaming
+/// path, whose ring never rebuilds. Hold the guard until the promotion finishes.
+///
+/// With promote-during-dram-scaling on, promotions continue during the window and the
+/// rebuild waits for a moment with none active.
+pub fn begin_promotion() -> Option<PromotionGuard> {
+    let refuse =
+        || !crate::promote_during_dram_scaling() && REGISTRATION_PENDING.load(Ordering::SeqCst);
+    if refuse() {
+        return None;
+    }
+    let guard = PromotionGuard(());
+    ACTIVE_PROMOTIONS.fetch_add(1, Ordering::SeqCst);
+    // The poller may have set the flag after the check above and before the increment.
+    if refuse() {
+        return None; // guard drops, undoing the increment
+    }
+    Some(guard)
 }
 
 // ─── Registered-table check ──────────────────────────────────────────────────
@@ -313,12 +342,16 @@ impl UringEngine {
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
                 break;
             }
-            // Re-register: once in-flight fixed ops have drained, rebuild + re-register
-            // the table. In-window ops went non-fixed, so stale indices are unused.
+            // Re-register: once in-flight fixed ops have drained and no promotion is
+            // active, rebuild + re-register the table. In-window ops went non-fixed, so
+            // stale indices are unused. Waiting for active promotions keeps their reads
+            // from queueing behind the rebuild (see ACTIVE_PROMOTIONS); new ones back out
+            // while the flag is set, so this wait is bounded by the in-flight promotions.
             // Only the DRAM ring rebuilds (NVMe is fixed-size, never re-registers).
             if pool == PoolType::Dram
-                && REGISTRATION_PENDING.load(Ordering::Relaxed)
+                && REGISTRATION_PENDING.load(Ordering::SeqCst)
                 && fixed_in_flight == 0
+                && ACTIVE_PROMOTIONS.load(Ordering::SeqCst) == 0
             {
                 let iovecs = super::rebuild_dense_iovecs_for(pool);
                 unsafe {
@@ -330,7 +363,7 @@ impl UringEngine {
                     }
                 }
                 table = registered_bases(&iovecs);
-                REGISTRATION_PENDING.store(false, Ordering::Relaxed);
+                REGISTRATION_PENDING.store(false, Ordering::SeqCst);
             }
             // Channel disconnected without shutdown flag = bug. The sender lives
             // in an OnceLock for the entire process lifetime. If it's gone without
@@ -355,7 +388,23 @@ impl UringEngine {
                 // a request arrives. Zero CPU when idle, instant wakeup on work.
                 // Once we have at least one pending op or one batched SQE, use try_recv
                 // to drain without blocking.
-                let req = if pending.is_empty() && batch == 0 {
+                let req = if pending.is_empty()
+                    && batch == 0
+                    && pool == PoolType::Dram
+                    && REGISTRATION_PENDING.load(Ordering::SeqCst)
+                {
+                    // A rebuild is waiting for active promotions to finish, and their
+                    // last step (the EFA write) sends nothing here. Wake every 1 ms to
+                    // re-check instead of blocking until the next request.
+                    match rx.recv_timeout(std::time::Duration::from_millis(1)) {
+                        Ok(req) => req,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            channel_alive = false;
+                            break;
+                        }
+                    }
+                } else if pending.is_empty() && batch == 0 {
                     match rx.recv() {
                         Ok(req) => req,
                         Err(_) => {
@@ -382,11 +431,12 @@ impl UringEngine {
                         // are forced non-fixed below until `fixed_in_flight` drains
                         // and the top-of-loop re-register rebuilds the table. No SQE
                         // to build.
-                        REGISTRATION_PENDING.store(true, Ordering::Relaxed);
+                        REGISTRATION_PENDING.store(true, Ordering::SeqCst);
                         // When no fixed ops are in flight, break out of Phase 1
                         // so the outer loop hits the rebuild check immediately.
                         // Otherwise continue draining — the rebuild fires once
-                        // in-flight fixed ops complete. (Without this break, recv()
+                        // in-flight fixed ops complete and no promotion is active.
+                        // (Without this break, recv()
                         // blocks waiting for a message that never comes: reads
                         // falling through to the NVMe pool during the rebuild go to the
                         // NVMe ring, not this one, so registration_pending stays true
@@ -631,5 +681,31 @@ mod tests {
         assert!(!in_table(&after, size, &wrong_seg, 4096));
         // A buffer that runs past its segment's end is not inside it.
         assert!(!in_table(&after, size, &op(1, 0x8f000 + 1), 4096));
+    }
+
+    // One test: it is the only one touching these statics, so no other test races it.
+    #[test]
+    fn promotions_hold_off_the_rebuild_and_back_out_while_it_is_pending() {
+        assert!(!crate::promote_during_dram_scaling());
+        let active = || ACTIVE_PROMOTIONS.load(Ordering::SeqCst);
+        // No rebuild pending: each promotion is admitted and counted until it drops.
+        let first = begin_promotion().expect("admitted while no rebuild is pending");
+        let second = begin_promotion().expect("admitted while no rebuild is pending");
+        assert_eq!(active(), 2);
+        // A rebuild is requested while both are active: the poller's condition fails
+        // until they finish, and new promotions are refused without being counted.
+        REGISTRATION_PENDING.store(true, Ordering::SeqCst);
+        assert!(begin_promotion().is_none());
+        assert_eq!(active(), 2);
+        drop(first);
+        assert_eq!(active(), 1);
+        drop(second);
+        assert_eq!(active(), 0); // the rebuild may run now
+                                 // Rebuild done: promotions are admitted again.
+        REGISTRATION_PENDING.store(false, Ordering::SeqCst);
+        let third = begin_promotion().expect("admitted after the rebuild");
+        assert_eq!(active(), 1);
+        drop(third);
+        assert_eq!(active(), 0);
     }
 }

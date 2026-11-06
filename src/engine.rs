@@ -350,10 +350,10 @@ fn cmd_get_tiered(
     // Skip both if the DRAM ring's iovec table is being re-registered and
     // promote-during-dram-scaling is disabled — promotion reads would go unfixed
     // (Readv instead of ReadFixed), so fall back to the NVMe streaming path
-    // whose ring never re-registers.
-    let skip_promotion =
-        !crate::promote_during_dram_scaling() && storage::uring::is_registration_pending();
-    let promoted = if !skip_promotion && cache.admission.admit(object_id, obj_len) {
+    // whose ring never re-registers. The guard holds the rebuild off until this
+    // promotion finishes, so its reads never wait behind it.
+    let promotion = storage::uring::begin_promotion();
+    let promoted = if promotion.is_some() && cache.admission.admit(object_id, obj_len) {
         dram_pool.try_promote_object(object_id, obj_len)
     } else {
         None
@@ -389,7 +389,7 @@ fn cmd_get_tiered(
         crate::runtime_handle().spawn(async move {
             // Drops before the captured thread_ctx: the fd clone is gone before
             // the client unblocks, so its next GET sees the fd unpinned.
-            let _keep_alive = (file, fd, unevictable);
+            let _keep_alive = (file, fd, unevictable, promotion);
             // Test hook: pause before NVMe reads so concurrent GETs can subscribe.
             let pause_ms = crate::test_pause_during_promotion_ms();
             if pause_ms > 0 {
