@@ -24,6 +24,7 @@ define_errors! {
     ERR_INVALID_RDMA_ADDR_HEX => "ERR invalid rdma address hex",
     ERR_RDMA_ADDR_LEN => "ERR rdma address must be 32 bytes",
     ERR_RDMA_ADDR_EMPTY => "ERR rdma address must not be empty",
+    ERR_RDMA_ADDR_FORMAT => "ERR rdma address is not a valid sockaddr",
     ERR_MALFORMED_MEMORY_ADDR_ARGS => "ERR memory address args must be rkey, addr, len triples",
     ERR_TOO_MANY_MEMORY_ADDRESSES => "ERR too many memory addresses (max 256)",
     ERR_INVALID_RKEY => "ERR invalid rkey",
