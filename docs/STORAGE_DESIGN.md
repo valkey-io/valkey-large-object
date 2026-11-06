@@ -1201,19 +1201,30 @@ registration failure fails module load.
 kernel's registration object, so **every** in-flight fixed op on the ring — not just
 ops on the changed segment — must complete before it runs.
 
+The only ops on the DRAM ring are promotion reads (NVMe file into DRAM buffers). Each
+promotion holds a `PromotionGuard` from admission until it finishes, and awaits every
+read it submits before it finishes.
+
 **Rebuild protocol** (poller thread, after `submit_reregister` on expand or release):
 
-1. `IoRequest::Reregister` sets `registration_pending`.
-2. **Kill-switch:** while pending, every op is issued non-fixed (plain Read/Write,
-   which names an address, not a table index), so no new op can reference the table
-   about to change.
-3. When `fixed_in_flight` reaches 0, `rebuild_dense_iovecs` reindexes the live
-   segments densely from 0 (holes dropped), marks them registered, and the poller runs
-   `unregister_buffers` + `register_buffers(dense)`. A failure here panics.
-4. `registration_pending` clears; ops go fixed again with their new `iovec_index`.
+1. `IoRequest::Reregister` sets `registration_pending`. New promotions are refused
+   (`promotion_guard()` returns `None`), so those GETs are served from NVMe.
+2. The poller waits until no promotion is in progress (`drained_for_rebuild`). The
+   last promotion to finish sends `IoRequest::Wake` so an idle poller re-checks.
+3. `rebuild_dense_iovecs` reindexes the live segments densely from 0 (holes dropped),
+   marks them registered, and the poller runs `unregister_buffers` +
+   `register_buffers(dense)`. A failure here panics.
+4. `registration_pending` clears; promotions resume with their new `iovec_index`.
+
+The rebuild must wait for in-progress promotions rather than only for reads in the
+kernel: `register_buffers` holds the ring's `uring_lock`, and submission takes the same
+lock, so a promotion's next chunk read would queue behind a rebuild that takes seconds
+at a few hundred segments.
 
 There is a window where nothing is registered (between the two syscalls). It is safe
-because of the drain + kill-switch, not because the swap is atomic. A newly expanded
+because no op is in flight and none is built until the rebuild finishes, not because
+the swap is atomic. `in_table` is the last check: an op whose `iovec_index` does not
+name its buffer's segment in the current table is issued non-fixed. A newly expanded
 segment is unregistered until step 3 marks it; `is_buf_io_uring_registered` keeps its
 I/O non-fixed until then, so it never issues a fixed op against an index that does not
 exist (EFAULT).

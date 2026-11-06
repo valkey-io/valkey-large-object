@@ -65,8 +65,8 @@ enum IoRequest {
         tx: oneshot::Sender<Result<(), StorageError>>,
     },
     /// Rebuild this ring's fixed-buffer table from its segments. 5.10 has
-    /// only a whole-table re-register: the poller sets `registration_pending` (new ops
-    /// go non-fixed), waits for in-flight fixed ops to drain, then
+    /// only a whole-table re-register: the poller sets `registration_pending` (new
+    /// promotions are refused), waits for in-progress promotions to finish, then
     /// unregister + register. Fire-and-forget from expand()/release().
     Reregister,
     /// No work: wakes the poller so it re-checks a rebuild that waits on promotions.
@@ -85,9 +85,6 @@ enum PendingOp {
         tx: oneshot::Sender<Result<u64, StorageError>>,
         /// Expected byte count for this I/O op. Short reads are rejected.
         expected_bytes: u64,
-        /// True if issued as ReadFixed — counts against `fixed_in_flight`, which
-        /// gates the whole-table re-registration (see `poller_loop`).
-        fixed: bool,
         /// Readv iovec, kept until the CQE: the kernel may read it after submit.
         _iov: Option<Box<libc::iovec>>,
     },
@@ -95,21 +92,12 @@ enum PendingOp {
         tx: oneshot::Sender<Result<(), StorageError>>,
         /// Expected byte count for this I/O op. Short writes are rejected.
         expected_bytes: u64,
-        /// True if issued as WriteFixed — counts against `fixed_in_flight`.
-        fixed: bool,
         /// Writev iovec, kept until the CQE (see `Read::_iov`).
         _iov: Option<Box<libc::iovec>>,
     },
 }
 
 impl PendingOp {
-    /// True if this op was issued on the fixed (ReadFixed/WriteFixed) path.
-    fn is_fixed(&self) -> bool {
-        match self {
-            PendingOp::Read { fixed, .. } | PendingOp::Write { fixed, .. } => *fixed,
-        }
-    }
-
     /// Send an error to the waiting caller. Used when submit fails fatally.
     fn send_error(self, code: i32) {
         match self {
@@ -158,10 +146,11 @@ impl Drop for PromotionGuard {
     }
 }
 
-/// Whether the DRAM ring may rebuild now: no fixed op in the kernel (`fixed_in_flight`,
-/// the poller's own count) and no promotion partway through its chunk reads.
-fn drained_for_rebuild(fixed_in_flight: usize) -> bool {
-    fixed_in_flight == 0 && ACTIVE_PROMOTIONS.load(Ordering::SeqCst) == 0
+/// Whether the DRAM ring may rebuild now: no promotion partway through its reads.
+/// Promotions are the only ops on the DRAM ring and each awaits all its reads before
+/// it finishes, so none is in the kernel and none holds an index the rebuild renumbers.
+fn drained_for_rebuild() -> bool {
+    ACTIVE_PROMOTIONS.load(Ordering::SeqCst) == 0
 }
 
 /// Hold this for a whole promotion. `None` when a rebuild is already pending: the
@@ -340,19 +329,17 @@ impl UringEngine {
         let mut next_token: u64 = 1;
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
-        let mut fixed_in_flight: usize = 0;
         let seg_size = crate::segment_size();
         loop {
             // Exit when shutdown requested and all in-flight ops are drained.
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
                 break;
             }
-            // Re-register: once drained, rebuild + re-register the table. In-window ops
-            // went non-fixed, so stale indices are unused.
+            // Re-register: once drained, rebuild + re-register the table.
             // Only the DRAM ring rebuilds (NVMe is fixed-size, never re-registers).
             if pool == PoolType::Dram
                 && REGISTRATION_PENDING.load(Ordering::SeqCst)
-                && drained_for_rebuild(fixed_in_flight)
+                && drained_for_rebuild()
             {
                 let iovecs = super::rebuild_dense_iovecs_for(pool);
                 unsafe {
@@ -412,39 +399,33 @@ impl UringEngine {
                 let (sqe, op) = match req {
                     IoRequest::Reregister => {
                         // Enter the re-register window. New promotions are skipped
-                        // (REGISTRATION_PENDING); ops already in the channel
-                        // are forced non-fixed below until `fixed_in_flight` drains
-                        // and the top-of-loop re-register rebuilds the table. No SQE
-                        // to build.
+                        // (REGISTRATION_PENDING) and the top-of-loop re-register
+                        // rebuilds the table once in-progress promotions finish. No
+                        // SQE to build.
                         REGISTRATION_PENDING.store(true, Ordering::SeqCst);
                         // When drained (`drained_for_rebuild`), break out of Phase 1
                         // so the outer loop hits the rebuild check immediately.
                         // Otherwise continue draining — the rebuild fires once
-                        // in-flight fixed ops and promotions complete. (Without this break, recv()
+                        // promotions complete. (Without this break, recv()
                         // blocks waiting for a message that never comes: reads
                         // falling through to the NVMe pool during the rebuild go to the
                         // NVMe ring, not this one, so registration_pending stays true
                         // and promotion never comes back through the DRAM pool.)
-                        if drained_for_rebuild(fixed_in_flight) {
+                        if drained_for_rebuild() {
                             break;
                         }
                         continue;
                     }
                     // The last in-progress promotion finished: same drain check.
                     IoRequest::Wake => {
-                        if drained_for_rebuild(fixed_in_flight) {
+                        if drained_for_rebuild() {
                             break;
                         }
                         continue;
                     }
                     IoRequest::Read { fd, op, tx } => {
                         let read_len = super::align_up(op.len as usize) as u32;
-                        // Kill-switch: while a re-register is pending, issue non-fixed so a
-                        // stale iovec_index against the about-to-change table is never used.
-                        let issue_fixed = op.use_fixed
-                            && !(pool == PoolType::Dram
-                                && REGISTRATION_PENDING.load(Ordering::Relaxed))
-                            && in_table(&table, seg_size, &op, read_len);
+                        let issue_fixed = op.use_fixed && in_table(&table, seg_size, &op, read_len);
                         let mut iov = None;
                         let sqe = if issue_fixed {
                             io_uring::opcode::ReadFixed::new(
@@ -475,17 +456,14 @@ impl UringEngine {
                             PendingOp::Read {
                                 tx,
                                 expected_bytes: op.len,
-                                fixed: issue_fixed,
                                 _iov: iov,
                             },
                         )
                     }
                     IoRequest::Write { fd, op, tx } => {
                         let write_len = super::align_up(op.len as usize) as u32;
-                        let issue_fixed = op.use_fixed
-                            && !(pool == PoolType::Dram
-                                && REGISTRATION_PENDING.load(Ordering::Relaxed))
-                            && in_table(&table, seg_size, &op, write_len);
+                        let issue_fixed =
+                            op.use_fixed && in_table(&table, seg_size, &op, write_len);
                         let mut iov = None;
                         let sqe = if issue_fixed {
                             io_uring::opcode::WriteFixed::new(
@@ -516,13 +494,11 @@ impl UringEngine {
                             PendingOp::Write {
                                 tx,
                                 expected_bytes: op.len,
-                                fixed: issue_fixed,
                                 _iov: iov,
                             },
                         )
                     }
                 };
-                let op_is_fixed = op.is_fixed();
                 unsafe {
                     if ring.submission().is_full() {
                         let _ = ring.submit();
@@ -532,9 +508,6 @@ impl UringEngine {
                         op.send_error(libc::EAGAIN);
                     } else {
                         pending.insert(token, op);
-                        if op_is_fixed {
-                            fixed_in_flight += 1;
-                        }
                     }
                 }
                 batch += 1;
@@ -578,9 +551,6 @@ impl UringEngine {
             }
             for (token, result) in completed {
                 if let Some(op) = pending.remove(&token) {
-                    if op.is_fixed() {
-                        fixed_in_flight -= 1;
-                    }
                     match op {
                         PendingOp::Read {
                             tx, expected_bytes, ..
@@ -621,9 +591,6 @@ impl UringEngine {
                     .collect();
                 for token in batch_tokens {
                     if let Some(op) = pending.remove(&token) {
-                        if op.is_fixed() {
-                            fixed_in_flight -= 1;
-                        }
                         op.send_error(code);
                     }
                 }
