@@ -15,6 +15,8 @@
 #   VALKEY_SERVER_PATH    path to pre-built valkey-server binary (skips building valkey)
 #   TEST_PATTERN          pytest -k filter pattern
 #   ASAN_BUILD            if set, builds valkey with SANITIZER=address
+#   COVERAGE              if set, instruments the module and prints integration-test
+#                         coverage after the run (needs: rustup component add llvm-tools-preview)
 
 set -e
 
@@ -26,6 +28,33 @@ if [ "$(uname)" = "Darwin" ]; then
     MODULE_EXT=".dylib"
 fi
 export MODULE_PATH="$SCRIPT_DIR/target/release/libvalkey_large_object$MODULE_EXT"
+
+# ─── Coverage ─────────────────────────────────────────────────────────────────
+
+if [ -n "$COVERAGE" ]; then
+    LLVM_BIN=$(dirname "$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)")
+    if [ ! -x "$LLVM_BIN/llvm-profdata" ]; then
+        echo "ERROR: llvm-profdata not found. Run: rustup component add llvm-tools-preview"
+        exit 1
+    fi
+    export RUSTFLAGS="-C instrument-coverage"
+    COV_DIR="$SCRIPT_DIR/target/coverage"
+    rm -rf "$COV_DIR"
+    mkdir -p "$COV_DIR"
+    # Each valkey-server the tests spawn inherits this and writes a profile on clean shutdown.
+    export LLVM_PROFILE_FILE="$COV_DIR/lo-%p-%m.profraw"
+fi
+
+# Run the unit tests. Under COVERAGE, also record the test binary's path so its counters can
+# be mapped back to source alongside the module's.
+run_unit_tests() {
+    if [ -n "$COVERAGE" ]; then
+        cargo test --features enable-system-alloc --no-run --message-format=json \
+            | grep '"executable":"[^"]*valkey_large_object-' \
+            | sed 's/.*"executable":"\([^"]*\)".*/\1/' | head -1 > "$COV_DIR/unit_bin"
+    fi
+    cargo test --features enable-system-alloc
+}
 
 # ─── Clean ────────────────────────────────────────────────────────────────────
 
@@ -41,7 +70,7 @@ fi
 
 if [ "$1" = "unit-test" ]; then
     echo "Running unit tests..."
-    cargo test --features enable-system-alloc
+    run_unit_tests
     exit 0
 fi
 
@@ -68,7 +97,7 @@ if [ "$1" != "test" ] && [ "$1" != "integ-test" ]; then
     echo ""
 
     echo "Running unit tests..."
-    cargo test --features enable-system-alloc
+    run_unit_tests
     echo ""
 fi
 
@@ -80,7 +109,7 @@ fi
 
 if [ "$1" = "test" ]; then
     echo "Running unit tests..."
-    cargo test --features enable-system-alloc
+    run_unit_tests
     echo ""
 fi
 
@@ -197,3 +226,23 @@ fi
 
 echo ""
 echo "All tests passed."
+
+# ─── Coverage Report ─────────────────────────────────────────────────────────
+
+if [ -n "$COVERAGE" ]; then
+    # Exclude dependencies, generated FFI bindings, std and tests so the number is the module's.
+    COV_IGNORE='(/\.cargo/|/registry/|cargo-home|/rustc/|rustlib/src/rust|ofi-libfabric-sys|/out/|target/(release|debug)/build|vendor|/tests?/|build\.rs)'
+    "$LLVM_BIN/llvm-profdata" merge -sparse "$COV_DIR"/*.profraw -o "$COV_DIR/lo.profdata"
+    echo ""
+    echo "Integration test coverage (module src/ only):"
+    "$LLVM_BIN/llvm-cov" report "$MODULE_PATH" -instr-profile="$COV_DIR/lo.profdata" \
+        -ignore-filename-regex="$COV_IGNORE" | tail -1
+    # The unit tests are a separate binary; adding it maps their counters back to source too.
+    UNIT_BIN=$(cat "$COV_DIR/unit_bin" 2>/dev/null)
+    if [ -n "$UNIT_BIN" ] && [ -x "$UNIT_BIN" ]; then
+        echo ""
+        echo "Combined unit + integration test coverage (module src/ only):"
+        "$LLVM_BIN/llvm-cov" report "$MODULE_PATH" -object "$UNIT_BIN" \
+            -instr-profile="$COV_DIR/lo.profdata" -ignore-filename-regex="$COV_IGNORE"
+    fi
+fi
