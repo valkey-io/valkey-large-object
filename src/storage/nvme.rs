@@ -447,8 +447,6 @@ pub fn open_nvme_file_for_write(
     if unsafe { libc::fallocate(fd.as_raw_fd(), 0, 0, disk_len as libc::off_t) } != 0 {
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::EOPNOTSUPP) {
-            // Created above; the caller's open-failure path does not unlink.
-            let _ = std::fs::remove_file(file_path);
             return Err(io_err(e));
         }
     }

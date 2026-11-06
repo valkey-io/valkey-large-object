@@ -901,6 +901,8 @@ async fn cmd_set_tiered_run(
     let fd = match storage::open_nvme_file_for_write(&file_path, disk_len) {
         Ok(fd) => fd,
         Err(_e) => {
+            // The open may have created the file before failing (fd placement, fallocate).
+            nvme::unlink(object_id);
             nvme::decrease_nvme_disk_usage(disk_len);
             reply_err(
                 &thread_ctx,
