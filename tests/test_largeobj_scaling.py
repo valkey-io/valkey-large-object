@@ -1234,3 +1234,67 @@ class TestDramEvictionPolicy(EvictionPolicyTests, DramBudget):
 
 class TestTieredEvictionPolicy(EvictionPolicyTests, TieredBudget):
     pass
+
+
+# ─── Rebuild of the DRAM ring's buffer table vs in-progress promotions ────────
+
+PROMOTION_PAUSE_SECS = 3
+
+
+class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
+    """An expand re-registers the DRAM ring's io_uring buffer table, and the rebuild blocks
+    that ring. A promotion already in progress must finish first (its reads would otherwise
+    queue behind the rebuild), and a GET arriving while the rebuild is pending is served from
+    NVMe instead of promoting. test-pause-during-promotion-ms holds a promotion in progress,
+    between admission and its disk reads."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (TIERED_ARGS.format(data_dir=data_dir)
+                + " scaling-expand-watermark 95"
+                + f" test-pause-during-promotion-ms {PROMOTION_PAUSE_SECS * 1000}")
+
+    def test_rebuild_waits_for_in_progress_promotion(self):
+        client = self.server.get_new_client()
+        payloads = {key: position_pattern(SEGMENT_FILLING_SIZE, key[-1]) for key in
+                    ('key_a', 'key_b', 'key_c')}
+        for key, payload in payloads.items():
+            client.execute_command('BLOB.TCP_SET', key, payload)
+
+        # key_a's promotion takes the only DRAM segment and pauses before its reads.
+        in_progress = {}
+
+        def promoting_get():
+            try:
+                in_progress['reply'] = self.server.get_new_client().execute_command(
+                    'BLOB.TCP_GET', 'key_a')
+            except Exception as e:
+                in_progress['error'] = e
+
+        promotion = threading.Thread(target=promoting_get)
+        promotion.start()
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == 1)
+
+        # key_b finds the pool full: it is served from NVMe and starts an expand, whose
+        # rebuild must wait for key_a's promotion.
+        assert client.execute_command('BLOB.TCP_GET', 'key_b') == payloads['key_b']
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 2)
+        time.sleep(0.5)  # an unguarded rebuild would run within milliseconds
+        info = info_largeobj(client)
+        assert promotion.is_alive(), "the promotion finished before the rebuild could be observed"
+        assert info['largeobj_dram_uring_registered_segments'] == 1, info
+
+        # While the rebuild is pending, a GET is served from NVMe and not promoted.
+        assert client.execute_command('BLOB.TCP_GET', 'key_c') == payloads['key_c']
+        assert client.execute_command('BLOB.INFO', 'key_c', 'TIER') != b'dram'
+
+        # The promotion completes with correct bytes, then the rebuild runs (woken by the
+        # promotion finishing: nothing else uses the DRAM ring here).
+        promotion.join(timeout=PROMOTION_PAUSE_SECS + 10)
+        assert not promotion.is_alive(), "the paused promotion never finished"
+        assert 'error' not in in_progress, in_progress.get('error')
+        assert in_progress['reply'] == payloads['key_a']
+        wait_uring_registered_matches_segments(client)
+
+        # Promotion resumes into the new segment.
+        promote(client, ['key_a', 'key_c'])
+        assert client.execute_command('BLOB.TCP_GET', 'key_c') == payloads['key_c']
