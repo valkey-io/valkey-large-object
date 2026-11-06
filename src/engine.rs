@@ -902,6 +902,7 @@ async fn cmd_set_tiered_run(
         Ok(fd) => fd,
         Err(_e) => {
             // The open may have created the file before failing (fd placement, fallocate).
+            // ENOENT is fine; like COPY's cleanup, any other unlink error aborts the node.
             nvme::unlink(object_id);
             nvme::decrease_nvme_disk_usage(disk_len);
             reply_err(
