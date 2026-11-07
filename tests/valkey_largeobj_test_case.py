@@ -192,7 +192,9 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         """Read up to `count` events as (event, key) tuples."""
         events = []
         for _ in range(count):
-            msg = pubsub.get_message()
+            # The event and the command's reply travel on different connections, so the
+            # event can arrive after the reply: wait for it rather than poll once.
+            msg = pubsub.get_message(timeout=1)
             if msg is None:
                 break
             event = msg['channel'].decode().split(':', 1)[1]
