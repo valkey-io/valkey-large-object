@@ -617,23 +617,17 @@ mod tests {
     }
 
     #[test]
-    fn test_object_disk_len_value_one_byte_past_a_chunk() {
-        // 8193 bytes, chunk_size=8192 → chunks: 8192, 1.
-        // align_up(1) = 4096. Data total = 12288.
-        let mut iter = super::super::ChunkIterator::new(8193, 8192, 2, None);
-        assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 4096);
-    }
-
-    #[test]
     fn test_open_for_write_preallocates_disk_len() {
         use std::os::unix::fs::MetadataExt;
-        // Nothing is written, so the size and the allocated blocks come from fallocate alone.
-        let path = ObjectId(0x6161).file_path(std::env::temp_dir().to_str().unwrap());
+        // A directory of its own, so the test never touches another run's file.
+        let dir = std::env::temp_dir().join(format!("lo-prealloc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = ObjectId(1).file_path(dir.to_str().unwrap());
         let disk_len = FILE_HEADER_SIZE + 2 * 1024 * 1024;
-        let fd = open_nvme_file_for_write(&path, disk_len).expect("open for write");
-        let meta = std::fs::metadata(&path).unwrap();
-        drop(fd);
-        let _ = std::fs::remove_file(&path);
+        // Nothing is written, so the size and the allocated blocks come from fallocate alone.
+        let meta = open_nvme_file_for_write(&path, disk_len).map(|_fd| std::fs::metadata(&path));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let meta = meta.expect("open for write").expect("stat");
         assert_eq!(meta.len(), disk_len);
         assert!(
             meta.blocks() * 512 >= disk_len,

@@ -123,6 +123,13 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         SERVER_VERSION: valkey-server version directory name
     """
 
+    # Must match storage::FILE_HEADER_SIZE and storage::IO_ALIGN in mod.rs.
+    FILE_HEADER_SIZE = 4096
+    IO_ALIGN = 4096
+
+    def _align_up(self, n):
+        return (n + self.IO_ALIGN - 1) & ~(self.IO_ALIGN - 1)
+
     def get_module_args(self, data_dir, direct_io):
         """Override in subclasses to customize module load args.
         Default: Tiered mode with 1MB pools (small, suitable for basic tests).
