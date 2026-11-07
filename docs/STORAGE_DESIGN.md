@@ -1223,8 +1223,9 @@ at a few hundred segments.
 
 There is a window where nothing is registered (between the two syscalls). It is safe
 because no op is in flight and none is built until the rebuild finishes, not because
-the swap is atomic. `in_table` is the last check: an op whose `iovec_index` does not
-name its buffer's segment in the current table is issued non-fixed. A newly expanded
+the swap is atomic. For the same reason no op carries an `iovec_index` from before a
+rebuild: a promotion reads each index when it submits, and the rebuild that renumbers
+the segments never overlaps a promotion. A newly expanded
 segment is unregistered until step 3 marks it; `is_buf_io_uring_registered` keeps its
 I/O non-fixed until then, so it never issues a fixed op against an index that does not
 exist (EFAULT).
