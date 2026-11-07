@@ -8,6 +8,7 @@ Tests cover:
   - Tiered mode: reactive expand on promotion
   - Tiered mode: shrink drops cached copies, NVMe data survives
   - Tiered mode: expand, shrink to zero segments, expand again
+  - Tiered mode: promotion into a segment that a middle segment's release renumbered
   - Tiered mode: shrink releases an EFA-registered segment
   - Eviction, both modes: a SET or COPY past the budget evicts other objects; their keys read as
     misses until the scaling cron deletes them. Tiered stays exact against concurrent GET, SET,
@@ -557,6 +558,50 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         assert regrown['largeobj_dram_segments'] == 1
         assert client.execute_command('BLOB.INFO', 'tshrink_0', 'TIER') == b'dram'
         assert client.execute_command('BLOB.TCP_GET', 'tshrink_0') == self.PAYLOADS['tshrink_0']
+        wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
+
+    def test_promotes_into_a_segment_the_shrink_renumbered(self):
+        """Releasing a middle segment rebuilds the DRAM ring's dense table, so the last segment
+        moves from index 2 to 1. A promotion into it afterwards reads into the right memory."""
+        client = self.server.get_new_client()
+        payloads = {
+            'renum_first': position_pattern(SEGMENT_FILLING_SIZE, 1),  # fills segment 0
+            'renum_middle': position_pattern(SEGMENT_FILLING_SIZE, 2),  # fills segment 1
+            'renum_last': position_pattern(600 * 1024, 3),  # segment 2, ~424 KB left
+            'renum_late': position_pattern(300 * 1024, 4),  # fits only what segment 2 has left
+        }
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.TCP_SET', key, payload) == b'OK'
+        promote(client, ['renum_first', 'renum_middle', 'renum_last'])
+        assert info_largeobj(client)['largeobj_dram_segments'] == 3
+
+        # An empty middle segment is the least loaded, so it is the one the shrink releases.
+        client.delete('renum_middle')
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == 2)
+        before = info_largeobj(client)
+
+        # Over the shrink watermark now, under it once one segment is gone: exactly one shrink.
+        used = int(client.info('memory')['used_memory'])
+        watermark = int(client.config_get('largeobj.scaling-shrink-watermark')
+                        ['largeobj.scaling-shrink-watermark']) / 100
+        segment = before['largeobj_dram_segment_size_bytes']
+        client.config_set('maxmemory-policy', 'noeviction')
+        client.config_set('maxmemory', int((used - segment / 2) / watermark))
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 2
+                      and shrink_completed(client), timeout=self.TIMEOUT_S)
+        client.config_set('maxmemory', 0)
+        shrunk = info_largeobj(client)
+        assert shrunk['largeobj_dram_scaling_shrinks'] == before['largeobj_dram_scaling_shrinks'] + 1
+        assert shrunk['largeobj_dram_objects'] == 2
+        time.sleep(0.5)  # the release's rebuild runs within milliseconds of it
+
+        promote(client, ['renum_first', 'renum_last', 'renum_late'])
+        after = info_largeobj(client)
+        # No expand: renum_late went into the renumbered last segment.
+        assert after['largeobj_dram_segments'] == 2
+        assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands']
+        for key in ('renum_first', 'renum_last', 'renum_late'):
+            assert client.execute_command('BLOB.TCP_GET', key) == payloads[key]
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
 
 
