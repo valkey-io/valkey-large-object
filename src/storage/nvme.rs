@@ -9,7 +9,7 @@ use super::fd_placement::ObjectFd;
 use std::fs::OpenOptions;
 use std::mem::size_of;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -428,17 +428,29 @@ pub async fn read_and_verify_file_header(
 
 /// Open an NVMe file for writing with O_CREAT|O_TRUNC and optionally O_DIRECT.
 /// Returns an `ObjectFd` that closes the file descriptor on drop.
-pub fn open_nvme_file_for_write(file_path: &str) -> Result<ObjectFd, super::StorageError> {
+pub fn open_nvme_file_for_write(
+    file_path: &str,
+    disk_len: u64,
+) -> Result<ObjectFd, super::StorageError> {
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true).mode(0o644);
     if crate::direct_io() {
         opts.custom_flags(libc::O_DIRECT);
     }
-    super::fd_placement::open_object_file(file_path, &opts).map_err(|e| {
-        super::StorageError::IoError {
-            code: e.raw_os_error().unwrap_or(libc::EIO),
+    let io_err = |e: std::io::Error| super::StorageError::IoError {
+        code: e.raw_os_error().unwrap_or(libc::EIO),
+    };
+    let fd = super::fd_placement::open_object_file(file_path, &opts).map_err(io_err)?;
+    // Preallocate the whole object so every O_DIRECT chunk write lands inside EOF. Extending
+    // writes make XFS take the inode IOLOCK exclusive (serializing the object's parallel chunk
+    // writes) and allocate extents inside each write. EOPNOTSUPP keeps extending writes.
+    if unsafe { libc::fallocate(fd.as_raw_fd(), 0, 0, disk_len as libc::off_t) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EOPNOTSUPP) {
+            return Err(io_err(e));
         }
-    })
+    }
+    Ok(fd)
 }
 
 /// Write FileHeader to offset 0 of an NVMe file using the given NVMePool buffer.
@@ -597,18 +609,29 @@ mod tests {
     }
 
     #[test]
-    fn test_object_disk_len_unaligned_chunk_size() {
-        // 10000 bytes, chunk_size=5000 → chunks: 5000, 5000.
-        // align_up(5000) = 8192 each. Data total = 16384.
-        let mut iter = super::super::ChunkIterator::new(10000, 5000, 2, None);
-        assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 8192);
+    fn test_object_disk_len_unaligned_value_multi_page_chunk_size() {
+        // 20000 bytes, chunk_size=8192 → chunks: 8192, 8192, 3616.
+        // align_up(3616) = 4096. Data total = 20480.
+        let mut iter = super::super::ChunkIterator::new(20000, 8192, 3, None);
+        assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 8192 + 4096);
     }
 
     #[test]
-    fn test_object_disk_len_unaligned_chunk_size_with_remainder() {
-        // 8193 bytes, chunk_size=5000 → chunks: 5000, 3193.
-        // align_up(5000)=8192, align_up(3193)=4096. Data total = 12288.
-        let mut iter = super::super::ChunkIterator::new(8193, 5000, 2, None);
-        assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 4096);
+    fn test_open_for_write_preallocates_disk_len() {
+        use std::os::unix::fs::MetadataExt;
+        // A directory of its own, so the test never touches another run's file.
+        let dir = std::env::temp_dir().join(format!("lo-prealloc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = ObjectId(1).file_path(dir.to_str().unwrap());
+        let disk_len = FILE_HEADER_SIZE + 2 * 1024 * 1024;
+        // Nothing is written, so the size and the allocated blocks come from fallocate alone.
+        let meta = open_nvme_file_for_write(&path, disk_len).map(|_fd| std::fs::metadata(&path));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let meta = meta.expect("open for write").expect("stat");
+        assert_eq!(meta.len(), disk_len);
+        assert!(
+            meta.blocks() * 512 >= disk_len,
+            "blocks are reserved at open"
+        );
     }
 }

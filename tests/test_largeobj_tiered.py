@@ -735,13 +735,6 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
     decremented at TRUE deletion (ObjectFile::Drop, after teardown), not merely at key-free.
     """
 
-    # Must match storage::FILE_HEADER_SIZE and storage::IO_ALIGN in mod.rs.
-    FILE_HEADER_SIZE = 4096
-    IO_ALIGN = 4096
-
-    def _align_up(self, n):
-        return (n + self.IO_ALIGN - 1) & ~(self.IO_ALIGN - 1)
-
     def _dat_count(self):
         return len(glob.glob(os.path.join(self.data_dir, "*.dat")))
 
@@ -1935,3 +1928,64 @@ class TestTieredMaxBuffersPerOpAtCapNoPromotion(ValkeyLargeObjTestCaseBase):
             reply = client.execute_command('BLOB.TCP_GET', 'wide')
             assert_bytes_equal(reply, WIDE_PAYLOAD, WIDE_CHUNK)
         assert client.execute_command('BLOB.INFO', 'wide', 'TIER') == b'disk'
+
+
+# ─── chunk-size alignment ─────────────────────────────────────────────────
+
+ALIGNED_CHUNK = 3 * 4096  # a multiple of 4096 that is not a power of two
+
+
+def _chunk_alignment_args(data_dir, direct_io, chunk_size):
+    return (
+        f"operating-mode Tiered"
+        f" disk-dir {data_dir}"
+        f" disk-staging-size 4194304"
+        f" segment-size 1048576"
+        f" max-promote-size 524288"
+        f" promote-min-hits 1"
+        f" chunk-size {chunk_size}"
+        f" bench-mode no"
+        f" direct-io {direct_io}"
+        f" fabric-provider Emulated"
+    )
+
+
+class TestTieredChunkSizeAlignment(ValkeyLargeObjTestCaseBase):
+    """chunk-size must be a multiple of 4096; values of any length are fine."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return _chunk_alignment_args(data_dir, direct_io, ALIGNED_CHUNK)
+
+    @pytest.mark.parametrize('length', [
+        ALIGNED_CHUNK - 1,         # one partial chunk, padded across pages
+        3 * ALIGNED_CHUNK + 5000,  # full chunks and an unaligned tail
+    ])
+    def test_unaligned_value_round_trips(self, length):
+        """Each chunk is padded to 4 KiB on disk, the file is exactly that size, and the
+        value reads back intact from NVMe and then from DRAM."""
+        client = self.server.get_new_client()
+        payload = position_pattern(length, 'U')
+        assert client.execute_command('BLOB.TCP_SET', 'unaligned', payload) == b'OK'
+        full_chunks, tail = divmod(length, ALIGNED_CHUNK)
+        disk_len = self.FILE_HEADER_SIZE + full_chunks * ALIGNED_CHUNK + self._align_up(tail)
+        assert [os.path.getsize(f) for f in self._object_files()] == [disk_len]
+        assert client.execute_command('BLOB.INFO', 'unaligned', 'TIER') == b'disk'
+        assert client.execute_command('BLOB.TCP_GET', 'unaligned') == payload
+        assert client.execute_command('BLOB.INFO', 'unaligned', 'TIER') == b'dram'
+        assert client.execute_command('BLOB.TCP_GET', 'unaligned') == payload
+
+    # A refused load makes Valkey drop its reference to the config data the valkey-module
+    # crate boxed for each config, and nothing frees it, so LeakSanitizer reports it at exit.
+    @pytest.mark.skip_for_asan
+    def test_unaligned_chunk_size_refuses_to_load(self):
+        testdir = os.path.abspath(os.path.join(self.testdir, 'unaligned-chunk'))
+        os.makedirs(testdir, exist_ok=True)
+        module_args = _chunk_alignment_args(os.path.join(testdir, 'nvme'), 'no', 5000)
+        server, _ = self.create_server(
+            testdir=testdir,
+            server_path=self.server.valkey_path,
+            args={'loadmodule': f"{os.environ['MODULE_PATH']} {module_args}"},
+            connect_client=False)
+        wait_for_true(lambda: server.server.poll() is not None)
+        assert server.server.returncode != 0
+        assert server.verify_string_in_logfile('chunk-size must be a multiple of 4096')
