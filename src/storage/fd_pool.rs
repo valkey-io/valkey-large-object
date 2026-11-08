@@ -245,6 +245,7 @@ mod tests {
     fn test_get_or_open_caches_and_reuses() {
         let dir = std::env::temp_dir();
         let dir = dir.to_str().unwrap();
+        crate::data_type::create_disk_dir_shards(dir).unwrap();
         let object_id = ObjectId(0x5151);
         let path = object_id.file_path(dir);
         std::fs::write(&path, b"hello").unwrap();
@@ -273,6 +274,7 @@ mod tests {
         // does on delete); the fd closes only when the last clone goes away.
         let dir = std::env::temp_dir();
         let dir = dir.to_str().unwrap();
+        crate::data_type::create_disk_dir_shards(dir).unwrap();
         let object_id = ObjectId(0x6262);
         let path = object_id.file_path(dir);
         std::fs::write(&path, b"world").unwrap();
@@ -310,6 +312,7 @@ mod tests {
     fn reclaimed_fd_stays_open_for_its_reader() {
         let dir = std::env::temp_dir();
         let dir = dir.to_str().unwrap();
+        crate::data_type::create_disk_dir_shards(dir).unwrap();
         let oids = [ObjectId(0x7370), ObjectId(0x7371)];
         for oid in &oids {
             std::fs::write(oid.file_path(dir), b"x").unwrap();
@@ -343,6 +346,7 @@ mod tests {
     fn shrink_to_evicts_down_to_the_cap_at_once() {
         let dir = std::env::temp_dir();
         let dir = dir.to_str().unwrap();
+        crate::data_type::create_disk_dir_shards(dir).unwrap();
         let full = 20;
         let oids: Vec<ObjectId> = (0..full as u64).map(|i| ObjectId(0x7400 + i)).collect();
         for oid in &oids {
@@ -376,6 +380,7 @@ mod tests {
         // that consulted it would open a fresh fd. A hit returns the cached handle.
         let dir = std::env::temp_dir();
         let dir = dir.to_str().unwrap();
+        crate::data_type::create_disk_dir_shards(dir).unwrap();
         let object_id = ObjectId(0x7600);
         std::fs::write(object_id.file_path(dir), b"x").unwrap();
         let pool = FdPool::new();
@@ -393,6 +398,7 @@ mod tests {
     fn cap_zero_opens_without_caching() {
         let dir = std::env::temp_dir();
         let dir = dir.to_str().unwrap();
+        crate::data_type::create_disk_dir_shards(dir).unwrap();
         let object_id = ObjectId(0x7500);
         std::fs::write(object_id.file_path(dir), b"x").unwrap();
         let pool = FdPool::new();

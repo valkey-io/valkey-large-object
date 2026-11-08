@@ -45,7 +45,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'X')
         client.execute_command('BLOB.TCP_SET', 'tiered_key', payload)
-        dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
+        dat_files = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
         assert len(dat_files) >= 1, "Tiered SET should create an NVMe .dat file"
 
     def test_keyspace_events(self):
@@ -60,7 +60,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         ]
 
     def _dat_count(self):
-        return len(glob.glob(os.path.join(self.data_dir, "*.dat")))
+        return len(glob.glob(os.path.join(self.data_dir, "*", "*.dat")))
 
     def _wait_free_settled(self, client):
         """Wait for Valkey lazyfree to drain AND teardown to unlink the file."""
@@ -87,7 +87,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', 'rt_multi') == payload_multi
         # Validate FileHeader on disk: first 4 bytes should be b"LOBJ",
         # data starts at offset 4096.
-        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
+        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected at least one .dat file"
         # Check the most recent file (highest OID = last in sorted hex names).
         with open(dat_files[-1], 'rb') as f:
@@ -124,11 +124,11 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'D')
         client.execute_command('BLOB.TCP_SET', 'del_key', payload)
-        dat_files_before = glob.glob(os.path.join(self.data_dir, '*.dat'))
+        dat_files_before = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
         assert len(dat_files_before) >= 1
         client.execute_command('DEL', 'del_key')
         wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
-        dat_files_after = glob.glob(os.path.join(self.data_dir, '*.dat'))
+        dat_files_after = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
         assert len(dat_files_after) < len(dat_files_before)
 
     # ─── COPY callback tests ─────────────────────────────────────────────
@@ -146,7 +146,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         # COPY carries the CRC over unchanged.
         assert (client.execute_command('BLOB.INFO', 'srckey', 'CRC')
                 == client.execute_command('BLOB.INFO', 'dstkey', 'CRC'))
-        dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
+        dat_files = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
         assert len(dat_files) >= 2, f"Expected at least 2 .dat files, got {len(dat_files)}"
         # COPY gets a new OID so digests differ
         src_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'srckey')
@@ -743,7 +743,7 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
         return (n + self.IO_ALIGN - 1) & ~(self.IO_ALIGN - 1)
 
     def _dat_count(self):
-        return len(glob.glob(os.path.join(self.data_dir, "*.dat")))
+        return len(glob.glob(os.path.join(self.data_dir, "*", "*.dat")))
 
     def _wait_free_settled(self, client):
         """Wait for Valkey lazyfree to drain AND teardown to unlink the file."""
@@ -968,7 +968,7 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
         payload = position_pattern(4096, 'X')
         client.execute_command('BLOB.TCP_SET', 'crc_key', payload)
         # Corrupt the CRC field in the FileHeader (bytes 21-24 in packed layout).
-        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
+        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected .dat file after SET"
         with open(dat_files[-1], 'r+b') as f:
             f.seek(21)
@@ -1002,7 +1002,7 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'Y')
         client.execute_command('BLOB.TCP_SET', 'magic_key', payload)
-        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
+        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected .dat file after SET"
         with open(dat_files[-1], 'r+b') as f:
             f.seek(0)
@@ -1935,3 +1935,36 @@ class TestTieredMaxBuffersPerOpAtCapNoPromotion(ValkeyLargeObjTestCaseBase):
             reply = client.execute_command('BLOB.TCP_GET', 'wide')
             assert_bytes_equal(reply, WIDE_PAYLOAD, WIDE_CHUNK)
         assert client.execute_command('BLOB.INFO', 'wide', 'TIER') == b'disk'
+
+
+# ─── disk-dir-shards ──────────────────────────────────────────────────────────
+
+
+class TestTieredDiskDirShards(ValkeyLargeObjTestCaseBase):
+    """Object files are spread over `disk-dir-shards` subdirectories of disk-dir by OID."""
+
+    SHARDS = 4
+
+    def get_module_args(self, data_dir, direct_io):
+        return (super().get_module_args(data_dir, direct_io)
+                + f" disk-dir-shards {self.SHARDS}")
+
+    def test_files_land_in_oid_shard(self):
+        client = self.server.get_new_client()
+        assert client.config_get('largeobj.disk-dir-shards') == {
+            'largeobj.disk-dir-shards': str(self.SHARDS)}
+        assert sorted(os.listdir(self.data_dir)) == [f'{s:04x}' for s in range(self.SHARDS)]
+        for i in range(8):
+            client.execute_command('BLOB.TCP_SET', f'shard_key_{i}', position_pattern(4096, 'S'))
+        files = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
+        assert len(files) == 8
+        for path in files:
+            shard, name = path.split(os.sep)[-2:]
+            assert int(shard, 16) == int(name[:16], 16) % self.SHARDS
+        # Consecutive OIDs spread over every shard.
+        assert {path.split(os.sep)[-2] for path in files} == {f'{s:04x}' for s in range(self.SHARDS)}
+
+    def test_immutable(self):
+        client = self.server.get_new_client()
+        with pytest.raises(ResponseError):
+            client.config_set('largeobj.disk-dir-shards', 8)

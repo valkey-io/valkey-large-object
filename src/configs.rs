@@ -71,6 +71,10 @@ pub const MAX_DISK_MAXMEMORY: i64 = i64::MAX;
 pub const DEFAULT_WORKER_THREADS: i64 = 4;
 pub const MIN_WORKER_THREADS: i64 = 1;
 pub const MAX_WORKER_THREADS: i64 = 32;
+// disk-dir-shards
+pub const DEFAULT_DISK_DIR_SHARDS: i64 = 1024;
+pub const MIN_DISK_DIR_SHARDS: i64 = 1;
+pub const MAX_DISK_DIR_SHARDS: i64 = 65536;
 // max-promote-size
 pub const DEFAULT_MAX_PROMOTE_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
 pub const MIN_MAX_PROMOTE_SIZE: i64 = 0;
@@ -187,6 +191,9 @@ lazy_static::lazy_static! {
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
     pub static ref CFG_WORKER_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_WORKER_THREADS);
+
+    /// Subdirectories of disk-dir that object files are spread over (`ObjectId::file_path`).
+    pub static ref CFG_DISK_DIR_SHARDS: AtomicI64 = AtomicI64::new(DEFAULT_DISK_DIR_SHARDS);
 
     /// Max object size eligible for DRAMPool promotion (Tiered mode).
     /// Objects larger than this skip promotion and are always served from NVMe.
@@ -387,6 +394,10 @@ pub fn nvme_maxmemory() -> u64 {
 
 pub fn worker_threads() -> usize {
     CFG_WORKER_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn disk_dir_shards() -> u64 {
+    CFG_DISK_DIR_SHARDS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn max_promote_size() -> u64 {

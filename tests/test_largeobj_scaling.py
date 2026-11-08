@@ -749,8 +749,11 @@ class TieredBudget(Budget):
         return client
 
     def object_files(self):
-        """Lowest oid first (file names are zero-padded hex oids): the oldest write first."""
-        return sorted(name for name in os.listdir(self.data_dir) if OBJECT_FILE.match(name))
+        """Lowest oid first (file names are zero-padded hex oids): the oldest write first. Paths are
+        relative to data_dir, across its shard subdirectories."""
+        files = [os.path.join(os.path.relpath(root, self.data_dir), name)
+                 for root, _, names in os.walk(self.data_dir) for name in names if OBJECT_FILE.match(name)]
+        return sorted(files, key=os.path.basename)
 
     def first_in_line(self, payloads):
         """The key LRU eviction takes first when none was read: the oldest write (lowest oid),

@@ -177,8 +177,8 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         logging.info("startup args are: %s", args)
 
     def _object_files(self):
-        """Every file currently in disk-dir (name-agnostic)."""
-        return sorted(glob.glob(os.path.join(self.data_dir, "*")))
+        """Every file currently in disk-dir and its shard subdirectories (name-agnostic)."""
+        return sorted(os.path.join(root, name) for root, _, names in os.walk(self.data_dir) for name in names)
 
     def subscribe_keyspace_events(self, client):
         """Enable module keyspace events and return a pubsub on the keyevent channels."""
