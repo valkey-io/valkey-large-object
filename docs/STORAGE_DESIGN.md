@@ -422,8 +422,12 @@ struct StreamingContext {
 ### 6.3 NVMe File Reference
 
 Each object version is one file, named directly from its `ObjectId` under the
-configured `disk-dir`: `{disk-dir}/{oid:016x}.dat` (via `ObjectId::file_path`).
-There is no extra subdirectory — `disk-dir` is the module-owned directory. The
+configured `disk-dir`: `{disk-dir}/{oid % disk-dir-shards:04x}/{oid:016x}.dat` (via
+`ObjectId::file_path`). `disk-dir` is the module-owned directory; its
+`disk-dir-shards` subdirectories (default 1024) are created when it is reset at
+startup. Every create and unlink
+takes its directory's inode lock exclusively, so one directory would serialize
+them across all SETs and evictions. The
 runtime handle is `ObjectFile { object_id, disk_len }` (held behind
 `Arc<ObjectFile>`); it stores no path and no fd — the path is derived from the OID
 and the fd is managed separately by the FdPool (§6.4).
@@ -542,7 +546,7 @@ Example: 50MB object cached in DRAMPool (long-lived). NVMePool would look the sa
 Valkey keyspace                Module internals
 ──────────────                 ────────────────
 key "obj-A"
-  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<ObjectFd> → {disk-dir}/000000000000002a.dat (50MB)
+  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<ObjectFd> → {disk-dir}/002a/000000000000002a.dat (50MB)
        len=50MB,                                                ▲
        crc32c=0xAB12}                                           │  N buffers : 1 file
                                                                 │  (parallel ReadFixed/WriteFixed
@@ -587,7 +591,7 @@ Each object is one contiguous file on NVMe regardless of size:
 
 ```
 Object "key123" (10GB):
-  NVMe: {disk-dir}/000000000000002a.dat   (10GB file, XFS extent-allocated)
+  NVMe: {disk-dir}/002a/000000000000002a.dat   (10GB file, XFS extent-allocated)
   LoValue: {oid=42, len=10GB, crc32c=0xAB12}
 ```
 

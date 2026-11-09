@@ -622,6 +622,7 @@ mod tests {
         // A directory of its own, so the test never touches another run's file.
         let dir = std::env::temp_dir().join(format!("lo-prealloc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        crate::data_type::create_disk_dir_shards(dir.to_str().unwrap()).unwrap();
         let path = ObjectId(1).file_path(dir.to_str().unwrap());
         let disk_len = FILE_HEADER_SIZE + 2 * 1024 * 1024;
         // Nothing is written, so the size and the allocated blocks come from fallocate alone.
