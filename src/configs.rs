@@ -83,6 +83,10 @@ pub const MAX_SCALING_POLL_MS: i64 = 60_000;
 pub const DEFAULT_REAPER_SCAN_BUDGET_US: i64 = 2000;
 pub const MIN_REAPER_SCAN_BUDGET_US: i64 = 100;
 pub const MAX_REAPER_SCAN_BUDGET_US: i64 = 100_000;
+// reaper-scan-budget-max-us
+pub const DEFAULT_REAPER_SCAN_BUDGET_MAX_US: i64 = 10_000;
+pub const MIN_REAPER_SCAN_BUDGET_MAX_US: i64 = 100;
+pub const MAX_REAPER_SCAN_BUDGET_MAX_US: i64 = 100_000;
 // reaper-poll-ms
 pub const DEFAULT_REAPER_POLL_MS: i64 = 35;
 pub const MIN_REAPER_POLL_MS: i64 = 10;
@@ -141,7 +145,7 @@ pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 0; // crate default
 pub const MIN_FABRIC_MAX_IN_FLIGHT: i64 = 0;
 pub const MAX_FABRIC_MAX_IN_FLIGHT: i64 = 65_536;
 // fabric-crc-pool-threads
-pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 1;
+pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 2;
 pub const MIN_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MAX_FABRIC_CRC_POOL_THREADS: i64 = 1024;
 
@@ -201,6 +205,10 @@ lazy_static::lazy_static! {
     /// Main-thread time, in microseconds, one scaling-cron tick may spend
     /// scanning for and deleting evicted keys. Default: 1000us.
     pub static ref CFG_REAPER_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(DEFAULT_REAPER_SCAN_BUDGET_US);
+
+    /// Cap on the reaper's per-tick budget, which doubles from
+    /// `reaper-scan-budget-us` on each tick the backlog grew. Default: 10000us.
+    pub static ref CFG_REAPER_SCAN_BUDGET_MAX_US: AtomicI64 = AtomicI64::new(DEFAULT_REAPER_SCAN_BUDGET_MAX_US);
 
     /// Scaling cron poll interval, in milliseconds, while evicted keys wait to be
     /// deleted. Default: 100ms.
@@ -407,6 +415,10 @@ pub fn scaling_poll_ms() -> u64 {
 
 pub fn reaper_scan_budget_us() -> u64 {
     CFG_REAPER_SCAN_BUDGET_US.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn reaper_scan_budget_max_us() -> u64 {
+    CFG_REAPER_SCAN_BUDGET_MAX_US.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn reaper_poll_ms() -> u64 {

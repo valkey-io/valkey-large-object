@@ -82,32 +82,52 @@ fn select_db(ctx: &Context, db: i32) -> bool {
     unsafe { raw::RedisModule_SelectDb.unwrap()(ctx.get_raw(), db) == raw::REDISMODULE_OK as i32 }
 }
 
-/// Where the reclaim scan resumes on the next tick.
-struct ReclaimScanCursor {
+/// Reclaim scan state carried across ticks.
+struct ReclaimScan {
+    /// Where the scan resumes.
     db: i32,
     cursor: KeysCursor,
+    /// This tick's time budget, in microseconds.
+    budget_us: u64,
+    /// Reclaim list length at the start of the previous tick.
+    backlog: usize,
 }
 
 thread_local! {
     // Scaling cron only, which always runs on the main event-loop thread.
-    static RECLAIM_SCAN_CURSOR: RefCell<ReclaimScanCursor> = RefCell::new(ReclaimScanCursor { db: 0, cursor: KeysCursor::new() });
+    static RECLAIM_SCAN: RefCell<ReclaimScan> =
+        RefCell::new(ReclaimScan { db: 0, cursor: KeysCursor::new(), budget_us: 0, backlog: 0 });
 }
 
-/// Delete keys whose oids are on the reclaim list, spending at most
-/// `reaper-scan-budget-us` of main-thread time per tick. Scans db by db,
-/// resuming across ticks, until the reclaim list is empty. Dram: an oid leaves the
-/// list when its key is deleted, here or via `lo_free`. Tiered: when its `ObjectFile`
+/// Delete keys whose oids are on the reclaim list. Scans db by db, resuming
+/// across ticks, until the reclaim list is empty. Dram: an oid leaves the list
+/// when its key is deleted, here or via `lo_free`. Tiered: when its `ObjectFile`
 /// drops. Either way the scan cannot outlive its keys.
+///
+/// Each tick spends at most its budget of main-thread time. The budget starts at
+/// `reaper-scan-budget-us` and doubles on every tick that finds the list longer
+/// than the tick before (evictions outpace the reaper), up to
+/// `reaper-scan-budget-max-us`. It drops back once the list empties.
 ///
 /// Cross-slot deletion is safe here: a timer callback runs outside command
 /// execution (`server.current_client` is NULL), so key lookups hash each key's
 /// own slot instead of reusing a command's cached slot.
 pub fn delete_reclaimed_keys(ctx: &Context) {
-    if RECLAIM_LIST.is_empty() {
-        return;
-    }
-    let deadline = Instant::now() + Duration::from_micros(crate::reaper_scan_budget_us());
-    RECLAIM_SCAN_CURSOR.with_borrow_mut(|scan| {
+    RECLAIM_SCAN.with_borrow_mut(|scan| {
+        let backlog = RECLAIM_LIST.len();
+        if backlog == 0 {
+            scan.budget_us = 0;
+            scan.backlog = 0;
+            return;
+        }
+        let base = crate::reaper_scan_budget_us();
+        let max = crate::reaper_scan_budget_max_us().max(base);
+        if backlog > scan.backlog {
+            scan.budget_us *= 2;
+        }
+        scan.budget_us = scan.budget_us.clamp(base, max);
+        scan.backlog = backlog;
+        let deadline = Instant::now() + Duration::from_micros(scan.budget_us);
         while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
             // Past the last db: one full pass done. At most one pass per tick
             // so a key moved behind the cursor can't spin us.
@@ -145,17 +165,22 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
 /// Only collects, never deletes: core reads each scanned value after the scan
 /// callback returns (`moduleCloseKey`), so unlinking a key inside the callback
 /// hands BIO an object core still dereferences.
+///
+/// Holds the reclaim list lock for the whole bucket, not per key. Nothing in the
+/// callback can re-enter it: core opens each scanned key read-only with its value
+/// in hand (`moduleScanCallback`), so no lookup expires or frees a key mid-scan.
 fn listed_keys_in_next_bucket(
     ctx: &Context,
     cursor: &KeysCursor,
 ) -> (Vec<(ValkeyString, ObjectId)>, bool) {
     let listed = RefCell::new(Vec::new());
+    let oids = RECLAIM_LIST.lock();
     // scan() calls this once per key in the bucket.
     let more = cursor.scan(ctx, &|_ctx, name, key| {
         let Some(Ok(Some(lo))) = key.map(|k| k.get_value::<LoValue>(&LO_TYPE)) else {
             return;
         };
-        if RECLAIM_LIST.contains(&lo.object_id) {
+        if oids.contains(&lo.object_id) {
             listed.borrow_mut().push((name, lo.object_id));
         }
     });

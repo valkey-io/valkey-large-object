@@ -88,7 +88,8 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `scaling-shrink-watermark` | 90 | Yes | Percent used_memory/maxmemory to trigger DRAM segment eviction. Min 50, max 95. |
 | `max-rdma-registered-bytes` | 380gb | Yes | With a fabric up: cap on segment bytes registered with EFA (DRAM pool plus disk staging). An expand past it is refused like a `maxmemory` one. 0 = no limit. |
 | `reaper-poll-ms` | 35 | Yes | Scaling cron poll interval in milliseconds while evicted keys wait to be deleted. Min 10, max 60000. |
-| `reaper-scan-budget-us` | 2000 | Yes | Microseconds per tick for deleting evicted keys; one uninterruptible event-loop stall, and over `reaper-poll-ms` the share of a core reclaim gets. Min 100, max 100000. |
+| `reaper-scan-budget-us` | 2000 | Yes | Starting microseconds per tick for deleting evicted keys; one uninterruptible event-loop stall, and over `reaper-poll-ms` the share of a core reclaim gets. Min 100, max 100000. |
+| `reaper-scan-budget-max-us` | 10000 | Yes | Cap on the per-tick budget, which doubles on each tick the backlog of evicted keys grew and drops back once it empties. Bounds the longest event-loop stall. Min 100, max 100000. |
 | `victim-sample-size` | 5 | Yes | Entries sampled per victim search (eviction, DRAM cache drop, fd close); the lowest LFU score goes. Min 1, max 64. |
 | `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Min 1, max 255. |
 | `lfu-decay-minutes` | 1 | Yes | Minutes per one-point decay of the LFU score used to rank DRAM objects and fds for eviction. 0 = no decay. Max 65535. |
@@ -101,7 +102,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `fabric-provider` | `EfaDirect` | Immutable | libfabric provider for the DMA path: `Emulated` (libfabric over TCP, runs anywhere) or `EfaDirect` (EFA hardware RDMA). |
 | `fabric-interfaces` | (empty) | Immutable | Comma-separated fabric domains to serve on. Empty = every domain the provider discovers. |
 | `fabric-max-in-flight` | 0 | Immutable | Transfers each fabric service keeps in flight. 0 = provider default. Max 65536. |
-| `fabric-crc-pool-threads` | 1 | Immutable | Threads hashing checksummed transfers. Min 1, max 1024. |
+| `fabric-crc-pool-threads` | 2 | Immutable | Threads hashing checksummed transfers. Min 1, max 1024. |
 
 All size parameters accept memory notation (`64mb`, `1gb`, etc.).
 

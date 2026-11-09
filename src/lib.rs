@@ -305,6 +305,8 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, None],
             ["reaper-scan-budget-us", &*CFG_REAPER_SCAN_BUDGET_US, DEFAULT_REAPER_SCAN_BUDGET_US, MIN_REAPER_SCAN_BUDGET_US, MAX_REAPER_SCAN_BUDGET_US,
              ConfigurationFlags::DEFAULT, None, None],
+            ["reaper-scan-budget-max-us", &*CFG_REAPER_SCAN_BUDGET_MAX_US, DEFAULT_REAPER_SCAN_BUDGET_MAX_US, MIN_REAPER_SCAN_BUDGET_MAX_US, MAX_REAPER_SCAN_BUDGET_MAX_US,
+             ConfigurationFlags::DEFAULT, None, None],
             ["reaper-poll-ms", &*CFG_REAPER_POLL_MS, DEFAULT_REAPER_POLL_MS, MIN_REAPER_POLL_MS, MAX_REAPER_POLL_MS,
              ConfigurationFlags::DEFAULT, None, None],
             ["smartlog-poll-secs", &*CFG_SMARTLOG_POLL_SECS, DEFAULT_SMARTLOG_POLL_SECS, MIN_SMARTLOG_POLL_SECS, MAX_SMARTLOG_POLL_SECS,
