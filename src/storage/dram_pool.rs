@@ -318,7 +318,7 @@ impl DRAMPool {
     }
 
     /// See `SegmentPool::rebuild_dense_iovecs`. Called by this pool's io_uring
-    /// engine on a re-registration.
+    /// engine on a rebuild.
     pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
         self.pool.rebuild_dense_iovecs()
     }
@@ -604,10 +604,10 @@ impl DRAMPool {
             .publish(segment)
             .expect("add_segment: the pool is at MAX_SEGMENTS, which may_expand ruled out");
         self.expand_count.fetch_add(1, Ordering::Relaxed);
-        // Rebuild + re-register the DRAM ring's fixed-buffer table so the new
-        // segment joins the fixed path (no-op in Dram mode). The iovecs table rebuild runs
-        // on the DRAM poller only; the NVMe ring is untouched and keeps serving.
-        super::uring::submit_reregister(super::uring::PoolType::Dram);
+        // Rebuild the DRAM ring's fixed-buffer table so the new segment joins the
+        // fixed path (no-op in Dram mode). The rebuild runs on the DRAM poller only;
+        // the NVMe ring is untouched and keeps serving.
+        super::uring::submit_rebuild(super::uring::PoolType::Dram);
         self.expanding.store(false, Ordering::Release);
         self.pool.notify_space_available();
     }
