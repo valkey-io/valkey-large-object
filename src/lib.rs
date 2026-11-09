@@ -148,6 +148,17 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         ));
         return Status::Err;
     }
+    // The shard subdirectories are created here, at startup only: the shutdown reset
+    // leaves disk-dir empty, and the next startup recreates them.
+    if mode == OperatingMode::Tiered {
+        if let Err(e) = data_type::create_disk_dir_shards(&dir) {
+            ctx.log_warning(&format!(
+                "largeobj: startup failed to create disk-dir shards under {}: {}; aborting module load",
+                dir, e
+            ));
+            return Status::Err;
+        }
+    }
 
     // The module only registers host memory. libfabric's default initializes every HMEM
     // interface it finds, so on a GPU node it starts CUDA and holds GPU memory; GPU

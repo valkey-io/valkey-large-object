@@ -520,8 +520,7 @@ pub fn validate_and_clean_disk_dir(mode: crate::OperatingMode, dir: &str) -> std
             return Err(e);
         }
     }
-    std::fs::create_dir_all(dir)?;
-    crate::data_type::create_disk_dir_shards(dir)
+    std::fs::create_dir_all(dir)
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

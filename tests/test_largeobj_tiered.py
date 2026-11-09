@@ -1947,10 +1947,12 @@ class TestTieredDiskDirShards(ValkeyLargeObjTestCaseBase):
         assert client.config_get('largeobj.disk-dir-shards') == {
             'largeobj.disk-dir-shards': str(self.SHARDS)}
         assert sorted(os.listdir(self.data_dir)) == [f'{s:04x}' for s in range(self.SHARDS)]
-        for i in range(8):
+        # Two objects per shard, so consecutive OIDs reach every shard whatever SHARDS is.
+        count = 2 * self.SHARDS
+        for i in range(count):
             client.execute_command('BLOB.TCP_SET', f'shard_key_{i}', position_pattern(4096, 'S'))
         files = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
-        assert len(files) == 8
+        assert len(files) == count
         for path in files:
             shard, name = path.split(os.sep)[-2:]
             assert int(shard, 16) == int(name[:16], 16) % self.SHARDS
