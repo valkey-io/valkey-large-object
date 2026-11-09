@@ -524,13 +524,12 @@ pub fn validate_and_clean_disk_dir(mode: crate::OperatingMode, dir: &str) -> std
     // The object-file layout (fallocate extents, O_DIRECT, stripe alignment) is
     // built for XFS, so refuse any other filesystem.
     let path = std::ffi::CString::new(dir)?;
-    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `path` is NUL-terminated and `fs` is a valid out-pointer.
-    if unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+    // SAFETY: `path` is NUL-terminated; statfs is plain data, so all-zero is valid.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(path.as_ptr(), &mut fs) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: statfs returned 0, so it filled `fs`.
-    if unsafe { fs.assume_init() }.f_type != libc::XFS_SUPER_MAGIC {
+    if fs.f_type != libc::XFS_SUPER_MAGIC {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "disk-dir must be on an XFS filesystem",
