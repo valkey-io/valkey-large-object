@@ -57,30 +57,27 @@ const XFS_IOC_FSGEOMETRY_V1: u64 =
     (2 << 30) | ((size_of::<XfsGeometry>() as u64) << 16) | ((b'X' as u64) << 8) | 100;
 
 /// Set the allocation unit `footprint` rounds to: disk-dir's XFS stripe unit, or one
-/// `IO_ALIGN` block if it is not a striped XFS. Returns the unit.
+/// `IO_ALIGN` block if the XFS is not striped. disk-dir must be on XFS. Returns the unit.
 pub fn init_disk_alloc_unit(dir: &str) -> Result<u64, String> {
     use std::os::unix::io::AsRawFd;
     let dir_fd =
         std::fs::File::open(dir).map_err(|e| format!("cannot open disk-dir {dir}: {e}"))?;
     let mut geometry: XfsGeometry = unsafe { std::mem::zeroed() };
     // SAFETY: `geometry` is the struct this ioctl writes, and outlives the call.
-    let ret = unsafe {
+    if unsafe {
         libc::ioctl(
             dir_fd.as_raw_fd(),
             XFS_IOC_FSGEOMETRY_V1 as _,
             &mut geometry,
         )
-    };
-    let stripe = if ret == 0 {
-        geometry.sunit as u64 * geometry.blocksize as u64
-    } else {
-        // Not XFS: the ioctl is unknown there.
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::ENOTTY) {
-            return Err(format!("cannot read disk-dir {dir} XFS geometry: {e}"));
-        }
-        0
-    };
+    } != 0
+    {
+        return Err(format!(
+            "disk-dir {dir} must be on XFS; cannot read its geometry: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stripe = geometry.sunit as u64 * geometry.blocksize as u64;
     let unit = stripe.max(super::IO_ALIGN as u64);
     DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
     Ok(unit)

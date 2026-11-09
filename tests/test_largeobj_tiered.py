@@ -935,14 +935,6 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
         self._set_rejected(client, "padkey", unaligned_payload)
         assert client.execute_command("DBSIZE") == 0
 
-    def test_disk_alloc_unit_off_xfs(self):
-        """Off XFS, the XFS geometry ioctl is unknown, so files are charged in
-        IO_ALIGN blocks, which startup logs."""
-        fstype = subprocess.run(["stat", "-f", "-c", "%T", self.data_dir],
-                                capture_output=True, text=True, check=True).stdout.strip()
-        if fstype == "xfs":
-            pytest.skip("disk-dir is on XFS; its unit depends on the stripe")
-        assert self.server.verify_string_in_logfile(f"disk_alloc_unit={self.IO_ALIGN}B")
 
 
 # ─── Corruption Detection ─────────────────────────────────────────────────
@@ -2034,3 +2026,40 @@ class TestTieredChunkSizeAlignment(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: server.server.poll() is not None)
         assert server.server.returncode != 0
         assert server.verify_string_in_logfile('chunk-size must be a multiple of 4096')
+
+
+# ─── disk-dir Filesystem ─────────────────────────────────────────────────────
+
+class TestTieredRequiresXfs(ValkeyLargeObjTestCaseBase):
+    """Tiered mode charges disk usage in disk-dir's XFS stripe unit, so it refuses to
+    load when disk-dir is not on XFS. The class's own server runs in Dram mode, which
+    never touches disk, so it starts on any filesystem."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            "operating-mode Dram"
+            " segment-size 2097152"
+            " max-object-size 1044480"
+            " bench-mode no"
+            " direct-io no"
+            " chunk-size 4096"
+            " fabric-provider Emulated"
+        )
+
+    def test_load_refused_off_xfs(self):
+        testdir = os.path.abspath(os.path.join(self.testdir, "tiered-off-xfs"))
+        data_dir = os.path.join(testdir, "nvme")
+        os.makedirs(data_dir, exist_ok=True)
+        fstype = subprocess.run(["stat", "-f", "-c", "%T", data_dir],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        if fstype == "xfs":
+            pytest.skip("disk-dir is on XFS")
+        server, _ = self.create_server(
+            testdir=testdir,
+            server_path=self.server.valkey_path,
+            args={"loadmodule": f"{os.environ['MODULE_PATH']} operating-mode Tiered"
+                                f" disk-dir {data_dir} direct-io no fabric-provider Emulated"},
+            connect_client=False)
+        wait_for_true(lambda: server.server.poll() is not None)
+        assert server.server.returncode != 0
+        assert server.verify_string_in_logfile("must be on XFS")
