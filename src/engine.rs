@@ -90,6 +90,9 @@ struct SetObjectInfo {
     /// When Some, the server compares the post-transfer CRC against this value
     /// and rejects the SET on mismatch.
     client_crc: Option<u32>,
+    /// `crate::tiered_eviction_allowed` at dispatch, read on the main thread so the
+    /// task need not take the server lock for it.
+    may_evict: bool,
 }
 
 // ─── Blocked Request ─────────────────────────────────────────────────────────
@@ -324,8 +327,12 @@ fn cmd_get_tiered(
     transport: Transport,
     thread_ctx: BlockedRequest,
 ) {
-    // We do not allow the eviction of files that are inflight.
-    let unevictable = storage::UnevictableOID::new(object_id);
+    // We do not allow the eviction of files that are inflight. None: an eviction
+    // claimed the file after the command resolved the key, so the key reads as missing.
+    let Some(unevictable) = storage::UnevictableOID::new_unless_claimed(object_id) else {
+        thread_ctx.reply(Ok(ValkeyValue::Null));
+        return;
+    };
     storage::eviction_candidates::touch(object_id);
     let dram_pool = storage::get_dram_pool();
     let cache = dram_pool.tiered_cache();
@@ -624,6 +631,7 @@ pub fn execute_set(
                 thread_ctx,
                 object_id,
                 old_oid,
+                crate::tiered_eviction_allowed(ctx),
             );
         }
     }
@@ -782,6 +790,7 @@ fn cmd_set_tiered(
     thread_ctx: BlockedRequest,
     object_id: ObjectId,
     old_oid: Option<ObjectId>,
+    may_evict: bool,
 ) {
     let max_buffers = crate::max_buffers_per_op();
     let min_buffers = crate::min_buffers_per_op();
@@ -816,6 +825,7 @@ fn cmd_set_tiered(
                     obj_len,
                     key_name,
                     client_crc: None,
+                    may_evict,
                 };
                 cmd_set_tiered_run(
                     set_info,
@@ -840,6 +850,7 @@ fn cmd_set_tiered(
                     obj_len,
                     key_name,
                     client_crc,
+                    may_evict,
                 };
                 cmd_set_tiered_run(
                     set_info,
@@ -881,13 +892,14 @@ async fn cmd_set_tiered_run(
         obj_len,
         key_name,
         client_crc,
+        may_evict,
     } = set_info;
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
     let mut chunk_iter = chunk_iter;
     let disk_len = storage::object_disk_len(&mut chunk_iter);
-    if !nvme::try_reserve_nvme_disk_usage(disk_len) {
+    if !nvme::try_reserve_nvme_disk_usage(disk_len, may_evict) {
         reply_err(
             &thread_ctx,
             &info::DISK_CAPACITY_EXCEEDED,

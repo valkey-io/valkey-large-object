@@ -48,8 +48,9 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
 /// does not fit within disk-maxmemory. Returns true and increments the counter on
 /// success; returns false and leaves the counter unchanged otherwise.
 /// Returns true if disk-maxmemory is 0 (unlimited).
-pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
-    reserve(bytes as i64) || evict_and_reserve(bytes)
+/// `may_evict` is `crate::tiered_eviction_allowed`, read by the caller on the main thread.
+pub fn try_reserve_nvme_disk_usage(bytes: u64, may_evict: bool) -> bool {
+    reserve(bytes as i64) || (may_evict && evict_and_reserve(bytes))
 }
 
 /// Atomically add `delta` to the usage if the result fits within disk-maxmemory;
@@ -81,25 +82,13 @@ pub fn nvme_disk_usage() -> u64 {
 /// Candidates picked per eviction.
 const EVICT_BATCH: usize = 64;
 
-/// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
-/// tokio task) take it. Never call off main while holding it: it would deadlock.
-fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
-    if crate::is_main_thread() {
-        f(&valkey_module::Context::dummy())
-    } else {
-        f(&valkey_module::ThreadSafeContext::new().lock())
-    }
-}
-
 /// Evict objects to make room for `bytes`, then reserve them. True if reserved.
 /// A refused write keeps its victims evicted: a claim is never undone.
+/// Takes no server lock: claims serialize with readers' pins on `UNEVICTABLE`.
 fn evict_and_reserve(bytes: u64) -> bool {
     let max = crate::nvme_maxmemory();
     // Eviction cannot make room for more than the cap.
     if bytes > max {
-        return false;
-    }
-    if !with_server_lock(crate::tiered_eviction_allowed) {
         return false;
     }
     // Take the headroom first, so no other write can use it while we evict.
@@ -115,8 +104,8 @@ fn evict_and_reserve(bytes: u64) -> bool {
         if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
             break;
         }
-        // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
-        let Some(unevictable) = with_server_lock(|_| super::object_file::claim_victim(oid)) else {
+        // UNEVICTABLE -> RECLAIM_LIST.
+        let Some(unevictable) = super::object_file::claim_victim(oid) else {
             continue;
         };
         match stat(oid) {
