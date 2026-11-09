@@ -58,6 +58,23 @@ impl UnevictableOID {
         }
     }
 
+    /// `new`, unless an eviction has claimed `oid`. A claim checks this list and adds
+    /// `oid` to the reclaim list in one `UNEVICTABLE` critical section, so the pin
+    /// either lands first (the claim fails) or sees the claim. A reader that resolved
+    /// the key must pin with this: eviction does not take the server lock.
+    #[must_use]
+    pub fn new_unless_claimed(oid: ObjectId) -> Option<Arc<Self>> {
+        let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
+        // First: a claim holds its own Arc, which must not be shared with a reader.
+        if super::reclaim::RECLAIM_LIST.contains(&oid) {
+            return None;
+        }
+        Some(match unevictable.get(&oid).and_then(Weak::upgrade) {
+            Some(shared) => shared,
+            None => Self::insert(&mut unevictable, oid),
+        })
+    }
+
     pub fn oid(&self) -> ObjectId {
         self.0
     }
@@ -95,9 +112,9 @@ pub fn unevictable_count() -> usize {
 
 /// Claim `oid` for eviction: add it to the reclaim list and the unevictable list,
 /// unless it is in either already, and take it off the eviction candidates. One
-/// `UNEVICTABLE` critical section, so a teardown either adds `oid` to the unevictable
-/// list first (the claim fails) or finds it in the reclaim list. Call under the server
-/// lock.
+/// `UNEVICTABLE` critical section, so a teardown or a reader's pin
+/// (`UnevictableOID::new_unless_claimed`) either adds `oid` to the unevictable list
+/// first (the claim fails) or finds it in the reclaim list. Needs no server lock.
 #[must_use]
 pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
     let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
@@ -165,8 +182,11 @@ impl ObjectFile {
         let dir = crate::disk_dir();
         let disk_len = self.disk_len;
         // We do not allow the eviction of the source or the new file mid-copy.
-        let _source = UnevictableOID::new(self.object_id);
-        if !super::nvme::try_reserve_nvme_disk_usage(disk_len) {
+        // None: an eviction claimed the source after COPY resolved its key.
+        let _source = UnevictableOID::new_unless_claimed(self.object_id)?;
+        // COPY runs on the main thread, which holds the server lock.
+        let may_evict = crate::tiered_eviction_allowed(&valkey_module::Context::dummy());
+        if !super::nvme::try_reserve_nvme_disk_usage(disk_len, may_evict) {
             return None;
         }
         let new_oid = ObjectId::next();
@@ -263,6 +283,26 @@ mod tests {
         eviction_candidates::insert(oid);
         let claim = claim_victim(oid).expect("not claimed yet");
         assert!(eviction_candidates::pick(usize::MAX, |o| o == oid).is_empty());
+        drop(claim);
+        RECLAIM_LIST.remove(&oid);
+    }
+
+    #[test]
+    fn a_claimed_victim_cannot_be_pinned_by_a_reader() {
+        let oid = ObjectId(9_501);
+        let claim = claim_victim(oid).expect("not claimed yet");
+        assert!(UnevictableOID::new_unless_claimed(oid).is_none());
+        drop(claim);
+        RECLAIM_LIST.remove(&oid);
+    }
+
+    #[test]
+    fn a_pinned_object_cannot_be_claimed() {
+        let oid = ObjectId(9_502);
+        let pin = UnevictableOID::new_unless_claimed(oid).expect("not claimed");
+        assert!(claim_victim(oid).is_none());
+        drop(pin);
+        let claim = claim_victim(oid).expect("pin released");
         drop(claim);
         RECLAIM_LIST.remove(&oid);
     }
