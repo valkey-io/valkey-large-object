@@ -120,12 +120,12 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
             scan.backlog = 0;
             return;
         }
-        let base = crate::reaper_scan_budget_us();
-        let max = crate::reaper_scan_budget_max_us().max(base);
-        if backlog > scan.backlog {
-            scan.budget_us *= 2;
-        }
-        scan.budget_us = scan.budget_us.clamp(base, max);
+        scan.budget_us = next_budget_us(
+            scan.budget_us,
+            backlog > scan.backlog,
+            crate::reaper_scan_budget_us(),
+            crate::reaper_scan_budget_max_us(),
+        );
         scan.backlog = backlog;
         let deadline = Instant::now() + Duration::from_micros(scan.budget_us);
         while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
@@ -159,6 +159,13 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
     });
 }
 
+/// This tick's budget: double the last one if the backlog grew, kept within
+/// `[base, max]`. A `max` below `base` means `base`.
+fn next_budget_us(budget_us: u64, grew: bool, base: u64, max: u64) -> u64 {
+    let budget = if grew { budget_us * 2 } else { budget_us };
+    budget.clamp(base, max.max(base))
+}
+
 /// Scan the next hashtable bucket of the selected db. Returns the bucket's keys
 /// whose oids are on the reclaim list, and whether the db has more buckets.
 ///
@@ -185,4 +192,37 @@ fn listed_keys_in_next_bucket(
         }
     });
     (listed.into_inner(), more)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_budget_us;
+
+    #[test]
+    fn budget_starts_at_base_and_doubles_while_the_backlog_grows() {
+        let mut budget = 0;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            budget = next_budget_us(budget, true, 100, 1000);
+            seen.push(budget);
+        }
+        assert_eq!(seen, [100, 200, 400, 800, 1000]);
+    }
+
+    #[test]
+    fn budget_holds_when_the_backlog_does_not_grow() {
+        assert_eq!(next_budget_us(800, false, 100, 1000), 800);
+        assert_eq!(next_budget_us(0, false, 100, 1000), 100);
+    }
+
+    #[test]
+    fn budget_follows_base_and_max_changed_at_runtime() {
+        assert_eq!(next_budget_us(800, false, 100, 300), 300);
+        assert_eq!(next_budget_us(200, false, 500, 1000), 500);
+        assert_eq!(
+            next_budget_us(200, true, 500, 100),
+            500,
+            "a max below base means base"
+        );
+    }
 }

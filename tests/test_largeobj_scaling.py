@@ -1240,40 +1240,24 @@ class TestTieredEvictionPolicy(EvictionPolicyTests, TieredBudget):
 
 
 class TestTieredReaperPace(TieredBudget):
-    """No server maxmemory, and enough other keys that one scan pass takes many 100us ticks: how
-    fast victims' keys go depends only on how often the cron ticks and on each tick's budget."""
+    """No server maxmemory, and enough other keys that one 1ms tick cannot finish a scan pass."""
 
     POLL_MS = 1000
-    FILLER = 300_000
+    FILLER = 100_000
 
     def get_module_args(self, data_dir, direct_io):
-        return super().get_module_args(data_dir, direct_io) + " reaper-scan-budget-us 100 reaper-scan-budget-max-us 100"
-
-    def populate(self, client):
-        client.execute_command('DEBUG', 'POPULATE', self.FILLER, 'filler', 8)
+        return (super().get_module_args(data_dir, direct_io)
+                + " reaper-poll-ms 10 reaper-scan-budget-us 1000 reaper-scan-budget-max-us 1000")
 
     def test_ghosts_drain_on_the_reaper_tick_without_a_server_maxmemory(self):
-        """With ghosts left, the cron re-arms at `reaper-poll-ms` (10ms), not `scaling-poll-ms`
-        (1s): the pass takes seconds. At one tick a second it would take minutes."""
+        """With ghosts left, the cron re-arms at `reaper-poll-ms` (10ms) on the no-maxmemory exit
+        too. `scaling-poll-ms` goes to 60s once the ghosts exist, so a re-arm there would leave
+        them past the timeout however fast the scan is."""
         client = self.new_client()
-        client.config_set('largeobj.reaper-poll-ms', 10)
-        self.populate(client)
+        client.execute_command('DEBUG', 'POPULATE', self.FILLER, 'filler', 8)
         payloads = set_objects(client, 'obj_', 2 * self.PER_BUDGET, self.OBJ)
         assert self.evictions(client) == self.PER_BUDGET
+        client.config_set('largeobj.scaling-poll-ms', 60_000)
         wait_for_true(lambda: pending_evictions(client) == 0, timeout=30)
         assert client.dbsize() == self.FILLER + self.PER_BUDGET
         assert len(surviving(client, payloads)) == self.PER_BUDGET
-
-    def test_a_growing_backlog_raises_the_budget(self):
-        """One tick a second, budget 100us: a backlog that grows tick after tick doubles the
-        budget up to `reaper-scan-budget-max-us`, so the pass ends in a few ticks. At 100us it
-        would take minutes."""
-        client = self.new_client()
-        client.config_set('largeobj.reaper-scan-budget-max-us', 100_000)
-        self.populate(client)
-        set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        for i in range(12):
-            assert client.execute_command('BLOB.TCP_SET', f'late_{i}', position_pattern(self.OBJ, 'L')) == b'OK'
-            time.sleep(1.2)  # one write per cron tick: the backlog grows across ticks
-        wait_for_true(lambda: pending_evictions(client) == 0, timeout=30)
-        assert client.dbsize() == self.FILLER + self.PER_BUDGET
