@@ -1246,14 +1246,16 @@ class TestTieredReaperPace(TieredBudget):
     FILLER = 100_000
 
     def get_module_args(self, data_dir, direct_io):
-        return (super().get_module_args(data_dir, direct_io)
-                + " reaper-poll-ms 10 reaper-scan-budget-us 1000 reaper-scan-budget-max-us 1000")
+        # Only configs the base args do not set: Valkey builds differ on which copy of a
+        # repeated module arg wins.
+        return super().get_module_args(data_dir, direct_io) + " reaper-scan-budget-us 1000 reaper-scan-budget-max-us 1000"
 
     def test_ghosts_drain_on_the_reaper_tick_without_a_server_maxmemory(self):
         """With ghosts left, the cron re-arms at `reaper-poll-ms` (10ms) on the no-maxmemory exit
         too. `scaling-poll-ms` goes to 60s once the ghosts exist, so a re-arm there would leave
         them past the timeout however fast the scan is."""
         client = self.new_client()
+        client.config_set('largeobj.reaper-poll-ms', 10)
         client.execute_command('DEBUG', 'POPULATE', self.FILLER, 'filler', 8)
         payloads = set_objects(client, 'obj_', 2 * self.PER_BUDGET, self.OBJ)
         assert self.evictions(client) == self.PER_BUDGET
