@@ -22,82 +22,62 @@ use crate::data_type::ObjectId;
 // ─── NVMe Disk Usage Tracking ────────────────────────────────────────────────
 
 /// Tracks total NVMe disk usage in bytes. Incremented on file creation, decremented on deletion.
-/// Counts each file's footprint (see `footprint`), not its length.
+/// Callers charge each file its `allocated_disk_bytes`, not its length.
 static NVME_DISK_USAGE: AtomicU64 = AtomicU64::new(0);
 
 /// The unit disk-dir's filesystem allocates each file in, set once at startup by
 /// `init_disk_alloc_unit`. One `IO_ALIGN` block until then, and in Dram mode.
 static DISK_ALLOC_UNIT: AtomicU64 = AtomicU64::new(super::IO_ALIGN as u64);
 
-/// Space a file of `len` bytes takes on disk: `len` rounded up to the allocation unit.
-/// On a striped XFS every file starts on a stripe-unit boundary, so the rest of its
-/// last stripe unit can't hold another file. Charging only `len` lets the filesystem
-/// fill up before disk-maxmemory is reached.
-pub fn footprint(len: u64) -> u64 {
+/// Bytes the filesystem allocates for a file of `len` bytes: `len` rounded up to the
+/// allocation unit. On a striped XFS every file starts on a stripe-unit boundary, so
+/// the rest of its last stripe unit can't hold another file. Charging only `len` lets
+/// the filesystem fill up before disk-maxmemory is reached.
+pub fn allocated_disk_bytes(len: u64) -> u64 {
     len.next_multiple_of(DISK_ALLOC_UNIT.load(Ordering::Relaxed))
 }
 
-/// Output of `XFS_IOC_FSGEOMETRY_V1` (`struct xfs_fsop_geom_v1` in the kernel's
-/// `xfs_fs.h`), naming only the fields we read. Crosses into the kernel, so `repr(C)`.
-#[repr(C)]
-struct XfsGeometry {
-    /// Filesystem block size, bytes.
-    blocksize: u32,
-    _counts: [u32; 7],
-    _blocks: [u64; 4],
-    _uuid: [u8; 16],
-    /// Stripe unit, filesystem blocks; 0 if not striped.
-    sunit: u32,
-    _rest: [u32; 6],
-}
-const _: () = assert!(size_of::<XfsGeometry>() == 112);
+/// `_IOR('X', 100, struct xfs_fsop_geom_v1)`: fills the 112-byte geometry struct
+/// from the kernel's `xfs_fs.h`.
+const XFS_IOC_FSGEOMETRY_V1: u32 = 0x8070_5864;
 
-/// `_IOR('X', 100, struct xfs_fsop_geom_v1)`.
-const XFS_IOC_FSGEOMETRY_V1: u64 =
-    (2 << 30) | ((size_of::<XfsGeometry>() as u64) << 16) | ((b'X' as u64) << 8) | 100;
-
-/// Set the allocation unit `footprint` rounds to: disk-dir's XFS stripe unit, or one
+/// Set the unit `allocated_disk_bytes` rounds to: disk-dir's XFS stripe unit, or one
 /// `IO_ALIGN` block if the XFS is not striped. disk-dir must be on XFS. Returns the unit.
 pub fn init_disk_alloc_unit(dir: &str) -> Result<u64, String> {
     use std::os::unix::io::AsRawFd;
     let dir_fd =
         std::fs::File::open(dir).map_err(|e| format!("cannot open disk-dir {dir}: {e}"))?;
-    let mut geometry: XfsGeometry = unsafe { std::mem::zeroed() };
-    // SAFETY: `geometry` is the struct this ioctl writes, and outlives the call.
-    if unsafe {
+    // The geometry as u32 words: [0] block size in bytes, [20] stripe unit in blocks.
+    let mut geometry = [0u32; 28];
+    // SAFETY: `geometry` is the 112 bytes this ioctl writes.
+    let ret = unsafe {
         libc::ioctl(
             dir_fd.as_raw_fd(),
             XFS_IOC_FSGEOMETRY_V1 as _,
-            &mut geometry,
+            geometry.as_mut_ptr(),
         )
-    } != 0
-    {
+    };
+    if ret != 0 {
         return Err(format!(
             "disk-dir {dir} must be on XFS; cannot read its geometry: {}",
             std::io::Error::last_os_error()
         ));
     }
-    let stripe = geometry.sunit as u64 * geometry.blocksize as u64;
-    let unit = stripe.max(super::IO_ALIGN as u64);
+    let unit = (geometry[20] as u64 * geometry[0] as u64).max(super::IO_ALIGN as u64);
     DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
     Ok(unit)
 }
 
-/// Increment NVMe disk usage after a file of `len` bytes is created.
-pub fn increase_nvme_disk_usage(len: u64) {
-    NVME_DISK_USAGE.fetch_add(footprint(len), Ordering::Relaxed);
+/// Increment NVMe disk usage after a file is created.
+pub fn increase_nvme_disk_usage(bytes: u64) {
+    NVME_DISK_USAGE.fetch_add(bytes, Ordering::Relaxed);
 }
 
-/// Decrement NVMe disk usage after a file of `len` bytes is deleted.
-pub fn decrease_nvme_disk_usage(len: u64) {
-    release(footprint(len));
-}
-
-/// Subtract `bytes` from the usage.
+/// Decrement NVMe disk usage after a file is deleted.
 ///
 /// FATAL on underflow: freeing more than is tracked means corrupt accounting, which
 /// must be accurate for capacity checks, so assert on the issue.
-fn release(bytes: u64) {
+pub fn decrease_nvme_disk_usage(bytes: u64) {
     if let Err(tracked) = NVME_DISK_USAGE.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
         cur.checked_sub(bytes)
     }) {
@@ -108,12 +88,11 @@ fn release(bytes: u64) {
     }
 }
 
-/// Reserve the footprint of a file of `len` bytes against disk-maxmemory, evicting
-/// other objects to make room if it does not fit. Returns true and increments the
-/// counter on success; returns false and leaves the counter unchanged otherwise.
+/// Reserve `bytes` of NVMe disk budget, evicting other objects to make room if it
+/// does not fit within disk-maxmemory. Returns true and increments the counter on
+/// success; returns false and leaves the counter unchanged otherwise.
 /// Returns true if disk-maxmemory is 0 (unlimited).
-pub fn try_reserve_nvme_disk_usage(len: u64) -> bool {
-    let bytes = footprint(len);
+pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
     reserve(bytes as i64) || evict_and_reserve(bytes)
 }
 
@@ -156,8 +135,7 @@ fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
     }
 }
 
-/// Evict objects to make room for `bytes` (a footprint), then reserve them. True if
-/// reserved.
+/// Evict objects to make room for `bytes`, then reserve them. True if reserved.
 /// A refused write keeps its victims evicted: a claim is never undone.
 fn evict_and_reserve(bytes: u64) -> bool {
     let max = crate::nvme_maxmemory();
@@ -187,9 +165,9 @@ fn evict_and_reserve(bytes: u64) -> bool {
         };
         match stat(oid) {
             Some(len) => {
-                let size = footprint(len);
-                covered += size;
-                victims.push((unevictable, size));
+                let bytes = allocated_disk_bytes(len);
+                covered += bytes;
+                victims.push((unevictable, bytes));
             }
             // Torn down between the pick and the claim, so its key is gone.
             None => {
@@ -203,13 +181,13 @@ fn evict_and_reserve(bytes: u64) -> bool {
     let reserved = reserve(bytes as i64 - taken as i64 - freed as i64);
     if !reserved {
         // Release the headroom; the victims stay evicted.
-        release(taken + freed);
+        decrease_nvme_disk_usage(taken + freed);
     }
     reserved
 }
 
-/// Unlink claimed `victims` and remove them from the unevictable list. Returns the
-/// footprint freed. Victims stay in the reclaim list: their keys read as missing until the cron
+/// Unlink claimed `victims` and remove them from the unevictable list. Returns the bytes
+/// freed. Victims stay in the reclaim list: their keys read as missing until the cron
 /// deletes them, and their teardown then only removes them from it.
 fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
     let mut freed = 0;
@@ -648,26 +626,20 @@ mod tests {
         let _g = lock();
         // Subtracting u64::MAX underflows from any real baseline, triggering the
         // fatal assert regardless of what the counter currently holds.
-        release(u64::MAX);
+        decrease_nvme_disk_usage(u64::MAX);
     }
 
-    // ─── footprint ───────────────────────────────────────────────────────
+    // ─── allocated_disk_bytes ────────────────────────────────────────────
 
-    // On a 1 MiB stripe unit, a file is charged whole stripe units: a 1 MiB + 4 KiB
-    // file takes 2 MiB. Reserve and release use the same rounding, so a create and
-    // delete of one file return the counter to its baseline.
+    // On a 1 MiB stripe unit, a file takes whole stripe units: a 1 MiB + 4 KiB file
+    // takes 2 MiB.
     #[test]
-    fn test_footprint_rounds_to_stripe_unit() {
+    fn test_allocated_disk_bytes_rounds_to_stripe_unit() {
         let _g = lock();
-        let base = nvme_disk_usage();
         let unit = DISK_ALLOC_UNIT.swap(1 << 20, Ordering::Relaxed);
-        assert_eq!(footprint(1 << 20), 1 << 20);
-        assert_eq!(footprint((1 << 20) + 4096), 2 << 20);
-        assert_eq!(footprint(4096), 1 << 20);
-        increase_nvme_disk_usage((1 << 20) + 4096);
-        assert_eq!(nvme_disk_usage(), base + (2 << 20));
-        decrease_nvme_disk_usage((1 << 20) + 4096);
-        assert_eq!(nvme_disk_usage(), base);
+        assert_eq!(allocated_disk_bytes(1 << 20), 1 << 20);
+        assert_eq!(allocated_disk_bytes((1 << 20) + 4096), 2 << 20);
+        assert_eq!(allocated_disk_bytes(4096), 1 << 20);
         DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
     }
 

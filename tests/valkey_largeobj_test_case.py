@@ -182,6 +182,11 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         )
         self.data_dir = data_dir
         logging.info("startup args are: %s", args)
+        # Exact-capacity assertions assume each file is charged its own 4 KiB-aligned
+        # length: disk-dir on an unstriped XFS, like CI's test-data mount.
+        if "operating-mode Tiered" in module_args:
+            assert self.server.verify_string_in_logfile("disk_alloc_unit=4096B"), \
+                "Tiered tests need disk-dir on an unstriped XFS (allocation unit 4096 B)"
 
     def _object_files(self):
         """Every file currently in disk-dir and its shard subdirectories (name-agnostic)."""
