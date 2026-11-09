@@ -1,31 +1,11 @@
 import array
 import os
-import errno
-import functools
 import glob
 import sys
-import tempfile
 import pytest
 from valkeytestframework.valkey_test_case import ValkeyTestCase
 from valkey import ResponseError
 import logging
-
-
-@functools.lru_cache(maxsize=None)
-def direct_io_supported(directory):
-    """Whether files in `directory` can be opened with O_DIRECT. Filesystems that reject
-    it (tmpfs before Linux 6.6) fail the open with EINVAL."""
-    fd, path = tempfile.mkstemp(dir=directory)
-    os.close(fd)
-    try:
-        os.close(os.open(path, os.O_RDONLY | os.O_DIRECT))
-        return True
-    except OSError as e:
-        if e.errno != errno.EINVAL:
-            raise
-        return False
-    finally:
-        os.unlink(path)
 
 
 _TAG_STRIDE = 0x9E3779B1  # odd, so distinct tags give distinct offsets mod 2**32
@@ -79,10 +59,10 @@ ORDER_SEGMENT_SIZE = 64 * MIB
 def chunk_order_module_args(data_dir, direct_io, max_promote_size):
     """Tiered module args for chunk-order tests; `max_promote_size` 0 disables promotion.
 
-    Skips without O_DIRECT: page-cache reads complete in submit order, so the test could
-    not catch a reply assembled in completion order."""
+    Skips without O_DIRECT (ASAN builds): page-cache reads complete in submit order, so
+    the test could not catch a reply assembled in completion order."""
     if direct_io != "yes":
-        pytest.skip("needs O_DIRECT on the test filesystem")
+        pytest.skip("needs O_DIRECT, which ASAN builds turn off")
     return (
         f"operating-mode Tiered"
         f" disk-dir {data_dir}"
@@ -133,7 +113,6 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     def get_module_args(self, data_dir, direct_io):
         """Override in subclasses to customize module load args.
         Default: Tiered mode with 1MB pools (small, suitable for basic tests).
-        Note: direct-io forced to 'no' because test dirs may be on tmpfs.
         """
         return (
             f"operating-mode Tiered"
@@ -162,12 +141,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         data_dir = os.path.abspath(os.path.join(self.testdir, "nvme"))
         # Disable O_DIRECT in ASAN builds — ASAN tests focus on memory safety,
         # not I/O bypass correctness. Avoids EINVAL from O_DIRECT alignment edge cases.
-        # Also off where the test filesystem rejects it (tmpfs).
-        direct_io = (
-            "yes"
-            if not os.environ.get("ASAN_BUILD") and direct_io_supported(self.testdir)
-            else "no"
-        )
+        direct_io = "no" if os.environ.get("ASAN_BUILD") else "yes"
         module_args = self.get_module_args(data_dir, direct_io)
         args = {
             'enable-debug-command': 'yes',

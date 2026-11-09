@@ -502,7 +502,7 @@ pub async fn write_file_header(
 /// Called both to reclaim a previous run's leftovers at startup and to clear
 /// this instance's files at shutdown. Returns `Ok(())` once disk-dir exists and
 /// is empty (or immediately, in Dram mode); `Err` if disk-dir is unset in Tiered
-/// mode, or the directory could not be removed or recreated.
+/// mode, the directory could not be removed or recreated, or it is not on XFS.
 pub fn validate_and_clean_disk_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
     if mode != crate::OperatingMode::Tiered {
         return Ok(());
@@ -520,7 +520,23 @@ pub fn validate_and_clean_disk_dir(mode: crate::OperatingMode, dir: &str) -> std
             return Err(e);
         }
     }
-    std::fs::create_dir_all(dir)
+    std::fs::create_dir_all(dir)?;
+    // The object-file layout (fallocate extents, O_DIRECT, stripe alignment) is
+    // built for XFS, so refuse any other filesystem.
+    let path = std::ffi::CString::new(dir)?;
+    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `fs` is a valid out-pointer.
+    if unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: statfs returned 0, so it filled `fs`.
+    if unsafe { fs.assume_init() }.f_type != libc::XFS_SUPER_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "disk-dir must be on an XFS filesystem",
+        ));
+    }
+    Ok(())
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
@@ -633,6 +649,25 @@ mod tests {
         assert!(
             meta.blocks() * 512 >= disk_len,
             "blocks are reserved at open"
+        );
+    }
+
+    // Tests run on XFS (TMPDIR on the tests/mount-xfs.sh mount); tmpfs is refused.
+    #[test]
+    fn test_disk_dir_must_be_on_xfs() {
+        let name = format!("lo-xfs-check-{}", std::process::id());
+        let xfs = std::env::temp_dir().join(&name);
+        let tmpfs = std::path::Path::new("/dev/shm").join(&name);
+        let on_xfs =
+            validate_and_clean_disk_dir(crate::OperatingMode::Tiered, xfs.to_str().unwrap());
+        let on_tmpfs =
+            validate_and_clean_disk_dir(crate::OperatingMode::Tiered, tmpfs.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&xfs);
+        let _ = std::fs::remove_dir_all(&tmpfs);
+        on_xfs.expect("TMPDIR must be on XFS: run tests/mount-xfs.sh");
+        assert_eq!(
+            on_tmpfs.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
         );
     }
 }

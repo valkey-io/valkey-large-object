@@ -74,7 +74,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | Parameter | Default | Mutable | Description |
 |-----------|---------|---------|-------------|
 | `operating-mode` | `Dram` | Immutable | `Dram` (DRAM-only) or `Tiered` (DRAM cache + NVMe). |
-| `disk-dir` | (empty) | Immutable | Directory for NVMe object files. Required in Tiered mode. Must support O_DIRECT. |
+| `disk-dir` | (empty) | Immutable | Directory for NVMe object files. Required in Tiered mode. Must be on XFS; the module refuses to load otherwise. |
 | `disk-dir-shards` | 1024 | Immutable | Tiered: subdirectories of `disk-dir` that object files are spread over, by OID, so creates and unlinks do not all serialize on one directory lock. Min 1, max 65536. |
 | `segment-size` | 1gb | Immutable | Size of each DRAMPool segment. Min 1mb, max 1gb. |
 | `disk-maxmemory` | 0 (unlimited) | Yes | Max NVMe disk usage. 0 = unlimited. |

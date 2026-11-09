@@ -34,7 +34,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev build-essential pkg-config
+          sudo apt-get install -y clang libclang-dev build-essential pkg-config xfsprogs
 
       - name: Install libfabric (EFA installer)
         env:
@@ -66,6 +66,12 @@ jobs:
 
       - name: Release build
         run: cargo build --release
+
+      # The module only runs on XFS, so unit and integration tests both run on it.
+      - name: Mount XFS test filesystem
+        run: |
+          sh tests/mount-xfs.sh
+          echo "TMPDIR=$PWD/test-data/tmp" >> $GITHUB_ENV
 
       - name: Run unit tests
         run: cargo test --features enable-system-alloc

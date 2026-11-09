@@ -1,6 +1,8 @@
 import os
+import shutil
+import pytest
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, position_pattern
-from valkeytestframework.util.waiters import wait_for_equal
+from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 
 
 class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
@@ -91,3 +93,22 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         assert client.execute_command("BLOB.TCP_SET", "after", position_pattern(4096, "Q")) == b"OK"
         assert len(self._object_files()) == 1
+
+    # A refused load makes Valkey drop its reference to the config data the valkey-module
+    # crate boxed for each config, and nothing frees it, so LeakSanitizer reports it at exit.
+    @pytest.mark.skip_for_asan
+    def test_disk_dir_not_on_xfs_refuses_to_load(self):
+        """The module refuses to load when disk-dir is not on XFS (here tmpfs)."""
+        testdir = os.path.abspath(os.path.join(self.testdir, 'not-xfs'))
+        os.makedirs(testdir, exist_ok=True)
+        tmpfs_dir = f"/dev/shm/lo-not-xfs-{os.getpid()}"
+        module_args = self.get_module_args(tmpfs_dir, 'no')
+        server, _ = self.create_server(
+            testdir=testdir,
+            server_path=self.server.valkey_path,
+            args={'loadmodule': f"{os.environ['MODULE_PATH']} {module_args}"},
+            connect_client=False)
+        wait_for_true(lambda: server.server.poll() is not None)
+        shutil.rmtree(tmpfs_dir, ignore_errors=True)
+        assert server.server.returncode != 0
+        assert server.verify_string_in_logfile('disk-dir must be on an XFS filesystem')
