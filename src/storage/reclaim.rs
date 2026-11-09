@@ -82,52 +82,32 @@ fn select_db(ctx: &Context, db: i32) -> bool {
     unsafe { raw::RedisModule_SelectDb.unwrap()(ctx.get_raw(), db) == raw::REDISMODULE_OK as i32 }
 }
 
-/// Reclaim scan state carried across ticks.
-struct ReclaimScan {
-    /// Where the scan resumes.
+/// Where the reclaim scan resumes on the next tick.
+struct ReclaimScanCursor {
     db: i32,
     cursor: KeysCursor,
-    /// This tick's time budget, in microseconds.
-    budget_us: u64,
-    /// Reclaim list length at the start of the previous tick.
-    backlog: usize,
 }
 
 thread_local! {
     // Scaling cron only, which always runs on the main event-loop thread.
-    static RECLAIM_SCAN: RefCell<ReclaimScan> =
-        RefCell::new(ReclaimScan { db: 0, cursor: KeysCursor::new(), budget_us: 0, backlog: 0 });
+    static RECLAIM_SCAN_CURSOR: RefCell<ReclaimScanCursor> = RefCell::new(ReclaimScanCursor { db: 0, cursor: KeysCursor::new() });
 }
 
-/// Delete keys whose oids are on the reclaim list. Scans db by db, resuming
-/// across ticks, until the reclaim list is empty. Dram: an oid leaves the list
-/// when its key is deleted, here or via `lo_free`. Tiered: when its `ObjectFile`
+/// Delete keys whose oids are on the reclaim list, spending at most
+/// `reaper-scan-budget-us` of main-thread time per tick. Scans db by db,
+/// resuming across ticks, until the reclaim list is empty. Dram: an oid leaves the
+/// list when its key is deleted, here or via `lo_free`. Tiered: when its `ObjectFile`
 /// drops. Either way the scan cannot outlive its keys.
-///
-/// Each tick spends at most its budget of main-thread time. The budget starts at
-/// `reaper-scan-budget-us` and doubles on every tick that finds the list longer
-/// than the tick before (evictions outpace the reaper), up to
-/// `reaper-scan-budget-max-us`. It drops back once the list empties.
 ///
 /// Cross-slot deletion is safe here: a timer callback runs outside command
 /// execution (`server.current_client` is NULL), so key lookups hash each key's
 /// own slot instead of reusing a command's cached slot.
 pub fn delete_reclaimed_keys(ctx: &Context) {
-    RECLAIM_SCAN.with_borrow_mut(|scan| {
-        let backlog = RECLAIM_LIST.len();
-        if backlog == 0 {
-            scan.budget_us = 0;
-            scan.backlog = 0;
-            return;
-        }
-        scan.budget_us = next_budget_us(
-            scan.budget_us,
-            backlog > scan.backlog,
-            crate::reaper_scan_budget_us(),
-            crate::reaper_scan_budget_max_us(),
-        );
-        scan.backlog = backlog;
-        let deadline = Instant::now() + Duration::from_micros(scan.budget_us);
+    if RECLAIM_LIST.is_empty() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_micros(crate::reaper_scan_budget_us());
+    RECLAIM_SCAN_CURSOR.with_borrow_mut(|scan| {
         while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
             // Past the last db: one full pass done. At most one pass per tick
             // so a key moved behind the cursor can't spin us.
@@ -159,13 +139,6 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
     });
 }
 
-/// This tick's budget: double the last one if the backlog grew, kept within
-/// `[base, max]`. A `max` below `base` means `base`.
-fn next_budget_us(budget_us: u64, grew: bool, base: u64, max: u64) -> u64 {
-    let budget = if grew { budget_us * 2 } else { budget_us };
-    budget.clamp(base, max.max(base))
-}
-
 /// Scan the next hashtable bucket of the selected db. Returns the bucket's keys
 /// whose oids are on the reclaim list, and whether the db has more buckets.
 ///
@@ -192,37 +165,4 @@ fn listed_keys_in_next_bucket(
         }
     });
     (listed.into_inner(), more)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::next_budget_us;
-
-    #[test]
-    fn budget_starts_at_base_and_doubles_while_the_backlog_grows() {
-        let mut budget = 0;
-        let mut seen = Vec::new();
-        for _ in 0..5 {
-            budget = next_budget_us(budget, true, 100, 1000);
-            seen.push(budget);
-        }
-        assert_eq!(seen, [100, 200, 400, 800, 1000]);
-    }
-
-    #[test]
-    fn budget_holds_when_the_backlog_does_not_grow() {
-        assert_eq!(next_budget_us(800, false, 100, 1000), 800);
-        assert_eq!(next_budget_us(0, false, 100, 1000), 100);
-    }
-
-    #[test]
-    fn budget_follows_base_and_max_changed_at_runtime() {
-        assert_eq!(next_budget_us(800, false, 100, 300), 300);
-        assert_eq!(next_budget_us(200, false, 500, 1000), 500);
-        assert_eq!(
-            next_budget_us(200, true, 500, 100),
-            500,
-            "a max below base means base"
-        );
-    }
 }

@@ -1248,7 +1248,7 @@ class TestTieredReaperPace(TieredBudget):
     def get_module_args(self, data_dir, direct_io):
         # Only configs the base args do not set: Valkey builds differ on which copy of a
         # repeated module arg wins.
-        return super().get_module_args(data_dir, direct_io) + " reaper-scan-budget-us 1000 reaper-scan-budget-max-us 1000"
+        return super().get_module_args(data_dir, direct_io) + " reaper-scan-budget-us 1000"
 
     def test_ghosts_drain_on_the_reaper_tick_without_a_server_maxmemory(self):
         """With ghosts left, the cron re-arms at `reaper-poll-ms` (10ms) on the no-maxmemory exit
