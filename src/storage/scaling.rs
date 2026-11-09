@@ -25,7 +25,6 @@ use super::get_dram_pool;
 pub fn scaling_cron(ctx: &Context) {
     let expand_watermark = crate::scaling_expand_watermark();
     let shrink_watermark = crate::scaling_shrink_watermark();
-    let poll_ms = crate::scaling_poll_ms();
     let pool = get_dram_pool();
 
     // 1. Complete draining of any segments whose refcount hit 0.
@@ -69,14 +68,17 @@ pub fn scaling_cron(ctx: &Context) {
     // the same tick, and firing both would add a segment then immediately drain
     // one — pure churn. Gated on a grow RUNNING, not merely wanted, so a pool
     // that can't grow still shrinks under pressure.
+    //
+    // Every exit re-arms with `next_poll_ms`: evictions do not depend on expand or
+    // on a server maxmemory, so neither may slow the reaper to `scaling-poll-ms`.
     if expanding {
-        rearm_scaling_cron(ctx, poll_ms);
+        rearm_scaling_cron(ctx, next_poll_ms());
         return;
     }
     let (used, maxmemory) = crate::server_memory(ctx);
     if maxmemory == 0 {
         // No server-wide maxmemory configured — no shrink pressure signal exists.
-        rearm_scaling_cron(ctx, poll_ms);
+        rearm_scaling_cron(ctx, next_poll_ms());
         return;
     }
     let ratio = used as f64 / maxmemory as f64;

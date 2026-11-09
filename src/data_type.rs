@@ -19,7 +19,7 @@ use crate::storage::{Crc, ObjectFile};
 
 // ─── ObjectId ────────────────────────────────────────────────────────────────
 
-/// ObjectId IS the file path: deterministic mapping OID → "{disk_dir}/{oid:016x}.dat"
+/// ObjectId IS the file path: deterministic mapping OID → "{disk_dir}/{oid % disk-dir-shards:04x}/{oid:016x}.dat"
 /// No lookup table. Compact u64 safe for replication streams, RDB, and LoValue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(pub u64);
@@ -36,10 +36,25 @@ impl ObjectId {
         Self(OID_COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Deterministic file path from OID.
+    /// Deterministic file path from OID, in one of the `disk-dir-shards` subdirectories of
+    /// disk-dir. Every create and unlink takes its directory's inode lock exclusively, so one
+    /// directory serializes them; consecutive OIDs land in different shards.
     pub fn file_path(&self, disk_dir: &str) -> String {
-        format!("{}/{:016x}.dat", disk_dir, self.0)
+        format!(
+            "{}/{:04x}/{:016x}.dat",
+            disk_dir,
+            self.0 % crate::disk_dir_shards(),
+            self.0
+        )
     }
+}
+
+/// Create the `disk-dir-shards` subdirectories of `disk_dir` (which must exist).
+pub fn create_disk_dir_shards(disk_dir: &str) -> std::io::Result<()> {
+    for shard in 0..crate::disk_dir_shards() {
+        std::fs::create_dir_all(format!("{disk_dir}/{shard:04x}"))?;
+    }
+    Ok(())
 }
 
 // ─── Tier ────────────────────────────────────────────────────────────────────
@@ -370,12 +385,17 @@ mod tests {
     #[test]
     fn test_oid_file_path_format() {
         let oid = ObjectId(0xff);
-        assert_eq!(oid.file_path("/data"), "/data/00000000000000ff.dat");
+        // Default disk-dir-shards (1024): the shard is oid % 1024.
+        assert_eq!(oid.file_path("/data"), "/data/00ff/00000000000000ff.dat");
 
         let oid2 = ObjectId(1);
         assert_eq!(
             oid2.file_path("/mnt/bigobj"),
-            "/mnt/bigobj/0000000000000001.dat"
+            "/mnt/bigobj/0001/0000000000000001.dat"
+        );
+        assert_eq!(
+            ObjectId(0x1234).file_path("/d"),
+            "/d/0234/0000000000001234.dat"
         );
     }
 

@@ -45,7 +45,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'X')
         client.execute_command('BLOB.TCP_SET', 'tiered_key', payload)
-        dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
+        dat_files = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
         assert len(dat_files) >= 1, "Tiered SET should create an NVMe .dat file"
 
     def test_keyspace_events(self):
@@ -60,7 +60,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         ]
 
     def _dat_count(self):
-        return len(glob.glob(os.path.join(self.data_dir, "*.dat")))
+        return len(glob.glob(os.path.join(self.data_dir, "*", "*.dat")))
 
     def _wait_free_settled(self, client):
         """Wait for Valkey lazyfree to drain AND teardown to unlink the file."""
@@ -87,7 +87,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', 'rt_multi') == payload_multi
         # The FileHeader is in the user.lobj xattr: magic b"LOBJ", version 1.
         # The file holds only the payload, from offset 0.
-        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
+        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected at least one .dat file"
         # Check the most recent file (highest OID = last in sorted hex names).
         header = os.getxattr(dat_files[-1], 'user.lobj')
@@ -122,11 +122,11 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'D')
         client.execute_command('BLOB.TCP_SET', 'del_key', payload)
-        dat_files_before = glob.glob(os.path.join(self.data_dir, '*.dat'))
+        dat_files_before = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
         assert len(dat_files_before) >= 1
         client.execute_command('DEL', 'del_key')
         wait_for_equal(lambda: client.info('memory').get('lazyfree_pending_objects', 0), 0)
-        dat_files_after = glob.glob(os.path.join(self.data_dir, '*.dat'))
+        dat_files_after = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
         assert len(dat_files_after) < len(dat_files_before)
 
     # ─── COPY callback tests ─────────────────────────────────────────────
@@ -144,7 +144,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         # COPY carries the CRC over unchanged.
         assert (client.execute_command('BLOB.INFO', 'srckey', 'CRC')
                 == client.execute_command('BLOB.INFO', 'dstkey', 'CRC'))
-        dat_files = glob.glob(os.path.join(self.data_dir, '*.dat'))
+        dat_files = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
         assert len(dat_files) >= 2, f"Expected at least 2 .dat files, got {len(dat_files)}"
         # COPY gets a new OID so digests differ
         src_digest = client.execute_command('DEBUG', 'DIGEST-VALUE', 'srckey')
@@ -733,14 +733,8 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
     decremented at TRUE deletion (ObjectFile::Drop, after teardown), not merely at key-free.
     """
 
-    # Must match storage::IO_ALIGN in mod.rs.
-    IO_ALIGN = 4096
-
-    def _align_up(self, n):
-        return (n + self.IO_ALIGN - 1) & ~(self.IO_ALIGN - 1)
-
     def _dat_count(self):
-        return len(glob.glob(os.path.join(self.data_dir, "*.dat")))
+        return len(glob.glob(os.path.join(self.data_dir, "*", "*.dat")))
 
     def _wait_free_settled(self, client):
         """Wait for Valkey lazyfree to drain AND teardown to unlink the file."""
@@ -929,8 +923,7 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
         self._set_ok(client, "fitkey", aligned_payload)
         assert client.execute_command("DBSIZE") == 1
         wait_for_equal(self._dat_count, 1)
-        [dat_file] = glob.glob(os.path.join(self.data_dir, "*.dat"))
-        assert os.path.getsize(dat_file) == len(aligned_payload)
+        assert [os.path.getsize(f) for f in self._object_files()] == [len(aligned_payload)]
         # Clean up so the unaligned case has full cap available.
         client.execute_command("DEL", "fitkey")
         self._wait_free_settled(client)
@@ -967,7 +960,7 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
         payload = position_pattern(4096, 'X')
         client.execute_command('BLOB.TCP_SET', 'crc_key', payload)
         # Corrupt the CRC field in the FileHeader xattr (bytes 21-24 in packed layout).
-        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
+        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected .dat file after SET"
         header = os.getxattr(dat_files[-1], 'user.lobj')
         os.setxattr(dat_files[-1], 'user.lobj', header[:21] + b'\xff\xff\xff\xff')
@@ -1000,7 +993,7 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'Y')
         client.execute_command('BLOB.TCP_SET', 'magic_key', payload)
-        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
+        dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected .dat file after SET"
         header = os.getxattr(dat_files[-1], 'user.lobj')
         os.setxattr(dat_files[-1], 'user.lobj', b'BAAD' + header[4:])
@@ -1932,3 +1925,99 @@ class TestTieredMaxBuffersPerOpAtCapNoPromotion(ValkeyLargeObjTestCaseBase):
             reply = client.execute_command('BLOB.TCP_GET', 'wide')
             assert_bytes_equal(reply, WIDE_PAYLOAD, WIDE_CHUNK)
         assert client.execute_command('BLOB.INFO', 'wide', 'TIER') == b'disk'
+
+
+# ─── disk-dir-shards ──────────────────────────────────────────────────────────
+
+
+class TestTieredDiskDirShards(ValkeyLargeObjTestCaseBase):
+    """Object files are spread over `disk-dir-shards` subdirectories of disk-dir by OID."""
+
+    SHARDS = 4
+
+    def get_module_args(self, data_dir, direct_io):
+        return (super().get_module_args(data_dir, direct_io)
+                + f" disk-dir-shards {self.SHARDS}")
+
+    def test_files_land_in_oid_shard(self):
+        client = self.server.get_new_client()
+        assert client.config_get('largeobj.disk-dir-shards') == {
+            'largeobj.disk-dir-shards': str(self.SHARDS)}
+        assert sorted(os.listdir(self.data_dir)) == [f'{s:04x}' for s in range(self.SHARDS)]
+        # Two objects per shard, so consecutive OIDs reach every shard whatever SHARDS is.
+        count = 2 * self.SHARDS
+        for i in range(count):
+            client.execute_command('BLOB.TCP_SET', f'shard_key_{i}', position_pattern(4096, 'S'))
+        files = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
+        assert len(files) == count
+        for path in files:
+            shard, name = path.split(os.sep)[-2:]
+            assert int(shard, 16) == int(name[:16], 16) % self.SHARDS
+        # Consecutive OIDs spread over every shard.
+        assert {path.split(os.sep)[-2] for path in files} == {f'{s:04x}' for s in range(self.SHARDS)}
+
+    def test_immutable(self):
+        client = self.server.get_new_client()
+        with pytest.raises(ResponseError):
+            client.config_set('largeobj.disk-dir-shards', 8)
+
+
+# ─── chunk-size alignment ─────────────────────────────────────────────────
+
+ALIGNED_CHUNK = 3 * 4096  # a multiple of 4096 that is not a power of two
+
+
+def _chunk_alignment_args(data_dir, direct_io, chunk_size):
+    return (
+        f"operating-mode Tiered"
+        f" disk-dir {data_dir}"
+        f" disk-staging-size 4194304"
+        f" segment-size 1048576"
+        f" max-promote-size 524288"
+        f" promote-min-hits 1"
+        f" chunk-size {chunk_size}"
+        f" bench-mode no"
+        f" direct-io {direct_io}"
+        f" fabric-provider Emulated"
+    )
+
+
+class TestTieredChunkSizeAlignment(ValkeyLargeObjTestCaseBase):
+    """chunk-size must be a multiple of 4096; values of any length are fine."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return _chunk_alignment_args(data_dir, direct_io, ALIGNED_CHUNK)
+
+    @pytest.mark.parametrize('length', [
+        ALIGNED_CHUNK - 1,         # one partial chunk, padded across pages
+        3 * ALIGNED_CHUNK + 5000,  # full chunks and an unaligned tail
+    ])
+    def test_unaligned_value_round_trips(self, length):
+        """Each chunk is padded to 4 KiB on disk, the file is exactly that size, and the
+        value reads back intact from NVMe and then from DRAM."""
+        client = self.server.get_new_client()
+        payload = position_pattern(length, 'U')
+        assert client.execute_command('BLOB.TCP_SET', 'unaligned', payload) == b'OK'
+        full_chunks, tail = divmod(length, ALIGNED_CHUNK)
+        disk_len = full_chunks * ALIGNED_CHUNK + self._align_up(tail)
+        assert [os.path.getsize(f) for f in self._object_files()] == [disk_len]
+        assert client.execute_command('BLOB.INFO', 'unaligned', 'TIER') == b'disk'
+        assert client.execute_command('BLOB.TCP_GET', 'unaligned') == payload
+        assert client.execute_command('BLOB.INFO', 'unaligned', 'TIER') == b'dram'
+        assert client.execute_command('BLOB.TCP_GET', 'unaligned') == payload
+
+    # A refused load makes Valkey drop its reference to the config data the valkey-module
+    # crate boxed for each config, and nothing frees it, so LeakSanitizer reports it at exit.
+    @pytest.mark.skip_for_asan
+    def test_unaligned_chunk_size_refuses_to_load(self):
+        testdir = os.path.abspath(os.path.join(self.testdir, 'unaligned-chunk'))
+        os.makedirs(testdir, exist_ok=True)
+        module_args = _chunk_alignment_args(os.path.join(testdir, 'nvme'), 'no', 5000)
+        server, _ = self.create_server(
+            testdir=testdir,
+            server_path=self.server.valkey_path,
+            args={'loadmodule': f"{os.environ['MODULE_PATH']} {module_args}"},
+            connect_client=False)
+        wait_for_true(lambda: server.server.poll() is not None)
+        assert server.server.returncode != 0
+        assert server.verify_string_in_logfile('chunk-size must be a multiple of 4096')

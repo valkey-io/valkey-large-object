@@ -422,8 +422,12 @@ struct StreamingContext {
 ### 6.3 NVMe File Reference
 
 Each object version is one file, named directly from its `ObjectId` under the
-configured `disk-dir`: `{disk-dir}/{oid:016x}.dat` (via `ObjectId::file_path`).
-There is no extra subdirectory — `disk-dir` is the module-owned directory. The
+configured `disk-dir`: `{disk-dir}/{oid % disk-dir-shards:04x}/{oid:016x}.dat` (via
+`ObjectId::file_path`). `disk-dir` is the module-owned directory; its
+`disk-dir-shards` subdirectories (default 1024) are created when it is reset at
+startup. Every create and unlink
+takes its directory's inode lock exclusively, so one directory would serialize
+them across all SETs and evictions. The
 runtime handle is `ObjectFile { object_id, disk_len }` (held behind
 `Arc<ObjectFile>`); it stores no path and no fd — the path is derived from the OID
 and the fd is managed separately by the FdPool (§6.4).
@@ -539,7 +543,7 @@ Example: 50MB object cached in DRAMPool (long-lived). NVMePool would look the sa
 Valkey keyspace                Module internals
 ──────────────                 ────────────────
 key "obj-A"
-  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<ObjectFd> → {disk-dir}/000000000000002a.dat (50MB)
+  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<ObjectFd> → {disk-dir}/002a/000000000000002a.dat (50MB)
        len=50MB,                                                ▲
        crc32c=0xAB12}                                           │  N buffers : 1 file
                                                                 │  (parallel ReadFixed/WriteFixed
@@ -584,7 +588,7 @@ Each object is one contiguous file on NVMe regardless of size:
 
 ```
 Object "key123" (10GB):
-  NVMe: {disk-dir}/000000000000002a.dat   (10GB file, XFS extent-allocated)
+  NVMe: {disk-dir}/002a/000000000000002a.dat   (10GB file, XFS extent-allocated)
   LoValue: {oid=42, len=10GB, crc32c=0xAB12}
 ```
 
@@ -1499,7 +1503,7 @@ this section owns the semantics.
 | `reclaim-sample-size` | `5` | `1` | `64` | Live | Objects sampled per cache-eviction round; the lowest LFU score is demoted |
 | `max-cached-fds` | `16384` | `0` (no cache) | `1048576` | Live | FdPool cap on cached read fds, clamped to what the fd limit allows (`fd-reserve` sets what happens when it does not fit; see `OBJECT_FD_PLACEMENT_DESIGN.md`) |
 | `max-object-size` | `512MB` | `1` | i64::MAX | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
-| `chunk-size` | `1MB` | `4096` | `256MB` | Immutable | I/O chunk / allocation unit (detail: §7.2) |
+| `chunk-size` | `1MB` | `4096` | `256MB` | Immutable | I/O chunk / allocation unit; must be a multiple of 4096 (detail: §7.2) |
 | `max-buffers-per-op` / `min-buffers-per-op` | 64 / 2 | 2 / 1 | 1024 / 1024 | Live | Streaming pipeline depth (detail: §7.3.6) |
 | `worker-threads` | `4` | `1` | `32` | Immutable | tokio worker threads |
 | `scaling-poll-ms` | `5000` | `1000` | `60000` | Live | Scaling cron interval: how often it checks utilization and memory pressure |
@@ -1512,7 +1516,7 @@ this section owns the semantics.
 | `fabric-provider` | `Emulated` | — | — | Immutable | libfabric provider: `Emulated` (tcp provider) or `EfaDirect` (EFA hardware) |
 | `fabric-interfaces` | `""` (all) | — | — | Immutable | Comma-separated fabric domains to open a service on |
 | `fabric-max-in-flight` | `0` (provider default) | `0` | `65536` | Immutable | Transfers each fabric service keeps in flight |
-| `fabric-crc-pool-threads` | `1` | `1` | `1024` | Immutable | Threads hashing checksummed transfers off the fabric workers |
+| `fabric-crc-pool-threads` | `2` | `1` | `1024` | Immutable | Threads hashing checksummed transfers off the fabric workers |
 
 **Segment size is capped at 1 GiB** for both `segment-size` and
 `disk-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):
