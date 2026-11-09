@@ -1515,7 +1515,7 @@ this section owns the semantics.
 | `fabric-provider` | `Emulated` | — | — | Immutable | libfabric provider: `Emulated` (tcp provider) or `EfaDirect` (EFA hardware) |
 | `fabric-interfaces` | `""` (all) | — | — | Immutable | Comma-separated fabric domains to open a service on |
 | `fabric-max-in-flight` | `0` (provider default) | `0` | `65536` | Immutable | Transfers each fabric service keeps in flight |
-| `fabric-crc-pool-threads` | `1` | `1` | `1024` | Immutable | Threads hashing checksummed transfers off the fabric workers |
+| `fabric-crc-pool-threads` | `2` | `1` | `1024` | Immutable | Threads hashing checksummed transfers off the fabric workers |
 
 **Segment size is capped at 1 GiB** for both `segment-size` and
 `disk-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):

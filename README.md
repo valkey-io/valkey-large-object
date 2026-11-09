@@ -101,7 +101,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `fabric-provider` | `EfaDirect` | Immutable | libfabric provider for the DMA path: `Emulated` (libfabric over TCP, runs anywhere) or `EfaDirect` (EFA hardware RDMA). |
 | `fabric-interfaces` | (empty) | Immutable | Comma-separated fabric domains to serve on. Empty = every domain the provider discovers. |
 | `fabric-max-in-flight` | 0 | Immutable | Transfers each fabric service keeps in flight. 0 = provider default. Max 65536. |
-| `fabric-crc-pool-threads` | 1 | Immutable | Threads hashing checksummed transfers. Min 1, max 1024. |
+| `fabric-crc-pool-threads` | 2 | Immutable | Threads hashing checksummed transfers. Min 1, max 1024. |
 
 All size parameters accept memory notation (`64mb`, `1gb`, etc.).
 

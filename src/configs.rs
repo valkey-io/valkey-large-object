@@ -141,7 +141,7 @@ pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 0; // crate default
 pub const MIN_FABRIC_MAX_IN_FLIGHT: i64 = 0;
 pub const MAX_FABRIC_MAX_IN_FLIGHT: i64 = 65_536;
 // fabric-crc-pool-threads
-pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 1;
+pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 2;
 pub const MIN_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MAX_FABRIC_CRC_POOL_THREADS: i64 = 1024;
 
