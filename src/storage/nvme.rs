@@ -226,8 +226,7 @@ fn transient(e: &std::io::Error) -> bool {
 /// multiple of the filesystem's stripe unit doesn't spill into one more stripe unit.
 pub const FILE_HEADER_XATTR: &std::ffi::CStr = c"user.lobj";
 pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
-/// Version 1 was a 4 KiB header page at file offset 0; version 2 is the xattr.
-pub const FILE_HEADER_VERSION: u8 = 2;
+pub const FILE_HEADER_VERSION: u8 = 1;
 
 /// Packed wire size of the header fields (no inter-field padding).
 /// Computed from field types so adding a field updates this automatically.

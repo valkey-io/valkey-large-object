@@ -85,14 +85,14 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert result == payload_multi
         # Second GET from DRAM after promotion.
         assert client.execute_command('BLOB.TCP_GET', 'rt_multi') == payload_multi
-        # The FileHeader is in the user.lobj xattr: magic b"LOBJ", version 2.
+        # The FileHeader is in the user.lobj xattr: magic b"LOBJ", version 1.
         # The file holds only the payload, from offset 0.
         dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*.dat')))
         assert len(dat_files) >= 1, "Expected at least one .dat file"
         # Check the most recent file (highest OID = last in sorted hex names).
         header = os.getxattr(dat_files[-1], 'user.lobj')
         assert header[:4] == b'LOBJ', "FileHeader magic mismatch"
-        assert header[4] == 2, "FileHeader version mismatch"
+        assert header[4] == 1, "FileHeader version mismatch"
         with open(dat_files[-1], 'rb') as f:
             data_on_disk = f.read(len(payload_multi))
             assert data_on_disk == payload_multi, "On-disk data at offset 0 mismatch"

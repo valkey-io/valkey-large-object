@@ -434,7 +434,7 @@ payload, from offset 0):**
 // consts in storage/nvme.rs
 pub const FILE_HEADER_XATTR: &CStr = c"user.lobj";
 pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
-pub const FILE_HEADER_VERSION: u8 = 2; // 1 was a 4 KiB header page at offset 0
+pub const FILE_HEADER_VERSION: u8 = 1;
 // Packed wire size, derived from field types (NOT hand-counted):
 pub const FILE_HEADER_WIRE_LEN: usize =
     size_of::<[u8; 4]>() + size_of::<u8>() + size_of::<u64>()
@@ -442,7 +442,7 @@ pub const FILE_HEADER_WIRE_LEN: usize =
 
 pub struct FileHeader {
     pub magic: [u8; 4],     // b"LOBJ" — identifies file as Large Object module data
-    pub version: u8,        // 2 — enables future format changes
+    pub version: u8,        // 1 — enables future format changes
     pub object_id: u64,     // Matches LoValue.object_id
     pub len: u64,           // True object length (before O_DIRECT padding)
     pub crc32c: Crc,        // Integrity checksum (same as LoValue.crc32c)
