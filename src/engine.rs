@@ -347,9 +347,9 @@ fn cmd_get_tiered(
     cache.stats.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // Admit via the admission filter, then allocate (reclaiming cold copies if full).
-    // Skip both while the DRAM ring's iovec table is being re-registered: the rebuild
+    // Skip both while a rebuild of the DRAM ring's iovec table is pending: the rebuild
     // blocks that ring, so promotion reads would queue behind it. Fall back to the
-    // NVMe streaming path, whose ring never re-registers. The guard, held for the
+    // NVMe streaming path, whose ring never rebuilds. The guard, held for the
     // whole promotion, makes the rebuild wait for it. None while a rebuild is pending.
     let rebuild_guard = storage::uring::promotion_guard();
     let promoted = if rebuild_guard.is_some() && cache.admission.admit(object_id, obj_len) {

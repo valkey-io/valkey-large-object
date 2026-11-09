@@ -21,7 +21,7 @@ use super::StorageError;
 
 // ─── Pool identity ───────────────────────────────────────────────────────────
 
-/// Which pool's ring an op or reregister targets. The whole generic seam: one
+/// Which pool's ring an op or rebuild targets. The whole generic seam: one
 /// `UringEngine` type, two instances keyed by this field — no trait, no dyn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolType {
@@ -64,11 +64,11 @@ enum IoRequest {
         op: UringOp,
         tx: oneshot::Sender<Result<(), StorageError>>,
     },
-    /// Rebuild this ring's fixed-buffer table from its segments. 5.10 has
-    /// only a whole-table re-register: the poller sets `registration_pending` (new
-    /// promotions are refused), waits for in-progress promotions to finish, then
-    /// unregister + register. Fire-and-forget from expand()/release().
-    Reregister,
+    /// Rebuild this ring's fixed-buffer table from its segments. 5.10 can only
+    /// register a whole table: the poller sets `REBUILD_PENDING` (new promotions are
+    /// refused), waits for in-progress promotions to finish, then renumbers the
+    /// segments and runs unregister + register. Fire-and-forget from expand()/release().
+    Rebuild,
     /// No work: wakes the poller so it re-checks a rebuild that waits on promotions.
     Wake,
 }
@@ -118,14 +118,14 @@ impl PendingOp {
 static DRAM_ENGINE: OnceLock<UringEngine> = OnceLock::new();
 static NVME_ENGINE: OnceLock<UringEngine> = OnceLock::new();
 
-/// True while the DRAM ring's poller is mid-rebuild (re-register window open).
-/// Never set to true by the NVMe poller (fixed-size pool, no re-registers).
+/// True from the DRAM poller receiving `Rebuild` until the rebuild has run.
+/// Never set to true by the NVMe poller (fixed-size pool, no rebuilds).
 /// The DRAM poller is the single writer; `promotion_guard` reads it.
-static REGISTRATION_PENDING: AtomicBool = AtomicBool::new(false);
+static REBUILD_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Promotions that started before the pending rebuild was requested and have not finished.
 /// The rebuild blocks the DRAM poller, so it waits for these: their remaining chunk reads
-/// would otherwise queue behind it. SeqCst pairs with REGISTRATION_PENDING: a promotion
+/// would otherwise queue behind it. SeqCst pairs with REBUILD_PENDING: a promotion
 /// increments then reads the flag, the poller sets the flag then reads this.
 static ACTIVE_PROMOTIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -136,7 +136,7 @@ impl Drop for PromotionGuard {
     fn drop(&mut self) {
         // The last one out wakes a poller whose rebuild was waiting on it.
         if ACTIVE_PROMOTIONS.fetch_sub(1, Ordering::SeqCst) == 1
-            && REGISTRATION_PENDING.load(Ordering::SeqCst)
+            && REBUILD_PENDING.load(Ordering::SeqCst)
             && engine(PoolType::Dram).is_some()
         {
             crate::runtime_handle().spawn(async {
@@ -153,18 +153,24 @@ fn drained_for_rebuild() -> bool {
     ACTIVE_PROMOTIONS.load(Ordering::SeqCst) == 0
 }
 
+/// Whether a rebuild of the DRAM ring's table is pending (INFO `dram_uring_rebuild_pending`).
+/// Stays true while in-progress promotions finish, so a stuck promotion shows up here.
+pub fn rebuild_pending() -> bool {
+    REBUILD_PENDING.load(Ordering::Relaxed)
+}
+
 /// Hold this for a whole promotion. `None` when a rebuild is already pending: the
 /// promotion is then not counted, so the rebuild never waits on promotions that
 /// start after it was requested.
 pub fn promotion_guard() -> Option<PromotionGuard> {
     // Checked before counting, so a GET refused during a rebuild never wakes the poller.
-    if REGISTRATION_PENDING.load(Ordering::SeqCst) {
+    if REBUILD_PENDING.load(Ordering::SeqCst) {
         return None;
     }
     ACTIVE_PROMOTIONS.fetch_add(1, Ordering::SeqCst);
     let guard = PromotionGuard(());
     // The poller may have set the flag between the check and the increment.
-    (!REGISTRATION_PENDING.load(Ordering::SeqCst)).then_some(guard)
+    (!REBUILD_PENDING.load(Ordering::SeqCst)).then_some(guard)
 }
 
 /// Install the engine for `pool`. Panics if already set (init runs once).
@@ -239,12 +245,12 @@ pub fn submit_write(
 /// Spawned on a tokio worker, not the caller: crossbeam's send inits a
 /// thread-local reclaimed only on thread exit, and the main valkey thread (the
 /// caller) never exits — a worker does.
-pub fn submit_reregister(pool: PoolType) {
+pub fn submit_rebuild(pool: PoolType) {
     if engine(pool).is_none() {
-        return; // Dram mode / not initialized — nothing to reregister.
+        return; // Dram mode / not initialized — nothing to rebuild.
     }
     crate::runtime_handle().spawn(async move {
-        let _ = submit(pool, IoRequest::Reregister);
+        let _ = submit(pool, IoRequest::Rebuild);
     });
 }
 
@@ -296,8 +302,7 @@ impl UringEngine {
     }
 
     /// The CQ poller loop — owns one pool's io_uring ring (received fully
-    /// initialized). `pool` selects which pool's table a re-registration
-    /// rebuilds.
+    /// initialized). `pool` selects which pool's table a rebuild rebuilds.
     fn poller_loop(
         pool: PoolType,
         rx: Receiver<IoRequest>,
@@ -313,10 +318,10 @@ impl UringEngine {
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
                 break;
             }
-            // Re-register: once drained, rebuild + re-register the table.
-            // Only the DRAM ring rebuilds (NVMe is fixed-size, never re-registers).
+            // Rebuild the table once drained.
+            // Only the DRAM ring rebuilds (NVMe is fixed-size).
             if pool == PoolType::Dram
-                && REGISTRATION_PENDING.load(Ordering::SeqCst)
+                && REBUILD_PENDING.load(Ordering::SeqCst)
                 && drained_for_rebuild()
             {
                 let iovecs = super::rebuild_dense_iovecs_for(pool);
@@ -325,10 +330,10 @@ impl UringEngine {
                     if !iovecs.is_empty() {
                         ring.submitter()
                             .register_buffers(&iovecs)
-                            .expect("largeobj: io_uring re-register_buffers failed");
+                            .expect("largeobj: io_uring register_buffers failed during a rebuild");
                     }
                 }
-                REGISTRATION_PENDING.store(false, Ordering::Relaxed);
+                REBUILD_PENDING.store(false, Ordering::Relaxed);
             }
             // Channel disconnected without shutdown flag = bug. The sender lives
             // in an OnceLock for the entire process lifetime. If it's gone without
@@ -374,19 +379,18 @@ impl UringEngine {
                 let token = next_token;
                 next_token += 1;
                 let (sqe, op) = match req {
-                    IoRequest::Reregister => {
-                        // Enter the re-register window. New promotions are skipped
-                        // (REGISTRATION_PENDING) and the top-of-loop re-register
-                        // rebuilds the table once in-progress promotions finish. No
-                        // SQE to build.
-                        REGISTRATION_PENDING.store(true, Ordering::SeqCst);
+                    IoRequest::Rebuild => {
+                        // The rebuild is now pending. New promotions are skipped
+                        // (REBUILD_PENDING) and the top-of-loop check rebuilds the
+                        // table once in-progress promotions finish. No SQE to build.
+                        REBUILD_PENDING.store(true, Ordering::SeqCst);
                         // When drained (`drained_for_rebuild`), break out of Phase 1
                         // so the outer loop hits the rebuild check immediately.
                         // Otherwise continue draining — the rebuild fires once
                         // promotions complete. (Without this break, recv()
                         // blocks waiting for a message that never comes: reads
                         // falling through to the NVMe pool during the rebuild go to the
-                        // NVMe ring, not this one, so registration_pending stays true
+                        // NVMe ring, not this one, so REBUILD_PENDING stays true
                         // and promotion never comes back through the DRAM pool.)
                         if drained_for_rebuild() {
                             break;

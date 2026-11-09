@@ -38,12 +38,18 @@ SEGMENT_FILLING_SIZE = 900 * 1024
 def wait_uring_registered_matches_segments(client, timeout=10):
     """Tiered: each pool's io_uring ring registers all its segments
     (dram_uring==dram_segments, nvme_uring==nvme_segments). wait_for because the
-    re-register on expand/shrink is fire-and-forget on the poller."""
+    rebuild on expand/shrink is fire-and-forget on the poller."""
     def _match():
         i = info_largeobj(client)
         return (i['largeobj_dram_uring_registered_segments'] == i['largeobj_dram_segments']
                 and i['largeobj_disk_staging_uring_registered_segments'] == i['largeobj_disk_staging_segments'])
     wait_for_true(_match, timeout=timeout)
+
+
+def wait_rebuild_pending(client):
+    """Wait for the DRAM poller to take the rebuild request. INFO shows the new segment count
+    before the request, sent from a tokio task, reaches the poller."""
+    wait_for_true(lambda: info_largeobj(client)['largeobj_dram_uring_rebuild_pending'] == 1)
 
 
 def apply_shrink_pressure(client, policy='noeviction'):
@@ -561,7 +567,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
 
         client.config_set('maxmemory', 0)
         # At zero segments the wait above passes trivially (0 == 0), possibly before the
-        # last re-register finishes; a GET in that window skips promotion. Retry the GET.
+        # last rebuild finishes; a GET in that window skips promotion. Retry the GET.
         wait_for_true(lambda: client.execute_command('BLOB.TCP_GET', 'tshrink_0') is not None
                       and info_largeobj(client)['largeobj_dram_objects'] == 1,
                       timeout=self.TIMEOUT_S)
@@ -1258,7 +1264,7 @@ PROMOTION_PAUSE_SECS = 3
 
 
 class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
-    """An expand or a shrink re-registers the DRAM ring's io_uring buffer table, and the
+    """An expand or a shrink rebuilds the DRAM ring's io_uring buffer table, and the
     rebuild blocks that ring. A promotion already in progress must finish first (its reads
     would otherwise queue behind the rebuild), and a GET arriving while the rebuild is pending
     is served from NVMe instead of promoting. test-pause-during-promotion-ms holds a promotion
@@ -1285,6 +1291,13 @@ class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
         return thread, result
 
     @staticmethod
+    def _assert_rebuild_still_pending(client, promotion):
+        """The rebuild still waits on the paused promotion, so everything checked since it
+        became pending ran before the rebuild."""
+        assert promotion.is_alive(), "the paused promotion finished before the checks ran"
+        assert info_largeobj(client)['largeobj_dram_uring_rebuild_pending'] == 1
+
+    @staticmethod
     def _assert_promotion_finishes(thread, result, payload):
         thread.join(timeout=PROMOTION_PAUSE_SECS + 10)
         assert not thread.is_alive(), "the paused promotion never finished"
@@ -1306,14 +1319,14 @@ class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
         # rebuild must wait for key_a's promotion.
         assert client.execute_command('BLOB.TCP_GET', 'key_b') == payloads['key_b']
         wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 2)
-        time.sleep(0.5)  # an unguarded rebuild would run within milliseconds
-        info = info_largeobj(client)
-        assert promotion.is_alive(), "the promotion finished before the rebuild could be observed"
-        assert info['largeobj_dram_uring_registered_segments'] == 1, info
+        wait_rebuild_pending(client)
 
-        # While the rebuild is pending, a GET is served from NVMe and not promoted.
+        # While the rebuild is pending, a GET is served from NVMe and not promoted, and the
+        # new segment is not in the table yet.
         assert client.execute_command('BLOB.TCP_GET', 'key_c') == payloads['key_c']
         assert client.execute_command('BLOB.INFO', 'key_c', 'TIER') != b'dram'
+        self._assert_rebuild_still_pending(client, promotion)
+        assert info_largeobj(client)['largeobj_dram_uring_registered_segments'] == 1
 
         # The promotion completes with correct bytes, then the rebuild runs (woken by the
         # promotion finishing: nothing else uses the DRAM ring here).
@@ -1354,12 +1367,12 @@ class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
         apply_one_segment_shrink_pressure(client)
         wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 2)
         client.config_set('maxmemory', 0)
-        time.sleep(0.5)  # an unguarded rebuild would run within milliseconds
-        assert promotion.is_alive(), "the promotion finished before the rebuild could be observed"
+        wait_rebuild_pending(client)
 
         # While the rebuild is pending, a GET is served from NVMe and not promoted.
         assert client.execute_command('BLOB.TCP_GET', 'renum_probe') == payloads['renum_probe']
         assert client.execute_command('BLOB.INFO', 'renum_probe', 'TIER') != b'dram'
+        self._assert_rebuild_still_pending(client, promotion)
 
         self._assert_promotion_finishes(promotion, in_progress, payloads['renum_during'])
         assert (info_largeobj(client)['largeobj_dram_scaling_shrinks']

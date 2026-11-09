@@ -156,7 +156,7 @@ Allocate one or more large contiguous memory segments at startup. Register each 
 - Alloc is O(1) amortized but O(n) worst case on fragmented arena
 - More complex implementation (~315 lines)
 - Shrinking requires drain + evacuation (cannot simply return a buffer)
-- Adding/removing segments requires `IORING_UNREGISTER_BUFFERS` + re-register (brief I/O pause)
+- Adding/removing segments requires a table rebuild (`IORING_UNREGISTER_BUFFERS` + `IORING_REGISTER_BUFFERS`), during which the ring does no I/O
 
 ### 4.3 Fragmentation in Approach B
 
@@ -1121,8 +1121,8 @@ lock and no Valkey API.
    is up). Existing MRs are untouched.
 4. **Publish:** take the pool's state lock, put the segment in a slot, and clear the running-expand
    flag. The allocator cannot see the segment before this, so it is always registered.
-5. **Re-register with io_uring** — **Tiered only** (Dram mode has no io_uring
-   engine). `submit_reregister(Dram)` asks the DRAM ring to rebuild its whole table
+5. **Rebuild the io_uring table** — **Tiered only** (Dram mode has no io_uring
+   engine). `submit_rebuild(Dram)` asks the DRAM ring to rebuild its whole table
    (§8.6).
 
 The new segment is usable for allocation as soon as it is published. Until the rebuild
@@ -1182,7 +1182,7 @@ those two races better is open (`DRAM_SHRINK_REVIEW.md`).
 ### 8.6 io_uring Registration (Tiered)
 
 Each pool has its own ring and its own fixed-buffer table (`IORING_REGISTER_BUFFERS`
-is per ring fd). Only the DRAM pool scales, so only the DRAM ring ever re-registers;
+is per ring fd). Only the DRAM pool scales, so only the DRAM ring ever rebuilds;
 the NVMe ring registers once at startup and never stalls.
 
 **Two indexes per segment:**
@@ -1209,16 +1209,18 @@ The only ops on the DRAM ring are promotion reads (NVMe file into DRAM buffers).
 promotion holds a `PromotionGuard` from admission until it finishes, and awaits every
 read it submits before it finishes.
 
-**Rebuild protocol** (poller thread, after `submit_reregister` on expand or release):
+**Rebuild protocol** (poller thread, after `submit_rebuild` on expand or release):
 
-1. `IoRequest::Reregister` sets `registration_pending`. New promotions are refused
+1. `IoRequest::Rebuild` sets `REBUILD_PENDING`. New promotions are refused
    (`promotion_guard()` returns `None`), so those GETs are served from NVMe.
 2. The poller waits until no promotion is in progress (`drained_for_rebuild`). The
    last promotion to finish sends `IoRequest::Wake` so an idle poller re-checks.
 3. `rebuild_dense_iovecs` reindexes the live segments densely from 0 (holes dropped),
    marks them registered, and the poller runs `unregister_buffers` +
    `register_buffers(dense)`. A failure here panics.
-4. `registration_pending` clears; promotions resume with their new `iovec_index`.
+4. `REBUILD_PENDING` clears; promotions resume with their new `iovec_index`.
+
+INFO `largeobj_dram_uring_rebuild_pending` is 1 from step 1 until step 4.
 
 The rebuild must wait for in-progress promotions rather than only for reads in the
 kernel: `register_buffers` holds the ring's `uring_lock`, and submission takes the same
@@ -1475,7 +1477,7 @@ When the scaling cron shrinks the DRAMPool (§8.5, both modes):
      → slots[i].take()          — leaves a None hole for the next expand
      → drop(segment)            — Segment::drop: EFA deregister, then dealloc;
                                   used_memory decreases
-     → submit_reregister(Dram)  — Tiered: rebuild the DRAM ring's table
+     → submit_rebuild(Dram)  — Tiered: rebuild the DRAM ring's table
 ```
 
 No spin and no blocking wait: release is polled by the cron, so a segment whose last

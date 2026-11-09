@@ -56,7 +56,7 @@ pub struct SegmentPool {
     state: RwLock<SegmentState>,
     /// Size of each segment (uniform within a pool).
     pub segment_size: usize,
-    /// Which pool (ring) this is — routes reregister to the correct io_uring
+    /// Which pool (ring) this is — routes a rebuild to the correct io_uring
     /// engine, since each pool has its own ring + registered-buffer table.
     pool_id: super::uring::PoolType,
     /// The waiting line for `wait_for`. tokio's mutex hands the lock out in arrival order, and
@@ -593,7 +593,7 @@ impl SegmentPool {
         if released_any {
             // A segment left this pool — rebuild its ring's table without it
             // (no-op in Dram mode). Touches only this ring.
-            super::uring::submit_reregister(self.pool_id);
+            super::uring::submit_rebuild(self.pool_id);
         }
     }
 
@@ -680,7 +680,7 @@ impl SegmentPool {
     }
 
     /// Count of segments marked io_uring-registered. Below the pool's segment
-    /// count means an expanded segment's re-register hasn't completed yet. INFO metric.
+    /// count means the rebuild after an expand hasn't completed yet. INFO metric.
     pub fn io_uring_registered_count(&self) -> usize {
         let st = self.state.read().expect("state lock unavailable");
         st.slots
