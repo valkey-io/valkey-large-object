@@ -84,7 +84,7 @@ class PersistenceHelpers:
         info = info_largeobj(client)
         assert info['largeobj_num_objects'] == len(self.blob_keys(client))
         if self.tiered:
-            files = os.listdir(data_dir or self.data_dir)
+            files = [f for _, _, names in os.walk(data_dir or self.data_dir) for f in names]
             assert len(files) == info['largeobj_num_objects']
 
     def assert_intact(self, client, blobs):

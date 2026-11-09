@@ -229,6 +229,30 @@ mod tests {
     use crate::data_type::ObjectId;
     use std::os::unix::io::AsRawFd;
 
+    /// A private disk-dir for one test, created with its shard subdirectories and
+    /// removed with everything in it on drop.
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("lo-fdpool-{}-{name}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            crate::data_type::create_disk_dir_shards(path.to_str().unwrap()).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     // get_or_open uses O_DIRECT when direct_io() is set and can fail on some
     // filesystems (e.g. tmpfs). When the open fails we skip the fd-dependent
     // assertions — the Python integration tests cover the real NVMe path.
@@ -243,8 +267,8 @@ mod tests {
 
     #[test]
     fn test_get_or_open_caches_and_reuses() {
-        let dir = std::env::temp_dir();
-        let dir = dir.to_str().unwrap();
+        let tmp = TestDir::new("caches_and_reuses");
+        let dir = tmp.path();
         let object_id = ObjectId(0x5151);
         let path = object_id.file_path(dir);
         std::fs::write(&path, b"hello").unwrap();
@@ -262,8 +286,6 @@ mod tests {
                 "reuse returns clones of the same Arc"
             );
         }
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -271,8 +293,8 @@ mod tests {
         // The honor rule at the refcount level: a reader holding an Arc<ObjectFd> clone
         // keeps the fd open even after the pool drops its own ref (as ObjectFile::Drop
         // does on delete); the fd closes only when the last clone goes away.
-        let dir = std::env::temp_dir();
-        let dir = dir.to_str().unwrap();
+        let tmp = TestDir::new("reader_clone");
+        let dir = tmp.path();
         let object_id = ObjectId(0x6262);
         let path = object_id.file_path(dir);
         std::fs::write(&path, b"world").unwrap();
@@ -297,8 +319,6 @@ mod tests {
                 "fd must be closed once the last clone drops"
             );
         }
-
-        let _ = std::fs::remove_file(&path);
     }
 
     // ─── Cap and reclaim ───
@@ -308,8 +328,8 @@ mod tests {
 
     #[test]
     fn reclaimed_fd_stays_open_for_its_reader() {
-        let dir = std::env::temp_dir();
-        let dir = dir.to_str().unwrap();
+        let tmp = TestDir::new("reclaimed_fd");
+        let dir = tmp.path();
         let oids = [ObjectId(0x7370), ObjectId(0x7371)];
         for oid in &oids {
             std::fs::write(oid.file_path(dir), b"x").unwrap();
@@ -333,16 +353,12 @@ mod tests {
             drop(reader);
             assert!(weak.upgrade().is_none(), "fd closes with its last reader");
         }
-
-        for oid in &oids {
-            let _ = std::fs::remove_file(oid.file_path(dir));
-        }
     }
 
     #[test]
     fn shrink_to_evicts_down_to_the_cap_at_once() {
-        let dir = std::env::temp_dir();
-        let dir = dir.to_str().unwrap();
+        let tmp = TestDir::new("shrink_to");
+        let dir = tmp.path();
         let full = 20;
         let oids: Vec<ObjectId> = (0..full as u64).map(|i| ObjectId(0x7400 + i)).collect();
         for oid in &oids {
@@ -364,18 +380,14 @@ mod tests {
             pool.shrink_to(1);
             assert_eq!(pool.evictions.load(Ordering::Relaxed), full as u64 - 1);
         }
-
-        for oid in &oids {
-            let _ = std::fs::remove_file(oid.file_path(dir));
-        }
     }
 
     #[test]
     fn get_or_open_hit_does_not_read_the_cap() {
         // In a unit test placement is off, so the global fd cache max entries is 0: a lookup
         // that consulted it would open a fresh fd. A hit returns the cached handle.
-        let dir = std::env::temp_dir();
-        let dir = dir.to_str().unwrap();
+        let tmp = TestDir::new("hit_no_cap");
+        let dir = tmp.path();
         let object_id = ObjectId(0x7600);
         std::fs::write(object_id.file_path(dir), b"x").unwrap();
         let pool = FdPool::new();
@@ -385,14 +397,12 @@ mod tests {
             assert!(Arc::ptr_eq(&cached, &hit));
             assert_eq!(pool.len(), 1);
         }
-
-        let _ = std::fs::remove_file(object_id.file_path(dir));
     }
 
     #[test]
     fn cap_zero_opens_without_caching() {
-        let dir = std::env::temp_dir();
-        let dir = dir.to_str().unwrap();
+        let tmp = TestDir::new("cap_zero");
+        let dir = tmp.path();
         let object_id = ObjectId(0x7500);
         std::fs::write(object_id.file_path(dir), b"x").unwrap();
         let pool = FdPool::new();
@@ -404,7 +414,5 @@ mod tests {
             drop(fd);
             assert!(weak.upgrade().is_none(), "fd closes with the caller's ref");
         }
-
-        let _ = std::fs::remove_file(object_id.file_path(dir));
     }
 }

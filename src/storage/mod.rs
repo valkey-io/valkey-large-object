@@ -178,6 +178,10 @@ pub fn init(
     // module range before any is opened, or they stop new clients being served.
     if mode == crate::OperatingMode::Tiered {
         fd_placement::raise_module_start(ctx)?;
+        // disk-dir was just reset to empty, and object files live in its shard
+        // subdirectories. Created here rather than in the reset, which also runs at shutdown.
+        crate::data_type::create_disk_dir_shards(disk_dir)
+            .map_err(|e| format!("failed to create disk-dir shards under {disk_dir}: {e}"))?;
     }
     // Disk usage charges each file in the filesystem's allocation unit.
     let disk_alloc_unit = if mode == crate::OperatingMode::Tiered {
