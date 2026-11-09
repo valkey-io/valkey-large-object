@@ -46,10 +46,14 @@ def wait_uring_registered_matches_segments(client, timeout=10):
     wait_for_true(_match, timeout=timeout)
 
 
-def wait_rebuild_pending(client):
-    """Wait for the DRAM poller to take the rebuild request. INFO shows the new segment count
-    before the request, sent from a tokio task, reaches the poller."""
-    wait_for_true(lambda: info_largeobj(client)['largeobj_dram_uring_rebuild_pending'] == 1)
+REBUILD_PENDING_LOG = 'DRAM io_uring table rebuild pending'
+REBUILT_LOG = 'rebuilt the DRAM io_uring table'
+
+
+def log_count(server, text):
+    """Lines of the server log that contain `text`."""
+    with open(os.path.join(server.cwd, server.args['logfile'])) as f:
+        return sum(text in line for line in f)
 
 
 def apply_shrink_pressure(client, policy='noeviction'):
@@ -1290,12 +1294,17 @@ class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
         thread.start()
         return thread, result
 
-    @staticmethod
-    def _assert_rebuild_still_pending(client, promotion):
+    def _wait_rebuild_pending(self, pending_before):
+        """Wait for the DRAM poller to take the rebuild request. INFO shows the new segment count
+        before the request, sent from a tokio task, reaches the poller."""
+        wait_for_true(lambda: log_count(self.server, REBUILD_PENDING_LOG) > pending_before)
+
+    def _assert_rebuild_still_pending(self, promotion, rebuilt_before):
         """The rebuild still waits on the paused promotion, so everything checked since it
-        became pending ran before the rebuild."""
+        became pending ran before the rebuild. The poller logs a rebuild before clearing the
+        pending flag, so no new line means it has not run."""
         assert promotion.is_alive(), "the paused promotion finished before the checks ran"
-        assert info_largeobj(client)['largeobj_dram_uring_rebuild_pending'] == 1
+        assert log_count(self.server, REBUILT_LOG) == rebuilt_before
 
     @staticmethod
     def _assert_promotion_finishes(thread, result, payload):
@@ -1317,15 +1326,17 @@ class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
 
         # key_b finds the pool full: it is served from NVMe and starts an expand, whose
         # rebuild must wait for key_a's promotion.
+        pending_before = log_count(self.server, REBUILD_PENDING_LOG)
+        rebuilt_before = log_count(self.server, REBUILT_LOG)
         assert client.execute_command('BLOB.TCP_GET', 'key_b') == payloads['key_b']
         wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 2)
-        wait_rebuild_pending(client)
+        self._wait_rebuild_pending(pending_before)
 
         # While the rebuild is pending, a GET is served from NVMe and not promoted, and the
         # new segment is not in the table yet.
         assert client.execute_command('BLOB.TCP_GET', 'key_c') == payloads['key_c']
         assert client.execute_command('BLOB.INFO', 'key_c', 'TIER') != b'dram'
-        self._assert_rebuild_still_pending(client, promotion)
+        self._assert_rebuild_still_pending(promotion, rebuilt_before)
         assert info_largeobj(client)['largeobj_dram_uring_registered_segments'] == 1
 
         # The promotion completes with correct bytes, then the rebuild runs (woken by the
@@ -1364,15 +1375,17 @@ class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
         client.delete('renum_middle')
         wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == 3)
         before = info_largeobj(client)
+        pending_before = log_count(self.server, REBUILD_PENDING_LOG)
+        rebuilt_before = log_count(self.server, REBUILT_LOG)
         apply_one_segment_shrink_pressure(client)
         wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 2)
         client.config_set('maxmemory', 0)
-        wait_rebuild_pending(client)
+        self._wait_rebuild_pending(pending_before)
 
         # While the rebuild is pending, a GET is served from NVMe and not promoted.
         assert client.execute_command('BLOB.TCP_GET', 'renum_probe') == payloads['renum_probe']
         assert client.execute_command('BLOB.INFO', 'renum_probe', 'TIER') != b'dram'
-        self._assert_rebuild_still_pending(client, promotion)
+        self._assert_rebuild_still_pending(promotion, rebuilt_before)
 
         self._assert_promotion_finishes(promotion, in_progress, payloads['renum_during'])
         assert (info_largeobj(client)['largeobj_dram_scaling_shrinks']

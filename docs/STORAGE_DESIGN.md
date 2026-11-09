@@ -1220,7 +1220,8 @@ read it submits before it finishes.
    `register_buffers(dense)`. A failure here panics.
 4. `REBUILD_PENDING` clears; promotions resume with their new `iovec_index`.
 
-INFO `largeobj_dram_uring_rebuild_pending` is 1 from step 1 until step 4.
+The poller logs a notice at step 1 (how many promotions it waits for) and one before step 4
+(segment count, time spent waiting for promotions, time the rebuild itself took).
 
 The rebuild must wait for in-progress promotions rather than only for reads in the
 kernel: `register_buffers` holds the ring's `uring_lock`, and submission takes the same

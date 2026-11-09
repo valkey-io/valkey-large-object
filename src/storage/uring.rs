@@ -13,6 +13,7 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::Instant;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use tokio::sync::oneshot;
@@ -151,12 +152,6 @@ impl Drop for PromotionGuard {
 /// it finishes, so none is in the kernel and none holds an index the rebuild renumbers.
 fn drained_for_rebuild() -> bool {
     ACTIVE_PROMOTIONS.load(Ordering::SeqCst) == 0
-}
-
-/// Whether a rebuild of the DRAM ring's table is pending (INFO `dram_uring_rebuild_pending`).
-/// Stays true while in-progress promotions finish, so a stuck promotion shows up here.
-pub fn rebuild_pending() -> bool {
-    REBUILD_PENDING.load(Ordering::Relaxed)
 }
 
 /// Hold this for a whole promotion. `None` when a rebuild is already pending: the
@@ -313,6 +308,8 @@ impl UringEngine {
         let mut next_token: u64 = 1;
         let mut channel_alive = true;
         let mut submit_error: Option<i32> = None;
+        // When the pending rebuild was requested, for its log line.
+        let mut rebuild_requested: Option<Instant> = None;
         loop {
             // Exit when shutdown requested and all in-flight ops are drained.
             if shutdown.load(Ordering::Relaxed) && pending.is_empty() {
@@ -324,6 +321,7 @@ impl UringEngine {
                 && REBUILD_PENDING.load(Ordering::SeqCst)
                 && drained_for_rebuild()
             {
+                let started = Instant::now();
                 let iovecs = super::rebuild_dense_iovecs_for(pool);
                 unsafe {
                     let _ = ring.submitter().unregister_buffers();
@@ -333,6 +331,17 @@ impl UringEngine {
                             .expect("largeobj: io_uring register_buffers failed during a rebuild");
                     }
                 }
+                // Logged before the flag clears, so a reader that does not see this line
+                // knows the rebuild is still pending.
+                let waited = rebuild_requested
+                    .take()
+                    .map_or(0, |at| (started - at).as_millis());
+                valkey_module::logging::log_notice(format!(
+                    "largeobj: rebuilt the DRAM io_uring table: {} segments, waited {waited} ms \
+                     for promotions, rebuild took {} ms",
+                    iovecs.len(),
+                    started.elapsed().as_millis()
+                ));
                 REBUILD_PENDING.store(false, Ordering::Relaxed);
             }
             // Channel disconnected without shutdown flag = bug. The sender lives
@@ -383,7 +392,15 @@ impl UringEngine {
                         // The rebuild is now pending. New promotions are skipped
                         // (REBUILD_PENDING) and the top-of-loop check rebuilds the
                         // table once in-progress promotions finish. No SQE to build.
-                        REBUILD_PENDING.store(true, Ordering::SeqCst);
+                        // A request while one is already pending folds into it.
+                        if !REBUILD_PENDING.swap(true, Ordering::SeqCst) {
+                            rebuild_requested = Some(Instant::now());
+                            valkey_module::logging::log_notice(format!(
+                                "largeobj: DRAM io_uring table rebuild pending, waiting for {} \
+                                 in-progress promotions",
+                                ACTIVE_PROMOTIONS.load(Ordering::SeqCst)
+                            ));
+                        }
                         // When drained (`drained_for_rebuild`), break out of Phase 1
                         // so the outer loop hits the rebuild check immediately.
                         // Otherwise continue draining — the rebuild fires once

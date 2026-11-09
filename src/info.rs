@@ -206,10 +206,6 @@ fn dram_pool_section(ctx: &InfoContext) -> ValkeyResult<()> {
             "dram_uring_registered_segments",
             dram.io_uring_registered_count() as i64,
         )?
-        .field(
-            "dram_uring_rebuild_pending",
-            storage::uring::rebuild_pending() as i64,
-        )?
         .build_section()?
         .build_info()
         .map(|_| ())
