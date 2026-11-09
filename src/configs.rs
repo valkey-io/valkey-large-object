@@ -145,7 +145,7 @@ pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 0; // crate default
 pub const MIN_FABRIC_MAX_IN_FLIGHT: i64 = 0;
 pub const MAX_FABRIC_MAX_IN_FLIGHT: i64 = 65_536;
 // fabric-crc-pool-threads
-pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 1;
+pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 2;
 pub const MIN_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MAX_FABRIC_CRC_POOL_THREADS: i64 = 1024;
 
@@ -677,6 +677,13 @@ fn object_fits_segment(segment_size: u64, object_size: u64) -> bool {
 /// validate_config_constraint() at runtime (CONFIG SET) after the framework has
 /// already stored the new value into the atomic.
 pub fn validate_all_constraints() -> Result<(), String> {
+    // Chunk i is written as align_up(len) bytes at FILE_HEADER_SIZE + i * chunk_size, so an
+    // unaligned chunk_size makes each write overlap the next chunk.
+    if !(CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize)
+        .is_multiple_of(storage::IO_ALIGN)
+    {
+        return Err(errors::ERR_CHUNK_NOT_ALIGNED.into());
+    }
     for constraint in config_constraints() {
         if !(constraint.enforce_condition)() {
             continue;
@@ -903,6 +910,12 @@ mod tests {
                 OperatingMode::Tiered,
                 vec![(&CFG_DISK_MAXMEMORY, max_obj - 1)],
                 Some("largeobj.disk-maxmemory must be >= largeobj.max-object-size in Tiered mode"),
+            ),
+            (
+                "chunk_not_4k_multiple_rejected",
+                OperatingMode::Dram,
+                vec![(&CFG_CHUNK_SIZE, 5000)],
+                Some("largeobj.chunk-size must be a multiple of 4096"),
             ),
         ]
     }

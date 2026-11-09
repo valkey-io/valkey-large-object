@@ -81,7 +81,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `disk-staging-size` | 1gb | Immutable | Size of NVMe staging buffer. Min 1mb. |
 | `max-object-size` | 512mb | Yes | Maximum allowed object size for BLOB.TCP_SET / BLOB.RDMA_SET. Min 1 byte. |
 | `max-promote-size` | 256mb | Yes | Max object size for NVMe→DRAM promotion. 0 = disable promotion. |
-| `chunk-size` | 1mb | Immutable | Chunk size for multi-buffer streaming I/O. Min 4kb, max 256mb. |
+| `chunk-size` | 1mb | Immutable | Chunk size for multi-buffer streaming I/O. Min 4kb, max 256mb, multiple of 4kb. |
 | `max-buffers-per-op` | 64 | Yes | Max buffers per streaming operation. Min 2, max 1024. |
 | `min-buffers-per-op` | 2 | Yes | Min buffers to start a streaming operation. Min 1, max 1024. |
 | `scaling-poll-ms` | 2500 | Yes | Scaling cron poll interval in milliseconds. Min 1000, max 60000. |
@@ -102,7 +102,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `fabric-provider` | `EfaDirect` | Immutable | libfabric provider for the DMA path: `Emulated` (libfabric over TCP, runs anywhere) or `EfaDirect` (EFA hardware RDMA). |
 | `fabric-interfaces` | (empty) | Immutable | Comma-separated fabric domains to serve on. Empty = every domain the provider discovers. |
 | `fabric-max-in-flight` | 0 | Immutable | Transfers each fabric service keeps in flight. 0 = provider default. Max 65536. |
-| `fabric-crc-pool-threads` | 1 | Immutable | Threads hashing checksummed transfers. Min 1, max 1024. |
+| `fabric-crc-pool-threads` | 2 | Immutable | Threads hashing checksummed transfers. Min 1, max 1024. |
 
 All size parameters accept memory notation (`64mb`, `1gb`, etc.).
 
