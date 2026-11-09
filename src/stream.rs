@@ -342,7 +342,7 @@ impl Pool {
     /// Whether the buffer's segment is registered in the kernel io_uring buffer
     /// table — drives the per-op fixed vs non-fixed path. Startup segments are
     /// registered; a segment added by expand() is not until the pool's poller
-    /// runs the whole-table unregister + re-register.
+    /// rebuilds the table.
     pub(crate) fn is_io_uring_registered(&self, b: &SegmentBuffer) -> bool {
         match self {
             Pool::Nvme(p) => p.is_buf_io_uring_registered(b),

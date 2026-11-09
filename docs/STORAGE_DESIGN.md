@@ -156,7 +156,7 @@ Allocate one or more large contiguous memory segments at startup. Register each 
 - Alloc is O(1) amortized but O(n) worst case on fragmented arena
 - More complex implementation (~315 lines)
 - Shrinking requires drain + evacuation (cannot simply return a buffer)
-- Adding/removing segments requires `IORING_UNREGISTER_BUFFERS` + re-register (brief I/O pause)
+- Adding/removing segments requires a table rebuild (`IORING_UNREGISTER_BUFFERS` + `IORING_REGISTER_BUFFERS`), during which the ring does no I/O
 
 ### 4.3 Fragmentation in Approach B
 
@@ -1121,8 +1121,8 @@ lock and no Valkey API.
    is up). Existing MRs are untouched.
 4. **Publish:** take the pool's state lock, put the segment in a slot, and clear the running-expand
    flag. The allocator cannot see the segment before this, so it is always registered.
-5. **Re-register with io_uring** — **Tiered only** (Dram mode has no io_uring
-   engine). `submit_reregister(Dram)` asks the DRAM ring to rebuild its whole table
+5. **Rebuild the io_uring table** — **Tiered only** (Dram mode has no io_uring
+   engine). `submit_rebuild(Dram)` asks the DRAM ring to rebuild its whole table
    (§8.6).
 
 The new segment is usable for allocation as soon as it is published. Until the rebuild
@@ -1182,7 +1182,7 @@ those two races better is open (`DRAM_SHRINK_REVIEW.md`).
 ### 8.6 io_uring Registration (Tiered)
 
 Each pool has its own ring and its own fixed-buffer table (`IORING_REGISTER_BUFFERS`
-is per ring fd). Only the DRAM pool scales, so only the DRAM ring ever re-registers;
+is per ring fd). Only the DRAM pool scales, so only the DRAM ring ever rebuilds;
 the NVMe ring registers once at startup and never stalls.
 
 **Two indexes per segment:**
@@ -1205,19 +1205,34 @@ registration failure fails module load.
 kernel's registration object, so **every** in-flight fixed op on the ring — not just
 ops on the changed segment — must complete before it runs.
 
-**Rebuild protocol** (poller thread, after `submit_reregister` on expand or release):
+The only ops on the DRAM ring are promotion reads (NVMe file into DRAM buffers). Each
+promotion holds a `PromotionGuard` from admission until it finishes, and awaits every
+read it submits before it finishes.
 
-1. `IoRequest::Reregister` sets `registration_pending`.
-2. **Kill-switch:** while pending, every op is issued non-fixed (plain Read/Write,
-   which names an address, not a table index), so no new op can reference the table
-   about to change.
-3. When `fixed_in_flight` reaches 0, `rebuild_dense_iovecs` reindexes the live
-   segments densely from 0 (holes dropped), marks them registered, and the poller runs
-   `unregister_buffers` + `register_buffers(dense)`. A failure here panics.
-4. `registration_pending` clears; ops go fixed again with their new `iovec_index`.
+**Rebuild protocol** (poller thread, after `submit_rebuild` on expand or release):
+
+1. `IoRequest::Rebuild` sets `REBUILD_PENDING`. New promotions are refused
+   (`promotion_guard()` returns `None`), so those GETs are served from NVMe.
+2. The poller waits until no promotion is in progress (`drained_for_rebuild`). The
+   last promotion to finish sends `IoRequest::Wake` so an idle poller re-checks.
+3. `rebuild_dense_iovecs` reindexes the live segments densely from 0 (holes dropped),
+   marks them registered, and the poller runs `unregister_buffers` +
+   `register_buffers(dense)`. A failure here panics.
+4. `REBUILD_PENDING` clears; promotions resume with their new `iovec_index`.
+
+The poller logs a notice at step 1 (how many promotions it waits for) and one before step 4
+(segment count, time spent waiting for promotions, time the rebuild itself took).
+
+The rebuild must wait for in-progress promotions rather than only for reads in the
+kernel: `register_buffers` holds the ring's `uring_lock`, and submission takes the same
+lock, so a promotion's next chunk read would queue behind a rebuild that takes seconds
+at a few hundred segments.
 
 There is a window where nothing is registered (between the two syscalls). It is safe
-because of the drain + kill-switch, not because the swap is atomic. A newly expanded
+because no op is in flight and none is built until the rebuild finishes, not because
+the swap is atomic. For the same reason no op carries an `iovec_index` from before a
+rebuild: a promotion reads each index when it submits, and the rebuild that renumbers
+the segments never overlaps a promotion. A newly expanded
 segment is unregistered until step 3 marks it; `is_buf_io_uring_registered` keeps its
 I/O non-fixed until then, so it never issues a fixed op against an index that does not
 exist (EFAULT).
@@ -1463,7 +1478,7 @@ When the scaling cron shrinks the DRAMPool (§8.5, both modes):
      → slots[i].take()          — leaves a None hole for the next expand
      → drop(segment)            — Segment::drop: EFA deregister, then dealloc;
                                   used_memory decreases
-     → submit_reregister(Dram)  — Tiered: rebuild the DRAM ring's table
+     → submit_rebuild(Dram)  — Tiered: rebuild the DRAM ring's table
 ```
 
 No spin and no blocking wait: release is polled by the cron, so a segment whose last

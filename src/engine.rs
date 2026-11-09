@@ -347,13 +347,12 @@ fn cmd_get_tiered(
     cache.stats.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // Admit via the admission filter, then allocate (reclaiming cold copies if full).
-    // Skip both if the DRAM ring's iovec table is being re-registered and
-    // promote-during-dram-scaling is disabled — promotion reads would go unfixed
-    // (Readv instead of ReadFixed), so fall back to the NVMe streaming path
-    // whose ring never re-registers.
-    let skip_promotion =
-        !crate::promote_during_dram_scaling() && storage::uring::is_registration_pending();
-    let promoted = if !skip_promotion && cache.admission.admit(object_id, obj_len) {
+    // Skip both while a rebuild of the DRAM ring's iovec table is pending: the rebuild
+    // blocks that ring, so promotion reads would queue behind it. Fall back to the
+    // NVMe streaming path, whose ring never rebuilds. The guard, held for the
+    // whole promotion, makes the rebuild wait for it. None while a rebuild is pending.
+    let rebuild_guard = storage::uring::promotion_guard();
+    let promoted = if rebuild_guard.is_some() && cache.admission.admit(object_id, obj_len) {
         dram_pool.try_promote_object(object_id, obj_len)
     } else {
         None
@@ -389,7 +388,7 @@ fn cmd_get_tiered(
         crate::runtime_handle().spawn(async move {
             // Drops before the captured thread_ctx: the fd clone is gone before
             // the client unblocks, so its next GET sees the fd unpinned.
-            let _keep_alive = (file, fd, unevictable);
+            let _keep_alive = (file, fd, unevictable, rebuild_guard);
             // Test hook: pause before NVMe reads so concurrent GETs can subscribe.
             let pause_ms = crate::test_pause_during_promotion_ms();
             if pause_ms > 0 {

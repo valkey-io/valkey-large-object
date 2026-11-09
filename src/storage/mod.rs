@@ -303,12 +303,12 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
 /// Rebuild ONE pool's dense io_uring fixed-buffer table from its segments,
 /// reassigning each a dense pool-local `iovec_index`, marking it registered, and
 /// returning the iovec array for that ring's `register_buffers`. Dense because
-/// 5.10 can only re-register the whole table. Only `PoolType::Dram` re-registers
-/// in practice; NVMe is fixed-size.
+/// 5.10 can only register a whole table. Only `PoolType::Dram` rebuilds in
+/// practice; NVMe is fixed-size.
 pub fn rebuild_dense_iovecs_for(pool: uring::PoolType) -> Vec<libc::iovec> {
     match pool {
         uring::PoolType::Dram => get_dram_pool().rebuild_dense_iovecs(),
-        uring::PoolType::Nvme => unreachable!("NVMe ring never reregisters"),
+        uring::PoolType::Nvme => unreachable!("NVMe ring never rebuilds"),
     }
 }
 
