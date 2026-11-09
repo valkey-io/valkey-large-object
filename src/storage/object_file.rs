@@ -121,15 +121,15 @@ pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
 pub struct ObjectFile {
     /// Identity; the file path is *derived* (`ObjectId::file_path`), never stored.
     object_id: ObjectId,
-    /// True on-disk size, used for NVMe utilization accounting.
+    /// File length; NVMe utilization accounting charges its `nvme::footprint`.
     disk_len: u64,
 }
 
 impl ObjectFile {
     /// Construct the handle for a newly committed object version whose file already
     /// exists on NVMe. No read fd is open yet — it opens lazily on the first GET via
-    /// `ensure_open`. `disk_len` is the true on-disk size; `Drop` releases exactly
-    /// that many bytes.
+    /// `ensure_open`. `disk_len` is the file length; `Drop` releases the footprint
+    /// reserved for it.
     pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
         super::eviction_candidates::insert(object_id);
         Self {

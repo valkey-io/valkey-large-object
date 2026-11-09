@@ -2,6 +2,7 @@ import os
 import glob
 import time
 import resource
+import subprocess
 import threading
 import pytest
 from valkey import ResponseError, Valkey
@@ -940,6 +941,15 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
         # Both objects differ by 1 byte logically, but 4095 bytes on disk (padding).
         self._set_rejected(client, "padkey", unaligned_payload)
         assert client.execute_command("DBSIZE") == 0
+
+    def test_disk_alloc_unit_off_xfs(self):
+        """Off XFS, the XFS geometry ioctl is unknown, so files are charged in
+        IO_ALIGN blocks, which startup logs."""
+        fstype = subprocess.run(["stat", "-f", "-c", "%T", self.data_dir],
+                                capture_output=True, text=True, check=True).stdout.strip()
+        if fstype == "xfs":
+            pytest.skip("disk-dir is on XFS; its unit depends on the stripe")
+        assert self.server.verify_string_in_logfile(f"disk_alloc_unit={self.IO_ALIGN}B")
 
 
 # ─── Corruption Detection ─────────────────────────────────────────────────

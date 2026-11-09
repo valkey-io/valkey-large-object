@@ -76,7 +76,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `operating-mode` | `Dram` | Immutable | `Dram` (DRAM-only) or `Tiered` (DRAM cache + NVMe). |
 | `disk-dir` | (empty) | Immutable | Directory for NVMe object files. Required in Tiered mode. Must support O_DIRECT. |
 | `segment-size` | 1gb | Immutable | Size of each DRAMPool segment. Min 1mb, max 1gb. |
-| `disk-maxmemory` | 0 (unlimited) | Yes | Max NVMe disk usage. 0 = unlimited. |
+| `disk-maxmemory` | 0 (unlimited) | Yes | Max NVMe disk usage, counting each file rounded up to the filesystem's allocation unit (the stripe unit on a striped XFS). 0 = unlimited. |
 | `disk-staging-size` | 1gb | Immutable | Size of NVMe staging buffer. Min 1mb. |
 | `max-object-size` | 512mb | Yes | Maximum allowed object size for BLOB.TCP_SET / BLOB.RDMA_SET. Min 1 byte. |
 | `max-promote-size` | 256mb | Yes | Max object size for NVMe→DRAM promotion. 0 = disable promotion. |
