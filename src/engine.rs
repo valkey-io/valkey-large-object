@@ -10,7 +10,7 @@
 //!
 //! Streaming:
 //!   All paths use multi-buffer chunked I/O via ChunkIterator. NVMe paths
-//!   write FileHeader at offset 0, data at offset 4096+. SET computes CRC
+//!   keep the FileHeader in an xattr, data from offset 0. SET computes CRC
 //!   incrementally per chunk; GET verifies CRC via FileHeader comparison only
 //!   (no rolling hash on the read path).
 //!
@@ -533,16 +533,13 @@ async fn cmd_get_tiered_run(
         obj_len,
         crc32c: crc32c_expected,
     } = get_info;
-    let hdr_buf = &buffers[0];
-    let job = crate::stream::StreamJob::for_nvme_get(
+    let job = crate::stream::StreamJob::for_nvme(
         fd,
         obj_len,
         crate::chunk_size(),
         object_id,
         crc32c_expected,
         batch_width,
-        hdr_buf,
-        source_pool,
     );
     let source = crate::stream::Source::NvmeRead {
         buffers,
@@ -912,14 +909,13 @@ async fn cmd_set_tiered_run(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
-    let job = crate::stream::StreamJob::for_nvme_set(
+    let job = crate::stream::StreamJob::for_nvme(
         fd.as_raw_fd(),
         obj_len,
         chunk_size,
         object_id,
+        0,
         batch_width,
-        &stream_ctx.buffers[0],
-        nvme_pool,
     );
     let target = crate::stream::Target::NvmeWrite {
         buffers: &stream_ctx.buffers,

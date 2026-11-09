@@ -428,47 +428,44 @@ runtime handle is `ObjectFile { object_id, disk_len }` (held behind
 `Arc<ObjectFile>`); it stores no path and no fd — the path is derived from the OID
 and the fd is managed separately by the FdPool (§6.4).
 
-**File header (`FILE_HEADER_SIZE` = 4096 bytes at start of file; data starts at
-offset 4096 for O_DIRECT alignment):**
+**File header (in the `user.lobj` extended attribute; the file holds only the
+payload, from offset 0):**
 ```rust
 // consts in storage/nvme.rs
-pub const FILE_HEADER_SIZE: u64 = 4096;
+pub const FILE_HEADER_XATTR: &CStr = c"user.lobj";
 pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
-pub const FILE_HEADER_VERSION: u8 = 1;
+pub const FILE_HEADER_VERSION: u8 = 2; // 1 was a 4 KiB header page at offset 0
 // Packed wire size, derived from field types (NOT hand-counted):
 pub const FILE_HEADER_WIRE_LEN: usize =
     size_of::<[u8; 4]>() + size_of::<u8>() + size_of::<u64>()
     + size_of::<u64>() + size_of::<u32>();
-const _: () = assert!(FILE_HEADER_WIRE_LEN <= FILE_HEADER_SIZE as usize);
 
 pub struct FileHeader {
     pub magic: [u8; 4],     // b"LOBJ" — identifies file as Large Object module data
-    pub version: u8,        // 1 — enables future format changes
+    pub version: u8,        // 2 — enables future format changes
     pub object_id: u64,     // Matches LoValue.object_id
     pub len: u64,           // True object length (before O_DIRECT padding)
     pub crc32c: Crc,        // Integrity checksum (same as LoValue.crc32c)
 }
 ```
 
-The header is serialized to the page on write and deserialized on read for magic/version validation. It is never byte-cast, so no `#[repr(C)]` is needed.
+The header is serialized to `FILE_HEADER_WIRE_LEN` bytes on write and deserialized on read for magic/version validation. It is never byte-cast, so no `#[repr(C)]` is needed. SET writes it with `fsetxattr` after the payload; every NVMe GET reads it with `fgetxattr` and checks it against the key's `LoValue` before the data reads. It is small enough for XFS to keep inside the inode, so it takes no data block.
 
 **File layout:**
 ```
-[0..WIRE_LEN):          FileHeader fields (little-endian, packed)
-[WIRE_LEN..4096):       Zero padding (aligns data start to 4KB for O_DIRECT)
-[4096..4096+len):       Object data
-[4096+len..):           O_DIRECT write padding to 4KB boundary
+[0..len):               Object data
+[len..):                O_DIRECT write padding to 4KB boundary
 ```
 
-Object data starts at offset 4096 so all ReadFixed/WriteFixed operations on the
-data portion are naturally 4KB-aligned. The header page is read only during
-recovery/reconciliation — never on the hot serving path (LoValue in the keyspace
-carries all metadata needed to serve).
+Keeping the header out of the file data matters on a striped XFS, which starts every
+file on a stripe-unit boundary: a payload that is a multiple of the stripe unit fills
+its last unit exactly, instead of spilling a header page into one more. Chunk `i`
+is written and read at file offset `i * chunk-size`.
 
 **Runtime references:**
 - The read fd is opened lazily on the first GET and cached in FdPool as `Arc<ObjectFd>` (SET opens its own private fd, not via FdPool — §6.4)
 - Lookup: `fd_pool.get_or_open(object_id, disk_dir)` → `Arc<ObjectFd>` for io_uring submission
-- File size = `4096 + ceil(len / 4096) * 4096` (header page + O_DIRECT-padded data)
+- File size = `ceil(len / 4096) * 4096` (O_DIRECT-padded data)
 - Actual object length stored in `LoValue.len` (hot path) and `FileHeader.len` (recovery path)
 - On DEL/free: `ObjectFile::Drop` removes the fd from FdPool (closes on last ref) and unlinks the file
 

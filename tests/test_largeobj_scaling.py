@@ -727,16 +727,18 @@ class TieredBudget(Budget):
     names, unless they pin one down."""
 
     OBJ = 512 * 1024
-    DISK_PER_OBJ = OBJ + 4096  # the ledger also charges the file's one-page header
+    DISK_PER_OBJ = OBJ  # the header is an xattr, so the file is exactly the payload
     PER_BUDGET = 8
     BUDGET = PER_BUDGET * DISK_PER_OBJ
     FULL = 'disk-maxmemory'
     EVICTS_EXACTLY = True
 
     def get_module_args(self, data_dir, direct_io):
-        return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET}"
+        # One byte over BUDGET: still PER_BUDGET objects, but an object of BUDGET + 1 bytes is
+        # allowed by max-object-size and pads past disk-maxmemory.
+        return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET + 1}"
                 f" disk-staging-size {2 * self.BUDGET} segment-size {2 * self.BUDGET}"
-                f" max-object-size {self.BUDGET} max-promote-size {self.BUDGET}"
+                f" max-object-size {self.BUDGET + 1} max-promote-size {self.BUDGET}"
                 f" scaling-poll-ms {self.POLL_MS} reaper-poll-ms {self.POLL_MS}"
                 f" bench-mode no direct-io no")
 
@@ -756,7 +758,6 @@ class TieredBudget(Budget):
         """The key LRU eviction takes first when none was read: the oldest write (lowest oid),
         found by its file's first payload word, which differs for every tag."""
         with open(os.path.join(self.data_dir, self.object_files()[0]), 'rb') as f:
-            f.seek(4096)
             head = f.read(4)
         return next(key for key, payload in payloads.items() if payload[:4] == head)
 
@@ -901,7 +902,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         """No eviction makes room for more than the cap."""
         client = self.new_client()
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        self.assert_refused(client, 'huge', position_pattern(self.BUDGET, 'H'))
+        self.assert_refused(client, 'huge', position_pattern(self.BUDGET + 1, 'H'))
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 0
         assert info['largeobj_disk_capacity_exceeded'] == 1
