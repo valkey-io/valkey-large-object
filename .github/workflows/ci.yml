@@ -108,7 +108,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Tiered mode requires disk-dir on XFS. Tests keep their data under ./test-data.
+      # Run the tests on XFS, so Tiered mode reads disk-dir's XFS geometry as on a
+      # production node (unstriped here, so 4 KiB). Tests keep their data under ./test-data.
       - name: Mount XFS for test data
         run: |
           truncate -s 16G "$RUNNER_TEMP/test-data.xfs"

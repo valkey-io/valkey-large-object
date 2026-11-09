@@ -40,30 +40,39 @@ pub fn allocated_disk_bytes(len: u64) -> u64 {
 /// `_IOR('X', 100, struct xfs_fsop_geom_v1)`: fills the 112-byte geometry struct
 /// from the kernel's `xfs_fs.h`.
 const XFS_IOC_FSGEOMETRY_V1: u32 = 0x8070_5864;
+/// u32 word index of `blocksize` (bytes 0..4): filesystem block size, bytes.
+const XFS_GEOM_BLOCKSIZE: usize = 0;
+/// u32 word index of `sunit` (bytes 80..84): stripe unit, filesystem blocks.
+const XFS_GEOM_SUNIT: usize = 20;
 
-/// Set the unit `allocated_disk_bytes` rounds to: disk-dir's XFS stripe unit, or one
-/// `IO_ALIGN` block if the XFS is not striped. disk-dir must be on XFS. Returns the unit.
+/// Set the unit `allocated_disk_bytes` rounds to: disk-dir's stripe unit if it is on a
+/// striped XFS, else one `IO_ALIGN` block. Returns the unit.
 pub fn init_disk_alloc_unit(dir: &str) -> Result<u64, String> {
     use std::os::unix::io::AsRawFd;
     let dir_fd =
         std::fs::File::open(dir).map_err(|e| format!("cannot open disk-dir {dir}: {e}"))?;
-    // The geometry as u32 words: [0] block size in bytes, [20] stripe unit in blocks.
-    let mut geometry = [0u32; 28];
-    // SAFETY: `geometry` is the 112 bytes this ioctl writes.
-    let ret = unsafe {
-        libc::ioctl(
-            dir_fd.as_raw_fd(),
-            XFS_IOC_FSGEOMETRY_V1 as _,
-            geometry.as_mut_ptr(),
-        )
-    };
-    if ret != 0 {
+    let fd = dir_fd.as_raw_fd();
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fs` is the struct fstatfs writes.
+    if unsafe { libc::fstatfs(fd, &mut fs) } != 0 {
         return Err(format!(
-            "disk-dir {dir} must be on XFS; cannot read its geometry: {}",
+            "cannot statfs disk-dir {dir}: {}",
             std::io::Error::last_os_error()
         ));
     }
-    let unit = (geometry[20] as u64 * geometry[0] as u64).max(super::IO_ALIGN as u64);
+    let mut stripe = 0;
+    if fs.f_type == libc::XFS_SUPER_MAGIC {
+        let mut geometry = [0u32; 28];
+        // SAFETY: `geometry` is the 112 bytes this ioctl writes.
+        if unsafe { libc::ioctl(fd, XFS_IOC_FSGEOMETRY_V1 as _, geometry.as_mut_ptr()) } != 0 {
+            return Err(format!(
+                "cannot read disk-dir {dir} XFS geometry: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        stripe = geometry[XFS_GEOM_SUNIT] as u64 * geometry[XFS_GEOM_BLOCKSIZE] as u64;
+    }
+    let unit = stripe.max(super::IO_ALIGN as u64);
     DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
     Ok(unit)
 }
