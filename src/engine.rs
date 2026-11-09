@@ -897,9 +897,12 @@ async fn cmd_set_tiered_run(
     // FdPool not used on SET: this write fd is short-lived and never cached.
     // FdPool caches read fds lazily on first GET via ensure_open.
     let file_path = object_id.file_path(&crate::disk_dir());
-    let fd = match storage::open_nvme_file_for_write(&file_path) {
+    let fd = match storage::open_nvme_file_for_write(&file_path, disk_len) {
         Ok(fd) => fd,
         Err(_e) => {
+            // The open may have created the file before failing (fd placement, fallocate).
+            // ENOENT is fine; like COPY's cleanup, any other unlink error aborts the node.
+            nvme::unlink(object_id);
             nvme::decrease_nvme_disk_usage(disk_len);
             reply_err(
                 &thread_ctx,

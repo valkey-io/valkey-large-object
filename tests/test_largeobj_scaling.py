@@ -762,8 +762,11 @@ class TieredBudget(Budget):
         return client
 
     def object_files(self):
-        """Lowest oid first (file names are zero-padded hex oids): the oldest write first."""
-        return sorted(name for name in os.listdir(self.data_dir) if OBJECT_FILE.match(name))
+        """Lowest oid first (file names are zero-padded hex oids): the oldest write first. Paths are
+        relative to data_dir, across its shard subdirectories."""
+        files = [os.path.join(os.path.relpath(root, self.data_dir), name)
+                 for root, _, names in os.walk(self.data_dir) for name in names if OBJECT_FILE.match(name)]
+        return sorted(files, key=os.path.basename)
 
     def first_in_line(self, payloads):
         """The key LRU eviction takes first when none was read: the oldest write (lowest oid),
@@ -1370,3 +1373,36 @@ class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
         for key in ('renum_first', 'renum_last', 'renum_during', 'renum_after'):
             assert client.execute_command('BLOB.TCP_GET', key) == payloads[key]
         wait_uring_registered_matches_segments(client)
+
+
+# ─── Reaper pace ─────────────────────────────────────────────────────────────
+
+
+class TestTieredReaperPace(TieredBudget):
+    """No server maxmemory, and enough other keys that a scan pass takes about 15 1ms ticks on a
+    fast host: too many for the 1-2 ticks a `scaling-poll-ms` re-arm leaves, and few enough that
+    a host 100x slower (ASAN) still finishes well inside the timeout."""
+
+    POLL_MS = 1000
+    FILLER = 20_000
+
+    def get_module_args(self, data_dir, direct_io):
+        # Only configs the base args do not set: Valkey builds differ on which copy of a
+        # repeated module arg wins.
+        return super().get_module_args(data_dir, direct_io) + " reaper-scan-budget-us 1000"
+
+    def test_ghosts_drain_on_the_reaper_tick_without_a_server_maxmemory(self):
+        """With ghosts left, the cron re-arms at `reaper-poll-ms` (10ms) on the no-maxmemory exit
+        too. `scaling-poll-ms` goes to 60s once the ghosts exist, so a re-arm there would get one
+        more tick at most before the timeout."""
+        client = self.new_client()
+        client.config_set('largeobj.reaper-poll-ms', 10)
+        client.execute_command('DEBUG', 'POPULATE', self.FILLER, 'filler', 8)
+        payloads = set_objects(client, 'obj_', 2 * self.PER_BUDGET, self.OBJ)
+        assert self.evictions(client) == self.PER_BUDGET
+        client.config_set('largeobj.scaling-poll-ms', 60_000)
+        wait_for_true(lambda: pending_evictions(client) == 0, timeout=30,
+                      on_failure=lambda: print(f"pending={pending_evictions(client)} "
+                                               f"evictions={self.evictions(client)} dbsize={client.dbsize()}"))
+        assert client.dbsize() == self.FILLER + self.PER_BUDGET
+        assert len(surviving(client, payloads)) == self.PER_BUDGET

@@ -287,6 +287,8 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["worker-threads", &*CFG_WORKER_THREADS, DEFAULT_WORKER_THREADS, MIN_WORKER_THREADS, MAX_WORKER_THREADS,
              ConfigurationFlags::IMMUTABLE, None, None],
+            ["disk-dir-shards", &*CFG_DISK_DIR_SHARDS, DEFAULT_DISK_DIR_SHARDS, MIN_DISK_DIR_SHARDS, MAX_DISK_DIR_SHARDS,
+             ConfigurationFlags::IMMUTABLE, None, None],
             ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, DEFAULT_MAX_PROMOTE_SIZE, MIN_MAX_PROMOTE_SIZE, MAX_MAX_PROMOTE_SIZE,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["chunk-size", &*CFG_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE,

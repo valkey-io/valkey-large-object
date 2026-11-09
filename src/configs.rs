@@ -71,6 +71,10 @@ pub const MAX_DISK_MAXMEMORY: i64 = i64::MAX;
 pub const DEFAULT_WORKER_THREADS: i64 = 4;
 pub const MIN_WORKER_THREADS: i64 = 1;
 pub const MAX_WORKER_THREADS: i64 = 32;
+// disk-dir-shards
+pub const DEFAULT_DISK_DIR_SHARDS: i64 = 1024;
+pub const MIN_DISK_DIR_SHARDS: i64 = 1;
+pub const MAX_DISK_DIR_SHARDS: i64 = 65536;
 // max-promote-size
 pub const DEFAULT_MAX_PROMOTE_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
 pub const MIN_MAX_PROMOTE_SIZE: i64 = 0;
@@ -141,7 +145,7 @@ pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 0; // crate default
 pub const MIN_FABRIC_MAX_IN_FLIGHT: i64 = 0;
 pub const MAX_FABRIC_MAX_IN_FLIGHT: i64 = 65_536;
 // fabric-crc-pool-threads
-pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 1;
+pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 2;
 pub const MIN_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MAX_FABRIC_CRC_POOL_THREADS: i64 = 1024;
 
@@ -187,6 +191,9 @@ lazy_static::lazy_static! {
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
     pub static ref CFG_WORKER_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_WORKER_THREADS);
+
+    /// Subdirectories of disk-dir that object files are spread over (`ObjectId::file_path`).
+    pub static ref CFG_DISK_DIR_SHARDS: AtomicI64 = AtomicI64::new(DEFAULT_DISK_DIR_SHARDS);
 
     /// Max object size eligible for DRAMPool promotion (Tiered mode).
     /// Objects larger than this skip promotion and are always served from NVMe.
@@ -379,6 +386,10 @@ pub fn nvme_maxmemory() -> u64 {
 
 pub fn worker_threads() -> usize {
     CFG_WORKER_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn disk_dir_shards() -> u64 {
+    CFG_DISK_DIR_SHARDS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn max_promote_size() -> u64 {
@@ -654,6 +665,13 @@ fn object_fits_segment(segment_size: u64, object_size: u64) -> bool {
 /// validate_config_constraint() at runtime (CONFIG SET) after the framework has
 /// already stored the new value into the atomic.
 pub fn validate_all_constraints() -> Result<(), String> {
+    // Chunk i is written as align_up(len) bytes at FILE_HEADER_SIZE + i * chunk_size, so an
+    // unaligned chunk_size makes each write overlap the next chunk.
+    if !(CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize)
+        .is_multiple_of(storage::IO_ALIGN)
+    {
+        return Err(errors::ERR_CHUNK_NOT_ALIGNED.into());
+    }
     for constraint in config_constraints() {
         if !(constraint.enforce_condition)() {
             continue;
@@ -880,6 +898,12 @@ mod tests {
                 OperatingMode::Tiered,
                 vec![(&CFG_DISK_MAXMEMORY, max_obj - 1)],
                 Some("largeobj.disk-maxmemory must be >= largeobj.max-object-size in Tiered mode"),
+            ),
+            (
+                "chunk_not_4k_multiple_rejected",
+                OperatingMode::Dram,
+                vec![(&CFG_CHUNK_SIZE, 5000)],
+                Some("largeobj.chunk-size must be a multiple of 4096"),
             ),
         ]
     }
