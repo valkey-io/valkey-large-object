@@ -19,7 +19,76 @@ use crate::data_type::ObjectId;
 // ─── NVMe Disk Usage Tracking ────────────────────────────────────────────────
 
 /// Tracks total NVMe disk usage in bytes. Incremented on file creation, decremented on deletion.
+/// Callers charge each file its `allocated_disk_bytes`, not its length.
 static NVME_DISK_USAGE: AtomicU64 = AtomicU64::new(0);
+
+/// The unit disk-dir's filesystem allocates each file in, set once at startup by
+/// `init_disk_alloc_unit`. One `IO_ALIGN` block until then, and in Dram mode.
+static DISK_ALLOC_UNIT: AtomicU64 = AtomicU64::new(super::IO_ALIGN as u64);
+
+/// Bytes the filesystem allocates for a file of `len` bytes. On a striped XFS, a file
+/// of at least one stripe unit starts on a stripe-unit boundary, so the rest of its
+/// last stripe unit can't hold another such file: charge `len` rounded up to the unit.
+/// Charging only `len` lets the filesystem fill up before disk-maxmemory is reached.
+/// XFS aligns only allocations of at least one stripe unit (`xfs_bmapi_allocate`),
+/// and the SET path allocates each file in one `fallocate`, so a shorter file takes
+/// only its own blocks: charge `len`, already `IO_ALIGN`-aligned.
+pub fn allocated_disk_bytes(len: u64) -> u64 {
+    let unit = DISK_ALLOC_UNIT.load(Ordering::Relaxed);
+    if len >= unit {
+        len.next_multiple_of(unit)
+    } else {
+        len
+    }
+}
+
+/// `_IOR('X', 100, struct xfs_fsop_geom_v1)`: fills the 112-byte geometry struct
+/// from the kernel's `xfs_fs.h`.
+const XFS_IOC_FSGEOMETRY_V1: u32 = 0x8070_5864;
+/// u32 word index of `blocksize` (bytes 0..4): filesystem block size, bytes.
+const XFS_GEOM_BLOCKSIZE: usize = 0;
+/// u32 word index of `sunit` (bytes 80..84): stripe unit, filesystem blocks.
+const XFS_GEOM_SUNIT: usize = 20;
+
+/// Set the unit `allocated_disk_bytes` rounds to: disk-dir's stripe unit if it is on a
+/// striped XFS, else one `IO_ALIGN` block. Returns the unit.
+pub fn init_disk_alloc_unit(dir: &str) -> Result<u64, String> {
+    use std::os::unix::io::AsRawFd;
+    let dir_fd =
+        std::fs::File::open(dir).map_err(|e| format!("cannot open disk-dir {dir}: {e}"))?;
+    let fd = dir_fd.as_raw_fd();
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fs` is the struct fstatfs writes.
+    if unsafe { libc::fstatfs(fd, &mut fs) } != 0 {
+        return Err(format!(
+            "cannot statfs disk-dir {dir}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut stripe = 0;
+    if fs.f_type == libc::XFS_SUPER_MAGIC {
+        let mut geometry = [0u32; 28];
+        // SAFETY: `geometry` is the 112 bytes this ioctl writes.
+        if unsafe { libc::ioctl(fd, XFS_IOC_FSGEOMETRY_V1 as _, geometry.as_mut_ptr()) } != 0 {
+            return Err(format!(
+                "cannot read disk-dir {dir} XFS geometry: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        stripe = geometry[XFS_GEOM_SUNIT] as u64 * geometry[XFS_GEOM_BLOCKSIZE] as u64;
+        valkey_module::logging::log_notice(format!(
+            "largeobj: disk-dir {dir} is on XFS, stripe unit {stripe} B (0 = not striped)"
+        ));
+    } else {
+        valkey_module::logging::log_warning(format!(
+            "largeobj: disk-dir {dir} is not on XFS; disk usage is charged in {} B blocks",
+            super::IO_ALIGN
+        ));
+    }
+    let unit = stripe.max(super::IO_ALIGN as u64);
+    DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
+    Ok(unit)
+}
 
 /// Increment NVMe disk usage after a file is created.
 pub fn increase_nvme_disk_usage(bytes: u64) {
@@ -118,8 +187,9 @@ fn evict_and_reserve(bytes: u64) -> bool {
         };
         match stat(oid) {
             Some(len) => {
-                covered += len;
-                victims.push((unevictable, len));
+                let bytes = allocated_disk_bytes(len);
+                covered += bytes;
+                victims.push((unevictable, bytes));
             }
             // Torn down between the pick and the claim, so its key is gone.
             None => {
@@ -536,6 +606,22 @@ mod tests {
         // Subtracting u64::MAX underflows from any real baseline, triggering the
         // fatal assert regardless of what the counter currently holds.
         decrease_nvme_disk_usage(u64::MAX);
+    }
+
+    // ─── allocated_disk_bytes ────────────────────────────────────────────
+
+    // On a 1 MiB stripe unit, a file of at least 1 MiB takes whole stripe units (a
+    // 1 MiB + 4 KiB file takes 2 MiB); a shorter file is not aligned and takes its
+    // own length.
+    #[test]
+    fn test_allocated_disk_bytes_rounds_to_stripe_unit() {
+        let _g = lock();
+        let unit = DISK_ALLOC_UNIT.swap(1 << 20, Ordering::Relaxed);
+        assert_eq!(allocated_disk_bytes(1 << 20), 1 << 20);
+        assert_eq!(allocated_disk_bytes((1 << 20) + 4096), 2 << 20);
+        assert_eq!(allocated_disk_bytes(8192), 8192);
+        assert_eq!(allocated_disk_bytes((1 << 20) - 4096), (1 << 20) - 4096);
+        DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
     }
 
     // ─── object_disk_len ─────────────────────────────────────────────────
