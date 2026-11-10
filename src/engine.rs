@@ -955,6 +955,15 @@ async fn cmd_set_tiered_run(
             return;
         }
     };
+    // A failure is an NVMe write error; ObjectFile Drop unlinks the file and releases
+    // the budget.
+    if object_file
+        .write_header(fd.as_raw_fd(), obj_len, crc)
+        .is_err()
+    {
+        crate::stream::reply_stream_err(&thread_ctx, crate::stream::StreamError::NvmeWrite);
+        return;
+    }
     // Optional end-to-end CRC verification: reject before commit
     // so no corrupted data is persisted. ObjectFile Drop handles
     // NVMe file removal and disk budget; StreamingContext Drop
@@ -970,26 +979,6 @@ async fn cmd_set_tiered_run(
         }
     }
     test_pause_before_finalize().await;
-    // NVMe disk accounting stays with the NVMe caller (no file on the DRAM path).
-    let object_id = object_file.object_id();
-    let disk_len = object_file.disk_len();
-    let file_path = object_id.file_path(&crate::disk_dir());
-    let meta = std::fs::metadata(&file_path).unwrap_or_else(|e| {
-        panic!(
-            "NVMe accounting: cannot stat object {:?} at {} \
-             to verify write size: {e}",
-            object_id, file_path
-        )
-    });
-    let on_disk = meta.len();
-    assert_eq!(
-        on_disk, disk_len,
-        "NVMe accounting: object {:?} on disk is {on_disk} B but we \
-         reserved {} B — write path and accounting have diverged",
-        object_id, disk_len
-    );
-    // The header is written: charge any xattr or extent-tree block the file took.
-    object_file.charge_metadata(&meta);
     let lo_value = LoValue::new(object_id, obj_len, crc, Some(Arc::new(object_file)));
     let outcome = commit_lo_value(&thread_ctx.lock(), &key_name, object_id, lo_value);
     match outcome {

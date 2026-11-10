@@ -13,7 +13,7 @@
 //! wrappers over one shared window loop (`drive_window`); each carries only its own
 //! verb's work (GET verifies the on-disk header and may run a promotion progress
 //! hook; SET computes the object CRC — TCP over the whole payload, EFA by combining
-//! per-chunk transport CRCs — and writes the header), so neither signature carries
+//! per-chunk transport CRCs; its caller writes the header), so neither signature carries
 //! fields inert to the other.
 //!
 //! | Op  | Mode   | Transport | Source                 | Target                |
@@ -414,8 +414,8 @@ pub struct StreamJob {
     pub fd: Option<RawFd>,
     pub obj_len: u64,
     pub chunk_size: usize,
-    /// NVMe object id — `Some` on NVMe GET/SET, whose file header is read (GET)
-    /// or written (SET); `None` on DRAM (no file, no header).
+    /// NVMe object id — `Some` on NVMe GET/SET, whose file header GET reads;
+    /// `None` on DRAM (no file, no header).
     pub object_id: Option<ObjectId>,
     /// GET verifies this against the file header; 0 on SET.
     pub crc32c_expected: Crc,
@@ -444,7 +444,7 @@ impl StreamJob {
     }
 
     /// A StreamJob for the NVMe path: GET verifies the file header before the data
-    /// reads, SET writes it after the batch loop. `crc32c_expected` is the GET's
+    /// reads; a SET's caller writes it after `run_set`. `crc32c_expected` is the GET's
     /// expected CRC, or 0 on SET (its CRC is computed after the loop).
     pub fn for_nvme(
         fd: RawFd,
@@ -640,10 +640,10 @@ pub async fn run_get(
 }
 
 /// SET driver: move every chunk source → target through the shared window, then
-/// compute the object CRC (`object_crc`) and, for an NVMe SET, persist the
-/// FileHeader. No header verify, no progress, no target-error latching (a SET has
-/// no progress hook, so any target error already aborted in `drive_window`).
-/// Returns the committed object CRC.
+/// compute the object CRC (`object_crc`). No header, no progress, no target-error
+/// latching (a SET has no progress hook, so any target error already aborted in
+/// `drive_window`). Returns the object CRC; an NVMe SET's caller then writes the
+/// FileHeader (`ObjectFile::write_header`).
 ///
 /// `object_crc`: SET-TCP checksums the whole payload post-hoc (one pass over the
 /// full `data`, ignoring the iterator); SET-EFA combines the per-chunk transport
@@ -663,22 +663,7 @@ pub async fn run_set(
         "run_set called with a non-SET source/target pairing"
     );
     let (chunk_iter, _target_err) = drive_window(job, chunk_iter, source, target, None).await?;
-    let crc = object_crc(&chunk_iter);
-    if let Some(object_id) = job.object_id {
-        // SET-to-NVMe: persist the FileHeader. A failure is an NVMe write error;
-        // the caller's ObjectFile Drop unlinks the file + releases the budget.
-        if storage::write_file_header(
-            job.fd.expect("SET header write requires an fd"),
-            object_id,
-            job.obj_len,
-            crc,
-        )
-        .is_err()
-        {
-            return Err(StreamError::NvmeWrite);
-        }
-    }
-    Ok(crc)
+    Ok(object_crc(&chunk_iter))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

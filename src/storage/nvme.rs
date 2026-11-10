@@ -49,15 +49,14 @@ pub fn allocated_disk_bytes(len: u64) -> u64 {
     data + DISK_INODE_SIZE.load(Ordering::Relaxed)
 }
 
-/// Blocks the filesystem allocated for the file `meta` describes beyond its data:
-/// an xattr block if the header doesn't fit in the inode, or an extent-tree block if
-/// the file is in too many extents to list in the inode. Charged on top of
-/// `allocated_disk_bytes`. Every object file is allocated in full (`preallocate`) in
-/// blocks that divide `IO_ALIGN`, so its data blocks are exactly its length.
-pub fn metadata_disk_bytes(meta: &std::fs::Metadata) -> u64 {
-    use std::os::unix::fs::MetadataExt;
-    // st_blocks counts 512-byte units.
-    (meta.blocks() * 512).saturating_sub(meta.len())
+/// Blocks the filesystem allocated for a file of `len` bytes in `blocks` 512-byte
+/// units (`st_blocks`) beyond its data: an xattr block if the header doesn't fit in
+/// the inode, or an extent-tree block if the file is in too many extents to list in
+/// the inode. Charged on top of `allocated_disk_bytes`. Every object file is allocated
+/// in full (`preallocate`) in blocks that divide `IO_ALIGN`, so its data blocks are
+/// exactly its length.
+pub fn metadata_disk_bytes(len: u64, blocks: u64) -> u64 {
+    (blocks * 512).saturating_sub(len)
 }
 
 /// `_IOR('X', 100, struct xfs_fsop_geom_v1)`: fills the 112-byte geometry struct
@@ -223,7 +222,9 @@ fn evict_and_reserve(bytes: u64) -> bool {
         match stat(oid) {
             Some(meta) => {
                 // What the file was charged: its ObjectFile's `disk_bytes`.
-                let bytes = allocated_disk_bytes(meta.len()) + metadata_disk_bytes(&meta);
+                use std::os::unix::fs::MetadataExt;
+                let bytes = allocated_disk_bytes(meta.len())
+                    + metadata_disk_bytes(meta.len(), meta.blocks());
                 covered += bytes;
                 victims.push((unevictable, bytes));
             }
@@ -507,8 +508,8 @@ pub fn preallocate(fd: RawFd, len: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write the FileHeader xattr of an NVMe object file. Callers write it after the
-/// payload, so a file with a header is a complete one.
+/// Write the FileHeader xattr of an NVMe object file (`ObjectFile::write_header`).
+/// Callers write it after the payload, so a file with a header is a complete one.
 pub fn write_file_header(
     fd: RawFd,
     object_id: ObjectId,
@@ -657,7 +658,12 @@ mod tests {
         preallocate(file.as_raw_fd(), 1 << 20).unwrap();
         // A written object file: its data and its header. The header fits in the inode.
         write_file_header(file.as_raw_fd(), ObjectId(1), 1 << 20, 7).unwrap();
-        let with_header = metadata_disk_bytes(&file.metadata().unwrap());
+        let disk = |f: &std::fs::File| {
+            use std::os::unix::fs::MetadataExt;
+            let meta = f.metadata().unwrap();
+            metadata_disk_bytes(meta.len(), meta.blocks())
+        };
+        let with_header = disk(&file);
         // An xattr too big for any inode takes a block of its own (tmpfs keeps it in memory).
         let big = [0u8; 2048];
         // SAFETY: the name is NUL-terminated and `big` is valid for its length.
@@ -670,7 +676,7 @@ mod tests {
                 0,
             )
         };
-        let with_big = metadata_disk_bytes(&file.metadata().unwrap());
+        let with_big = disk(&file);
         let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
         let is_tmpfs = unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } == 0
             && fs.f_type == libc::TMPFS_MAGIC;

@@ -36,6 +36,7 @@ use super::fd_placement::ObjectFd;
 use super::fd_pool::FdPool;
 use super::Crc;
 use crate::data_type::ObjectId;
+use std::os::unix::io::RawFd;
 
 /// Unevictable list (Tiered): oids whose files are in use by a GET, SET, COPY,
 /// teardown or eviction, as oid -> the `Arc<UnevictableOID>` its holders share.
@@ -124,7 +125,7 @@ pub struct ObjectFile {
     /// File length.
     disk_len: u64,
     /// Disk usage charged for the file, released on `Drop`: its `allocated_disk_bytes`,
-    /// plus its `metadata_disk_bytes` once `charge_metadata` has run.
+    /// plus its `metadata_disk_bytes` once `write_header` has run.
     disk_bytes: u64,
 }
 
@@ -142,14 +143,29 @@ impl ObjectFile {
         }
     }
 
-    /// Charge the blocks the filesystem allocated for the written file beyond its data,
-    /// from its metadata `meta`, as eviction's stat credits them. Called once, after the
-    /// last write to the file (its header). Charged without a disk-maxmemory check:
-    /// the blocks are already allocated, and the next reservation evicts for them.
-    pub fn charge_metadata(&mut self, meta: &std::fs::Metadata) {
-        let bytes = super::nvme::metadata_disk_bytes(meta);
+    /// Write the file's header through `fd`, its last write once the payload is
+    /// written, then charge the blocks the file took beyond its data
+    /// (`metadata_disk_bytes`), as eviction's stat credits them. Charged without a
+    /// disk-maxmemory check: the blocks are already allocated, and the next
+    /// reservation evicts for them. On error, `Drop` still unlinks the file and
+    /// releases what was charged.
+    pub fn write_header(&mut self, fd: RawFd, len: u64, crc32c: Crc) -> std::io::Result<()> {
+        super::write_file_header(fd, self.object_id, len, crc32c)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is the struct fstat writes.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        assert_eq!(
+            st.st_size as u64, self.disk_len,
+            "NVMe accounting: object {:?} on disk is {} B but we reserved {} B — write \
+             path and accounting have diverged",
+            self.object_id, st.st_size, self.disk_len
+        );
+        let bytes = super::nvme::metadata_disk_bytes(self.disk_len, st.st_blocks as u64);
         super::nvme::increase_nvme_disk_usage(bytes);
         self.disk_bytes += bytes;
+        Ok(())
     }
 
     pub fn object_id(&self) -> ObjectId {
@@ -169,8 +185,9 @@ impl ObjectFile {
 
     /// Copy this file into a new object version: allocates a fresh `ObjectId`, copies the
     /// payload byte-for-byte, then writes a header carrying the new OID with this
-    /// object's `len`/`crc32c`. `fsync`s before returning so the file is
-    /// durable before it is exposed to O_DIRECT reads via io_uring.
+    /// object's `len`/`crc32c`. `fsync`s the payload before the header, so the file is
+    /// on disk before it is exposed to O_DIRECT reads via io_uring, and its blocks are
+    /// final when the header write charges them.
     ///
     /// Reserves `disk_len` against disk-maxmemory up front; the returned handle's `Drop`
     /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
@@ -186,16 +203,11 @@ impl ObjectFile {
         }
         let new_oid = ObjectId::next();
         let _copy = UnevictableOID::new(new_oid);
-        let dst_path = new_oid.file_path(&dir);
-        match self.copy_file(&dst_path, new_oid, len, crc32c) {
-            Ok(meta) => {
-                let mut copy = ObjectFile::new(new_oid, disk_len);
-                copy.charge_metadata(&meta);
-                Some(copy)
-            }
+        // Owns cleanup from here: Drop removes the file and releases disk budget.
+        let mut copy = ObjectFile::new(new_oid, disk_len);
+        match self.copy_file(&mut copy, &dir, len, crc32c) {
+            Ok(()) => Some(copy),
             Err(e) => {
-                super::nvme::unlink(new_oid);
-                super::nvme::decrease_nvme_disk_usage(disk_bytes);
                 valkey_module::logging::log_warning(format!(
                     "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
                     self.object_id
@@ -207,25 +219,23 @@ impl ObjectFile {
 
     /// Payload copy + header write for `copy`. Buffered I/O on purpose: this runs off
     /// the io_uring path, and the destination is not yet visible to any reader.
-    /// Returns the destination's metadata.
     fn copy_file(
         &self,
-        dst_path: &str,
-        new_oid: ObjectId,
+        copy: &mut ObjectFile,
+        dir: &str,
         len: u64,
         crc32c: Crc,
-    ) -> std::io::Result<std::fs::Metadata> {
+    ) -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
         let mut src = std::fs::File::open(self.object_id.file_path(&crate::disk_dir()))?;
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(dst_path)?;
+            .open(copy.object_id.file_path(dir))?;
         super::nvme::preallocate(dst.as_raw_fd(), self.disk_len)?;
         std::io::copy(&mut src, &mut dst)?;
-        super::write_file_header(dst.as_raw_fd(), new_oid, len, crc32c)?;
         dst.sync_all()?;
-        dst.metadata()
+        copy.write_header(dst.as_raw_fd(), len, crc32c)
     }
 }
 
