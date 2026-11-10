@@ -63,6 +63,18 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
         except ResponseError as e:
             assert str(e) == 'rdma address must not be empty'
 
+    def test_hello_rejects_malformed_sockaddr(self):
+        """The tcp provider needs a sockaddr_in (16 bytes, AF_INET) or sockaddr_in6 (28 bytes,
+        AF_INET6). Too short, or the right length with another family, is rejected before it
+        reaches fi_av_insert. A well-formed address is accepted."""
+        client = self.server.get_new_client()
+        short = binascii.hexlify(b'\x02\x00\x00\x01').decode()
+        wrong_family = binascii.hexlify(b'\x00\x00' + bytes(14)).decode()
+        for address in (short, wrong_family):
+            self.verify_error_response(
+                client, f'BLOB.RDMA_HELLO {address}', 'rdma address is not a valid sockaddr')
+        assert len(client.execute_command('BLOB.RDMA_HELLO', PEER_ADDRESS)) == 1
+
     def test_efa_get_needs_hello(self):
         """The RDMA arity of BLOB.RDMA_GET is refused until this client has a session."""
         client = self.server.get_new_client()
