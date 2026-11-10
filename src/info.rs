@@ -88,10 +88,6 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
         )?
         .field("evictions", EVICTIONS.load(Ordering::Relaxed) as i64)?
         .field(
-            "pending_eviction_key_hints",
-            storage::reclaim::pending_key_hints() as i64,
-        )?
-        .field(
             "evicted_keys_deleted_by_name",
             storage::reclaim::REAPED_BY_NAME.load(Ordering::Relaxed) as i64,
         )?

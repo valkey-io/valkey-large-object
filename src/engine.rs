@@ -107,8 +107,6 @@ pub(crate) struct BlockedRequest {
     thread_ctx: valkey_module::ThreadSafeContext<valkey_module::BlockedClient>,
     /// The client's selected db when it blocked.
     db: i32,
-    /// `db`'s token for a key hint, taken on the main thread with `db`.
-    db_token: u32,
 }
 
 impl BlockedRequest {
@@ -121,7 +119,6 @@ impl BlockedRequest {
         Self {
             thread_ctx: valkey_module::ThreadSafeContext::with_blocked_client(blocked_client),
             db,
-            db_token: storage::reclaim::db_token(db),
         }
     }
 
@@ -922,7 +919,7 @@ async fn cmd_set_tiered_run(
         0,
         batch_width,
     );
-    job.key_hint = Some(storage::KeyHint::new(thread_ctx.db_token, &key_name));
+    job.key_hint = Some(storage::KeyHint::new(thread_ctx.db as u32, &key_name));
     let target = crate::stream::Target::NvmeWrite {
         buffers: &stream_ctx.buffers,
         pool: nvme_pool,

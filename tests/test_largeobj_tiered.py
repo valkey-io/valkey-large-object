@@ -92,11 +92,11 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert len(dat_files) >= 1, "Expected at least one .dat file"
         # Check the most recent file (highest OID = last in sorted hex names).
         header = os.getxattr(dat_files[-1], 'user.lobj')
-        version, oid, length, _crc, db_token, key_len = struct.unpack_from('<BQQIIB', header)
+        version, oid, length, _crc, db, key_len = struct.unpack_from('<BQQIIB', header)
         assert version == 1, "FileHeader version mismatch"
         assert oid == int(os.path.basename(dat_files[-1])[:-4], 16)
         assert length == len(payload_multi)
-        assert (db_token, header[26:]) == (0, b'rt_multi') and key_len == len(b'rt_multi')
+        assert (db, header[26:]) == (0, b'rt_multi') and key_len == len(b'rt_multi')
         with open(dat_files[-1], 'rb') as f:
             data_on_disk = f.read(len(payload_multi))
             assert data_on_disk == payload_multi, "On-disk data at offset 0 mismatch"

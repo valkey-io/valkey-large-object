@@ -448,13 +448,13 @@ pub struct FileHeader {
     pub object_id: u64,     // Matches LoValue.object_id
     pub len: u64,           // True object length (before O_DIRECT padding)
     pub crc32c: Crc,        // Integrity checksum (same as LoValue.crc32c)
-    pub hint: KeyHint,      // db_token: u32, then key_len: u8 and the key bytes
+    pub hint: KeyHint,      // db: u32, then key_len: u8 and the key bytes
 }
 ```
 
 The header is serialized to `FILE_HEADER_FIXED_LEN` bytes plus the key on write and deserialized on read, checking the version and that the length matches `key_len`. Only the module writes `user.lobj`, so the name alone identifies the value; there is no magic. It is never byte-cast, so no `#[repr(C)]` is needed. SET writes it with `fsetxattr` after the payload; every NVMe GET reads it with `fgetxattr` and checks `object_id`, `len` and `crc32c` against the key's `LoValue` before the data reads, never the key hint. At most 154 bytes, it stays inside a default 512-byte XFS inode (measured: inline up to 223 bytes next to a 33-byte SELinux label), so it takes no data block.
 
-The key hint is the key's name and db when the object was written (COPY records the destination's), for the reaper: after an eviction it deletes that key by name if the key still holds the victim's `object_id`, instead of scanning the keyspace. RENAME and MOVE never rewrite it, so a stale hint is caught by that check and the key is left to the scan. The db is a token that SWAPDB swaps with the db, so a hint follows its key through a SWAPDB. A key longer than `KEY_HINT_MAX_LEN` is recorded as no key and always found by scan.
+The key hint is the key's name and db when the object was written, for the reaper: after an eviction it deletes that key by name if the key still holds the victim's `object_id`, instead of scanning the keyspace. RENAME, MOVE and SWAPDB never rewrite it, so a stale hint is caught by that check and the key is left to the scan. A COPY, and a key longer than `KEY_HINT_MAX_LEN`, record no key and are always found by scan.
 
 **File layout:**
 ```

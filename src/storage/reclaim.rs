@@ -10,7 +10,7 @@
 //!   eviction finds its file already gone (a stale directory entry).
 //!
 //! Tiered: an eviction reads the victim's key hint (its key's name and db when it was
-//! written, from the file header) and hands it to the cron, which deletes that key by
+//! written, from the file header) and queues it for the cron, which deletes that key by
 //! name if it still holds the victim. Victims without a usable hint are found by scan.
 //!
 //! Lock order: `RECLAIM_LIST` before `DRAMPool.objects` when both are held.
@@ -30,154 +30,18 @@ use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 pub static REAPED_BY_NAME: AtomicU64 = AtomicU64::new(0);
 pub static REAPED_BY_SCAN: AtomicU64 = AtomicU64::new(0);
 
-/// Tiered victims between their claim and the cron.
-#[derive(Default)]
-struct KeyHints {
-    /// Every victim whose key hint is being read or waits in `ready`. The scan skips
-    /// these, so it never races the delete by name. An oid leaves when the cron takes
-    /// its hint, or when the eviction finds none and leaves the key to the scan.
-    hinted: HashSet<ObjectId>,
-    /// Hints read, oldest first, for the cron.
-    ready: VecDeque<(ObjectId, KeyHint)>,
-}
+/// Tiered victims' key hints, oldest first, for the cron. An eviction queues a hint
+/// under the same server-lock hold as its claim, so a cron tick, which deletes queued
+/// keys before it scans, never scans for a victim whose hint is queued.
+static KEY_HINTS: LazyLock<Mutex<VecDeque<(ObjectId, KeyHint)>>> = LazyLock::new(Mutex::default);
 
-static KEY_HINTS: LazyLock<Mutex<KeyHints>> = LazyLock::new(Mutex::default);
-
-fn key_hints() -> MutexGuard<'static, KeyHints> {
+fn key_hints() -> MutexGuard<'static, VecDeque<(ObjectId, KeyHint)>> {
     KEY_HINTS.lock().expect("KEY_HINTS lock unavailable")
 }
 
-/// Tiered: keys only the scan can delete (a victim with no key hint or a stale one, or
-/// a placeholder from a load). The
-/// Tiered scan runs only while this is above 0, so deleting by name costs no scan.
-/// It can overcount (such a key deleted by a client instead), which only costs scan
-/// time, never a missed key; it resets once the reclaim list empties.
-static SCAN_OWED: AtomicUsize = AtomicUsize::new(0);
-
-/// A claimed victim's key hint is on its way: hide the victim from the scan.
-pub fn expect_key_hint(oid: ObjectId) {
-    key_hints().hinted.insert(oid);
-}
-
-/// The victim's key hint, or `None` to leave its key to the scan.
-pub fn provide_key_hint(oid: ObjectId, hint: Option<KeyHint>) {
-    let mut hints = key_hints();
-    match hint {
-        Some(hint) => hints.ready.push_back((oid, hint)),
-        None => {
-            hints.hinted.remove(&oid);
-            SCAN_OWED.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Put `oid` on the reclaim list with no key hint, so the scan deletes its key (a blob
-/// placeholder from a load).
-pub fn reclaim_by_scan(oid: ObjectId) {
-    RECLAIM_LIST.insert(oid);
-    SCAN_OWED.fetch_add(1, Ordering::Relaxed);
-}
-
-/// The claimed victim was torn down before its eviction, so its key is gone.
-pub fn forget_key_hint(oid: ObjectId) {
-    key_hints().hinted.remove(&oid);
-}
-
-/// The oldest hint read, taking its victim off the hinted set.
-fn take_key_hint() -> Option<(ObjectId, KeyHint)> {
-    let mut hints = key_hints();
-    let (oid, hint) = hints.ready.pop_front()?;
-    hints.hinted.remove(&oid);
-    Some((oid, hint))
-}
-
-/// INFO: victims whose key hint waits for the cron, or is still being read.
-pub fn pending_key_hints() -> usize {
-    key_hints().hinted.len()
-}
-
-// ─── db tokens ───────────────────────────────────────────────────────────────
-
-/// A key hint names its db by token, not number: SWAPDB swaps two dbs' tokens, so a
-/// hint written before a SWAPDB still names the db its key moved to. Tokens start
-/// equal to db numbers; only SWAPDB moves them. Main thread only (commands, COPY,
-/// SWAPDB, the cron).
-#[derive(Default)]
-struct DbTokens {
-    /// `token_of[db]`; a db past the end has token == db.
-    token_of: Vec<u32>,
-    /// `db_of[token]`, the inverse.
-    db_of: Vec<i32>,
-}
-
-impl DbTokens {
-    fn token_of(&self, db: i32) -> u32 {
-        self.token_of.get(db as usize).copied().unwrap_or(db as u32)
-    }
-
-    fn db_of(&self, token: u32) -> i32 {
-        self.db_of
-            .get(token as usize)
-            .copied()
-            .unwrap_or(token as i32)
-    }
-
-    fn swap(&mut self, a: i32, b: i32) {
-        let len = a.max(b) as usize + 1;
-        while self.token_of.len() < len {
-            let n = self.token_of.len();
-            self.token_of.push(n as u32);
-            self.db_of.push(n as i32);
-        }
-        self.token_of.swap(a as usize, b as usize);
-        self.db_of[self.token_of[a as usize] as usize] = a;
-        self.db_of[self.token_of[b as usize] as usize] = b;
-    }
-}
-
-thread_local! {
-    static DB_TOKENS: RefCell<DbTokens> = RefCell::default();
-}
-
-/// The token a key hint records for `db`. Main thread only.
-pub fn db_token(db: i32) -> u32 {
-    DB_TOKENS.with_borrow(|t| t.token_of(db))
-}
-
-/// `SWAPDB`'s server event payload (`RedisModuleSwapDbInfoV1`); crosses FFI.
-#[repr(C)]
-struct SwapDbInfo {
-    _version: u64,
-    dbnum_first: i32,
-    dbnum_second: i32,
-}
-
-/// Subscribe to SWAPDB, so the db tokens follow every swap. The crate's SWAPDB hook
-/// drops the payload, so this subscribes directly.
-pub fn subscribe_swapdb(ctx: &Context) -> Result<(), String> {
-    unsafe extern "C" fn on_swapdb(
-        _ctx: *mut raw::RedisModuleCtx,
-        _eid: raw::RedisModuleEvent,
-        _subevent: u64,
-        data: *mut std::ffi::c_void,
-    ) {
-        // SAFETY: core passes a RedisModuleSwapDbInfo for this event.
-        let info = unsafe { &*(data as *const SwapDbInfo) };
-        DB_TOKENS.with_borrow_mut(|t| t.swap(info.dbnum_first, info.dbnum_second));
-    }
-    let event = raw::RedisModuleEvent {
-        id: raw::REDISMODULE_EVENT_SWAPDB,
-        dataver: 1,
-    };
-    // SAFETY: `ctx` is the live load context.
-    let rc = unsafe {
-        raw::RedisModule_SubscribeToServerEvent.unwrap()(ctx.get_raw(), event, Some(on_swapdb))
-    };
-    if rc == raw::REDISMODULE_OK as i32 {
-        Ok(())
-    } else {
-        Err("failed to subscribe to SWAPDB".to_string())
-    }
+/// Queue a claimed victim's key hint for the cron. Call under the claim's server lock.
+pub fn queue_key_hint(oid: ObjectId, hint: KeyHint) {
+    key_hints().push_back((oid, hint));
 }
 
 pub static RECLAIM_LIST: LazyLock<ReclaimList> = LazyLock::new(ReclaimList::default);
@@ -264,36 +128,22 @@ thread_local! {
 /// own slot instead of reusing a command's cached slot.
 pub fn delete_reclaimed_keys(ctx: &Context) {
     if RECLAIM_LIST.is_empty() {
-        // No victims left, so none is owed to the scan.
-        SCAN_OWED.store(0, Ordering::Relaxed);
         return;
     }
     let deadline = Instant::now() + Duration::from_micros(crate::reaper_scan_budget_us());
     delete_hinted_keys(ctx, deadline);
     RECLAIM_SCAN_CURSOR.with_borrow_mut(|scan| {
-        // Dram has no key hints, so every victim is the scan's.
-        while !RECLAIM_LIST.is_empty()
-            && (crate::operating_mode() == crate::OperatingMode::Dram
-                || SCAN_OWED.load(Ordering::Relaxed) > 0)
-            && Instant::now() < deadline
-        {
+        while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
             // Past the last db: one full pass done. At most one pass per tick
             // so a key moved behind the cursor can't spin us.
             if !select_db(ctx, scan.db) {
                 scan.db = 0;
                 break;
             }
-            let (mut listed_keys, more) = listed_keys_in_next_bucket(ctx, &scan.cursor);
-            // Victims with a key hint coming, or waiting, are deleted by name.
-            {
-                let hints = key_hints();
-                listed_keys.retain(|(_, oid)| !hints.hinted.contains(oid));
-            }
+            let (listed_keys, more) = listed_keys_in_next_bucket(ctx, &scan.cursor);
             for (name, oid) in listed_keys {
                 let _ = ctx.open_key_writable(&name).unlink();
                 REAPED_BY_SCAN.fetch_add(1, Ordering::Relaxed);
-                let _ = SCAN_OWED
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
                 // Same keyspace event core fires for its own evictions.
                 ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
                 // Tiered Mode: Do not touch the RECLAIM_LIST. ObjectFile's drop uses
@@ -315,23 +165,22 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
     });
 }
 
-/// Delete, by name, the keys of victims whose key hint has arrived, until `deadline`.
-/// A key is deleted only if it still holds its victim: oids are never reused, so a
-/// key that was renamed, moved, overwritten or replaced since holds another oid, or
-/// is gone. Such a victim is left to the scan. Runs on the main thread, like every
-/// keyspace change, so nothing moves the key between the check and the delete.
+/// Delete, by name, the keys of queued key hints, until `deadline`. A key is deleted
+/// only if it still holds its victim: oids are never reused, so a key that was
+/// renamed, moved, swapped to another db, overwritten or replaced since holds another
+/// oid, or is gone. Such a victim is left to the scan. Runs on the main thread, like
+/// every keyspace change, so nothing moves the key between the check and the delete.
 fn delete_hinted_keys(ctx: &Context, deadline: Instant) {
     while Instant::now() < deadline {
-        let Some((oid, hint)) = take_key_hint() else {
+        let Some((oid, hint)) = key_hints().pop_front() else {
             return;
         };
         // Torn down since the eviction: its key is gone already.
         if !RECLAIM_LIST.contains(&oid) {
             continue;
         }
-        let db = DB_TOKENS.with_borrow(|t| t.db_of(hint.db_token));
         let name = ValkeyString::create_from_slice(ctx.get_raw(), &hint.key);
-        let deleted = select_db(ctx, db) && {
+        let deleted = select_db(ctx, hint.db as i32) && {
             let key = ctx.open_key_writable(&name);
             let holds_victim = matches!(
                 key.get_value::<LoValue>(&LO_TYPE),
@@ -343,8 +192,6 @@ fn delete_hinted_keys(ctx: &Context, deadline: Instant) {
             REAPED_BY_NAME.fetch_add(1, Ordering::Relaxed);
             // Same keyspace event core fires for its own evictions.
             ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
-        } else {
-            SCAN_OWED.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -375,31 +222,4 @@ fn listed_keys_in_next_bucket(
         }
     });
     (listed.into_inner(), more)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Tokens follow the data through any sequence of swaps: the token a db had when a
-    // key was written still maps to wherever that data is now.
-    #[test]
-    fn db_tokens_follow_every_swapdb() {
-        let mut tokens = DbTokens::default();
-        assert_eq!((tokens.token_of(5), tokens.db_of(5)), (5, 5));
-        let written_in_0 = tokens.token_of(0);
-        let written_in_3 = tokens.token_of(3);
-        tokens.swap(0, 3);
-        assert_eq!(tokens.db_of(written_in_0), 3);
-        assert_eq!(tokens.db_of(written_in_3), 0);
-        tokens.swap(3, 7);
-        assert_eq!(tokens.db_of(written_in_0), 7);
-        assert_eq!(tokens.db_of(written_in_3), 0);
-        tokens.swap(0, 7);
-        assert_eq!(tokens.db_of(written_in_0), 0);
-        assert_eq!(tokens.db_of(written_in_3), 7);
-        for db in 0..10 {
-            assert_eq!(tokens.db_of(tokens.token_of(db)), db, "a permutation");
-        }
-    }
 }

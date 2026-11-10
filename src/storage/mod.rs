@@ -182,8 +182,6 @@ pub fn init(
         // subdirectories. Created here rather than in the reset, which also runs at shutdown.
         crate::data_type::create_disk_dir_shards(disk_dir)
             .map_err(|e| format!("failed to create disk-dir shards under {disk_dir}: {e}"))?;
-        // Key hints name dbs by token; SWAPDB must move the tokens.
-        reclaim::subscribe_swapdb(ctx)?;
     }
     // Disk usage charges each file in the filesystem's allocation unit.
     let disk_alloc_unit = if mode == crate::OperatingMode::Tiered {

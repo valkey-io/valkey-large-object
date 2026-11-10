@@ -153,15 +153,15 @@ impl ObjectFile {
         pool.get_or_open(self.object_id, dir)
     }
 
-    /// Copy this file into a new object version: allocates a fresh `ObjectId`, copies the
-    /// payload byte-for-byte, then writes a header carrying the new OID with this
-    /// object's `len`/`crc32c` and the destination key's `hint`. `fsync`s before returning so the file is
+    /// Copy this file into a new object version: allocates a fresh `ObjectId`, writes a
+    /// header carrying the new OID with this object's `len`/`crc32c`, then copies the
+    /// payload past the header byte-for-byte. `fsync`s before returning so the file is
     /// durable before it is exposed to O_DIRECT reads via io_uring.
     ///
     /// Reserves `disk_len` against disk-maxmemory up front; the returned handle's `Drop`
     /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
     /// the command rather than aborting the node), leaving no partial file behind.
-    pub fn copy(&self, len: u64, crc32c: Crc, hint: super::KeyHint) -> Option<ObjectFile> {
+    pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
         let dir = crate::disk_dir();
         let disk_len = self.disk_len;
         let disk_bytes = super::nvme::allocated_disk_bytes(disk_len);
@@ -173,7 +173,7 @@ impl ObjectFile {
         let new_oid = ObjectId::next();
         let _copy = UnevictableOID::new(new_oid);
         let dst_path = new_oid.file_path(&dir);
-        match self.copy_file(&dst_path, new_oid, len, crc32c, hint) {
+        match self.copy_file(&dst_path, new_oid, len, crc32c) {
             Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
             Err(e) => {
                 super::nvme::unlink(new_oid);
@@ -195,7 +195,6 @@ impl ObjectFile {
         new_oid: ObjectId,
         len: u64,
         crc32c: Crc,
-        hint: super::KeyHint,
     ) -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
         let mut src = std::fs::File::open(self.object_id.file_path(&crate::disk_dir()))?;
@@ -204,7 +203,9 @@ impl ObjectFile {
             .create_new(true)
             .open(dst_path)?;
         std::io::copy(&mut src, &mut dst)?;
-        super::write_file_header(dst.as_raw_fd(), new_oid, len, crc32c, hint)?;
+        // No key hint: the copy callback doesn't know the destination db, so an evicted
+        // copy's key is found by scan.
+        super::write_file_header(dst.as_raw_fd(), new_oid, len, crc32c, Default::default())?;
         dst.sync_all()
     }
 }

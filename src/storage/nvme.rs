@@ -181,12 +181,14 @@ fn evict_and_reserve(bytes: u64) -> bool {
         if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
             break;
         }
-        // Server lock -> UNEVICTABLE -> RECLAIM_LIST. The reaper scan skips the victim
-        // from the claim on, until `evict` hands it its key hint or lets it go.
+        // Read before the claim, off the server lock; queued in the claim's lock hold,
+        // so no cron tick sees the victim listed without its hint.
+        let hint = read_key_hint(oid);
+        // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
         let Some(unevictable) = with_server_lock(|_| {
             let claim = super::object_file::claim_victim(oid);
-            if claim.is_some() {
-                super::reclaim::expect_key_hint(oid);
+            if let (Some(_), Some(hint)) = (&claim, hint) {
+                super::reclaim::queue_key_hint(oid, hint);
             }
             claim
         }) else {
@@ -201,7 +203,6 @@ fn evict_and_reserve(bytes: u64) -> bool {
             // Torn down between the pick and the claim, so its key is gone.
             None => {
                 super::reclaim::RECLAIM_LIST.remove(&oid);
-                super::reclaim::forget_key_hint(oid);
             }
         }
     }
@@ -218,8 +219,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
 
 /// Unlink claimed `victims` and remove them from the unevictable list. Returns the bytes
 /// freed. Victims stay in the reclaim list: their keys read as missing until the cron
-/// deletes them, by the name in their key hint or else by scan, and their teardown then
-/// only removes them from it.
+/// deletes them, and their teardown then only removes them from it.
 fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
     let mut freed = 0;
     for (unevictable, size) in victims {
@@ -229,8 +229,6 @@ fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
         }
         super::get_dram_pool().remove_object(&oid);
         crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
-        // Before the unlink, while the header is still there.
-        super::reclaim::provide_key_hint(oid, read_key_hint(oid));
         unlink(oid);
         freed += size;
     }
@@ -314,7 +312,7 @@ pub const FILE_HEADER_FIXED_LEN: usize = size_of::<u8>() // version
     + size_of::<u64>()                                    // object_id
     + size_of::<u64>()                                    // len
     + size_of::<u32>()                                    // crc32c
-    + size_of::<u32>()                                    // db_token
+    + size_of::<u32>()                                    // db
     + size_of::<u8>(); // key_len
 
 /// Longest key name the header records. Keeps the whole xattr inline in a default
@@ -328,24 +326,24 @@ pub const FILE_HEADER_MAX_LEN: usize = FILE_HEADER_FIXED_LEN + KEY_HINT_MAX_LEN;
 
 /// Where the object's key was when it was written, so the reaper can delete it by
 /// name after an eviction instead of scanning the keyspace for it. Only a hint:
-/// RENAME, MOVE or COPY never rewrite it, so the reaper checks the key still holds
-/// this object before deleting it.
+/// RENAME, MOVE and SWAPDB never rewrite it, so the reaper checks the key still holds
+/// this object before deleting it, and leaves it to the scan if not. A COPY records
+/// no key.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct KeyHint {
-    /// `reclaim::db_token` of the key's db, which SWAPDB never invalidates.
-    pub db_token: u32,
+    pub db: u32,
     /// The key name, or empty if it was longer than `KEY_HINT_MAX_LEN`.
     pub key: Vec<u8>,
 }
 
 impl KeyHint {
-    pub fn new(db_token: u32, key: &[u8]) -> Self {
+    pub fn new(db: u32, key: &[u8]) -> Self {
         let key = if key.len() <= KEY_HINT_MAX_LEN {
             key.to_vec()
         } else {
             Vec::new()
         };
-        Self { db_token, key }
+        Self { db, key }
     }
 }
 
@@ -388,7 +386,7 @@ impl FileHeader {
         page.extend_from_slice(&self.object_id.to_le_bytes());
         page.extend_from_slice(&self.len.to_le_bytes());
         page.extend_from_slice(&self.crc32c.to_le_bytes());
-        page.extend_from_slice(&self.hint.db_token.to_le_bytes());
+        page.extend_from_slice(&self.hint.db.to_le_bytes());
         page.push(key.len() as u8);
         page.extend_from_slice(key);
         page
@@ -425,7 +423,7 @@ impl FileHeader {
             len: u64_at(9),
             crc32c: u32_at(17),
             hint: KeyHint {
-                db_token: u32_at(21),
+                db: u32_at(21),
                 key: key.to_vec(),
             },
         })

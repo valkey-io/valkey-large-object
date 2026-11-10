@@ -1441,8 +1441,8 @@ class TestTieredReaperPace(TieredBudget):
 class TestTieredEvictionKeyHints(TieredBudget):
     """A Tiered object's file header records its key and db (the key hint). After an eviction the
     cron deletes the victim's key by that name, without a scan, if the key still holds the victim;
-    a renamed, moved or too-long key is left to the scan. Each test evicts exactly the oldest
-    objects: LRU order is write order here, and RENAME, MOVE and SWAPDB don't reorder it."""
+    a renamed or too-long key is left to the scan. Each test evicts exactly the oldest objects:
+    LRU order is write order here, and RENAME doesn't reorder it."""
 
     POLL_MS = 1000
 
@@ -1452,10 +1452,7 @@ class TestTieredEvictionKeyHints(TieredBudget):
                 info['largeobj_evicted_keys_deleted_by_scan'])
 
     def drain(self, client):
-        def drained():
-            info = info_largeobj(client)
-            return info['largeobj_pending_evictions'] == info['largeobj_pending_eviction_key_hints'] == 0
-        wait_for_true(drained, timeout=15)
+        wait_for_true(lambda: pending_evictions(client) == 0, timeout=15)
 
     def fill(self, client, written):
         """Fill the budget behind the `written` objects; the next write evicts the oldest."""
@@ -1495,31 +1492,6 @@ class TestTieredEvictionKeyHints(TieredBudget):
         assert client.execute_command('BLOB.TCP_GET', 'victim0') == other
         assert client.execute_command('EXISTS', 'moved_victim') == 0
         assert self.reaped(client) == (0, 1)
-
-    def test_a_hint_follows_its_key_through_swapdb(self):
-        client = self.new_client()
-        set_objects(client, 'swapped', 1, self.OBJ)
-        self.fill(client, 1)
-        client.execute_command('SWAPDB', 0, 1)
-        set_objects(client, 'evictor_', 1, self.OBJ)
-        self.drain(client)
-        assert self.reaped(client) == (1, 0)
-        assert client.dbsize() == 1
-        client.execute_command('SELECT', 1)
-        assert client.execute_command('EXISTS', 'swapped0') == 0
-        assert client.dbsize() == self.PER_BUDGET - 1
-
-    def test_a_copy_is_deleted_by_name_in_its_destination_db(self):
-        """COPY records the destination key and db, not the source's."""
-        client = self.new_client()
-        set_objects(client, 'src', 1, self.OBJ)
-        assert client.execute_command('COPY', 'src0', 'dst', 'DB', 2) in (1, True)
-        set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        self.drain(client)
-        assert self.evictions(client) == 2
-        assert self.reaped(client) == (2, 0)
-        client.execute_command('SELECT', 2)
-        assert client.dbsize() == 0
 
     def test_a_key_over_the_cap_is_found_by_scan(self):
         """128 bytes is the longest name a header records."""
