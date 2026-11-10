@@ -1,5 +1,6 @@
 import os
 import glob
+import struct
 import time
 import resource
 import threading
@@ -85,14 +86,17 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert result == payload_multi
         # Second GET from DRAM after promotion.
         assert client.execute_command('BLOB.TCP_GET', 'rt_multi') == payload_multi
-        # The FileHeader is in the user.lobj xattr: magic b"LOBJ", version 1.
-        # The file holds only the payload, from offset 0.
+        # The FileHeader is in the user.lobj xattr: version 1, oid, len, crc32c, then the key
+        # hint (db token, key_len, key). The file holds only the payload, from offset 0.
         dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected at least one .dat file"
         # Check the most recent file (highest OID = last in sorted hex names).
         header = os.getxattr(dat_files[-1], 'user.lobj')
-        assert header[:4] == b'LOBJ', "FileHeader magic mismatch"
-        assert header[4] == 1, "FileHeader version mismatch"
+        version, oid, length, _crc, db_token, key_len = struct.unpack_from('<BQQIIB', header)
+        assert version == 1, "FileHeader version mismatch"
+        assert oid == int(os.path.basename(dat_files[-1])[:-4], 16)
+        assert length == len(payload_multi)
+        assert (db_token, header[26:]) == (0, b'rt_multi') and key_len == len(b'rt_multi')
         with open(dat_files[-1], 'rb') as f:
             data_on_disk = f.read(len(payload_multi))
             assert data_on_disk == payload_multi, "On-disk data at offset 0 mismatch"
@@ -959,11 +963,11 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'X')
         client.execute_command('BLOB.TCP_SET', 'crc_key', payload)
-        # Corrupt the CRC field in the FileHeader xattr (bytes 21-24 in packed layout).
+        # Corrupt the CRC field in the FileHeader xattr (bytes 17-20 in packed layout).
         dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected .dat file after SET"
         header = os.getxattr(dat_files[-1], 'user.lobj')
-        os.setxattr(dat_files[-1], 'user.lobj', header[:21] + b'\xff\xff\xff\xff')
+        os.setxattr(dat_files[-1], 'user.lobj', header[:17] + b'\xff\xff\xff\xff' + header[21:])
         # GET should trigger panic (CRC mismatch in read_and_verify_file_header).
         with self.server.expect_crash(self):
             try:
@@ -972,8 +976,8 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
                 pass
 
 
-class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
-    """FileHeader magic corruption: server must crash on corrupt data."""
+class TestTieredCorruptionHeaderLength(ValkeyLargeObjTestCaseBase):
+    """A FileHeader whose length disagrees with its key_len: server must crash on corrupt data."""
 
     def get_module_args(self, data_dir, direct_io):
         return (
@@ -988,18 +992,18 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
             f" fabric-provider Emulated"
         )
 
-    def test_tiered_file_header_magic_corruption(self):
-        """Corrupt magic bytes → GET triggers panic."""
+    def test_tiered_file_header_truncated(self):
+        """A header missing its last key byte → GET triggers panic."""
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'Y')
-        client.execute_command('BLOB.TCP_SET', 'magic_key', payload)
+        client.execute_command('BLOB.TCP_SET', 'truncated_key', payload)
         dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected .dat file after SET"
         header = os.getxattr(dat_files[-1], 'user.lobj')
-        os.setxattr(dat_files[-1], 'user.lobj', b'BAAD' + header[4:])
+        os.setxattr(dat_files[-1], 'user.lobj', header[:-1])
         with self.server.expect_crash(self):
             try:
-                client.execute_command('BLOB.TCP_GET', 'magic_key')
+                client.execute_command('BLOB.TCP_GET', 'truncated_key')
             except Exception:
                 pass
 

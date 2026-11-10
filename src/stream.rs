@@ -421,6 +421,8 @@ pub struct StreamJob {
     pub crc32c_expected: Crc,
     /// Window width — SQEs/transfers in flight per batch, and the buffer-reuse bound.
     pub batch_width: usize,
+    /// NVMe SET: the key hint its file header records. `None` otherwise.
+    pub key_hint: Option<storage::KeyHint>,
 }
 
 impl StreamJob {
@@ -440,6 +442,7 @@ impl StreamJob {
             object_id: None,
             crc32c_expected,
             batch_width,
+            key_hint: None,
         }
     }
 
@@ -461,6 +464,7 @@ impl StreamJob {
             object_id: Some(object_id),
             crc32c_expected,
             batch_width,
+            key_hint: None,
         }
     }
 }
@@ -672,6 +676,9 @@ pub async fn run_set(
             object_id,
             job.obj_len,
             crc,
+            job.key_hint
+                .clone()
+                .expect("SET header write requires a key hint"),
         )
         .is_err()
         {

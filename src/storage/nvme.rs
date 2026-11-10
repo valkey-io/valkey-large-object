@@ -112,8 +112,15 @@ fn evict_and_reserve(bytes: u64) -> bool {
         if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
             break;
         }
-        // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
-        let Some(unevictable) = with_server_lock(|_| super::object_file::claim_victim(oid)) else {
+        // Server lock -> UNEVICTABLE -> RECLAIM_LIST. The reaper scan skips the victim
+        // from the claim on, until `evict` hands it its key hint or lets it go.
+        let Some(unevictable) = with_server_lock(|_| {
+            let claim = super::object_file::claim_victim(oid);
+            if claim.is_some() {
+                super::reclaim::expect_key_hint(oid);
+            }
+            claim
+        }) else {
             continue;
         };
         match stat(oid) {
@@ -124,6 +131,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
             // Torn down between the pick and the claim, so its key is gone.
             None => {
                 super::reclaim::RECLAIM_LIST.remove(&oid);
+                super::reclaim::forget_key_hint(oid);
             }
         }
     }
@@ -140,7 +148,8 @@ fn evict_and_reserve(bytes: u64) -> bool {
 
 /// Unlink claimed `victims` and remove them from the unevictable list. Returns the bytes
 /// freed. Victims stay in the reclaim list: their keys read as missing until the cron
-/// deletes them, and their teardown then only removes them from it.
+/// deletes them, by the name in their key hint or else by scan, and their teardown then
+/// only removes them from it.
 fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
     let mut freed = 0;
     for (unevictable, size) in victims {
@@ -150,6 +159,8 @@ fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
         }
         super::get_dram_pool().remove_object(&oid);
         crate::info::EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        // Before the unlink, while the header is still there.
+        super::reclaim::provide_key_hint(oid, read_key_hint(oid));
         unlink(oid);
         freed += size;
     }
@@ -224,110 +235,158 @@ fn transient(e: &std::io::Error) -> bool {
 /// Extended attribute that holds an object file's `FileHeader`. Keeping the header
 /// out of the file data makes the file exactly its payload, so a payload that is a
 /// multiple of the filesystem's stripe unit doesn't spill into one more stripe unit.
+/// Only the module writes this name, so a value read from it is ours: no magic.
 pub const FILE_HEADER_XATTR: &std::ffi::CStr = c"user.lobj";
-pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
 pub const FILE_HEADER_VERSION: u8 = 1;
 
-/// Packed wire size of the header fields (no inter-field padding).
-/// Computed from field types so adding a field updates this automatically.
-pub const FILE_HEADER_WIRE_LEN: usize = size_of::<[u8; 4]>()  // magic
-    + size_of::<u8>()                                           // version
-    + size_of::<u64>()                                          // object_id
-    + size_of::<u64>()                                          // len
-    + size_of::<u32>(); // crc32c
+/// Packed size of the fixed fields (no inter-field padding), before the key bytes.
+pub const FILE_HEADER_FIXED_LEN: usize = size_of::<u8>() // version
+    + size_of::<u64>()                                    // object_id
+    + size_of::<u64>()                                    // len
+    + size_of::<u32>()                                    // crc32c
+    + size_of::<u32>()                                    // db_token
+    + size_of::<u8>(); // key_len
+
+/// Longest key name the header records. Keeps the whole xattr inline in a default
+/// 512-byte XFS inode: measured, the value stays inline up to 223 bytes next to a
+/// 33-byte SELinux label, and this leaves room for a longer label, more extents and
+/// later fields. A longer key is recorded as no key.
+pub const KEY_HINT_MAX_LEN: usize = 128;
+
+/// Largest header value: the fixed fields plus the longest key.
+pub const FILE_HEADER_MAX_LEN: usize = FILE_HEADER_FIXED_LEN + KEY_HINT_MAX_LEN;
+
+/// Where the object's key was when it was written, so the reaper can delete it by
+/// name after an eviction instead of scanning the keyspace for it. Only a hint:
+/// RENAME, MOVE or COPY never rewrite it, so the reaper checks the key still holds
+/// this object before deleting it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeyHint {
+    /// `reclaim::db_token` of the key's db, which SWAPDB never invalidates.
+    pub db_token: u32,
+    /// The key name, or empty if it was longer than `KEY_HINT_MAX_LEN`.
+    pub key: Vec<u8>,
+}
+
+impl KeyHint {
+    pub fn new(db_token: u32, key: &[u8]) -> Self {
+        let key = if key.len() <= KEY_HINT_MAX_LEN {
+            key.to_vec()
+        } else {
+            Vec::new()
+        };
+        Self { db_token, key }
+    }
+}
 
 /// On-disk file header for NVMe object files, stored in the `FILE_HEADER_XATTR`
 /// xattr. The file itself holds only the payload, starting at offset 0.
 ///
 /// The struct's in-memory layout does NOT match the on-disk wire format —
 /// the compiler inserts padding for natural field alignment. Serialization
-/// is handled by `to_bytes` (sequential writes) and `from_bytes` (sequential
+/// is handled by `to_bytes` (sequential writes) and `parse` (sequential
 /// reads with validation). Do not attempt to byte-cast this struct.
+#[derive(Debug, PartialEq)]
 pub struct FileHeader {
-    pub magic: [u8; 4],
     pub version: u8,
     pub object_id: u64,
     pub len: u64,
     pub crc32c: Crc,
+    pub hint: KeyHint,
 }
 
 impl FileHeader {
-    pub fn new(object_id: ObjectId, len: u64, crc32c: Crc) -> Self {
+    pub fn new(object_id: ObjectId, len: u64, crc32c: Crc, hint: KeyHint) -> Self {
         Self {
-            magic: *FILE_HEADER_MAGIC,
             version: FILE_HEADER_VERSION,
             object_id: object_id.0,
             len,
             crc32c,
+            hint,
         }
     }
 
-    /// Serialize the fields back to back (`FILE_HEADER_WIRE_LEN` bytes).
+    /// Serialize the fields back to back: `FILE_HEADER_FIXED_LEN` bytes, then the key.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut page = Vec::with_capacity(FILE_HEADER_WIRE_LEN);
-        page.extend_from_slice(&self.magic);
+        let key = &self.hint.key;
+        assert!(
+            key.len() <= KEY_HINT_MAX_LEN,
+            "key hint longer than the cap"
+        );
+        let mut page = Vec::with_capacity(FILE_HEADER_FIXED_LEN + key.len());
         page.push(self.version);
         page.extend_from_slice(&self.object_id.to_le_bytes());
         page.extend_from_slice(&self.len.to_le_bytes());
         page.extend_from_slice(&self.crc32c.to_le_bytes());
-        assert_eq!(page.len(), FILE_HEADER_WIRE_LEN);
+        page.extend_from_slice(&self.hint.db_token.to_le_bytes());
+        page.push(key.len() as u8);
+        page.extend_from_slice(key);
         page
     }
 
-    /// Deserialize. Panics on invalid magic, version, or truncated bytes
-    /// (these indicate corrupt on-disk data). Fields are read sequentially via cursor.
-    pub fn from_bytes(page: &[u8]) -> Self {
-        if page.len() < FILE_HEADER_WIRE_LEN {
-            panic!(
-                "largeobj: file header too short ({} bytes, need {})",
-                page.len(),
-                FILE_HEADER_WIRE_LEN
-            );
+    /// Deserialize. Errs on an unknown version, or a length that doesn't match the
+    /// fixed fields plus `key_len`: a truncated or corrupt value.
+    pub fn parse(page: &[u8]) -> Result<Self, String> {
+        if page.len() < FILE_HEADER_FIXED_LEN {
+            return Err(format!(
+                "file header too short ({} bytes, need {FILE_HEADER_FIXED_LEN})",
+                page.len()
+            ));
         }
-        let mut cur = 0;
-        let magic: [u8; 4] = page[cur..cur + 4]
-            .try_into()
-            .expect("file header magic slice");
-        cur += 4;
-        if &magic != FILE_HEADER_MAGIC {
-            panic!(
-                "largeobj: file header invalid magic {:?} (expected {:?})",
-                magic, FILE_HEADER_MAGIC
-            );
-        }
-        let version = page[cur];
-        cur += 1;
+        let (fixed, key) = page.split_at(FILE_HEADER_FIXED_LEN);
+        let version = fixed[0];
         if version != FILE_HEADER_VERSION {
-            panic!(
-                "largeobj: file header unsupported version {} (expected {})",
-                version, FILE_HEADER_VERSION
-            );
+            return Err(format!(
+                "file header unsupported version {version} (expected {FILE_HEADER_VERSION})"
+            ));
         }
-        let object_id = u64::from_le_bytes(
-            page[cur..cur + 8]
-                .try_into()
-                .expect("file header object_id slice"),
-        );
-        cur += 8;
-        let len = u64::from_le_bytes(
-            page[cur..cur + 8]
-                .try_into()
-                .expect("file header len slice"),
-        );
-        cur += 8;
-        let crc32c = u32::from_le_bytes(
-            page[cur..cur + 4]
-                .try_into()
-                .expect("file header crc32c slice"),
-        );
-        Self {
-            magic,
+        let u64_at = |at: usize| u64::from_le_bytes(fixed[at..at + 8].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(fixed[at..at + 4].try_into().unwrap());
+        let key_len = fixed[FILE_HEADER_FIXED_LEN - 1] as usize;
+        if key.len() != key_len {
+            return Err(format!(
+                "file header key_len {key_len} but {} key bytes",
+                key.len()
+            ));
+        }
+        Ok(Self {
             version,
-            object_id,
-            len,
-            crc32c,
-        }
+            object_id: u64_at(1),
+            len: u64_at(9),
+            crc32c: u32_at(17),
+            hint: KeyHint {
+                db_token: u32_at(21),
+                key: key.to_vec(),
+            },
+        })
     }
+
+    /// `parse`, panicking on corrupt on-disk data.
+    pub fn from_bytes(page: &[u8]) -> Self {
+        Self::parse(page).unwrap_or_else(|e| panic!("largeobj: {e}"))
+    }
+}
+
+/// The key hint in `oid`'s file header, if it has one. `None` if the file has no
+/// valid header for `oid` or recorded no key: the reaper then finds the key by scan.
+/// Reads by path, so the caller needs no open fd.
+pub fn read_key_hint(oid: ObjectId) -> Option<KeyHint> {
+    let path = std::ffi::CString::new(oid.file_path(&crate::disk_dir())).ok()?;
+    let mut bytes = [0u8; FILE_HEADER_MAX_LEN];
+    // SAFETY: both names are NUL-terminated and `bytes` is valid for `bytes.len()`.
+    let n = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            FILE_HEADER_XATTR.as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    let header = FileHeader::parse(&bytes[..n as usize]).ok()?;
+    (header.object_id == oid.0 && !header.hint.key.is_empty()).then_some(header.hint)
 }
 
 // ─── Disk Length ──────────────────────────────────────────────────────────────
@@ -352,7 +411,8 @@ pub fn object_disk_len(chunk_iter: &mut super::ChunkIterator) -> u64 {
 // ─── NVMe File I/O Helpers ───────────────────────────────────────────────────
 
 /// Read the FileHeader xattr of an NVMe file and validate it against expected
-/// values. Checks magic, version, object_id, len, and CRC.
+/// values. Checks version, object_id, len, and CRC; never the key hint, which a
+/// RENAME or MOVE makes stale.
 /// Panics on a missing or corrupt header (unrecoverable on-disk corruption). Panics
 /// on CRC mismatch (serving corrupt data is worse than crashing).
 pub fn read_and_verify_file_header(
@@ -361,7 +421,8 @@ pub fn read_and_verify_file_header(
     expected_len: u64,
     crc32c_expected: Crc,
 ) {
-    let mut bytes = [0u8; FILE_HEADER_WIRE_LEN];
+    // Sized for the longest header: a smaller buffer fails fgetxattr with ERANGE.
+    let mut bytes = [0u8; FILE_HEADER_MAX_LEN];
     // SAFETY: the name is NUL-terminated and `bytes` is valid for `bytes.len()`.
     let n = unsafe {
         libc::fgetxattr(
@@ -378,7 +439,7 @@ pub fn read_and_verify_file_header(
             std::io::Error::last_os_error()
         );
     }
-    // from_bytes panics on corrupt magic/version (unrecoverable on-disk corruption).
+    // from_bytes panics on a corrupt version or length (unrecoverable on-disk corruption).
     let header = FileHeader::from_bytes(&bytes[..n as usize]);
     if header.object_id != expected_object_id.0 || header.len != expected_len {
         panic!(
@@ -429,8 +490,9 @@ pub fn write_file_header(
     object_id: ObjectId,
     obj_len: u64,
     crc: Crc,
+    hint: KeyHint,
 ) -> std::io::Result<()> {
-    let bytes = FileHeader::new(object_id, obj_len, crc).to_bytes();
+    let bytes = FileHeader::new(object_id, obj_len, crc, hint).to_bytes();
     // SAFETY: the name is NUL-terminated and `bytes` is valid for `bytes.len()`.
     let rc = unsafe {
         libc::fsetxattr(
@@ -588,5 +650,54 @@ mod tests {
             meta.blocks() * 512 >= disk_len,
             "blocks are reserved at open"
         );
+    }
+
+    // ─── FileHeader ──────────────────────────────────────────────────────
+
+    fn header(key: &[u8]) -> FileHeader {
+        FileHeader::new(
+            ObjectId(0x0102_0304_0506_0708),
+            0x1112_1314_1516_1718,
+            0x2122_2324,
+            KeyHint::new(0x3132_3334, key),
+        )
+    }
+
+    // Every field round-trips, at its fixed offset, and the key follows the fixed part.
+    #[test]
+    fn a_header_round_trips_with_its_key_hint() {
+        let key = b"model@00000003@0@abcdef";
+        let bytes = header(key).to_bytes();
+        assert_eq!(bytes.len(), FILE_HEADER_FIXED_LEN + key.len());
+        assert_eq!(bytes[0], FILE_HEADER_VERSION);
+        assert_eq!(bytes[FILE_HEADER_FIXED_LEN - 1] as usize, key.len());
+        assert_eq!(&bytes[FILE_HEADER_FIXED_LEN..], key);
+        assert_eq!(FileHeader::parse(&bytes), Ok(header(key)));
+    }
+
+    // A key at the cap is kept; one byte over records no key, so the reaper scans for it.
+    #[test]
+    fn a_key_over_the_cap_is_recorded_as_no_key() {
+        let at_cap = vec![b'k'; KEY_HINT_MAX_LEN];
+        assert_eq!(KeyHint::new(7, &at_cap).key, at_cap);
+        let over = vec![b'k'; KEY_HINT_MAX_LEN + 1];
+        let hint = KeyHint::new(7, &over);
+        assert!(hint.key.is_empty());
+        let bytes = header(&over).to_bytes();
+        assert_eq!(bytes.len(), FILE_HEADER_FIXED_LEN);
+        assert_eq!(FileHeader::parse(&bytes).unwrap().hint.key, b"");
+        assert_eq!(header(&at_cap).to_bytes().len(), FILE_HEADER_MAX_LEN);
+    }
+
+    // A truncated or padded value, or another version, is corrupt.
+    #[test]
+    fn a_header_of_the_wrong_length_or_version_is_rejected() {
+        let bytes = header(b"key").to_bytes();
+        assert!(FileHeader::parse(&bytes[..bytes.len() - 1]).is_err());
+        assert!(FileHeader::parse(&[bytes.as_slice(), b"x"].concat()).is_err());
+        assert!(FileHeader::parse(&bytes[..FILE_HEADER_FIXED_LEN - 1]).is_err());
+        let mut other_version = bytes.clone();
+        other_version[0] = FILE_HEADER_VERSION + 1;
+        assert!(FileHeader::parse(&other_version).is_err());
     }
 }

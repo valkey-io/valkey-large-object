@@ -162,13 +162,18 @@ impl LoValue {
     /// Deep-copy for the COPY command callback.
     /// Dram mode: clone ObjectContext via try_clone. Tiered mode: copy NVMe file.
     /// Returns None on capacity exhaustion (pool full or disk-maxmemory exceeded).
-    pub fn create_copy(&self) -> Option<LoValue> {
+    /// `to_db` / `to_key`: the destination, which a Tiered copy records as its key hint.
+    /// Main thread only (the COPY callback).
+    pub fn create_copy(&self, to_db: i32, to_key: &[u8]) -> Option<LoValue> {
         if self.reclaim_in_progress() {
             return None;
         }
         let copy = match crate::operating_mode() {
             crate::OperatingMode::Dram => self.create_copy_dram(),
-            crate::OperatingMode::Tiered => self.create_copy_tiered(),
+            crate::OperatingMode::Tiered => self.create_copy_tiered(crate::storage::KeyHint::new(
+                crate::storage::reclaim::db_token(to_db),
+                to_key,
+            )),
         }?;
         crate::storage::eviction_candidates::inherit_ttl(self.object_id, copy.object_id);
         Some(copy)
@@ -190,8 +195,8 @@ impl LoValue {
     /// Tiered mode: copy NVMe file with a fresh OID.
     /// Operates at the NVMe level only — DRAMPool promotion is per-key and not carried over.
     /// Returns None if disk-maxmemory would be exceeded or the copy fails.
-    fn create_copy_tiered(&self) -> Option<LoValue> {
-        let file = self.file.as_ref()?.copy(self.len, self.crc32c)?;
+    fn create_copy_tiered(&self, hint: crate::storage::KeyHint) -> Option<LoValue> {
+        let file = self.file.as_ref()?.copy(self.len, self.crc32c, hint)?;
         Some(LoValue::new(
             file.object_id(),
             self.len,
@@ -247,15 +252,19 @@ unsafe extern "C" fn lo_free_effort(
     val.free_effort()
 }
 
-/// COPY callback.
+/// COPY callback (`copy2`, which also gives the destination db).
 /// Deep-copies the object based on operating mode. Returns null on failure.
-unsafe extern "C" fn lo_copy(
-    _from_key: *mut raw::RedisModuleString,
-    _to_key: *mut raw::RedisModuleString,
+unsafe extern "C" fn lo_copy2(
+    ctx: *mut raw::RedisModuleKeyOptCtx,
     value: *const std::ffi::c_void,
 ) -> *mut std::ffi::c_void {
     let src = &*(value as *const LoValue);
-    match src.create_copy() {
+    let to_key = raw::RedisModule_GetToKeyNameFromOptCtx.unwrap()(ctx);
+    let to_db = raw::RedisModule_GetToDbIdFromOptCtx.unwrap()(ctx);
+    let mut len = 0;
+    let name = raw::RedisModule_StringPtrLen.unwrap()(to_key, &mut len);
+    let to_key = std::slice::from_raw_parts(name.cast::<u8>(), len);
+    match src.create_copy(to_db, to_key) {
         Some(new_val) => Box::into_raw(Box::new(new_val)) as *mut std::ffi::c_void,
         None => std::ptr::null_mut(),
     }
@@ -321,7 +330,7 @@ unsafe extern "C" fn lo_rdb_load(
         );
     }
     let placeholder = LoValue::new(ObjectId::next(), 0, 0, None);
-    crate::storage::reclaim::RECLAIM_LIST.insert(placeholder.object_id);
+    crate::storage::reclaim::reclaim_by_scan(placeholder.object_id);
     Box::into_raw(Box::new(placeholder)) as *mut std::ffi::c_void
 }
 
@@ -358,12 +367,12 @@ pub static LO_TYPE: ValkeyType = ValkeyType::new(
         aux_save_triggers: 0,
         free_effort: Some(lo_free_effort),
         unlink: None,
-        copy: Some(lo_copy),
+        copy: None,
         defrag: None, // TODO
         mem_usage2: None,
         free_effort2: None,
         unlink2: None,
-        copy2: None,
+        copy2: Some(lo_copy2),
     },
 );
 

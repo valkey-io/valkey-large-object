@@ -32,8 +32,8 @@ pub use object_file::{ObjectFile, UnevictableOID};
 // Re-exports from nvme.rs
 pub use nvme::{
     object_disk_len, open_nvme_file_for_write, read_and_verify_file_header,
-    validate_and_clean_disk_dir, write_file_header, FileHeader, FILE_HEADER_MAGIC,
-    FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN, FILE_HEADER_XATTR,
+    validate_and_clean_disk_dir, write_file_header, FileHeader, KeyHint, FILE_HEADER_FIXED_LEN,
+    FILE_HEADER_MAX_LEN, FILE_HEADER_VERSION, FILE_HEADER_XATTR, KEY_HINT_MAX_LEN,
 };
 
 pub use dram_pool::DRAMPool;
@@ -182,6 +182,8 @@ pub fn init(
         // subdirectories. Created here rather than in the reset, which also runs at shutdown.
         crate::data_type::create_disk_dir_shards(disk_dir)
             .map_err(|e| format!("failed to create disk-dir shards under {disk_dir}: {e}"))?;
+        // Key hints name dbs by token; SWAPDB must move the tokens.
+        reclaim::subscribe_swapdb(ctx)?;
     }
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.
