@@ -322,13 +322,13 @@ pub type ClientEFAAddress = (u64, usize, u64);
 
 /// A lightweight reference to one chunk of the object — its position, which
 /// window buffer holds it, and (for EFA) the client memory regions to transfer
-/// into. Pure metadata: it does NOT own the chunk's bytes, and the stream driver
-/// clones one per chunk into its per-chunk futures.
+/// into. Pure metadata: it does NOT own the chunk's bytes. `next_chunk` hands one
+/// out by value and the stream driver moves it into its per-chunk future.
 ///
-/// INVARIANT — keep this type cheap to clone. It is cloned once per chunk on the
-/// batch-snapshot hot path, so it must never grow a field that carries a real or
-/// large allocation (payload bytes, buffers, big owned collections). Only small
-/// coordinates belong here: indices, lengths, and the short `addrs` region list.
+/// INVARIANT — keep this type small. One is built per chunk on the batch hot path,
+/// so it must never grow a field that carries a real or large allocation (payload
+/// bytes, buffers, big owned collections). Only small coordinates belong here:
+/// indices, lengths, and the short `addrs` region list.
 /// If you need heavyweight per-chunk state, store it in the owning context/pool
 /// and reference it by `buffer_idx`, not inline here.
 #[derive(Debug, Clone)]
@@ -343,7 +343,7 @@ pub struct ChunkRef {
     pub buffer_idx: usize,
     /// Per-chunk EFA transfer addresses. None for TCP paths.
     /// Each entry is a ClientEFAAddress (remote_addr, len, rkey) — one fi_write/fi_read per entry.
-    /// Populated incrementally by ChunkIterator::next_chunk().
+    /// Mapped by ChunkIterator::next_chunk() for the chunk it returns.
     pub addrs: Option<Vec<ClientEFAAddress>>,
 }
 
@@ -352,7 +352,8 @@ pub struct ChunkRef {
 /// address mapping. Does NOT own buffers — indexes into the owning context's
 /// Vec<SegmentBuffer>.
 pub struct ChunkIterator {
-    /// Pre-computed chunk metadata (user_data_len, buffer_idx). Addresses populated lazily.
+    /// Pre-computed chunk metadata (user_data_len, buffer_idx). `addrs` stays None here;
+    /// next_chunk() maps it on the copy it returns.
     chunks: Vec<ChunkRef>,
     /// Next chunk to return.
     cursor: usize,
@@ -425,21 +426,18 @@ impl ChunkIterator {
         self.chunks.len() as u32
     }
 
-    /// Advance to the next chunk, populating its client regions if EFA.
+    /// Advance to the next chunk, mapping its client regions if EFA.
     /// Returns None when all chunks have been consumed.
-    pub fn next_chunk(&mut self) -> Option<&ChunkRef> {
+    pub fn next_chunk(&mut self) -> Option<ChunkRef> {
         if self.cursor >= self.chunks.len() {
             return None;
         }
         let idx = self.cursor;
         self.cursor += 1;
+        let mut chunk = self.chunks[idx].clone();
         // Incremental client address mapping (EFA only).
-        // Skip if addresses were already populated (e.g. re-iteration after reset_cursor).
-        if self.chunks[idx].addrs.is_some() {
-            return Some(&self.chunks[idx]);
-        }
         if let Some(efa_addrs) = &self.client_efa_addrs {
-            let mut remaining = self.chunks[idx].user_data_len;
+            let mut remaining = chunk.user_data_len;
             let mut addrs = Vec::new();
             while remaining > 0 {
                 if self.addr_idx >= efa_addrs.len() {
@@ -461,22 +459,17 @@ impl ChunkIterator {
                 self.addr_offset += take;
                 remaining -= take;
             }
-            self.chunks[idx].addrs = Some(addrs);
+            chunk.addrs = Some(addrs);
         }
-        Some(&self.chunks[idx])
-    }
-
-    /// Random access to a chunk by absolute index. Does NOT advance cursor.
-    /// Used by completion handlers to look up chunk metadata (buffer_idx, addrs)
-    /// after next_chunk() populated it during batch submission.
-    pub fn peek_chunk(&self, idx: u32) -> &ChunkRef {
-        &self.chunks[idx as usize]
+        Some(chunk)
     }
 
     /// Reset cursor to the beginning. Used when re-iterating (e.g. collect_dram_bytes).
-    /// Does NOT reset client address mapping state — addresses already populated stay.
+    /// Also rewinds the client address mapping, so a re-iteration maps the same addrs.
     pub fn reset_cursor(&mut self) {
         self.cursor = 0;
+        self.addr_idx = 0;
+        self.addr_offset = 0;
     }
 
     /// Record a per-chunk CRC32C from an EFA transport completion.
@@ -656,6 +649,17 @@ mod tests {
         assert!(it.next_chunk().is_none());
         it.reset_cursor();
         assert_eq!(it.next_chunk().unwrap().buffer_idx, 0);
+    }
+
+    #[test]
+    fn test_reset_cursor_remaps_same_addrs() {
+        // Chunk 1 straddles both addresses, so a stale mapping cursor would show.
+        let cr = vec![(0x1000u64, 5000usize, 7u64), (0x2000, 3193, 7)];
+        let mut it = ChunkIterator::new(8193, 4096, 3, Some(cr));
+        let first: Vec<_> = std::iter::from_fn(|| it.next_chunk().map(|c| c.addrs)).collect();
+        it.reset_cursor();
+        let second: Vec<_> = std::iter::from_fn(|| it.next_chunk().map(|c| c.addrs)).collect();
+        assert_eq!(first, second);
     }
 
     #[test]

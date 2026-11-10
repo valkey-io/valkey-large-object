@@ -881,8 +881,7 @@ async fn cmd_set_tiered_run(
     let chunk_size = crate::chunk_size();
     let batch_width = stream_ctx.buffers.len();
     let nvme_pool = storage::get_nvme_pool();
-    let mut chunk_iter = chunk_iter;
-    let disk_len = storage::object_disk_len(&mut chunk_iter);
+    let disk_len = storage::object_disk_len(&chunk_iter);
     if !nvme::try_reserve_nvme_disk_usage(nvme::allocated_disk_bytes(disk_len)) {
         reply_err(
             &thread_ctx,
