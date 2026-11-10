@@ -41,6 +41,8 @@ pub fn configuration() -> Configuration {
         // connection and one that is dead. This keeps rpcs from trying to post forever and
         // spinning the efa service thread.
         progress_deadline: std::time::Duration::from_secs(1),
+        // No sentinel read-back after GET writes: the crate's default.
+        quiesce_writes: false,
     }
 }
 
