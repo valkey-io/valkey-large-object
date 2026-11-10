@@ -88,7 +88,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `scaling-expand-watermark` | 80 | Yes | Percent utilization to trigger proactive segment expansion. Min 50, max 95. |
 | `scaling-shrink-watermark` | 90 | Yes | Percent used_memory/maxmemory to trigger DRAM segment eviction. Min 50, max 95. |
 | `max-rdma-registered-bytes` | 380gb | Yes | With a fabric up: cap on segment bytes registered with EFA (DRAM pool plus disk staging). An expand past it is refused like a `maxmemory` one. 0 = no limit. |
-| `reaper-poll-ms` | 35 | Yes | Scaling cron poll interval in milliseconds while evicted keys wait to be deleted. Min 10, max 60000. |
+| `reaper-poll-ms` | 25 | Yes | Scaling cron poll interval in milliseconds while evicted keys wait to be deleted. Min 10, max 60000. |
 | `reaper-scan-budget-us` | 2000 | Yes | Microseconds per tick for deleting evicted keys; one uninterruptible event-loop stall, and over `reaper-poll-ms` the share of a core reclaim gets. Min 100, max 100000. |
 | `victim-sample-size` | 5 | Yes | Entries sampled per victim search (eviction, DRAM cache drop, fd close); the lowest LFU score goes. Min 1, max 64. |
 | `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Min 1, max 255. |
@@ -96,12 +96,12 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `max-cached-fds` | 16384 | Yes | Tiered: how many read fds to keep cached. 0..1048576; 0 caches nothing. The fd cache max entries is the smaller of this and the fd limit minus `2 x maxclients + 128`; a larger value is clamped with a warning. |
 | `fd-reserve` | Lenient | Immutable | Tiered: what happens when the open-file limit is below `2 x maxclients + 128` (module start plus the command reserve). `Lenient` loads with object-file fd placement and the fd cache off; `Strict` also needs `max-cached-fds` to fit (`2 x maxclients + 128 + max-cached-fds`): it refuses to load otherwise, rejects a `CONFIG SET max-cached-fds` that does not fit, and aborts the server on a `CONFIG SET maxclients` that breaks the reserve or squeezes the cache. See `docs/OBJECT_FD_PLACEMENT_DESIGN.md`. |
 | `smartlog-poll-secs` | 60 | Immutable | NVMe SMART poll interval in seconds. 0 = disabled. Max 86400. |
-| `worker-threads` | 4 | Immutable | Tokio worker threads for async I/O tasks. Min 1, max 32. |
+| `worker-threads` | 8 | Immutable | Tokio worker threads for async I/O tasks. Min 1, max 32. |
 | `direct-io` | yes | Immutable | Use O_DIRECT for NVMe files. Disable for ASAN builds. |
 | `bench-mode` | no | Immutable | BLOB.TCP_GET returns integer size instead of bulk data (isolates NVMe throughput). Hidden. |
 | `fabric-provider` | `EfaDirect` | Immutable | libfabric provider for the DMA path: `Emulated` (libfabric over TCP, runs anywhere) or `EfaDirect` (EFA hardware RDMA). |
 | `fabric-interfaces` | (empty) | Immutable | Comma-separated fabric domains to serve on. Empty = every domain the provider discovers. |
-| `fabric-max-in-flight` | 0 | Immutable | Transfers each fabric service keeps in flight. 0 = provider default. Max 65536. |
+| `fabric-max-in-flight` | 256 | Immutable | Transfers each fabric service keeps in flight. 0 = provider default. Max 65536. |
 | `fabric-crc-pool-threads` | 2 | Immutable | Threads hashing checksummed transfers. Min 1, max 1024. |
 
 All size parameters accept memory notation (`64mb`, `1gb`, etc.).
