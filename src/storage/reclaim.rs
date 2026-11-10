@@ -118,10 +118,7 @@ thread_local! {
 
 /// Delete keys whose oids are on the reclaim list, spending at most
 /// `reaper-scan-budget-us` of main-thread time per tick: first the victims with a
-/// key hint, by name, then the rest by scan. The scan goes db by db, resuming across
-/// ticks, until the reclaim list is empty. Dram: an oid leaves the list when its key
-/// is deleted, here or via `lo_free`. Tiered: when its `ObjectFile` drops. Either way
-/// the scan cannot outlive its keys.
+/// key hint, by name, then the rest by scan.
 ///
 /// Cross-slot deletion is safe here: a timer callback runs outside command
 /// execution (`server.current_client` is NULL), so key lookups hash each key's
@@ -132,6 +129,14 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
     }
     let deadline = Instant::now() + Duration::from_micros(crate::reaper_scan_budget_us());
     delete_hinted_keys(ctx, deadline);
+    delete_scanned_keys(ctx, deadline);
+}
+
+/// Delete, by scan, the keys whose oids are on the reclaim list, until `deadline`.
+/// Goes db by db, resuming across ticks, until the reclaim list is empty. Dram: an
+/// oid leaves the list when its key is deleted, here or via `lo_free`. Tiered: when
+/// its `ObjectFile` drops. Either way the scan cannot outlive its keys.
+fn delete_scanned_keys(ctx: &Context, deadline: Instant) {
     RECLAIM_SCAN_CURSOR.with_borrow_mut(|scan| {
         while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
             // Past the last db: one full pass done. At most one pass per tick
