@@ -188,7 +188,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
         let Some(unevictable) = with_server_lock(|_| {
             let claim = super::object_file::claim_victim(oid);
             if let (Some(_), Some(hint)) = (&claim, hint) {
-                super::reclaim::queue_key_hint(oid, hint);
+                super::reclaim::queue_delete_by_name(oid, hint);
             }
             claim
         }) else {

@@ -63,6 +63,7 @@ pub fn lo_info(ctx: &InfoContext, _for_crash_report: bool) {
 
 fn info_sections(ctx: &InfoContext) -> ValkeyResult<()> {
     core_metrics_section(ctx)?;
+    evictions_section(ctx)?;
     dram_pool_section(ctx)?;
     disk_section(ctx)?;
     disk_staging_section(ctx)?;
@@ -83,21 +84,36 @@ fn core_metrics_section(ctx: &InfoContext) -> ValkeyResult<()> {
             LARGE_OBJECT_COUNT.load(Ordering::Relaxed) as i64,
         )?
         .field(
+            "inflight_requests",
+            crate::engine::inflight_requests() as i64,
+        )?
+        .build_section()?
+        .build_info()?;
+    Ok(())
+}
+
+/// Evictions and the reaper that deletes the evicted objects' keys.
+fn evictions_section(ctx: &InfoContext) -> ValkeyResult<()> {
+    ctx.builder()
+        .add_section("evictions")
+        .field("evictions", EVICTIONS.load(Ordering::Relaxed) as i64)?
+        // Evicted objects whose keys are not deleted yet.
+        .field(
             "pending_evictions",
             storage::reclaim::RECLAIM_LIST.len() as i64,
         )?
-        .field("evictions", EVICTIONS.load(Ordering::Relaxed) as i64)?
+        // Of those, queued for deletion by name (Tiered).
         .field(
-            "evicted_keys_deleted_by_name",
-            storage::reclaim::DELETED_BY_NAME.load(Ordering::Relaxed) as i64,
+            "pending_evictions_by_name",
+            storage::reclaim::pending_evictions_by_name() as i64,
         )?
         .field(
-            "evicted_keys_deleted_by_scan",
-            storage::reclaim::DELETED_BY_SCAN.load(Ordering::Relaxed) as i64,
+            "evicted_keys_by_name",
+            storage::reclaim::EVICTED_KEYS_BY_NAME.load(Ordering::Relaxed) as i64,
         )?
         .field(
-            "inflight_requests",
-            crate::engine::inflight_requests() as i64,
+            "evicted_keys_by_scan",
+            storage::reclaim::EVICTED_KEYS_BY_SCAN.load(Ordering::Relaxed) as i64,
         )?
         .build_section()?
         .build_info()?;

@@ -1448,8 +1448,8 @@ class TestTieredEvictionKeyHints(TieredBudget):
 
     def reaped(self, client):
         info = info_largeobj(client)
-        return (info['largeobj_evicted_keys_deleted_by_name'],
-                info['largeobj_evicted_keys_deleted_by_scan'])
+        return (info['largeobj_evicted_keys_by_name'],
+                info['largeobj_evicted_keys_by_scan'])
 
     def drain(self, client):
         wait_for_true(lambda: pending_evictions(client) == 0, timeout=15)
@@ -1504,3 +1504,15 @@ class TestTieredEvictionKeyHints(TieredBudget):
         self.drain(client)
         assert self.reaped(client) == (1, 1)
         assert client.execute_command('EXISTS', at_cap, over_cap) == 0
+
+    def test_the_queue_is_cleared_once_no_evicted_key_is_left(self):
+        """Keys deleted another way (here FLUSHALL) leave their queued entries stale. Once no
+        evicted key is left, the reaper drops them instead of keeping them until the next
+        eviction."""
+        client = self.new_client()
+        set_objects(client, 'obj_', 3 * self.PER_BUDGET, self.OBJ)
+        assert self.evictions(client) == 2 * self.PER_BUDGET
+        client.execute_command('FLUSHALL')
+        wait_for_true(lambda: pending_evictions(client) == 0, timeout=15)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_pending_evictions_by_name'] == 0,
+                      timeout=15)
