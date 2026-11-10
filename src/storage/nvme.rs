@@ -352,7 +352,7 @@ impl KeyHint {
 ///
 /// The struct's in-memory layout does NOT match the on-disk wire format —
 /// the compiler inserts padding for natural field alignment. Serialization
-/// is handled by `to_bytes` (sequential writes) and `parse` (sequential
+/// is handled by `to_bytes` (sequential writes) and `from_bytes` (sequential
 /// reads with validation). Do not attempt to byte-cast this struct.
 #[derive(Debug, PartialEq)]
 pub struct FileHeader {
@@ -364,29 +364,20 @@ pub struct FileHeader {
 }
 
 impl FileHeader {
-    pub fn new(object_id: ObjectId, len: u64, crc32c: Crc, hint: KeyHint) -> Self {
-        Self {
-            version: FILE_HEADER_VERSION,
-            object_id: object_id.0,
-            len,
-            crc32c,
-            hint,
-        }
-    }
-
-    /// Serialize the fields back to back: `FILE_HEADER_FIXED_LEN` bytes, then the key.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let key = &self.hint.key;
+    /// Serialize a header's fields back to back: `FILE_HEADER_FIXED_LEN` bytes, then
+    /// the key.
+    pub fn to_bytes(object_id: ObjectId, len: u64, crc32c: Crc, hint: &KeyHint) -> Vec<u8> {
+        let key = &hint.key;
         assert!(
             key.len() <= KEY_HINT_MAX_LEN,
             "key hint longer than the cap"
         );
         let mut page = Vec::with_capacity(FILE_HEADER_FIXED_LEN + key.len());
-        page.push(self.version);
-        page.extend_from_slice(&self.object_id.to_le_bytes());
-        page.extend_from_slice(&self.len.to_le_bytes());
-        page.extend_from_slice(&self.crc32c.to_le_bytes());
-        page.extend_from_slice(&self.hint.db.to_le_bytes());
+        page.push(FILE_HEADER_VERSION);
+        page.extend_from_slice(&object_id.0.to_le_bytes());
+        page.extend_from_slice(&len.to_le_bytes());
+        page.extend_from_slice(&crc32c.to_le_bytes());
+        page.extend_from_slice(&hint.db.to_le_bytes());
         page.push(key.len() as u8);
         page.extend_from_slice(key);
         page
@@ -394,7 +385,7 @@ impl FileHeader {
 
     /// Deserialize. Errs on an unknown version, or a length that doesn't match the
     /// fixed fields plus `key_len`: a truncated or corrupt value.
-    pub fn parse(page: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(page: &[u8]) -> Result<Self, String> {
         if page.len() < FILE_HEADER_FIXED_LEN {
             return Err(format!(
                 "file header too short ({} bytes, need {FILE_HEADER_FIXED_LEN})",
@@ -428,11 +419,6 @@ impl FileHeader {
             },
         })
     }
-
-    /// `parse`, panicking on corrupt on-disk data.
-    pub fn from_bytes(page: &[u8]) -> Self {
-        Self::parse(page).unwrap_or_else(|e| panic!("largeobj: {e}"))
-    }
 }
 
 /// The key hint in `oid`'s file header, if it has one. `None` if the file has no
@@ -453,7 +439,7 @@ pub fn read_key_hint(oid: ObjectId) -> Option<KeyHint> {
     if n < 0 {
         return None;
     }
-    let header = FileHeader::parse(&bytes[..n as usize]).ok()?;
+    let header = FileHeader::from_bytes(&bytes[..n as usize]).ok()?;
     (header.object_id == oid.0 && !header.hint.key.is_empty()).then_some(header.hint)
 }
 
@@ -507,8 +493,9 @@ pub fn read_and_verify_file_header(
             std::io::Error::last_os_error()
         );
     }
-    // from_bytes panics on a corrupt version or length (unrecoverable on-disk corruption).
-    let header = FileHeader::from_bytes(&bytes[..n as usize]);
+    // A corrupt version or length is unrecoverable on-disk corruption.
+    let header = FileHeader::from_bytes(&bytes[..n as usize])
+        .unwrap_or_else(|e| panic!("largeobj: object {expected_object_id:?}: {e}"));
     if header.object_id != expected_object_id.0 || header.len != expected_len {
         panic!(
             "largeobj: file header mismatch for object {:?}: \
@@ -558,9 +545,9 @@ pub fn write_file_header(
     object_id: ObjectId,
     obj_len: u64,
     crc: Crc,
-    hint: KeyHint,
+    hint: &KeyHint,
 ) -> std::io::Result<()> {
-    let bytes = FileHeader::new(object_id, obj_len, crc, hint).to_bytes();
+    let bytes = FileHeader::to_bytes(object_id, obj_len, crc, hint);
     // SAFETY: the name is NUL-terminated and `bytes` is valid for `bytes.len()`.
     let rc = unsafe {
         libc::fsetxattr(
@@ -739,49 +726,54 @@ mod tests {
     // ─── FileHeader ──────────────────────────────────────────────────────
 
     fn header(key: &[u8]) -> FileHeader {
-        FileHeader::new(
-            ObjectId(0x0102_0304_0506_0708),
-            0x1112_1314_1516_1718,
-            0x2122_2324,
-            KeyHint::new(0x3132_3334, key),
-        )
+        FileHeader {
+            version: FILE_HEADER_VERSION,
+            object_id: 0x0102_0304_0506_0708,
+            len: 0x1112_1314_1516_1718,
+            crc32c: 0x2122_2324,
+            hint: KeyHint::new(0x3132_3334, key),
+        }
+    }
+
+    fn to_bytes(h: &FileHeader) -> Vec<u8> {
+        FileHeader::to_bytes(ObjectId(h.object_id), h.len, h.crc32c, &h.hint)
     }
 
     // Every field round-trips, at its fixed offset, and the key follows the fixed part.
     #[test]
-    fn a_header_round_trips_with_its_key_hint() {
+    fn test_file_header_round_trips_with_its_key_hint() {
         let key = b"model@00000003@0@abcdef";
-        let bytes = header(key).to_bytes();
+        let bytes = to_bytes(&header(key));
         assert_eq!(bytes.len(), FILE_HEADER_FIXED_LEN + key.len());
         assert_eq!(bytes[0], FILE_HEADER_VERSION);
         assert_eq!(bytes[FILE_HEADER_FIXED_LEN - 1] as usize, key.len());
         assert_eq!(&bytes[FILE_HEADER_FIXED_LEN..], key);
-        assert_eq!(FileHeader::parse(&bytes), Ok(header(key)));
+        assert_eq!(FileHeader::from_bytes(&bytes), Ok(header(key)));
     }
 
     // A key at the cap is kept; one byte over records no key, so the reaper scans for it.
     #[test]
-    fn a_key_over_the_cap_is_recorded_as_no_key() {
+    fn test_file_header_records_a_key_over_the_cap_as_no_key() {
         let at_cap = vec![b'k'; KEY_HINT_MAX_LEN];
         assert_eq!(KeyHint::new(7, &at_cap).key, at_cap);
         let over = vec![b'k'; KEY_HINT_MAX_LEN + 1];
         let hint = KeyHint::new(7, &over);
         assert!(hint.key.is_empty());
-        let bytes = header(&over).to_bytes();
+        let bytes = to_bytes(&header(&over));
         assert_eq!(bytes.len(), FILE_HEADER_FIXED_LEN);
-        assert_eq!(FileHeader::parse(&bytes).unwrap().hint.key, b"");
-        assert_eq!(header(&at_cap).to_bytes().len(), FILE_HEADER_MAX_LEN);
+        assert_eq!(FileHeader::from_bytes(&bytes).unwrap().hint.key, b"");
+        assert_eq!(to_bytes(&header(&at_cap)).len(), FILE_HEADER_MAX_LEN);
     }
 
     // A truncated or padded value, or another version, is corrupt.
     #[test]
-    fn a_header_of_the_wrong_length_or_version_is_rejected() {
-        let bytes = header(b"key").to_bytes();
-        assert!(FileHeader::parse(&bytes[..bytes.len() - 1]).is_err());
-        assert!(FileHeader::parse(&[bytes.as_slice(), b"x"].concat()).is_err());
-        assert!(FileHeader::parse(&bytes[..FILE_HEADER_FIXED_LEN - 1]).is_err());
+    fn test_file_header_of_the_wrong_length_or_version_is_rejected() {
+        let bytes = to_bytes(&header(b"key"));
+        assert!(FileHeader::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        assert!(FileHeader::from_bytes(&[bytes.as_slice(), b"x"].concat()).is_err());
+        assert!(FileHeader::from_bytes(&bytes[..FILE_HEADER_FIXED_LEN - 1]).is_err());
         let mut other_version = bytes.clone();
         other_version[0] = FILE_HEADER_VERSION + 1;
-        assert!(FileHeader::parse(&other_version).is_err());
+        assert!(FileHeader::from_bytes(&other_version).is_err());
     }
 }

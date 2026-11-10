@@ -32,8 +32,7 @@ pub use object_file::{ObjectFile, UnevictableOID};
 // Re-exports from nvme.rs
 pub use nvme::{
     object_disk_len, open_nvme_file_for_write, read_and_verify_file_header,
-    validate_and_clean_disk_dir, write_file_header, FileHeader, KeyHint, FILE_HEADER_FIXED_LEN,
-    FILE_HEADER_MAX_LEN, FILE_HEADER_VERSION, FILE_HEADER_XATTR, KEY_HINT_MAX_LEN,
+    validate_and_clean_disk_dir, write_file_header, KeyHint,
 };
 
 pub use dram_pool::DRAMPool;

@@ -677,7 +677,7 @@ pub async fn run_set(
             job.obj_len,
             crc,
             job.key_hint
-                .clone()
+                .as_ref()
                 .expect("SET header write requires a key hint"),
         )
         .is_err()

@@ -10,8 +10,9 @@
 //!   eviction finds its file already gone (a stale directory entry).
 //!
 //! Tiered: an eviction reads the victim's key hint (its key's name and db when it was
-//! written, from the file header) and queues it for the cron, which deletes that key by
-//! name if it still holds the victim. Victims without a usable hint are found by scan.
+//! written, from the file header) and queues it for the reaper (the scaling cron), which
+//! deletes that key by name if it still holds the victim. Victims without a usable hint
+//! are found by scan.
 //!
 //! Lock order: `RECLAIM_LIST` before `DRAMPool.objects` when both are held.
 
@@ -26,12 +27,12 @@ use valkey_module::{raw, Context, KeysCursor, ValkeyString};
 use super::nvme::KeyHint;
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 
-/// INFO: victims' keys the cron deleted by their key hint, and by scan.
-pub static REAPED_BY_NAME: AtomicU64 = AtomicU64::new(0);
-pub static REAPED_BY_SCAN: AtomicU64 = AtomicU64::new(0);
+/// INFO: victims' keys the reaper deleted by their key hint, and by scan.
+pub static DELETED_BY_NAME: AtomicU64 = AtomicU64::new(0);
+pub static DELETED_BY_SCAN: AtomicU64 = AtomicU64::new(0);
 
-/// Tiered victims' key hints, oldest first, for the cron. An eviction queues a hint
-/// under the same server-lock hold as its claim, so a cron tick, which deletes queued
+/// Tiered victims' key hints, oldest first, for the reaper. An eviction queues a hint
+/// under the same server-lock hold as its claim, so a reaper tick, which deletes queued
 /// keys before it scans, never scans for a victim whose hint is queued.
 static KEY_HINTS: LazyLock<Mutex<VecDeque<(ObjectId, KeyHint)>>> = LazyLock::new(Mutex::default);
 
@@ -39,7 +40,7 @@ fn key_hints() -> MutexGuard<'static, VecDeque<(ObjectId, KeyHint)>> {
     KEY_HINTS.lock().expect("KEY_HINTS lock unavailable")
 }
 
-/// Queue a claimed victim's key hint for the cron. Call under the claim's server lock.
+/// Queue a claimed victim's key hint for the reaper. Call under the claim's server lock.
 pub fn queue_key_hint(oid: ObjectId, hint: KeyHint) {
     key_hints().push_back((oid, hint));
 }
@@ -147,10 +148,11 @@ fn delete_scanned_keys(ctx: &Context, deadline: Instant) {
             }
             let (listed_keys, more) = listed_keys_in_next_bucket(ctx, &scan.cursor);
             for (name, oid) in listed_keys {
-                let _ = ctx.open_key_writable(&name).unlink();
-                REAPED_BY_SCAN.fetch_add(1, Ordering::Relaxed);
-                // Same keyspace event core fires for its own evictions.
-                ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
+                if ctx.open_key_writable(&name).unlink().is_ok() {
+                    DELETED_BY_SCAN.fetch_add(1, Ordering::Relaxed);
+                    // Same keyspace event core fires for its own evictions.
+                    ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
+                }
                 // Tiered Mode: Do not touch the RECLAIM_LIST. ObjectFile's drop uses
                 // presence in the list to determine if the file was claimed by eviction.
                 // This is necessary in order to not double-free evicted items.
@@ -184,17 +186,17 @@ fn delete_hinted_keys(ctx: &Context, deadline: Instant) {
         if !RECLAIM_LIST.contains(&oid) {
             continue;
         }
+        if !select_db(ctx, hint.db as i32) {
+            continue;
+        }
         let name = ValkeyString::create_from_slice(ctx.get_raw(), &hint.key);
-        let deleted = select_db(ctx, hint.db as i32) && {
-            let key = ctx.open_key_writable(&name);
-            let holds_victim = matches!(
-                key.get_value::<LoValue>(&LO_TYPE),
-                Ok(Some(lo)) if lo.object_id == oid
-            );
-            holds_victim && key.unlink().is_ok()
-        };
-        if deleted {
-            REAPED_BY_NAME.fetch_add(1, Ordering::Relaxed);
+        let key = ctx.open_key_writable(&name);
+        let holds_victim = matches!(
+            key.get_value::<LoValue>(&LO_TYPE),
+            Ok(Some(lo)) if lo.object_id == oid
+        );
+        if holds_victim && key.unlink().is_ok() {
+            DELETED_BY_NAME.fetch_add(1, Ordering::Relaxed);
             // Same keyspace event core fires for its own evictions.
             ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
         }

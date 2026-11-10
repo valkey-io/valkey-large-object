@@ -205,7 +205,13 @@ impl ObjectFile {
         std::io::copy(&mut src, &mut dst)?;
         // No key hint: the copy callback doesn't know the destination db, so an evicted
         // copy's key is found by scan.
-        super::write_file_header(dst.as_raw_fd(), new_oid, len, crc32c, Default::default())?;
+        super::write_file_header(
+            dst.as_raw_fd(),
+            new_oid,
+            len,
+            crc32c,
+            &super::KeyHint::default(),
+        )?;
         dst.sync_all()
     }
 }
@@ -262,7 +268,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_claimed_victim_leaves_the_eviction_candidates() {
+    fn test_a_claimed_victim_leaves_the_eviction_candidates() {
         let oid = ObjectId(9_500);
         eviction_candidates::insert(oid);
         let claim = claim_victim(oid).expect("not claimed yet");
