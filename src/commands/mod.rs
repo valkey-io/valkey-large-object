@@ -120,14 +120,17 @@ fn parse_optional_crc(
 }
 
 /// Whether `addr` is a well-formed sockaddr for the tcp provider: a sockaddr_in
-/// (16 bytes, AF_INET) or sockaddr_in6 (28 bytes, AF_INET6).
+/// (16 bytes, AF_INET) or sockaddr_in6 (28 bytes, AF_INET6). fi_av_insert reads the
+/// family to pick the address length, so anything else is an over-read.
 fn is_valid_sockaddr(addr: &[u8]) -> bool {
-    const AF_INET: u16 = 2;
-    const AF_INET6: u16 = 10;
     let Some(family) = addr.get(..2).map(|b| u16::from_ne_bytes([b[0], b[1]])) else {
         return false;
     };
-    matches!((addr.len(), family), (16, AF_INET) | (28, AF_INET6))
+    let family = libc::c_int::from(family);
+    matches!(
+        (addr.len(), family),
+        (16, libc::AF_INET) | (28, libc::AF_INET6)
+    )
 }
 
 // ─── BLOB.RDMA_HELLO ───────────────────────────────────────────────────────────
@@ -149,9 +152,8 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let rdma_address = decode_hex(args[1].as_slice())
         .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RDMA_ADDR_HEX))?;
-    // An EFA address is exactly 32 bytes; a tcp one must be a well-formed sockaddr.
-    // A malformed address that reaches fi_av_insert wedges the shared address
-    // vector for every peer, so reject it here.
+    // An EFA address is exactly 32 bytes; a tcp one must be a well-formed sockaddr, so
+    // fi_av_insert never reads past the bytes the client sent.
     match crate::fabric_provider() {
         FabricProvider::EfaDirect if rdma_address.len() != 32 => {
             return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_LEN));
