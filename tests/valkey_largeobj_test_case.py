@@ -123,8 +123,7 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
         SERVER_VERSION: valkey-server version directory name
     """
 
-    # Must match storage::FILE_HEADER_SIZE and storage::IO_ALIGN in mod.rs.
-    FILE_HEADER_SIZE = 4096
+    # Must match storage::IO_ALIGN in mod.rs.
     IO_ALIGN = 4096
 
     def _align_up(self, n):
