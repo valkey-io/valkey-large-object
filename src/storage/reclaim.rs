@@ -165,11 +165,13 @@ fn delete_keys_by_scan(ctx: &Context, deadline: Instant) {
             }
             let (listed_keys, more) = listed_keys_in_next_bucket(ctx, &scan.cursor);
             for (name, oid) in listed_keys {
-                if ctx.open_key_writable(&name).unlink().is_ok() {
-                    EVICTED_KEYS_BY_SCAN.fetch_add(1, Ordering::Relaxed);
-                    // Same keyspace event core fires for its own evictions.
-                    ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
-                }
+                // Unlink fails only on a key not opened for writing (VM_UnlinkKey).
+                ctx.open_key_writable(&name)
+                    .unlink()
+                    .expect("a key opened for writing unlinks");
+                EVICTED_KEYS_BY_SCAN.fetch_add(1, Ordering::Relaxed);
+                // Same keyspace event core fires for its own evictions.
+                ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
                 // Tiered Mode: Do not touch the RECLAIM_LIST. ObjectFile's drop uses
                 // presence in the list to determine if the file was claimed by eviction.
                 // This is necessary in order to not double-free evicted items.
@@ -203,20 +205,29 @@ fn delete_keys_by_name(ctx: &Context, deadline: Instant) {
         if !RECLAIM_LIST.contains(&oid) {
             continue;
         }
-        if !select_db(ctx, hint.db as i32) {
-            continue;
-        }
+        // Fails only for a db outside 0..databases (selectDb). The hint holds a client's
+        // selected db from this run, and databases cannot change at runtime.
+        assert!(
+            select_db(ctx, hint.db as i32),
+            "largeobj: key hint of object {oid:?} names db {}, which does not exist",
+            hint.db
+        );
         let name = ValkeyString::create_from_slice(ctx.get_raw(), &hint.key);
         let key = ctx.open_key_writable(&name);
+        // Gone, another type, or another object: the key moved on since the write (a
+        // rename, overwrite or delete), so it is not the victim's. Left to the scan.
         let holds_victim = matches!(
             key.get_value::<LoValue>(&LO_TYPE),
             Ok(Some(lo)) if lo.object_id == oid
         );
-        if holds_victim && key.unlink().is_ok() {
-            EVICTED_KEYS_BY_NAME.fetch_add(1, Ordering::Relaxed);
-            // Same keyspace event core fires for its own evictions.
-            ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
+        if !holds_victim {
+            continue;
         }
+        // Unlink fails only on a key not opened for writing (VM_UnlinkKey).
+        key.unlink().expect("a key opened for writing unlinks");
+        EVICTED_KEYS_BY_NAME.fetch_add(1, Ordering::Relaxed);
+        // Same keyspace event core fires for its own evictions.
+        ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
     }
 }
 
