@@ -10,6 +10,8 @@
 #   ./build.sh test           # unit tests + integration tests (assumes already built)
 #   ./build.sh clean          # remove build artifacts
 #
+# Tests run on an XFS loop mount at test-data/ (tests/mount-xfs.sh, needs sudo once).
+#
 # Environment variables:
 #   SERVER_VERSION        valkey branch, tag, or PR (like pull/4050/head) to build (default: unstable)
 #   VALKEY_SERVER_PATH    path to pre-built valkey-server binary (skips building valkey)
@@ -36,6 +38,12 @@ if [ "$1" = "clean" ]; then
     echo "Done."
     exit 0
 fi
+
+# ─── XFS Test Filesystem ──────────────────────────────────────────────────────
+
+# The module only runs on XFS, so unit and integration tests both run on it.
+sh tests/mount-xfs.sh
+export TMPDIR="$SCRIPT_DIR/test-data/tmp"
 
 # ─── Unit Tests Only ──────────────────────────────────────────────────────────
 

@@ -253,10 +253,6 @@ mod tests {
         }
     }
 
-    // get_or_open uses O_DIRECT when direct_io() is set and can fail on some
-    // filesystems (e.g. tmpfs). When the open fails we skip the fd-dependent
-    // assertions — the Python integration tests cover the real NVMe path.
-
     #[test]
     fn test_remove_is_idempotent() {
         let pool = FdPool::new();

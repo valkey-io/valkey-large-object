@@ -1526,8 +1526,8 @@ this section owns the semantics.
 | `segment-size` | `1GiB` | `1MB` | `1GiB` | Immutable | Uniform segment size for both pools. DRAMPool growth unit |
 | `disk-staging-size` | `1GiB` | `1MB` | `1GiB` | Immutable | NVMePool staging capacity, split into `ceil(disk-staging-size / segment-size)` segments of `segment-size`. Sized for max concurrent I/O, not object capacity |
 | `disk-maxmemory` | `0` (unlimited) | `0` | i64::MAX | Live | NVMe **disk** ceiling; SET-admission bound in Tiered (enforcement: §9.3) |
-| `disk-dir` | `""` | — | — | Immutable | NVMe object directory (Tiered) |
-| `direct-io` | `yes` | — | — | Immutable | O_DIRECT on NVMe files (must be `no` on tmpfs) |
+| `disk-dir` | `""` | — | — | Immutable | NVMe object directory (Tiered); must be on XFS |
+| `direct-io` | `yes` | — | — | Immutable | O_DIRECT on NVMe files |
 | `max-promote-size` | `256MB` | `0` (disable) | `1TB` | Live | Promotion eligibility; objects above this never enter DRAMPool (detail: §7.5) |
 | `promote-min-hits` | `2` | `1` | `255` | Live | Admission-filter misses before a GET promotes an object |
 | `lfu-decay-minutes` | `1` | `0` (off) | `65535` | Live | LFU decay: minutes per one-point decrement |

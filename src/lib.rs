@@ -143,7 +143,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // rather than start dirty.
     if let Err(e) = storage::validate_and_clean_disk_dir(mode, &dir) {
         ctx.log_warning(&format!(
-            "largeobj: startup failed to reset disk-dir {}: {}; aborting module load",
+            "largeobj: startup failed to set up disk-dir {}: {}; aborting module load",
             dir, e
         ));
         return Status::Err;
