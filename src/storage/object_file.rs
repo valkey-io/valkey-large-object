@@ -121,8 +121,11 @@ pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
 pub struct ObjectFile {
     /// Identity; the file path is *derived* (`ObjectId::file_path`), never stored.
     object_id: ObjectId,
-    /// File length; NVMe utilization accounting charges its `nvme::allocated_disk_bytes`.
+    /// File length.
     disk_len: u64,
+    /// Disk usage charged for the file, released on `Drop`: its `allocated_disk_bytes`,
+    /// plus its `metadata_disk_bytes` once `charge_metadata` has run.
+    disk_bytes: u64,
 }
 
 impl ObjectFile {
@@ -135,7 +138,18 @@ impl ObjectFile {
         Self {
             object_id,
             disk_len,
+            disk_bytes: super::nvme::allocated_disk_bytes(disk_len),
         }
+    }
+
+    /// Charge the blocks the filesystem allocated for the written file beyond its data,
+    /// from its metadata `meta`, as eviction's stat credits them. Called once, after the
+    /// last write to the file (its header). Charged without a disk-maxmemory check:
+    /// the blocks are already allocated, and the next reservation evicts for them.
+    pub fn charge_metadata(&mut self, meta: &std::fs::Metadata) {
+        let bytes = super::nvme::metadata_disk_bytes(meta);
+        super::nvme::increase_nvme_disk_usage(bytes);
+        self.disk_bytes += bytes;
     }
 
     pub fn object_id(&self) -> ObjectId {
@@ -153,9 +167,9 @@ impl ObjectFile {
         pool.get_or_open(self.object_id, dir)
     }
 
-    /// Copy this file into a new object version: allocates a fresh `ObjectId`, writes a
-    /// header carrying the new OID with this object's `len`/`crc32c`, then copies the
-    /// payload past the header byte-for-byte. `fsync`s before returning so the file is
+    /// Copy this file into a new object version: allocates a fresh `ObjectId`, copies the
+    /// payload byte-for-byte, then writes a header carrying the new OID with this
+    /// object's `len`/`crc32c`. `fsync`s before returning so the file is
     /// durable before it is exposed to O_DIRECT reads via io_uring.
     ///
     /// Reserves `disk_len` against disk-maxmemory up front; the returned handle's `Drop`
@@ -174,7 +188,11 @@ impl ObjectFile {
         let _copy = UnevictableOID::new(new_oid);
         let dst_path = new_oid.file_path(&dir);
         match self.copy_file(&dst_path, new_oid, len, crc32c) {
-            Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
+            Ok(meta) => {
+                let mut copy = ObjectFile::new(new_oid, disk_len);
+                copy.charge_metadata(&meta);
+                Some(copy)
+            }
             Err(e) => {
                 super::nvme::unlink(new_oid);
                 super::nvme::decrease_nvme_disk_usage(disk_bytes);
@@ -189,22 +207,25 @@ impl ObjectFile {
 
     /// Payload copy + header write for `copy`. Buffered I/O on purpose: this runs off
     /// the io_uring path, and the destination is not yet visible to any reader.
+    /// Returns the destination's metadata.
     fn copy_file(
         &self,
         dst_path: &str,
         new_oid: ObjectId,
         len: u64,
         crc32c: Crc,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<std::fs::Metadata> {
         use std::os::unix::io::AsRawFd;
         let mut src = std::fs::File::open(self.object_id.file_path(&crate::disk_dir()))?;
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(dst_path)?;
+        super::nvme::preallocate(dst.as_raw_fd(), self.disk_len)?;
         std::io::copy(&mut src, &mut dst)?;
         super::write_file_header(dst.as_raw_fd(), new_oid, len, crc32c)?;
-        dst.sync_all()
+        dst.sync_all()?;
+        dst.metadata()
     }
 }
 
@@ -214,7 +235,7 @@ impl Drop for ObjectFile {
         // remaining ObjectFile refs. Means "object gone" — deregister the fd and,
         // unless an eviction owns it, unlink the file.
         let object_id = self.object_id;
-        let disk_len = self.disk_len;
+        let disk_bytes = self.disk_bytes;
         // Eviction must not pick a file that is being torn down.
         super::eviction_candidates::remove(object_id);
         // We do not allow the eviction of a file that is being torn down.
@@ -238,9 +259,7 @@ impl Drop for ObjectFile {
             } else {
                 super::nvme::unlink(object_id);
                 // Release exactly what create added — no stat, so it can't drift.
-                crate::storage::nvme::decrease_nvme_disk_usage(
-                    crate::storage::nvme::allocated_disk_bytes(disk_len),
-                );
+                crate::storage::nvme::decrease_nvme_disk_usage(disk_bytes);
             }
         };
 

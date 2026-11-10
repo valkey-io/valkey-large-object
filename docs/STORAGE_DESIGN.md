@@ -437,23 +437,19 @@ payload, from offset 0):**
 ```rust
 // consts in storage/nvme.rs
 pub const FILE_HEADER_XATTR: &CStr = c"user.lobj";
-pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
-pub const FILE_HEADER_VERSION: u8 = 1;
-// Packed wire size, derived from field types (NOT hand-counted):
+pub const FILE_HEADER_VERSION: u8 = 1;  // first wire byte; enables future format changes
+// Packed wire size (21 bytes), derived from field types (NOT hand-counted):
 pub const FILE_HEADER_WIRE_LEN: usize =
-    size_of::<[u8; 4]>() + size_of::<u8>() + size_of::<u64>()
-    + size_of::<u64>() + size_of::<u32>();
+    size_of::<u8>() + size_of::<u64>() + size_of::<u64>() + size_of::<Crc>();
 
 pub struct FileHeader {
-    pub magic: [u8; 4],     // b"LOBJ" — identifies file as Large Object module data
-    pub version: u8,        // 1 — enables future format changes
     pub object_id: u64,     // Matches LoValue.object_id
     pub len: u64,           // True object length (before O_DIRECT padding)
     pub crc32c: Crc,        // Integrity checksum (same as LoValue.crc32c)
 }
 ```
 
-The header is serialized to `FILE_HEADER_WIRE_LEN` bytes on write and deserialized on read for magic/version validation. It is never byte-cast, so no `#[repr(C)]` is needed. SET writes it with `fsetxattr` after the payload; every NVMe GET reads it with `fgetxattr` and checks it against the key's `LoValue` before the data reads. It is small enough for XFS to keep inside the inode, so it takes no data block.
+The header is serialized to `FILE_HEADER_WIRE_LEN` bytes, the version first, on write; on read it must be exactly that length and that version. It is never byte-cast, so no `#[repr(C)]` is needed. SET writes it with `fsetxattr` after the payload; every NVMe GET reads it with `fgetxattr` and checks it against the key's `LoValue` before the data reads. It is small enough for XFS to keep inside the inode, so it takes no data block.
 
 **File layout:**
 ```
@@ -1437,7 +1433,9 @@ only same-segment operations serialize. Hold time ~10-50ns. Negligible contentio
 | exactly 1 MiB | yes | 1 MiB |
 | 8 KiB | no | 8 KiB |
 
-- **How the unit is read.** Once at startup, `init_disk_alloc_unit` calls `fstatfs` on disk-dir. On XFS it calls the `XFS_IOC_FSGEOMETRY_V1` ioctl (the call `xfs_info` uses) and takes `sunit × blocksize`, words 20 and 0 of the 112-byte `struct xfs_fsop_geom_v1` from the kernel's `xfs_fs.h`. If that ioctl fails, the module refuses to load rather than charge too little. On any other filesystem, or an XFS with no stripe unit, the unit is one `IO_ALIGN` block (4 KiB), which `object_disk_len` already pads every file to. The startup log reports it as `disk_alloc_unit=<bytes>B`.
+- **How the unit is read.** Once at startup, `init_disk_geometry` calls `fstatfs` on disk-dir and refuses to load unless the block size divides `IO_ALIGN`. On XFS it calls the `XFS_IOC_FSGEOMETRY_V1` ioctl (the call `xfs_info` uses) and takes `sunit × blocksize`, words 20 and 0 of the 112-byte `struct xfs_fsop_geom_v1` from the kernel's `xfs_fs.h`. If that ioctl fails, the module refuses to load rather than charge too little. On any other filesystem, or an XFS with no stripe unit, the unit is one `IO_ALIGN` block (4 KiB), which `object_disk_len` already pads every file to. The startup log reports it as `disk_alloc_unit=<bytes>B`.
+- **Inodes.** XFS allocates inodes from free space, so `allocated_disk_bytes` also charges every file its inode (`inodesize`, word 6 of the same geometry struct; 512 B by default). Other filesystems (ext4) set inodes aside at mkfs, so they charge none.
+- **Metadata blocks.** A file can also take blocks beyond its data: an xattr block if the header doesn't fit in the inode, or an extent-tree block if the file is in too many extents to list in the inode. Every object file is allocated in one `fallocate` (`preallocate`), so its data blocks are exactly its length, and anything more in `st_blocks` is metadata (`metadata_disk_bytes`). SET and COPY charge it after the header write, from the `stat` they already make, and eviction credits it from its own `stat`.
 - **Mixed object sizes.** A short file can land in the gap after a long one, so with mixed sizes the long files are slightly over-charged and eviction starts a little early. It never under-charges, so the filesystem cannot overfill.
 - **Tests.** The exact-capacity integration tests assume a 4 KiB unit, so the test base fails fast if disk-dir is on a striped XFS. CI runs the tests on an unstriped XFS loop mount so the XFS path is exercised.
 

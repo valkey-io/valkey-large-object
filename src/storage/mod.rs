@@ -32,8 +32,8 @@ pub use object_file::{ObjectFile, UnevictableOID};
 // Re-exports from nvme.rs
 pub use nvme::{
     object_disk_len, open_nvme_file_for_write, read_and_verify_file_header,
-    validate_and_clean_disk_dir, write_file_header, FileHeader, FILE_HEADER_MAGIC,
-    FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN, FILE_HEADER_XATTR,
+    validate_and_clean_disk_dir, write_file_header, FileHeader, FILE_HEADER_VERSION,
+    FILE_HEADER_WIRE_LEN, FILE_HEADER_XATTR,
 };
 
 pub use dram_pool::DRAMPool;
@@ -183,9 +183,9 @@ pub fn init(
         crate::data_type::create_disk_dir_shards(disk_dir)
             .map_err(|e| format!("failed to create disk-dir shards under {disk_dir}: {e}"))?;
     }
-    // Disk usage charges each file in the filesystem's allocation unit.
+    // Disk usage charges each file what the filesystem allocates for it.
     let disk_alloc_unit = if mode == crate::OperatingMode::Tiered {
-        nvme::init_disk_alloc_unit(disk_dir)?
+        nvme::init_disk_geometry(disk_dir)?
     } else {
         0
     };

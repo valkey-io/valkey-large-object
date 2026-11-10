@@ -23,23 +23,41 @@ use crate::data_type::ObjectId;
 static NVME_DISK_USAGE: AtomicU64 = AtomicU64::new(0);
 
 /// The unit disk-dir's filesystem allocates each file in, set once at startup by
-/// `init_disk_alloc_unit`. One `IO_ALIGN` block until then, and in Dram mode.
+/// `init_disk_geometry`. One `IO_ALIGN` block until then, and in Dram mode.
 static DISK_ALLOC_UNIT: AtomicU64 = AtomicU64::new(super::IO_ALIGN as u64);
 
-/// Bytes the filesystem allocates for a file of `len` bytes. On a striped XFS, a file
-/// of at least one stripe unit starts on a stripe-unit boundary, so the rest of its
-/// last stripe unit can't hold another such file: charge `len` rounded up to the unit.
-/// Charging only `len` lets the filesystem fill up before disk-maxmemory is reached.
-/// XFS aligns only allocations of at least one stripe unit (`xfs_bmapi_allocate`),
-/// and the SET path allocates each file in one `fallocate`, so a shorter file takes
-/// only its own blocks: charge `len`, already `IO_ALIGN`-aligned.
+/// Disk space each file's inode takes, set once at startup by `init_disk_geometry`.
+/// XFS allocates inodes from free space; other filesystems (ext4) set them aside at
+/// mkfs, so they take none. 0 until then, and in Dram mode.
+static DISK_INODE_SIZE: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes the filesystem allocates for a file of `len` bytes: its data, plus its inode.
+/// On a striped XFS, a file of at least one stripe unit starts on a stripe-unit
+/// boundary, so the rest of its last stripe unit can't hold another such file: charge
+/// `len` rounded up to the unit. Charging only `len` lets the filesystem fill up before
+/// disk-maxmemory is reached. XFS aligns only allocations of at least one stripe unit
+/// (`xfs_bmapi_allocate`), and every object file is allocated in one `fallocate`
+/// (`preallocate`), so a shorter file takes only its own blocks: charge `len`, already
+/// `IO_ALIGN`-aligned.
 pub fn allocated_disk_bytes(len: u64) -> u64 {
     let unit = DISK_ALLOC_UNIT.load(Ordering::Relaxed);
-    if len >= unit {
+    let data = if len >= unit {
         len.next_multiple_of(unit)
     } else {
         len
-    }
+    };
+    data + DISK_INODE_SIZE.load(Ordering::Relaxed)
+}
+
+/// Blocks the filesystem allocated for the file `meta` describes beyond its data:
+/// an xattr block if the header doesn't fit in the inode, or an extent-tree block if
+/// the file is in too many extents to list in the inode. Charged on top of
+/// `allocated_disk_bytes`. Every object file is allocated in full (`preallocate`) in
+/// blocks that divide `IO_ALIGN`, so its data blocks are exactly its length.
+pub fn metadata_disk_bytes(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    // st_blocks counts 512-byte units.
+    (meta.blocks() * 512).saturating_sub(meta.len())
 }
 
 /// `_IOR('X', 100, struct xfs_fsop_geom_v1)`: fills the 112-byte geometry struct
@@ -47,12 +65,16 @@ pub fn allocated_disk_bytes(len: u64) -> u64 {
 const XFS_IOC_FSGEOMETRY_V1: u32 = 0x8070_5864;
 /// u32 word index of `blocksize` (bytes 0..4): filesystem block size, bytes.
 const XFS_GEOM_BLOCKSIZE: usize = 0;
+/// u32 word index of `inodesize` (bytes 24..28): inode size, bytes.
+const XFS_GEOM_INODESIZE: usize = 6;
 /// u32 word index of `sunit` (bytes 80..84): stripe unit, filesystem blocks.
 const XFS_GEOM_SUNIT: usize = 20;
 
-/// Set the unit `allocated_disk_bytes` rounds to: disk-dir's stripe unit if it is on a
-/// striped XFS, else one `IO_ALIGN` block. Returns the unit.
-pub fn init_disk_alloc_unit(dir: &str) -> Result<u64, String> {
+/// Read disk-dir's filesystem geometry and check the module can write and charge
+/// files on it exactly. Sets the unit `allocated_disk_bytes` rounds to (disk-dir's
+/// stripe unit if it is on a striped XFS, else one `IO_ALIGN` block) and the inode
+/// size it adds. Returns the unit.
+pub fn init_disk_geometry(dir: &str) -> Result<u64, String> {
     use std::os::unix::io::AsRawFd;
     let dir_fd =
         std::fs::File::open(dir).map_err(|e| format!("cannot open disk-dir {dir}: {e}"))?;
@@ -65,7 +87,18 @@ pub fn init_disk_alloc_unit(dir: &str) -> Result<u64, String> {
             std::io::Error::last_os_error()
         ));
     }
+    let io_align = super::IO_ALIGN as u64;
+    // Files are allocated and charged in IO_ALIGN units: exact only if blocks divide it.
+    // O_DIRECT writes are IO_ALIGN-aligned, so the sector size must divide it too: on XFS
+    // it does once the block size does (mkfs.xfs keeps the sector size <= the block size).
+    let block = fs.f_bsize as u64;
+    if !io_align.is_multiple_of(block) {
+        return Err(format!(
+            "disk-dir {dir} block size {block} B does not divide {io_align} B"
+        ));
+    }
     let mut stripe = 0;
+    let mut inode = 0;
     if fs.f_type == libc::XFS_SUPER_MAGIC {
         let mut geometry = [0u32; 28];
         // SAFETY: `geometry` is the 112 bytes this ioctl writes.
@@ -76,17 +109,19 @@ pub fn init_disk_alloc_unit(dir: &str) -> Result<u64, String> {
             ));
         }
         stripe = geometry[XFS_GEOM_SUNIT] as u64 * geometry[XFS_GEOM_BLOCKSIZE] as u64;
+        inode = geometry[XFS_GEOM_INODESIZE] as u64;
         valkey_module::logging::log_notice(format!(
-            "largeobj: disk-dir {dir} is on XFS, stripe unit {stripe} B (0 = not striped)"
+            "largeobj: disk-dir {dir} is on XFS, stripe unit {stripe} B (0 = not striped), \
+             inode {inode} B"
         ));
     } else {
         valkey_module::logging::log_warning(format!(
-            "largeobj: disk-dir {dir} is not on XFS; disk usage is charged in {} B blocks",
-            super::IO_ALIGN
+            "largeobj: disk-dir {dir} is not on XFS; disk usage is charged in {io_align} B blocks"
         ));
     }
-    let unit = stripe.max(super::IO_ALIGN as u64);
+    let unit = stripe.max(io_align);
     DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
+    DISK_INODE_SIZE.store(inode, Ordering::Relaxed);
     Ok(unit)
 }
 
@@ -186,8 +221,9 @@ fn evict_and_reserve(bytes: u64) -> bool {
             continue;
         };
         match stat(oid) {
-            Some(len) => {
-                let bytes = allocated_disk_bytes(len);
+            Some(meta) => {
+                // What the file was charged: its ObjectFile's `disk_bytes`.
+                let bytes = allocated_disk_bytes(meta.len()) + metadata_disk_bytes(&meta);
                 covered += bytes;
                 victims.push((unevictable, bytes));
             }
@@ -246,11 +282,11 @@ pub(crate) fn unlink(oid: ObjectId) {
     }
 }
 
-/// Size of `oid`'s file.
+/// Metadata of `oid`'s file.
 /// - `None` if it is gone (`ENOENT`).
 /// - A `transient` error is retried once.
 /// - Any other error, or a second transient one, aborts the server.
-fn stat(oid: ObjectId) -> Option<u64> {
+fn stat(oid: ObjectId) -> Option<std::fs::Metadata> {
     let path = oid.file_path(&crate::disk_dir());
     let meta = std::fs::metadata(&path).or_else(|e| {
         if transient(&e) {
@@ -260,7 +296,7 @@ fn stat(oid: ObjectId) -> Option<u64> {
         }
     });
     match meta {
-        Ok(meta) => Some(meta.len()),
+        Ok(meta) => Some(meta),
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
         Err(e) => panic!("largeobj: failed to stat object file {path}: {e}"),
     }
@@ -295,27 +331,23 @@ fn transient(e: &std::io::Error) -> bool {
 /// out of the file data makes the file exactly its payload, so a payload that is a
 /// multiple of the filesystem's stripe unit doesn't spill into one more stripe unit.
 pub const FILE_HEADER_XATTR: &std::ffi::CStr = c"user.lobj";
-pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
 pub const FILE_HEADER_VERSION: u8 = 1;
 
-/// Packed wire size of the header fields (no inter-field padding).
-/// Computed from field types so adding a field updates this automatically.
-pub const FILE_HEADER_WIRE_LEN: usize = size_of::<[u8; 4]>()  // magic
-    + size_of::<u8>()                                           // version
-    + size_of::<u64>()                                          // object_id
-    + size_of::<u64>()                                          // len
-    + size_of::<u32>(); // crc32c
+/// Packed wire size of the header: the version, then the `FileHeader` fields.
+pub const FILE_HEADER_WIRE_LEN: usize = size_of::<u8>() // version
+    + size_of::<u64>()                                    // object_id
+    + size_of::<u64>()                                    // len
+    + size_of::<Crc>(); // crc32c
 
 /// On-disk file header for NVMe object files, stored in the `FILE_HEADER_XATTR`
 /// xattr. The file itself holds only the payload, starting at offset 0.
 ///
-/// The struct's in-memory layout does NOT match the on-disk wire format —
+/// The struct's in-memory layout does NOT match the on-disk wire format --
 /// the compiler inserts padding for natural field alignment. Serialization
-/// is handled by `to_bytes` (sequential writes) and `from_bytes` (sequential
-/// reads with validation). Do not attempt to byte-cast this struct.
+/// is handled by `to_bytes` and `from_bytes`, field by field in the order above.
+/// Do not attempt to byte-cast this struct.
+#[derive(Debug, PartialEq)]
 pub struct FileHeader {
-    pub magic: [u8; 4],
-    pub version: u8,
     pub object_id: u64,
     pub len: u64,
     pub crc32c: Crc,
@@ -324,78 +356,54 @@ pub struct FileHeader {
 impl FileHeader {
     pub fn new(object_id: ObjectId, len: u64, crc32c: Crc) -> Self {
         Self {
-            magic: *FILE_HEADER_MAGIC,
-            version: FILE_HEADER_VERSION,
             object_id: object_id.0,
             len,
             crc32c,
         }
     }
 
-    /// Serialize the fields back to back (`FILE_HEADER_WIRE_LEN` bytes).
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut page = Vec::with_capacity(FILE_HEADER_WIRE_LEN);
-        page.extend_from_slice(&self.magic);
-        page.push(self.version);
-        page.extend_from_slice(&self.object_id.to_le_bytes());
-        page.extend_from_slice(&self.len.to_le_bytes());
-        page.extend_from_slice(&self.crc32c.to_le_bytes());
-        assert_eq!(page.len(), FILE_HEADER_WIRE_LEN);
-        page
+    /// Serialize: the version, then the fields back to back, little-endian.
+    pub fn to_bytes(&self) -> [u8; FILE_HEADER_WIRE_LEN] {
+        let fields: [&[u8]; 4] = [
+            &[FILE_HEADER_VERSION],
+            &self.object_id.to_le_bytes(),
+            &self.len.to_le_bytes(),
+            &self.crc32c.to_le_bytes(),
+        ];
+        let mut bytes = [0u8; FILE_HEADER_WIRE_LEN];
+        let mut at = 0;
+        for field in fields {
+            bytes[at..at + field.len()].copy_from_slice(field);
+            at += field.len();
+        }
+        bytes
     }
 
-    /// Deserialize. Panics on invalid magic, version, or truncated bytes
-    /// (these indicate corrupt on-disk data). Fields are read sequentially via cursor.
-    pub fn from_bytes(page: &[u8]) -> Self {
-        if page.len() < FILE_HEADER_WIRE_LEN {
+    /// Deserialize. Panics on a wrong length or version (corrupt on-disk data).
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        if bytes.len() != FILE_HEADER_WIRE_LEN {
             panic!(
-                "largeobj: file header too short ({} bytes, need {})",
-                page.len(),
-                FILE_HEADER_WIRE_LEN
+                "largeobj: file header is {} bytes, expected {FILE_HEADER_WIRE_LEN}",
+                bytes.len()
             );
         }
-        let mut cur = 0;
-        let magic: [u8; 4] = page[cur..cur + 4]
-            .try_into()
-            .expect("file header magic slice");
-        cur += 4;
-        if &magic != FILE_HEADER_MAGIC {
-            panic!(
-                "largeobj: file header invalid magic {:?} (expected {:?})",
-                magic, FILE_HEADER_MAGIC
-            );
-        }
-        let version = page[cur];
-        cur += 1;
+        let (&version, mut rest) = bytes.split_first().expect("length checked");
         if version != FILE_HEADER_VERSION {
             panic!(
-                "largeobj: file header unsupported version {} (expected {})",
-                version, FILE_HEADER_VERSION
+                "largeobj: file header unsupported version {version} \
+                 (expected {FILE_HEADER_VERSION})"
             );
         }
-        let object_id = u64::from_le_bytes(
-            page[cur..cur + 8]
-                .try_into()
-                .expect("file header object_id slice"),
-        );
-        cur += 8;
-        let len = u64::from_le_bytes(
-            page[cur..cur + 8]
-                .try_into()
-                .expect("file header len slice"),
-        );
-        cur += 8;
-        let crc32c = u32::from_le_bytes(
-            page[cur..cur + 4]
-                .try_into()
-                .expect("file header crc32c slice"),
-        );
+        // The next N bytes; the length check above keeps every take in bounds.
+        let mut take = |n: usize| {
+            let (field, tail) = rest.split_at(n);
+            rest = tail;
+            field
+        };
         Self {
-            magic,
-            version,
-            object_id,
-            len,
-            crc32c,
+            object_id: u64::from_le_bytes(take(8).try_into().expect("8 bytes")),
+            len: u64::from_le_bytes(take(8).try_into().expect("8 bytes")),
+            crc32c: Crc::from_le_bytes(take(4).try_into().expect("4 bytes")),
         }
     }
 }
@@ -422,7 +430,7 @@ pub fn object_disk_len(chunk_iter: &mut super::ChunkIterator) -> u64 {
 // ─── NVMe File I/O Helpers ───────────────────────────────────────────────────
 
 /// Read the FileHeader xattr of an NVMe file and validate it against expected
-/// values. Checks magic, version, object_id, len, and CRC.
+/// values. Checks version, length, object_id, len, and CRC.
 /// Panics on a missing or corrupt header (unrecoverable on-disk corruption). Panics
 /// on CRC mismatch (serving corrupt data is worse than crashing).
 pub fn read_and_verify_file_header(
@@ -448,7 +456,7 @@ pub fn read_and_verify_file_header(
             std::io::Error::last_os_error()
         );
     }
-    // from_bytes panics on corrupt magic/version (unrecoverable on-disk corruption).
+    // from_bytes panics on a corrupt length or version (unrecoverable on-disk corruption).
     let header = FileHeader::from_bytes(&bytes[..n as usize]);
     if header.object_id != expected_object_id.0 || header.len != expected_len {
         panic!(
@@ -480,16 +488,23 @@ pub fn open_nvme_file_for_write(
         code: e.raw_os_error().unwrap_or(libc::EIO),
     };
     let fd = super::fd_placement::open_object_file(file_path, &opts).map_err(io_err)?;
-    // Preallocate the whole object so every O_DIRECT chunk write lands inside EOF. Extending
-    // writes make XFS take the inode IOLOCK exclusive (serializing the object's parallel chunk
-    // writes) and allocate extents inside each write. EOPNOTSUPP keeps extending writes.
-    if unsafe { libc::fallocate(fd.as_raw_fd(), 0, 0, disk_len as libc::off_t) } != 0 {
+    preallocate(fd.as_raw_fd(), disk_len).map_err(io_err)?;
+    Ok(fd)
+}
+
+/// Allocate all `len` bytes of a new object file in one `fallocate`, so its data blocks
+/// are exactly `len` (`allocated_disk_bytes`, `metadata_disk_bytes`) and every O_DIRECT
+/// chunk write lands inside EOF. Extending writes make XFS take the inode IOLOCK
+/// exclusive (serializing the object's parallel chunk writes), allocate extents inside
+/// each write, and preallocate past EOF. EOPNOTSUPP keeps extending writes.
+pub fn preallocate(fd: RawFd, len: u64) -> std::io::Result<()> {
+    if unsafe { libc::fallocate(fd, 0, 0, len as libc::off_t) } != 0 {
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::EOPNOTSUPP) {
-            return Err(io_err(e));
+            return Err(e);
         }
     }
-    Ok(fd)
+    Ok(())
 }
 
 /// Write the FileHeader xattr of an NVMe object file. Callers write it after the
@@ -622,6 +637,74 @@ mod tests {
         assert_eq!(allocated_disk_bytes(8192), 8192);
         assert_eq!(allocated_disk_bytes((1 << 20) - 4096), (1 << 20) - 4096);
         DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_allocated_disk_bytes_adds_the_inode() {
+        let _g = lock();
+        let inode = DISK_INODE_SIZE.swap(512, Ordering::Relaxed);
+        assert_eq!(allocated_disk_bytes(8192), 8192 + 512);
+        DISK_INODE_SIZE.store(inode, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn test_metadata_disk_bytes_counts_blocks_beyond_the_data() {
+        // A directory of its own, so the test never touches another run's file.
+        let dir = std::env::temp_dir().join(format!("lo-metadata-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("object");
+        let file = std::fs::File::create(&path).unwrap();
+        preallocate(file.as_raw_fd(), 1 << 20).unwrap();
+        // A written object file: its data and its header. The header fits in the inode.
+        write_file_header(file.as_raw_fd(), ObjectId(1), 1 << 20, 7).unwrap();
+        let with_header = metadata_disk_bytes(&file.metadata().unwrap());
+        // An xattr too big for any inode takes a block of its own (tmpfs keeps it in memory).
+        let big = [0u8; 2048];
+        // SAFETY: the name is NUL-terminated and `big` is valid for its length.
+        let rc = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                c"user.big".as_ptr(),
+                big.as_ptr().cast(),
+                big.len(),
+                0,
+            )
+        };
+        let with_big = metadata_disk_bytes(&file.metadata().unwrap());
+        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+        let is_tmpfs = unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } == 0
+            && fs.f_type == libc::TMPFS_MAGIC;
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(with_header, 0, "the header must fit in the inode");
+        assert_eq!(rc, 0, "set a 2 KiB xattr");
+        if !is_tmpfs {
+            assert!(with_big > 0, "an xattr block is metadata");
+        }
+    }
+
+    // ─── FileHeader ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_file_header_round_trips() {
+        let header = FileHeader::new(ObjectId(0x0102_0304_0506_0708), 0x1112_1314, 0x2122_2324);
+        let bytes = header.to_bytes();
+        assert_eq!(bytes[0], FILE_HEADER_VERSION);
+        assert_eq!(FileHeader::from_bytes(&bytes), header);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 21")]
+    fn test_file_header_of_the_wrong_length_is_rejected() {
+        let bytes = FileHeader::new(ObjectId(1), 2, 3).to_bytes();
+        FileHeader::from_bytes(&bytes[..FILE_HEADER_WIRE_LEN - 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unsupported version")]
+    fn test_file_header_of_another_version_is_rejected() {
+        let mut bytes = FileHeader::new(ObjectId(1), 2, 3).to_bytes();
+        bytes[0] = FILE_HEADER_VERSION + 1;
+        FileHeader::from_bytes(&bytes);
     }
 
     // ─── object_disk_len ─────────────────────────────────────────────────

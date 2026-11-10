@@ -29,7 +29,7 @@ from contextlib import contextmanager
 import pytest
 from valkey import OutOfMemoryError, ResponseError
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
+from valkey_largeobj_test_case import DISK_INODE, ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
 
 # 900KB in a 1MB segment: one object of this size fills a segment by itself.
 SEGMENT_FILLING_SIZE = 900 * 1024
@@ -750,7 +750,8 @@ class TieredBudget(Budget):
     names, unless they pin one down."""
 
     OBJ = 512 * 1024
-    DISK_PER_OBJ = OBJ  # the header is an xattr, so the file is exactly the payload
+    # Each object is charged its file (the header is an xattr, so exactly the payload) and its inode.
+    DISK_PER_OBJ = OBJ + DISK_INODE
     PER_BUDGET = 8
     BUDGET = PER_BUDGET * DISK_PER_OBJ
     FULL = 'disk-maxmemory'
@@ -788,12 +789,13 @@ class TieredBudget(Budget):
         return next(key for key, payload in payloads.items() if payload[:4] == head)
 
     def settle(self, client, live, timeout=10):
-        """Every unevictable-list entry removed and every unlink done: the ledger equals the bytes
-        on disk, and the directory holds `live` objects."""
+        """Every unevictable-list entry removed and every unlink done: the ledger equals the disk
+        the files take (their blocks and inodes), and the directory holds `live` objects."""
         def settled():
             info = info_largeobj(client)
             files = self.object_files()
-            on_disk = sum(os.path.getsize(os.path.join(self.data_dir, name)) for name in files)
+            on_disk = sum(os.stat(os.path.join(self.data_dir, name)).st_blocks * 512 + DISK_INODE
+                          for name in files)
             return (info['largeobj_disk_unevictable_objects'] == 0
                     and info['largeobj_disk_used_bytes'] == on_disk
                     and (live is None or len(files) == live))

@@ -6,6 +6,7 @@ import threading
 import pytest
 from valkey import ResponseError, Valkey
 from valkey_largeobj_test_case import (
+    DISK_INODE,
     MIB,
     ORDER_CHUNK_SIZE,
     ORDER_OBJECT_LEN,
@@ -85,14 +86,17 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert result == payload_multi
         # Second GET from DRAM after promotion.
         assert client.execute_command('BLOB.TCP_GET', 'rt_multi') == payload_multi
-        # The FileHeader is in the user.lobj xattr: magic b"LOBJ", version 1.
-        # The file holds only the payload, from offset 0.
+        # The FileHeader is in the user.lobj xattr: version 1, then oid, len and crc.
+        # The file holds only the payload, from offset 0, and no metadata block: the
+        # header fits in the inode.
         dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected at least one .dat file"
         # Check the most recent file (highest OID = last in sorted hex names).
         header = os.getxattr(dat_files[-1], 'user.lobj')
-        assert header[:4] == b'LOBJ', "FileHeader magic mismatch"
-        assert header[4] == 1, "FileHeader version mismatch"
+        assert len(header) == 21, "FileHeader length mismatch"
+        assert header[0] == 1, "FileHeader version mismatch"
+        st = os.stat(dat_files[-1])
+        assert st.st_blocks * 512 == st.st_size, "object file has a metadata block"
         with open(dat_files[-1], 'rb') as f:
             data_on_disk = f.read(len(payload_multi))
             assert data_on_disk == payload_multi, "On-disk data at offset 0 mismatch"
@@ -208,10 +212,10 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
     def test_nvme_maxmemory_exhaustion(self):
         """SET that would exceed disk-maxmemory is rejected."""
         client = self.server.get_new_client()
-        # disk-maxmemory minimum is 1MB. Set to 1MB.
-        client.execute_command('CONFIG', 'SET', 'largeobj.disk-maxmemory', '1048576')
-        # Each 256KB object has disk_len = 256KB (the header is an xattr).
-        # Four fit (exactly 1MB), the fifth exceeds (1310720 > 1MB).
+        # Each 256KB object is charged its file (the header is an xattr) and its inode.
+        # Four fit exactly, the fifth exceeds.
+        client.execute_command('CONFIG', 'SET', 'largeobj.disk-maxmemory',
+                               4 * (256 * 1024 + DISK_INODE))
         payload = position_pattern(256 * 1024, 'A')
         for i in range(4):
             result = client.execute_command('BLOB.TCP_SET', f'nvme_cap_{i}', payload)
@@ -784,10 +788,10 @@ class _NvmeAccountingBase(ValkeyLargeObjTestCaseBase):
 class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
     """Capacity is reclaimed only when the file is truly unlinked."""
 
-    # 2 MiB cap. Each 256 KiB object has disk_len = 256 KiB (the header is an xattr).
-    # Eight fit (exactly 2 MiB), the ninth would exceed it.
-    CAP = 2 * 1024 * 1024
+    # Each 256 KiB object is charged its file (the header is an xattr) and its inode.
+    # Eight fit exactly, the ninth would exceed the cap.
     OBJ = 256 * 1024
+    CAP = 8 * (OBJ + DISK_INODE)
 
     def get_module_args(self, data_dir, direct_io):
         # max-promote-size must fit in segment after talc overhead.
@@ -814,7 +818,7 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
         client = self.server.get_new_client()
         payload = position_pattern(self.OBJ, "X")
 
-        # Fill the cap (8 * 256 KiB = 2 MiB); the ninth must be rejected.
+        # Fill the cap (8 objects); the ninth must be rejected.
         for i in range(8):
             self._set_ok(client, f"k{i}", payload)
         wait_for_equal(self._dat_count, 8)
@@ -852,11 +856,11 @@ class TestNvmeUsageFreedOnDelete(_NvmeAccountingBase):
 
         for i in range(7):
             self._set_ok(client, f"k{i}", position_pattern(self.OBJ, "X"))
-        # Two decimals: 7 files of 262144 bytes = 1835008 / 2097152 = 87.5%.
+        # Two decimals: 7 of the 8 objects the cap holds = 87.5%.
         assert util() == 87.5
         client.execute_command("DEL", "k0")
         self._wait_free_settled(client)
-        # 6 * 262144 / 2097152 = 75%.
+        # 6 of 8 = 75%.
         wait_for_equal(util, 75)
         client.execute_command("FLUSHALL")
         self._wait_free_settled(client)
@@ -879,13 +883,13 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
     """O_DIRECT pads writes up to IO_ALIGN (4096); accounting must count the padded
     on-disk size (align_up(logical_len)), not the logical length."""
 
-    # Cap = 1 MiB + 1, so a 1 MiB + 1 object passes max-object-size (which must be
-    # <= disk-maxmemory) and only its padding can reject it.
-    # An aligned 1 MiB object fits: disk_len = 1048576 <= cap.
+    # Cap = 1 MiB + its inode + 1, so a 1 MiB + 1 object passes max-object-size (which
+    # must be <= disk-maxmemory) and only its padding can reject it.
+    # An aligned 1 MiB object fits: disk_len = 1048576, plus the inode, <= cap.
     # A non-aligned object of 1048577 bytes does NOT fit:
-    #   disk_len = align_up(1048577) = 1052672 > cap.
+    #   disk_len = align_up(1048577) = 1052672, plus the inode, > cap.
     #   The extra 4095 bytes of padding push it over — that IS the padding effect.
-    CAP = 1024 * 1024 + 1
+    CAP = 1024 * 1024 + DISK_INODE + 1
 
     def get_module_args(self, data_dir, direct_io):
         # segment-size must exceed the largest staged object (object < segment):
@@ -917,8 +921,8 @@ class TestNvmeUsageAccountsForPadding(_NvmeAccountingBase):
         aligned_payload = position_pattern(1024 * 1024, "Q")  # 1048576 — already 4096-aligned
         unaligned_payload = position_pattern(1024 * 1024 + 1, "P")  # 1048577 — needs padding
         # Verify the relationship between payload sizes and disk-maxmemory cap.
-        assert len(aligned_payload) <= self.CAP
-        assert self._align_up(len(unaligned_payload)) > self.CAP
+        assert len(aligned_payload) + DISK_INODE <= self.CAP
+        assert self._align_up(len(unaligned_payload)) + DISK_INODE > self.CAP
         # Aligned case succeeds: disk_len = 1048576 <= cap.
         self._set_ok(client, "fitkey", aligned_payload)
         assert client.execute_command("DBSIZE") == 1
@@ -959,11 +963,11 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'X')
         client.execute_command('BLOB.TCP_SET', 'crc_key', payload)
-        # Corrupt the CRC field in the FileHeader xattr (bytes 21-24 in packed layout).
+        # Corrupt the CRC field in the FileHeader xattr (bytes 17-20 in packed layout).
         dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected .dat file after SET"
         header = os.getxattr(dat_files[-1], 'user.lobj')
-        os.setxattr(dat_files[-1], 'user.lobj', header[:21] + b'\xff\xff\xff\xff')
+        os.setxattr(dat_files[-1], 'user.lobj', header[:17] + b'\xff\xff\xff\xff')
         # GET should trigger panic (CRC mismatch in read_and_verify_file_header).
         with self.server.expect_crash(self):
             try:
@@ -972,8 +976,8 @@ class TestTieredCorruptionCrcMismatch(ValkeyLargeObjTestCaseBase):
                 pass
 
 
-class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
-    """FileHeader magic corruption: server must crash on corrupt data."""
+class TestTieredCorruptionVersion(ValkeyLargeObjTestCaseBase):
+    """FileHeader version corruption: server must crash on corrupt data."""
 
     def get_module_args(self, data_dir, direct_io):
         return (
@@ -988,18 +992,18 @@ class TestTieredCorruptionMagic(ValkeyLargeObjTestCaseBase):
             f" fabric-provider Emulated"
         )
 
-    def test_tiered_file_header_magic_corruption(self):
-        """Corrupt magic bytes → GET triggers panic."""
+    def test_tiered_file_header_version_corruption(self):
+        """Corrupt version byte → GET triggers panic."""
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'Y')
-        client.execute_command('BLOB.TCP_SET', 'magic_key', payload)
+        client.execute_command('BLOB.TCP_SET', 'version_key', payload)
         dat_files = sorted(glob.glob(os.path.join(self.data_dir, '*', '*.dat')), key=os.path.basename)
         assert len(dat_files) >= 1, "Expected .dat file after SET"
         header = os.getxattr(dat_files[-1], 'user.lobj')
-        os.setxattr(dat_files[-1], 'user.lobj', b'BAAD' + header[4:])
+        os.setxattr(dat_files[-1], 'user.lobj', b'\x02' + header[1:])
         with self.server.expect_crash(self):
             try:
-                client.execute_command('BLOB.TCP_GET', 'magic_key')
+                client.execute_command('BLOB.TCP_GET', 'version_key')
             except Exception:
                 pass
 
