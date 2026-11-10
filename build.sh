@@ -17,6 +17,7 @@
 #   ASAN_BUILD            if set, builds valkey with SANITIZER=address
 #   COVERAGE              if set, instruments the module and prints integration-test
 #                         coverage after the run (needs: rustup component add llvm-tools-preview)
+#   COVERAGE_MIN          with COVERAGE, fail if unit + integration line coverage is below this percent
 
 set -e
 
@@ -244,5 +245,21 @@ if [ -n "$COVERAGE" ]; then
         echo "Combined unit + integration test coverage (module src/ only):"
         "$LLVM_BIN/llvm-cov" report "$MODULE_PATH" -object "$UNIT_BIN" \
             -instr-profile="$COV_DIR/lo.profdata" -ignore-filename-regex="$COV_IGNORE"
+    fi
+    if [ -n "$COVERAGE_MIN" ]; then
+        if [ -z "$UNIT_BIN" ] || [ ! -x "$UNIT_BIN" ]; then
+            echo "ERROR: COVERAGE_MIN needs the unit tests to run in the same build (run ./build.sh with no arguments)."
+            exit 1
+        fi
+        LINE_COV=$("$LLVM_BIN/llvm-cov" export "$MODULE_PATH" -object "$UNIT_BIN" \
+            -instr-profile="$COV_DIR/lo.profdata" -ignore-filename-regex="$COV_IGNORE" -summary-only \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["data"][0]["totals"]["lines"]["percent"])')
+        echo ""
+        if awk -v c="$LINE_COV" -v m="$COVERAGE_MIN" 'BEGIN { exit !(c >= m) }'; then
+            echo "Unit + integration line coverage ${LINE_COV}% meets the ${COVERAGE_MIN}% minimum."
+        else
+            echo "ERROR: Unit + integration line coverage ${LINE_COV}% is below the ${COVERAGE_MIN}% minimum."
+            exit 1
+        fi
     fi
 fi
