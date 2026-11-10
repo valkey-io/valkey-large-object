@@ -40,6 +40,8 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         # touch testdir — the module is solely responsible for the .dat files.
         self.server.exit(cleanup=False)
         assert self._object_files() == [], "shutdown did not clean remaining files"
+        # Shard subdirectories are created at startup only, so shutdown leaves disk-dir empty.
+        assert os.listdir(self.data_dir) == [], "shutdown left subdirectories in disk-dir"
 
     def test_startup_purges_orphaned_files(self):
         """Startup wipes crash-orphaned files in disk-dir; files outside it survive.

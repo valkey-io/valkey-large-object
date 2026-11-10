@@ -24,6 +24,7 @@ define_errors! {
     ERR_INVALID_RDMA_ADDR_HEX => "ERR invalid rdma address hex",
     ERR_RDMA_ADDR_LEN => "ERR rdma address must be 32 bytes",
     ERR_RDMA_ADDR_EMPTY => "ERR rdma address must not be empty",
+    ERR_RDMA_ADDR_FORMAT => "ERR rdma address is not a valid sockaddr",
     ERR_MALFORMED_MEMORY_ADDR_ARGS => "ERR memory address args must be rkey, addr, len triples",
     ERR_TOO_MANY_MEMORY_ADDRESSES => "ERR too many memory addresses (max 256)",
     ERR_INVALID_RKEY => "ERR invalid rkey",
@@ -64,6 +65,7 @@ define_errors! {
     ERR_SEGMENT_GE_PROMOTE => "ERR largeobj.segment-size is insufficient for largeobj.max-promote-size",
     ERR_STAGING_GE_SEGMENT => "ERR largeobj.disk-staging-size must be >= largeobj.segment-size",
     ERR_SEGMENT_GE_CHUNK => "ERR largeobj.segment-size must be >= largeobj.chunk-size",
+    ERR_CHUNK_NOT_ALIGNED => "ERR largeobj.chunk-size must be a multiple of 4096",
     ERR_MAX_BUF_GE_MIN_BUF => "ERR largeobj.max-buffers-per-op must be >= largeobj.min-buffers-per-op",
 }
 

@@ -68,9 +68,13 @@ pub const DEFAULT_DISK_MAXMEMORY: i64 = 0; // unlimited
 pub const MIN_DISK_MAXMEMORY: i64 = 0;
 pub const MAX_DISK_MAXMEMORY: i64 = i64::MAX;
 // worker-threads
-pub const DEFAULT_WORKER_THREADS: i64 = 4;
+pub const DEFAULT_WORKER_THREADS: i64 = 8;
 pub const MIN_WORKER_THREADS: i64 = 1;
 pub const MAX_WORKER_THREADS: i64 = 32;
+// disk-dir-shards
+pub const DEFAULT_DISK_DIR_SHARDS: i64 = 1024;
+pub const MIN_DISK_DIR_SHARDS: i64 = 1;
+pub const MAX_DISK_DIR_SHARDS: i64 = 65536;
 // max-promote-size
 pub const DEFAULT_MAX_PROMOTE_SIZE: i64 = 256 * 1024 * 1024; // 256 MiB
 pub const MIN_MAX_PROMOTE_SIZE: i64 = 0;
@@ -84,7 +88,7 @@ pub const DEFAULT_REAPER_SCAN_BUDGET_US: i64 = 2000;
 pub const MIN_REAPER_SCAN_BUDGET_US: i64 = 100;
 pub const MAX_REAPER_SCAN_BUDGET_US: i64 = 100_000;
 // reaper-poll-ms
-pub const DEFAULT_REAPER_POLL_MS: i64 = 35;
+pub const DEFAULT_REAPER_POLL_MS: i64 = 25;
 pub const MIN_REAPER_POLL_MS: i64 = 10;
 pub const MAX_REAPER_POLL_MS: i64 = 60_000;
 // smartlog-poll-secs
@@ -137,11 +141,11 @@ pub const DEFAULT_MAX_RDMA_REGISTERED_BYTES: i64 = 380 * 1024 * 1024 * 1024; // 
 pub const MIN_MAX_RDMA_REGISTERED_BYTES: i64 = 0; // no limit
 pub const MAX_MAX_RDMA_REGISTERED_BYTES: i64 = i64::MAX;
 // fabric-max-in-flight
-pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 0; // crate default
+pub const DEFAULT_FABRIC_MAX_IN_FLIGHT: i64 = 256;
 pub const MIN_FABRIC_MAX_IN_FLIGHT: i64 = 0;
 pub const MAX_FABRIC_MAX_IN_FLIGHT: i64 = 65_536;
 // fabric-crc-pool-threads
-pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 1;
+pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 2;
 pub const MIN_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MAX_FABRIC_CRC_POOL_THREADS: i64 = 1024;
 
@@ -187,6 +191,9 @@ lazy_static::lazy_static! {
 
     /// Number of tokio worker threads for transport CQ polling. Immutable after load.
     pub static ref CFG_WORKER_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_WORKER_THREADS);
+
+    /// Subdirectories of disk-dir that object files are spread over (`ObjectId::file_path`).
+    pub static ref CFG_DISK_DIR_SHARDS: AtomicI64 = AtomicI64::new(DEFAULT_DISK_DIR_SHARDS);
 
     /// Max object size eligible for DRAMPool promotion (Tiered mode).
     /// Objects larger than this skip promotion and are always served from NVMe.
@@ -239,14 +246,6 @@ lazy_static::lazy_static! {
     /// For benchmarking NVMe read throughput without TCP output buffer overhead.
     pub static ref CFG_BENCH_MODE: AtomicBool = AtomicBool::new(false);
 
-    /// Controls whether DRAM promotion is attempted while the DRAM pool is
-    /// scaling (expand/shrink). When false (default), promotion is skipped
-    /// during the scaling window and reads fall through to the NVMe streaming
-    /// path, which always uses fixed I/O because its pool never changes in size.
-    /// When true, promotion proceeds and the poller forces any in-window
-    /// reads to non-fixed I/O. Immutable after load.
-    pub static ref CFG_PROMOTE_DURING_DRAM_SCALING: AtomicBool = AtomicBool::new(false);
-
     /// Direct I/O mode: when enabled, file opens use O_DIRECT to bypass the kernel page cache.
     ///
     /// WHY: Large objects (4KB-50MB) would thrash the page cache if buffered. O_DIRECT ensures
@@ -282,7 +281,7 @@ lazy_static::lazy_static! {
         ValkeyGILGuard::new(ValkeyString::create(None, ""));
     static ref FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
 
-    /// Transfers each fabric service keeps in flight. Default: the crate's provider-derived default.
+    /// Transfers each fabric service keeps in flight. Default: 256. 0 = the crate's provider-derived default.
     pub static ref CFG_FABRIC_MAX_IN_FLIGHT: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_MAX_IN_FLIGHT);
 
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
@@ -389,16 +388,16 @@ pub fn worker_threads() -> usize {
     CFG_WORKER_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
 }
 
+pub fn disk_dir_shards() -> u64 {
+    CFG_DISK_DIR_SHARDS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
 pub fn max_promote_size() -> u64 {
     CFG_MAX_PROMOTE_SIZE.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn bench_mode() -> bool {
     CFG_BENCH_MODE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub fn promote_during_dram_scaling() -> bool {
-    CFG_PROMOTE_DURING_DRAM_SCALING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn scaling_poll_ms() -> u64 {
@@ -666,6 +665,13 @@ fn object_fits_segment(segment_size: u64, object_size: u64) -> bool {
 /// validate_config_constraint() at runtime (CONFIG SET) after the framework has
 /// already stored the new value into the atomic.
 pub fn validate_all_constraints() -> Result<(), String> {
+    // Chunk i is written as align_up(len) bytes at i * chunk_size, so an
+    // unaligned chunk_size makes each write overlap the next chunk.
+    if !(CFG_CHUNK_SIZE.load(std::sync::atomic::Ordering::Relaxed) as usize)
+        .is_multiple_of(storage::IO_ALIGN)
+    {
+        return Err(errors::ERR_CHUNK_NOT_ALIGNED.into());
+    }
     for constraint in config_constraints() {
         if !(constraint.enforce_condition)() {
             continue;
@@ -892,6 +898,12 @@ mod tests {
                 OperatingMode::Tiered,
                 vec![(&CFG_DISK_MAXMEMORY, max_obj - 1)],
                 Some("largeobj.disk-maxmemory must be >= largeobj.max-object-size in Tiered mode"),
+            ),
+            (
+                "chunk_not_4k_multiple_rejected",
+                OperatingMode::Dram,
+                vec![(&CFG_CHUNK_SIZE, 5000)],
+                Some("largeobj.chunk-size must be a multiple of 4096"),
             ),
         ]
     }

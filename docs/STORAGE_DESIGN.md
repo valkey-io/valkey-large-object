@@ -156,7 +156,7 @@ Allocate one or more large contiguous memory segments at startup. Register each 
 - Alloc is O(1) amortized but O(n) worst case on fragmented arena
 - More complex implementation (~315 lines)
 - Shrinking requires drain + evacuation (cannot simply return a buffer)
-- Adding/removing segments requires `IORING_UNREGISTER_BUFFERS` + re-register (brief I/O pause)
+- Adding/removing segments requires a table rebuild (`IORING_UNREGISTER_BUFFERS` + `IORING_REGISTER_BUFFERS`), during which the ring does no I/O
 
 ### 4.3 Fragmentation in Approach B
 
@@ -422,24 +422,27 @@ struct StreamingContext {
 ### 6.3 NVMe File Reference
 
 Each object version is one file, named directly from its `ObjectId` under the
-configured `disk-dir`: `{disk-dir}/{oid:016x}.dat` (via `ObjectId::file_path`).
-There is no extra subdirectory — `disk-dir` is the module-owned directory. The
+configured `disk-dir`: `{disk-dir}/{oid % disk-dir-shards:04x}/{oid:016x}.dat` (via
+`ObjectId::file_path`). `disk-dir` is the module-owned directory; its
+`disk-dir-shards` subdirectories (default 1024) are created when it is reset at
+startup. Every create and unlink
+takes its directory's inode lock exclusively, so one directory would serialize
+them across all SETs and evictions. The
 runtime handle is `ObjectFile { object_id, disk_len }` (held behind
 `Arc<ObjectFile>`); it stores no path and no fd — the path is derived from the OID
 and the fd is managed separately by the FdPool (§6.4).
 
-**File header (`FILE_HEADER_SIZE` = 4096 bytes at start of file; data starts at
-offset 4096 for O_DIRECT alignment):**
+**File header (in the `user.lobj` extended attribute; the file holds only the
+payload, from offset 0):**
 ```rust
 // consts in storage/nvme.rs
-pub const FILE_HEADER_SIZE: u64 = 4096;
+pub const FILE_HEADER_XATTR: &CStr = c"user.lobj";
 pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
 pub const FILE_HEADER_VERSION: u8 = 1;
 // Packed wire size, derived from field types (NOT hand-counted):
 pub const FILE_HEADER_WIRE_LEN: usize =
     size_of::<[u8; 4]>() + size_of::<u8>() + size_of::<u64>()
     + size_of::<u64>() + size_of::<u32>();
-const _: () = assert!(FILE_HEADER_WIRE_LEN <= FILE_HEADER_SIZE as usize);
 
 pub struct FileHeader {
     pub magic: [u8; 4],     // b"LOBJ" — identifies file as Large Object module data
@@ -450,25 +453,23 @@ pub struct FileHeader {
 }
 ```
 
-The header is serialized to the page on write and deserialized on read for magic/version validation. It is never byte-cast, so no `#[repr(C)]` is needed.
+The header is serialized to `FILE_HEADER_WIRE_LEN` bytes on write and deserialized on read for magic/version validation. It is never byte-cast, so no `#[repr(C)]` is needed. SET writes it with `fsetxattr` after the payload; every NVMe GET reads it with `fgetxattr` and checks it against the key's `LoValue` before the data reads. It is small enough for XFS to keep inside the inode, so it takes no data block.
 
 **File layout:**
 ```
-[0..WIRE_LEN):          FileHeader fields (little-endian, packed)
-[WIRE_LEN..4096):       Zero padding (aligns data start to 4KB for O_DIRECT)
-[4096..4096+len):       Object data
-[4096+len..):           O_DIRECT write padding to 4KB boundary
+[0..len):               Object data
+[len..):                O_DIRECT write padding to 4KB boundary
 ```
 
-Object data starts at offset 4096 so all ReadFixed/WriteFixed operations on the
-data portion are naturally 4KB-aligned. The header page is read only during
-recovery/reconciliation — never on the hot serving path (LoValue in the keyspace
-carries all metadata needed to serve).
+Keeping the header out of the file data matters on a striped XFS, which starts every
+file on a stripe-unit boundary: a payload that is a multiple of the stripe unit fills
+its last unit exactly, instead of spilling a header page into one more. Chunk `i`
+is written and read at file offset `i * chunk-size`.
 
 **Runtime references:**
 - The read fd is opened lazily on the first GET and cached in FdPool as `Arc<ObjectFd>` (SET opens its own private fd, not via FdPool — §6.4)
 - Lookup: `fd_pool.get_or_open(object_id, disk_dir)` → `Arc<ObjectFd>` for io_uring submission
-- File size = `4096 + ceil(len / 4096) * 4096` (header page + O_DIRECT-padded data)
+- File size = `ceil(len / 4096) * 4096` (O_DIRECT-padded data)
 - Actual object length stored in `LoValue.len` (hot path) and `FileHeader.len` (recovery path)
 - On DEL/free: `ObjectFile::Drop` removes the fd from FdPool (closes on last ref) and unlinks the file
 
@@ -542,7 +543,7 @@ Example: 50MB object cached in DRAMPool (long-lived). NVMePool would look the sa
 Valkey keyspace                Module internals
 ──────────────                 ────────────────
 key "obj-A"
-  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<ObjectFd> → {disk-dir}/000000000000002a.dat (50MB)
+  └─ LoValue {oid=42,         fd_pool.get_or_open(42) → Arc<ObjectFd> → {disk-dir}/002a/000000000000002a.dat (50MB)
        len=50MB,                                                ▲
        crc32c=0xAB12}                                           │  N buffers : 1 file
                                                                 │  (parallel ReadFixed/WriteFixed
@@ -587,7 +588,7 @@ Each object is one contiguous file on NVMe regardless of size:
 
 ```
 Object "key123" (10GB):
-  NVMe: {disk-dir}/000000000000002a.dat   (10GB file, XFS extent-allocated)
+  NVMe: {disk-dir}/002a/000000000000002a.dat   (10GB file, XFS extent-allocated)
   LoValue: {oid=42, len=10GB, crc32c=0xAB12}
 ```
 
@@ -1117,8 +1118,8 @@ lock and no Valkey API.
    is up). Existing MRs are untouched.
 4. **Publish:** take the pool's state lock, put the segment in a slot, and clear the running-expand
    flag. The allocator cannot see the segment before this, so it is always registered.
-5. **Re-register with io_uring** — **Tiered only** (Dram mode has no io_uring
-   engine). `submit_reregister(Dram)` asks the DRAM ring to rebuild its whole table
+5. **Rebuild the io_uring table** — **Tiered only** (Dram mode has no io_uring
+   engine). `submit_rebuild(Dram)` asks the DRAM ring to rebuild its whole table
    (§8.6).
 
 The new segment is usable for allocation as soon as it is published. Until the rebuild
@@ -1178,7 +1179,7 @@ those two races better is open (`DRAM_SHRINK_REVIEW.md`).
 ### 8.6 io_uring Registration (Tiered)
 
 Each pool has its own ring and its own fixed-buffer table (`IORING_REGISTER_BUFFERS`
-is per ring fd). Only the DRAM pool scales, so only the DRAM ring ever re-registers;
+is per ring fd). Only the DRAM pool scales, so only the DRAM ring ever rebuilds;
 the NVMe ring registers once at startup and never stalls.
 
 **Two indexes per segment:**
@@ -1201,19 +1202,34 @@ registration failure fails module load.
 kernel's registration object, so **every** in-flight fixed op on the ring — not just
 ops on the changed segment — must complete before it runs.
 
-**Rebuild protocol** (poller thread, after `submit_reregister` on expand or release):
+The only ops on the DRAM ring are promotion reads (NVMe file into DRAM buffers). Each
+promotion holds a `PromotionGuard` from admission until it finishes, and awaits every
+read it submits before it finishes.
 
-1. `IoRequest::Reregister` sets `registration_pending`.
-2. **Kill-switch:** while pending, every op is issued non-fixed (plain Read/Write,
-   which names an address, not a table index), so no new op can reference the table
-   about to change.
-3. When `fixed_in_flight` reaches 0, `rebuild_dense_iovecs` reindexes the live
-   segments densely from 0 (holes dropped), marks them registered, and the poller runs
-   `unregister_buffers` + `register_buffers(dense)`. A failure here panics.
-4. `registration_pending` clears; ops go fixed again with their new `iovec_index`.
+**Rebuild protocol** (poller thread, after `submit_rebuild` on expand or release):
+
+1. `IoRequest::Rebuild` sets `REBUILD_PENDING`. New promotions are refused
+   (`promotion_guard()` returns `None`), so those GETs are served from NVMe.
+2. The poller waits until no promotion is in progress (`drained_for_rebuild`). The
+   last promotion to finish sends `IoRequest::Wake` so an idle poller re-checks.
+3. `rebuild_dense_iovecs` reindexes the live segments densely from 0 (holes dropped),
+   marks them registered, and the poller runs `unregister_buffers` +
+   `register_buffers(dense)`. A failure here panics.
+4. `REBUILD_PENDING` clears; promotions resume with their new `iovec_index`.
+
+The poller logs a notice at step 1 (how many promotions it waits for) and one before step 4
+(segment count, time spent waiting for promotions, time the rebuild itself took).
+
+The rebuild must wait for in-progress promotions rather than only for reads in the
+kernel: `register_buffers` holds the ring's `uring_lock`, and submission takes the same
+lock, so a promotion's next chunk read would queue behind a rebuild that takes seconds
+at a few hundred segments.
 
 There is a window where nothing is registered (between the two syscalls). It is safe
-because of the drain + kill-switch, not because the swap is atomic. A newly expanded
+because no op is in flight and none is built until the rebuild finishes, not because
+the swap is atomic. For the same reason no op carries an `iovec_index` from before a
+rebuild: a promotion reads each index when it submits, and the rebuild that renumbers
+the segments never overlaps a promotion. A newly expanded
 segment is unregistered until step 3 marks it; `is_buf_io_uring_registered` keeps its
 I/O non-fixed until then, so it never issues a fixed op against an index that does not
 exist (EFAULT).
@@ -1407,7 +1423,23 @@ only same-segment operations serialize. Hold time ~10-50ns. Negligible contentio
 
 **Consistency with §9.2:** Main thread never allocs from NVMePool (all Tiered I/O goes through tokio). Main thread allocs from DRAMPool only for the first try of a DRAM-only SET, and for COPY. Main thread frees via Arc Drop in free callback (which may call the owning segment's talc.free if last ref).
 
-**NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `disk-maxmemory` and fails the SET if it would exceed the cap (`disk-maxmemory` of 0 = unlimited). Module-driven NVMe eviction (§8.1) frees space instead of failing when `maxmemory-policy` allows it. This is the only increment path in production (a separate `increase_nvme_disk_usage` exists but is test-only). Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The reserved/written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length.
+**NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `disk-maxmemory` and fails the SET if it would exceed the cap (`disk-maxmemory` of 0 = unlimited). Module-driven NVMe eviction (§8.1) frees space instead of failing when `maxmemory-policy` allows it. This is the only increment path in production (a separate `increase_nvme_disk_usage` exists but is test-only). Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length. Each charge is that length passed through `allocated_disk_bytes`, described next. Eviction credits each victim the same way.
+
+**Charging a file's real disk use on a striped XFS (`allocated_disk_bytes`):** the counter must track the space the filesystem actually consumes. Otherwise the filesystem fills before disk-maxmemory is reached, and once only unusable gaps remain, every SET's `fallocate` searches them and GET and SET collapse together. (On an i8ge with a 256 KiB stripe unit and 1 MiB objects, throughput fell from ~397 to ~68 Gbps before any eviction.)
+
+- **Why files waste space.** disk-dir sits on an LVM stripe across the NVMe drives, and `mkfs.xfs` records the stripe unit (`sunit`) in the superblock. XFS starts any allocation of at least one stripe unit on a stripe-unit boundary. A file of 1 MiB payload + 4 KiB header on a 1 MiB stripe unit therefore occupies 2 MiB: the next such file can't start in the 1020 KiB left after it.
+- **The rule.** A file of at least one stripe unit is charged its length rounded up to the stripe unit. A shorter file is charged its own length.
+- **Why shorter files are not rounded.** XFS considers stripe alignment only when the allocation is at least one stripe unit long (`xfs_bmapi_allocate`: `if (mp->m_dalign && bma->length >= mp->m_dalign)`). The SET path allocates each file in a single `fallocate` of its full length, so a shorter file is placed without alignment and takes only its own blocks.
+
+| File (1 MiB stripe unit) | XFS aligns it | Charged |
+|---|---|---|
+| 1 MiB + 4 KiB | yes | 2 MiB |
+| exactly 1 MiB | yes | 1 MiB |
+| 8 KiB | no | 8 KiB |
+
+- **How the unit is read.** Once at startup, `init_disk_alloc_unit` calls `fstatfs` on disk-dir. On XFS it calls the `XFS_IOC_FSGEOMETRY_V1` ioctl (the call `xfs_info` uses) and takes `sunit × blocksize`, words 20 and 0 of the 112-byte `struct xfs_fsop_geom_v1` from the kernel's `xfs_fs.h`. If that ioctl fails, the module refuses to load rather than charge too little. On any other filesystem, or an XFS with no stripe unit, the unit is one `IO_ALIGN` block (4 KiB), which `object_disk_len` already pads every file to. The startup log reports it as `disk_alloc_unit=<bytes>B`.
+- **Mixed object sizes.** A short file can land in the gap after a long one, so with mixed sizes the long files are slightly over-charged and eviction starts a little early. It never under-charges, so the filesystem cannot overfill.
+- **Tests.** The exact-capacity integration tests assume a 4 KiB unit, so the test base fails fast if disk-dir is on a striped XFS. CI runs the tests on an unstriped XFS loop mount so the XFS path is exercised.
 
 ### 9.4 Free Callback Lifecycle
 
@@ -1459,7 +1491,7 @@ When the scaling cron shrinks the DRAMPool (§8.5, both modes):
      → slots[i].take()          — leaves a None hole for the next expand
      → drop(segment)            — Segment::drop: EFA deregister, then dealloc;
                                   used_memory decreases
-     → submit_reregister(Dram)  — Tiered: rebuild the DRAM ring's table
+     → submit_rebuild(Dram)  — Tiered: rebuild the DRAM ring's table
 ```
 
 No spin and no blocking wait: release is polled by the cron, so a segment whose last
@@ -1502,9 +1534,9 @@ this section owns the semantics.
 | `reclaim-sample-size` | `5` | `1` | `64` | Live | Objects sampled per cache-eviction round; the lowest LFU score is demoted |
 | `max-cached-fds` | `16384` | `0` (no cache) | `1048576` | Live | FdPool cap on cached read fds, clamped to what the fd limit allows (`fd-reserve` sets what happens when it does not fit; see `OBJECT_FD_PLACEMENT_DESIGN.md`) |
 | `max-object-size` | `512MB` | `1` | i64::MAX | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
-| `chunk-size` | `1MB` | `4096` | `256MB` | Immutable | I/O chunk / allocation unit (detail: §7.2) |
+| `chunk-size` | `1MB` | `4096` | `256MB` | Immutable | I/O chunk / allocation unit; must be a multiple of 4096 (detail: §7.2) |
 | `max-buffers-per-op` / `min-buffers-per-op` | 64 / 2 | 2 / 1 | 1024 / 1024 | Live | Streaming pipeline depth (detail: §7.3.6) |
-| `worker-threads` | `4` | `1` | `32` | Immutable | tokio worker threads |
+| `worker-threads` | `8` | `1` | `32` | Immutable | tokio worker threads |
 | `scaling-poll-ms` | `5000` | `1000` | `60000` | Live | Scaling cron interval: how often it checks utilization and memory pressure |
 | `scaling-expand-watermark` | `80` | `50` | `95` | Live | Pool utilization % above which the cron adds a segment in the background |
 | `scaling-shrink-watermark` | `90` | `50` | `95` | Live | Server `used_memory / maxmemory` % above which the cron shrinks a segment; also the ceiling expand may not cross |
@@ -1514,8 +1546,8 @@ this section owns the semantics.
 | `smartlog-poll-secs` | `60` | `0` (off) | `86400` | Immutable | NVMe SMART poll interval (Tiered) |
 | `fabric-provider` | `Emulated` | — | — | Immutable | libfabric provider: `Emulated` (tcp provider) or `EfaDirect` (EFA hardware) |
 | `fabric-interfaces` | `""` (all) | — | — | Immutable | Comma-separated fabric domains to open a service on |
-| `fabric-max-in-flight` | `0` (provider default) | `0` | `65536` | Immutable | Transfers each fabric service keeps in flight |
-| `fabric-crc-pool-threads` | `1` | `1` | `1024` | Immutable | Threads hashing checksummed transfers off the fabric workers |
+| `fabric-max-in-flight` | `256` (`0` = provider default) | `0` | `65536` | Immutable | Transfers each fabric service keeps in flight |
+| `fabric-crc-pool-threads` | `2` | `1` | `1024` | Immutable | Threads hashing checksummed transfers off the fabric workers |
 
 **Segment size is capped at 1 GiB** for both `segment-size` and
 `disk-staging-size`. This is the `IORING_REGISTER_BUFFERS` per-buffer limit (§2):

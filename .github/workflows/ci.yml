@@ -34,7 +34,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev build-essential pkg-config
+          sudo apt-get install -y clang libclang-dev build-essential pkg-config xfsprogs
 
       - name: Install libfabric (EFA installer)
         env:
@@ -107,6 +107,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # Run the tests on XFS, so Tiered mode reads disk-dir's XFS geometry as on a
+      # production node (unstriped here, so 4 KiB). Tests keep their data under ./test-data.
+      - name: Mount XFS for test data
+        run: |
+          truncate -s 16G "$RUNNER_TEMP/test-data.xfs"
+          mkfs.xfs -q "$RUNNER_TEMP/test-data.xfs"
+          mkdir -p test-data
+          sudo mount -o loop "$RUNNER_TEMP/test-data.xfs" test-data
+          sudo chown "$(id -u):$(id -g)" test-data
 
       - name: Set module path
         run: echo "MODULE_PATH=$(realpath target/release/libvalkey_large_object.so)" >> $GITHUB_ENV

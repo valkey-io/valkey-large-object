@@ -145,17 +145,22 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
 /// Only collects, never deletes: core reads each scanned value after the scan
 /// callback returns (`moduleCloseKey`), so unlinking a key inside the callback
 /// hands BIO an object core still dereferences.
+///
+/// Holds the reclaim list lock for the whole bucket, not per key. Nothing in the
+/// callback can re-enter it: core opens each scanned key read-only with its value
+/// in hand (`moduleScanCallback`), so no lookup expires or frees a key mid-scan.
 fn listed_keys_in_next_bucket(
     ctx: &Context,
     cursor: &KeysCursor,
 ) -> (Vec<(ValkeyString, ObjectId)>, bool) {
     let listed = RefCell::new(Vec::new());
+    let oids = RECLAIM_LIST.lock();
     // scan() calls this once per key in the bucket.
     let more = cursor.scan(ctx, &|_ctx, name, key| {
         let Some(Ok(Some(lo))) = key.map(|k| k.get_value::<LoValue>(&LO_TYPE)) else {
             return;
         };
-        if RECLAIM_LIST.contains(&lo.object_id) {
+        if oids.contains(&lo.object_id) {
             listed.borrow_mut().push((name, lo.object_id));
         }
     });

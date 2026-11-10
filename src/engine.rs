@@ -10,7 +10,7 @@
 //!
 //! Streaming:
 //!   All paths use multi-buffer chunked I/O via ChunkIterator. NVMe paths
-//!   write FileHeader at offset 0, data at offset 4096+. SET computes CRC
+//!   keep the FileHeader in an xattr, data from offset 0. SET computes CRC
 //!   incrementally per chunk; GET verifies CRC via FileHeader comparison only
 //!   (no rolling hash on the read path).
 //!
@@ -347,13 +347,12 @@ fn cmd_get_tiered(
     cache.stats.record_miss();
     // ─── Try DRAMPool promotion ──────────────────────────────────────────
     // Admit via the admission filter, then allocate (reclaiming cold copies if full).
-    // Skip both if the DRAM ring's iovec table is being re-registered and
-    // promote-during-dram-scaling is disabled — promotion reads would go unfixed
-    // (Readv instead of ReadFixed), so fall back to the NVMe streaming path
-    // whose ring never re-registers.
-    let skip_promotion =
-        !crate::promote_during_dram_scaling() && storage::uring::is_registration_pending();
-    let promoted = if !skip_promotion && cache.admission.admit(object_id, obj_len) {
+    // Skip both while a rebuild of the DRAM ring's iovec table is pending: the rebuild
+    // blocks that ring, so promotion reads would queue behind it. Fall back to the
+    // NVMe streaming path, whose ring never rebuilds. The guard, held for the
+    // whole promotion, makes the rebuild wait for it. None while a rebuild is pending.
+    let rebuild_guard = storage::uring::promotion_guard();
+    let promoted = if rebuild_guard.is_some() && cache.admission.admit(object_id, obj_len) {
         dram_pool.try_promote_object(object_id, obj_len)
     } else {
         None
@@ -389,7 +388,7 @@ fn cmd_get_tiered(
         crate::runtime_handle().spawn(async move {
             // Drops before the captured thread_ctx: the fd clone is gone before
             // the client unblocks, so its next GET sees the fd unpinned.
-            let _keep_alive = (file, fd, unevictable);
+            let _keep_alive = (file, fd, unevictable, rebuild_guard);
             // Test hook: pause before NVMe reads so concurrent GETs can subscribe.
             let pause_ms = crate::test_pause_during_promotion_ms();
             if pause_ms > 0 {
@@ -533,16 +532,13 @@ async fn cmd_get_tiered_run(
         obj_len,
         crc32c: crc32c_expected,
     } = get_info;
-    let hdr_buf = &buffers[0];
-    let job = crate::stream::StreamJob::for_nvme_get(
+    let job = crate::stream::StreamJob::for_nvme(
         fd,
         obj_len,
         crate::chunk_size(),
         object_id,
         crc32c_expected,
         batch_width,
-        hdr_buf,
-        source_pool,
     );
     let source = crate::stream::Source::NvmeRead {
         buffers,
@@ -887,7 +883,7 @@ async fn cmd_set_tiered_run(
     let nvme_pool = storage::get_nvme_pool();
     let mut chunk_iter = chunk_iter;
     let disk_len = storage::object_disk_len(&mut chunk_iter);
-    if !nvme::try_reserve_nvme_disk_usage(disk_len) {
+    if !nvme::try_reserve_nvme_disk_usage(nvme::allocated_disk_bytes(disk_len)) {
         reply_err(
             &thread_ctx,
             &info::DISK_CAPACITY_EXCEEDED,
@@ -898,10 +894,13 @@ async fn cmd_set_tiered_run(
     // FdPool not used on SET: this write fd is short-lived and never cached.
     // FdPool caches read fds lazily on first GET via ensure_open.
     let file_path = object_id.file_path(&crate::disk_dir());
-    let fd = match storage::open_nvme_file_for_write(&file_path) {
+    let fd = match storage::open_nvme_file_for_write(&file_path, disk_len) {
         Ok(fd) => fd,
         Err(_e) => {
-            nvme::decrease_nvme_disk_usage(disk_len);
+            // The open may have created the file before failing (fd placement, fallocate).
+            // ENOENT is fine; like COPY's cleanup, any other unlink error aborts the node.
+            nvme::unlink(object_id);
+            nvme::decrease_nvme_disk_usage(nvme::allocated_disk_bytes(disk_len));
             reply_err(
                 &thread_ctx,
                 &info::DISK_WRITE_ERRORS,
@@ -912,14 +911,13 @@ async fn cmd_set_tiered_run(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
-    let job = crate::stream::StreamJob::for_nvme_set(
+    let job = crate::stream::StreamJob::for_nvme(
         fd.as_raw_fd(),
         obj_len,
         chunk_size,
         object_id,
+        0,
         batch_width,
-        &stream_ctx.buffers[0],
-        nvme_pool,
     );
     let target = crate::stream::Target::NvmeWrite {
         buffers: &stream_ctx.buffers,

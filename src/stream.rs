@@ -153,8 +153,7 @@ impl Source<'_> {
                     uring::UringOp {
                         iovec_index: pool.iovec(buf),
                         buf_ptr: pool.ptr(buf),
-                        file_offset: storage::FILE_HEADER_SIZE
-                            + chunk.index as u64 * chunk_size as u64,
+                        file_offset: chunk.index as u64 * chunk_size as u64,
                         len: chunk.user_data_len as u64,
                         use_fixed: pool.is_io_uring_registered(buf),
                     },
@@ -297,8 +296,7 @@ impl Target<'_> {
                     uring::UringOp {
                         iovec_index: pool.iovec_index_for_buf(buf),
                         buf_ptr: pool.buffer_ptr(buf),
-                        file_offset: storage::FILE_HEADER_SIZE
-                            + chunk.index as u64 * chunk_size as u64,
+                        file_offset: chunk.index as u64 * chunk_size as u64,
                         len: chunk.user_data_len as u64,
                         use_fixed: pool.is_buf_io_uring_registered(buf),
                     },
@@ -342,7 +340,7 @@ impl Pool {
     /// Whether the buffer's segment is registered in the kernel io_uring buffer
     /// table — drives the per-op fixed vs non-fixed path. Startup segments are
     /// registered; a segment added by expand() is not until the pool's poller
-    /// runs the whole-table unregister + re-register.
+    /// rebuilds the table.
     pub(crate) fn is_io_uring_registered(&self, b: &SegmentBuffer) -> bool {
         match self {
             Pool::Nvme(p) => p.is_buf_io_uring_registered(b),
@@ -409,56 +407,26 @@ pub struct PromotionProgress<'a> {
 //  The driver job + the ONE run() loop
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// The FileHeader a SET-to-NVMe path writes after its batch loop. Absent for GET
-/// (which reads+verifies the on-disk header via `verify_file_header`) and for Dram
-/// SET (no file). Carries exactly what `write_file_header` needs.
-pub struct FileHeaderWrite<'a> {
-    pub hdr_buf: &'a SegmentBuffer,
-    pub pool: &'static storage::NVMePool,
-}
-
-/// Where a GET reads the on-disk FileHeader into, before the data reads.
-/// `Some` on a GET (verify the header); `None` on SET and DRAM (no header read).
-pub struct FileHeaderRead {
-    /// io_uring registered-buffer slot for the header read.
-    pub iovec: u16,
-    /// Pool buffer pointer the header is read into.
-    pub ptr: usize,
-    /// Whether the header buffer's segment is registered in the io_uring buffer
-    /// table — drives the fixed vs non-fixed read path for the header op.
-    pub use_fixed: bool,
-    /// Which pool's ring owns the header buffer (DRAM promotion buffer vs NVMe
-    /// streaming buffer) — routes the header read to the correct engine.
-    pub pool_id: uring::PoolType,
-}
-
 /// Everything the loop needs that isn't the source/target themselves.
-pub struct StreamJob<'a> {
+pub struct StreamJob {
     /// NVMe file fd — `Some` on NVMe GET/SET, `None` on DRAM (no file). Only the
     /// `NvmeRead`/`NvmeWrite` arms read it; other arms never touch it.
     pub fd: Option<RawFd>,
     pub obj_len: u64,
     pub chunk_size: usize,
-    /// NVMe object id — `Some` when a file header is read/written, `None` on DRAM.
+    /// NVMe object id — `Some` on NVMe GET/SET, whose file header is read (GET)
+    /// or written (SET); `None` on DRAM (no file, no header).
     pub object_id: Option<ObjectId>,
-    /// GET verifies this before the loop; SET-to-NVMe writes it in the header.
+    /// GET verifies this against the file header; 0 on SET.
     pub crc32c_expected: Crc,
-    /// GET header-read placement — `Some` means "read+verify the on-disk FileHeader
-    /// before the data reads"; `None` on SET and DRAM (no header read).
-    pub verify_file_header: Option<FileHeaderRead>,
     /// Window width — SQEs/transfers in flight per batch, and the buffer-reuse bound.
     pub batch_width: usize,
-    /// `Some` for SET-to-NVMe: the FileHeader to persist after the batch loop.
-    /// `None` for GET and for DRAM-only SET (no file to write a header to).
-    pub persist_file_header: Option<FileHeaderWrite<'a>>,
 }
 
-impl<'a> StreamJob<'a> {
+impl StreamJob {
     /// A StreamJob for the DRAM path (GET serve from resident buffers, or DRAM
-    /// SET): no file, so no fd and no file-header work — `verify_file_header` and
-    /// `persist_file_header` are both `None`, and `object_id` (read only under
-    /// those) is always `None` too. `crc32c_expected` is the GET's expected CRC,
-    /// or 0 on SET.
+    /// SET): no file, so no fd, no `object_id` and no file-header work.
+    /// `crc32c_expected` is the GET's expected CRC, or 0 on SET.
     pub fn for_dram(
         obj_len: u64,
         chunk_size: usize,
@@ -471,25 +439,20 @@ impl<'a> StreamJob<'a> {
             chunk_size,
             object_id: None,
             crc32c_expected,
-            verify_file_header: None,
             batch_width,
-            persist_file_header: None,
         }
     }
 
-    /// A StreamJob for the NVMe GET path: reads+verifies the on-disk FileHeader
-    /// before the data reads. Builds the `FileHeaderRead` from the header buffer
-    /// and its pool. `persist_file_header` is `None` (GET writes no header).
-    #[allow(clippy::too_many_arguments)]
-    pub fn for_nvme_get(
+    /// A StreamJob for the NVMe path: GET verifies the file header before the data
+    /// reads, SET writes it after the batch loop. `crc32c_expected` is the GET's
+    /// expected CRC, or 0 on SET (its CRC is computed after the loop).
+    pub fn for_nvme(
         fd: RawFd,
         obj_len: u64,
         chunk_size: usize,
         object_id: ObjectId,
         crc32c_expected: Crc,
         batch_width: usize,
-        hdr_buf: &SegmentBuffer,
-        pool: Pool,
     ) -> Self {
         StreamJob {
             fd: Some(fd),
@@ -497,39 +460,7 @@ impl<'a> StreamJob<'a> {
             chunk_size,
             object_id: Some(object_id),
             crc32c_expected,
-            verify_file_header: Some(FileHeaderRead {
-                iovec: pool.iovec(hdr_buf),
-                ptr: pool.ptr(hdr_buf) as usize,
-                use_fixed: pool.is_io_uring_registered(hdr_buf),
-                pool_id: pool.pool_id(),
-            }),
             batch_width,
-            persist_file_header: None,
-        }
-    }
-
-    /// A StreamJob for the NVMe SET path: persists the FileHeader after the batch
-    /// loop. Builds the `FileHeaderWrite` from the header buffer and its NVMe pool.
-    /// `verify_file_header` is `None` and `crc32c_expected` is 0 (SET reads no
-    /// header; the object CRC is computed and written after the loop).
-    pub fn for_nvme_set(
-        fd: RawFd,
-        obj_len: u64,
-        chunk_size: usize,
-        object_id: ObjectId,
-        batch_width: usize,
-        hdr_buf: &'a SegmentBuffer,
-        pool: &'static storage::NVMePool,
-    ) -> Self {
-        StreamJob {
-            fd: Some(fd),
-            obj_len,
-            chunk_size,
-            object_id: Some(object_id),
-            crc32c_expected: 0,
-            verify_file_header: None,
-            batch_width,
-            persist_file_header: Some(FileHeaderWrite { hdr_buf, pool }),
         }
     }
 }
@@ -572,7 +503,7 @@ async fn test_inject_promotion_failure(p: &PromotionProgress<'_>) -> Result<(), 
 /// Returns the (advanced) iterator — so the caller can compute the object CRC from
 /// its recorded per-chunk checksums — and the latched target error, if any.
 async fn drive_window(
-    job: &StreamJob<'_>,
+    job: &StreamJob,
     mut chunk_iter: ChunkIterator,
     source: &Source<'_>,
     target: &Target<'_>,
@@ -681,7 +612,7 @@ async fn drive_window(
 /// caller builds the reply from the target. Returns the latched target error
 /// (`Some` only for a DRAM promotion whose client transfer failed mid-fill).
 pub async fn run_get(
-    job: &StreamJob<'_>,
+    job: &StreamJob,
     chunk_iter: ChunkIterator,
     source: &Source<'_>,
     target: &Target<'_>,
@@ -695,24 +626,14 @@ pub async fn run_get(
         ) && matches!(target, Target::TcpReply { .. } | Target::EfaWrite { .. }),
         "run_get called with a non-GET source/target pairing"
     );
-    if let Some(fh) = job.verify_file_header.as_ref() {
-        // GET reads+verifies the on-disk FileHeader before the data reads.
-        // TODO: Parallelize header and data read submission. Currently serialized
-        // because buffers[0] is shared between the header read and chunk 0's data
-        // read — submitting both concurrently would overwrite header bytes before
-        // validation.
+    if let Some(object_id) = job.object_id {
+        // NVMe GET verifies the file header before the data reads.
         storage::read_and_verify_file_header(
             job.fd.expect("GET header read requires an fd"),
-            fh.pool_id,
-            fh.iovec,
-            fh.ptr,
-            fh.use_fixed,
-            job.object_id
-                .expect("GET header read requires an object_id"),
+            object_id,
             job.obj_len,
             job.crc32c_expected,
-        )
-        .await;
+        );
     }
     let (_chunk_iter, target_err) = drive_window(job, chunk_iter, source, target, progress).await?;
     Ok(target_err)
@@ -729,7 +650,7 @@ pub async fn run_get(
 /// CRCs. TCP's closure takes `|_|` because it has the whole payload in `data`; only
 /// EFA needs the iterator's per-chunk CRCs.
 pub async fn run_set(
-    job: &StreamJob<'_>,
+    job: &StreamJob,
     chunk_iter: ChunkIterator,
     source: &Source<'_>,
     target: &Target<'_>,
@@ -743,19 +664,15 @@ pub async fn run_set(
     );
     let (chunk_iter, _target_err) = drive_window(job, chunk_iter, source, target, None).await?;
     let crc = object_crc(&chunk_iter);
-    if let Some(hw) = job.persist_file_header.as_ref() {
+    if let Some(object_id) = job.object_id {
         // SET-to-NVMe: persist the FileHeader. A failure is an NVMe write error;
         // the caller's ObjectFile Drop unlinks the file + releases the budget.
         if storage::write_file_header(
             job.fd.expect("SET header write requires an fd"),
-            job.object_id
-                .expect("SET header write requires an object_id"),
+            object_id,
             job.obj_len,
             crc,
-            hw.hdr_buf,
-            hw.pool,
         )
-        .await
         .is_err()
         {
             return Err(StreamError::NvmeWrite);

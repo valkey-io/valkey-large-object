@@ -61,7 +61,7 @@ impl NVMePool {
     }
 
     /// See `SegmentPool::rebuild_dense_iovecs`. The NVMe pool never expands or
-    /// shrinks, so its ring never actually re-registers; provided only so the poller's
+    /// shrinks, so its ring never actually rebuilds; provided only so the poller's
     /// pool-generic rebuild path is total.
     pub fn rebuild_dense_iovecs(&self) -> Vec<libc::iovec> {
         self.pool.rebuild_dense_iovecs()

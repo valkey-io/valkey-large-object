@@ -158,10 +158,11 @@ async fn efa_write_to_client(session: Arc<Session>, buf_ptr: usize, len, rkey, r
 | `dram-maxmemory` | 0 (no limit) | Total DRAM budget. 0 = grow on demand. |
 | `segment-size` | 64mb | Size of each DRAMPool segment |
 | `disk-dir` | (required if Tiered) | Dedicated, module-owned directory for .dat files. Wiped wholesale on startup and teardown, so it must NOT be shared with other files. |
+| `disk-dir-shards` | 1024 | Subdirectories of `disk-dir` that object files are spread over, by OID. Immutable. |
 | `disk-maxmemory` | 10gb | Max disk usage |
 | `disk-staging-size` | 64mb | Single NVMe staging segment (DRAM) |
 | `max-promote-size` | 256mb | Max object size for DRAMPool promotion. 0 = disable. |
-| `worker-threads` | 4 | Tokio runtime thread count |
+| `worker-threads` | 8 | Tokio runtime thread count |
 | `direct-io` | yes | O_DIRECT for NVMe files |
 
 ---

@@ -287,6 +287,8 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["worker-threads", &*CFG_WORKER_THREADS, DEFAULT_WORKER_THREADS, MIN_WORKER_THREADS, MAX_WORKER_THREADS,
              ConfigurationFlags::IMMUTABLE, None, None],
+            ["disk-dir-shards", &*CFG_DISK_DIR_SHARDS, DEFAULT_DISK_DIR_SHARDS, MIN_DISK_DIR_SHARDS, MAX_DISK_DIR_SHARDS,
+             ConfigurationFlags::IMMUTABLE, None, None],
             ["max-promote-size", &*CFG_MAX_PROMOTE_SIZE, DEFAULT_MAX_PROMOTE_SIZE, MIN_MAX_PROMOTE_SIZE, MAX_MAX_PROMOTE_SIZE,
              ConfigurationFlags::MEMORY, None, Some(Box::new(validate_config_constraint))],
             ["chunk-size", &*CFG_CHUNK_SIZE, DEFAULT_CHUNK_SIZE, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE,
@@ -336,7 +338,6 @@ valkey_module! {
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
-            ["promote-during-dram-scaling", &*CFG_PROMOTE_DURING_DRAM_SCALING, false, ConfigurationFlags::IMMUTABLE, None],
             ["test-rdma-fail-partial", &*CFG_TEST_RDMA_FAIL_PARTIAL, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["test-fail-promotion-read", &*CFG_TEST_FAIL_PROMOTION_READ, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],
             ["direct-io", &*CFG_DIRECT_IO, true, ConfigurationFlags::IMMUTABLE, None],

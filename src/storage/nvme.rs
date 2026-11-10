@@ -9,20 +9,86 @@ use super::fd_placement::ObjectFd;
 use std::fs::OpenOptions;
 use std::mem::size_of;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::context::SegmentBuffer;
-use super::uring;
 use super::Crc;
-use super::NVMePool;
 use crate::data_type::ObjectId;
 
 // ─── NVMe Disk Usage Tracking ────────────────────────────────────────────────
 
 /// Tracks total NVMe disk usage in bytes. Incremented on file creation, decremented on deletion.
+/// Callers charge each file its `allocated_disk_bytes`, not its length.
 static NVME_DISK_USAGE: AtomicU64 = AtomicU64::new(0);
+
+/// The unit disk-dir's filesystem allocates each file in, set once at startup by
+/// `init_disk_alloc_unit`. One `IO_ALIGN` block until then, and in Dram mode.
+static DISK_ALLOC_UNIT: AtomicU64 = AtomicU64::new(super::IO_ALIGN as u64);
+
+/// Bytes the filesystem allocates for a file of `len` bytes. On a striped XFS, a file
+/// of at least one stripe unit starts on a stripe-unit boundary, so the rest of its
+/// last stripe unit can't hold another such file: charge `len` rounded up to the unit.
+/// Charging only `len` lets the filesystem fill up before disk-maxmemory is reached.
+/// XFS aligns only allocations of at least one stripe unit (`xfs_bmapi_allocate`),
+/// and the SET path allocates each file in one `fallocate`, so a shorter file takes
+/// only its own blocks: charge `len`, already `IO_ALIGN`-aligned.
+pub fn allocated_disk_bytes(len: u64) -> u64 {
+    let unit = DISK_ALLOC_UNIT.load(Ordering::Relaxed);
+    if len >= unit {
+        len.next_multiple_of(unit)
+    } else {
+        len
+    }
+}
+
+/// `_IOR('X', 100, struct xfs_fsop_geom_v1)`: fills the 112-byte geometry struct
+/// from the kernel's `xfs_fs.h`.
+const XFS_IOC_FSGEOMETRY_V1: u32 = 0x8070_5864;
+/// u32 word index of `blocksize` (bytes 0..4): filesystem block size, bytes.
+const XFS_GEOM_BLOCKSIZE: usize = 0;
+/// u32 word index of `sunit` (bytes 80..84): stripe unit, filesystem blocks.
+const XFS_GEOM_SUNIT: usize = 20;
+
+/// Set the unit `allocated_disk_bytes` rounds to: disk-dir's stripe unit if it is on a
+/// striped XFS, else one `IO_ALIGN` block. Returns the unit.
+pub fn init_disk_alloc_unit(dir: &str) -> Result<u64, String> {
+    use std::os::unix::io::AsRawFd;
+    let dir_fd =
+        std::fs::File::open(dir).map_err(|e| format!("cannot open disk-dir {dir}: {e}"))?;
+    let fd = dir_fd.as_raw_fd();
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `fs` is the struct fstatfs writes.
+    if unsafe { libc::fstatfs(fd, &mut fs) } != 0 {
+        return Err(format!(
+            "cannot statfs disk-dir {dir}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut stripe = 0;
+    if fs.f_type == libc::XFS_SUPER_MAGIC {
+        let mut geometry = [0u32; 28];
+        // SAFETY: `geometry` is the 112 bytes this ioctl writes.
+        if unsafe { libc::ioctl(fd, XFS_IOC_FSGEOMETRY_V1 as _, geometry.as_mut_ptr()) } != 0 {
+            return Err(format!(
+                "cannot read disk-dir {dir} XFS geometry: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        stripe = geometry[XFS_GEOM_SUNIT] as u64 * geometry[XFS_GEOM_BLOCKSIZE] as u64;
+        valkey_module::logging::log_notice(format!(
+            "largeobj: disk-dir {dir} is on XFS, stripe unit {stripe} B (0 = not striped)"
+        ));
+    } else {
+        valkey_module::logging::log_warning(format!(
+            "largeobj: disk-dir {dir} is not on XFS; disk usage is charged in {} B blocks",
+            super::IO_ALIGN
+        ));
+    }
+    let unit = stripe.max(super::IO_ALIGN as u64);
+    DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
+    Ok(unit)
+}
 
 /// Increment NVMe disk usage after a file is created.
 pub fn increase_nvme_disk_usage(bytes: u64) {
@@ -121,8 +187,9 @@ fn evict_and_reserve(bytes: u64) -> bool {
         };
         match stat(oid) {
             Some(len) => {
-                covered += len;
-                victims.push((unevictable, len));
+                let bytes = allocated_disk_bytes(len);
+                covered += bytes;
+                victims.push((unevictable, bytes));
             }
             // Torn down between the pick and the claim, so its key is gone.
             None => {
@@ -224,7 +291,10 @@ fn transient(e: &std::io::Error) -> bool {
 
 // ─── FileHeader ──────────────────────────────────────────────────────────────
 
-pub const FILE_HEADER_SIZE: u64 = 4096;
+/// Extended attribute that holds an object file's `FileHeader`. Keeping the header
+/// out of the file data makes the file exactly its payload, so a payload that is a
+/// multiple of the filesystem's stripe unit doesn't spill into one more stripe unit.
+pub const FILE_HEADER_XATTR: &std::ffi::CStr = c"user.lobj";
 pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
 pub const FILE_HEADER_VERSION: u8 = 1;
 
@@ -236,15 +306,12 @@ pub const FILE_HEADER_WIRE_LEN: usize = size_of::<[u8; 4]>()  // magic
     + size_of::<u64>()                                          // len
     + size_of::<u32>(); // crc32c
 
-// Static assert: wire header fits within the page.
-const _: () = assert!(FILE_HEADER_WIRE_LEN <= FILE_HEADER_SIZE as usize);
-
-/// On-disk file header for NVMe object files.
-/// Data starts at offset FILE_HEADER_SIZE (4096) for O_DIRECT alignment.
+/// On-disk file header for NVMe object files, stored in the `FILE_HEADER_XATTR`
+/// xattr. The file itself holds only the payload, starting at offset 0.
 ///
 /// The struct's in-memory layout does NOT match the on-disk wire format —
 /// the compiler inserts padding for natural field alignment. Serialization
-/// is handled by `to_page` (sequential writes) and `from_page` (sequential
+/// is handled by `to_bytes` (sequential writes) and `from_bytes` (sequential
 /// reads with validation). Do not attempt to byte-cast this struct.
 pub struct FileHeader {
     pub magic: [u8; 4],
@@ -265,22 +332,21 @@ impl FileHeader {
         }
     }
 
-    /// Serialize into a 4096-byte page (header bytes + zero padding).
-    pub fn to_page(&self) -> Vec<u8> {
-        let mut page = Vec::with_capacity(FILE_HEADER_SIZE as usize);
+    /// Serialize the fields back to back (`FILE_HEADER_WIRE_LEN` bytes).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut page = Vec::with_capacity(FILE_HEADER_WIRE_LEN);
         page.extend_from_slice(&self.magic);
         page.push(self.version);
         page.extend_from_slice(&self.object_id.to_le_bytes());
         page.extend_from_slice(&self.len.to_le_bytes());
         page.extend_from_slice(&self.crc32c.to_le_bytes());
         assert_eq!(page.len(), FILE_HEADER_WIRE_LEN);
-        page.resize(FILE_HEADER_SIZE as usize, 0);
         page
     }
 
-    /// Deserialize from a page. Panics on invalid magic, version, or truncated page
+    /// Deserialize. Panics on invalid magic, version, or truncated bytes
     /// (these indicate corrupt on-disk data). Fields are read sequentially via cursor.
-    pub fn from_page(page: &[u8]) -> Self {
+    pub fn from_bytes(page: &[u8]) -> Self {
         if page.len() < FILE_HEADER_WIRE_LEN {
             panic!(
                 "largeobj: file header too short ({} bytes, need {})",
@@ -350,67 +416,40 @@ pub fn object_disk_len(chunk_iter: &mut super::ChunkIterator) -> u64 {
         chunk_bytes += super::align_up(chunk.user_data_len) as u64;
     }
     chunk_iter.reset_cursor();
-    FILE_HEADER_SIZE + chunk_bytes
+    chunk_bytes
 }
 
 // ─── NVMe File I/O Helpers ───────────────────────────────────────────────────
 
-/// Read FileHeader from offset 0 of an NVMe file into a pool buffer, parse and
-/// validate against expected values. Checks magic, version, object_id, len, and CRC.
-/// Panics on corrupt headers (unrecoverable on-disk corruption). Panics on CRC
-/// mismatch (serving corrupt data is worse than crashing). Panics on poller failure
-/// (RecvError means the io_uring poller is dead).
-/// `pool_buffer_ptr` passed as usize for Send safety (raw pointer is not Send).
-/// chunk-size config enforces min 4096, so every pool buffer can hold a full
-/// FileHeader page.
-#[allow(clippy::too_many_arguments)]
-pub async fn read_and_verify_file_header(
+/// Read the FileHeader xattr of an NVMe file and validate it against expected
+/// values. Checks magic, version, object_id, len, and CRC.
+/// Panics on a missing or corrupt header (unrecoverable on-disk corruption). Panics
+/// on CRC mismatch (serving corrupt data is worse than crashing).
+pub fn read_and_verify_file_header(
     fd: RawFd,
-    pool_id: uring::PoolType,
-    iovec_index: u16,
-    pool_buffer_ptr: usize,
-    use_fixed: bool,
     expected_object_id: ObjectId,
     expected_len: u64,
     crc32c_expected: Crc,
 ) {
-    assert!(
-        pool_buffer_ptr != 0,
-        "read_and_verify_file_header: null buffer pointer"
-    );
-    let hdr_op = uring::UringOp {
-        iovec_index,
-        buf_ptr: pool_buffer_ptr as *mut u8,
-        file_offset: 0,
-        len: FILE_HEADER_SIZE,
-        use_fixed,
+    let mut bytes = [0u8; FILE_HEADER_WIRE_LEN];
+    // SAFETY: the name is NUL-terminated and `bytes` is valid for `bytes.len()`.
+    let n = unsafe {
+        libc::fgetxattr(
+            fd,
+            FILE_HEADER_XATTR.as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
     };
-    let hdr_rx = uring::submit_read(pool_id, fd, hdr_op);
-    // RecvError: this pool's io_uring poller dropped the oneshot sender without
-    // calling send(). This only happens if that poller thread panicked or exited
-    // — it owns all senders in its pending HashMap. Each pool has its own
-    // long-lived poller, so losing the one for `pool_id` is permanent: no future
-    // I/O on that ring can complete. Abort.
-    match hdr_rx.await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => {
-            panic!(
-                "largeobj: file header read I/O error for object {:?}: {}",
-                expected_object_id, e
-            );
-        }
-        Err(_) => {
-            panic!(
-                "largeobj: io_uring poller dropped oneshot sender — poller is dead, \
-                 all NVMe I/O is unrecoverable"
-            );
-        }
+    if n < 0 {
+        panic!(
+            "largeobj: file header read error for object {:?}: {}",
+            expected_object_id,
+            std::io::Error::last_os_error()
+        );
     }
-    let hdr_slice = unsafe {
-        std::slice::from_raw_parts(pool_buffer_ptr as *const u8, FILE_HEADER_SIZE as usize)
-    };
-    // from_page panics on corrupt magic/version (unrecoverable on-disk corruption).
-    let header = FileHeader::from_page(hdr_slice);
+    // from_bytes panics on corrupt magic/version (unrecoverable on-disk corruption).
+    let header = FileHeader::from_bytes(&bytes[..n as usize]);
     if header.object_id != expected_object_id.0 || header.len != expected_len {
         panic!(
             "largeobj: file header mismatch for object {:?}: \
@@ -428,57 +467,54 @@ pub async fn read_and_verify_file_header(
 
 /// Open an NVMe file for writing with O_CREAT|O_TRUNC and optionally O_DIRECT.
 /// Returns an `ObjectFd` that closes the file descriptor on drop.
-pub fn open_nvme_file_for_write(file_path: &str) -> Result<ObjectFd, super::StorageError> {
+pub fn open_nvme_file_for_write(
+    file_path: &str,
+    disk_len: u64,
+) -> Result<ObjectFd, super::StorageError> {
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true).mode(0o644);
     if crate::direct_io() {
         opts.custom_flags(libc::O_DIRECT);
     }
-    super::fd_placement::open_object_file(file_path, &opts).map_err(|e| {
-        super::StorageError::IoError {
-            code: e.raw_os_error().unwrap_or(libc::EIO),
+    let io_err = |e: std::io::Error| super::StorageError::IoError {
+        code: e.raw_os_error().unwrap_or(libc::EIO),
+    };
+    let fd = super::fd_placement::open_object_file(file_path, &opts).map_err(io_err)?;
+    // Preallocate the whole object so every O_DIRECT chunk write lands inside EOF. Extending
+    // writes make XFS take the inode IOLOCK exclusive (serializing the object's parallel chunk
+    // writes) and allocate extents inside each write. EOPNOTSUPP keeps extending writes.
+    if unsafe { libc::fallocate(fd.as_raw_fd(), 0, 0, disk_len as libc::off_t) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EOPNOTSUPP) {
+            return Err(io_err(e));
         }
-    })
+    }
+    Ok(fd)
 }
 
-/// Write FileHeader to offset 0 of an NVMe file using the given NVMePool buffer.
-/// chunk-size config enforces min 4096, so every pool buffer can hold a full
-/// FileHeader page.
-pub async fn write_file_header(
+/// Write the FileHeader xattr of an NVMe object file. Callers write it after the
+/// payload, so a file with a header is a complete one.
+pub fn write_file_header(
     fd: RawFd,
     object_id: ObjectId,
     obj_len: u64,
     crc: Crc,
-    buf: &SegmentBuffer,
-    nvme_pool: &NVMePool,
-) -> Result<(), super::StorageError> {
-    assert!(
-        buf.len as u64 >= FILE_HEADER_SIZE,
-        "NVMePool buffer too small for FileHeader"
-    );
-    let header = FileHeader::new(object_id, obj_len, crc);
-    let header_page = header.to_page();
-    let hdr_ptr = nvme_pool.buffer_ptr(buf);
-    unsafe {
-        std::ptr::copy_nonoverlapping(header_page.as_ptr(), hdr_ptr, header_page.len());
-    }
-    let hdr_op = uring::UringOp {
-        iovec_index: nvme_pool.iovec_index_for_buf(buf),
-        buf_ptr: hdr_ptr,
-        file_offset: 0,
-        len: FILE_HEADER_SIZE,
-        use_fixed: nvme_pool.is_buf_io_uring_registered(buf),
+) -> std::io::Result<()> {
+    let bytes = FileHeader::new(object_id, obj_len, crc).to_bytes();
+    // SAFETY: the name is NUL-terminated and `bytes` is valid for `bytes.len()`.
+    let rc = unsafe {
+        libc::fsetxattr(
+            fd,
+            FILE_HEADER_XATTR.as_ptr(),
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            0,
+        )
     };
-    let hdr_rx = uring::submit_write(uring::PoolType::Nvme, fd, hdr_op);
-    match hdr_rx.await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e),
-        Err(_) => {
-            panic!(
-                "largeobj: io_uring poller dropped oneshot sender — poller is dead, \
-                 all NVMe I/O is unrecoverable"
-            );
-        }
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -572,20 +608,36 @@ mod tests {
         decrease_nvme_disk_usage(u64::MAX);
     }
 
+    // ─── allocated_disk_bytes ────────────────────────────────────────────
+
+    // On a 1 MiB stripe unit, a file of at least 1 MiB takes whole stripe units (a
+    // 1 MiB + 4 KiB file takes 2 MiB); a shorter file is not aligned and takes its
+    // own length.
+    #[test]
+    fn test_allocated_disk_bytes_rounds_to_stripe_unit() {
+        let _g = lock();
+        let unit = DISK_ALLOC_UNIT.swap(1 << 20, Ordering::Relaxed);
+        assert_eq!(allocated_disk_bytes(1 << 20), 1 << 20);
+        assert_eq!(allocated_disk_bytes((1 << 20) + 4096), 2 << 20);
+        assert_eq!(allocated_disk_bytes(8192), 8192);
+        assert_eq!(allocated_disk_bytes((1 << 20) - 4096), (1 << 20) - 4096);
+        DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
+    }
+
     // ─── object_disk_len ─────────────────────────────────────────────────
 
     #[test]
     fn test_object_disk_len_single_chunk() {
-        // 1 byte → 1 chunk, align_up(1) = 4096. Total = 4096 header + 4096 data.
+        // 1 byte → 1 chunk, align_up(1) = 4096. Total = 4096.
         let mut iter = super::super::ChunkIterator::new(1, 4096, 1, None);
-        assert_eq!(object_disk_len(&mut iter), 4096 + 4096);
+        assert_eq!(object_disk_len(&mut iter), 4096);
     }
 
     #[test]
     fn test_object_disk_len_exact_multiple_aligned_chunk_size() {
         // 8192 bytes, chunk_size=4096 → 2 full chunks. Each align_up(4096)=4096.
         let mut iter = super::super::ChunkIterator::new(8192, 4096, 2, None);
-        assert_eq!(object_disk_len(&mut iter), 4096 + 4096 + 4096);
+        assert_eq!(object_disk_len(&mut iter), 4096 + 4096);
     }
 
     #[test]
@@ -593,22 +645,34 @@ mod tests {
         // 10000 bytes, chunk_size=4096 → chunks: 4096, 4096, 1808.
         // align_up: 4096, 4096, 4096. Data total = 12288.
         let mut iter = super::super::ChunkIterator::new(10000, 4096, 3, None);
-        assert_eq!(object_disk_len(&mut iter), 4096 + 12288);
+        assert_eq!(object_disk_len(&mut iter), 12288);
     }
 
     #[test]
-    fn test_object_disk_len_unaligned_chunk_size() {
-        // 10000 bytes, chunk_size=5000 → chunks: 5000, 5000.
-        // align_up(5000) = 8192 each. Data total = 16384.
-        let mut iter = super::super::ChunkIterator::new(10000, 5000, 2, None);
-        assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 8192);
+    fn test_object_disk_len_unaligned_value_multi_page_chunk_size() {
+        // 20000 bytes, chunk_size=8192 → chunks: 8192, 8192, 3616.
+        // align_up(3616) = 4096. Data total = 20480.
+        let mut iter = super::super::ChunkIterator::new(20000, 8192, 3, None);
+        assert_eq!(object_disk_len(&mut iter), 8192 + 8192 + 4096);
     }
 
     #[test]
-    fn test_object_disk_len_unaligned_chunk_size_with_remainder() {
-        // 8193 bytes, chunk_size=5000 → chunks: 5000, 3193.
-        // align_up(5000)=8192, align_up(3193)=4096. Data total = 12288.
-        let mut iter = super::super::ChunkIterator::new(8193, 5000, 2, None);
-        assert_eq!(object_disk_len(&mut iter), 4096 + 8192 + 4096);
+    fn test_open_for_write_preallocates_disk_len() {
+        use std::os::unix::fs::MetadataExt;
+        // A directory of its own, so the test never touches another run's file.
+        let dir = std::env::temp_dir().join(format!("lo-prealloc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::data_type::create_disk_dir_shards(dir.to_str().unwrap()).unwrap();
+        let path = ObjectId(1).file_path(dir.to_str().unwrap());
+        let disk_len = 2 * 1024 * 1024;
+        // Nothing is written, so the size and the allocated blocks come from fallocate alone.
+        let meta = open_nvme_file_for_write(&path, disk_len).map(|_fd| std::fs::metadata(&path));
+        std::fs::remove_dir_all(&dir).unwrap();
+        let meta = meta.expect("open for write").expect("stat");
+        assert_eq!(meta.len(), disk_len);
+        assert!(
+            meta.blocks() * 512 >= disk_len,
+            "blocks are reserved at open"
+        );
     }
 }

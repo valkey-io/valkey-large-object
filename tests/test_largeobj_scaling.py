@@ -8,6 +8,8 @@ Tests cover:
   - Tiered mode: reactive expand on promotion
   - Tiered mode: shrink drops cached copies, NVMe data survives
   - Tiered mode: expand, shrink to zero segments, expand again
+  - Tiered mode: the DRAM ring's rebuild (after an expand or a shrink) waits for in-progress
+    promotions, and promotions after a shrink read into renumbered segments
   - Tiered mode: shrink releases an EFA-registered segment
   - Eviction, both modes: a SET or COPY past the budget evicts other objects; their keys read as
     misses until the scaling cron deletes them. Tiered stays exact against concurrent GET, SET,
@@ -36,12 +38,22 @@ SEGMENT_FILLING_SIZE = 900 * 1024
 def wait_uring_registered_matches_segments(client, timeout=10):
     """Tiered: each pool's io_uring ring registers all its segments
     (dram_uring==dram_segments, nvme_uring==nvme_segments). wait_for because the
-    re-register on expand/shrink is fire-and-forget on the poller."""
+    rebuild on expand/shrink is fire-and-forget on the poller."""
     def _match():
         i = info_largeobj(client)
         return (i['largeobj_dram_uring_registered_segments'] == i['largeobj_dram_segments']
                 and i['largeobj_disk_staging_uring_registered_segments'] == i['largeobj_disk_staging_segments'])
     wait_for_true(_match, timeout=timeout)
+
+
+REBUILD_PENDING_LOG = 'DRAM io_uring table rebuild pending'
+REBUILT_LOG = 'rebuilt the DRAM io_uring table'
+
+
+def log_count(server, text):
+    """Lines of the server log that contain `text`."""
+    with open(os.path.join(server.cwd, server.args['logfile'])) as f:
+        return sum(text in line for line in f)
 
 
 def apply_shrink_pressure(client, policy='noeviction'):
@@ -50,6 +62,17 @@ def apply_shrink_pressure(client, policy='noeviction'):
     noeviction."""
     client.config_set('maxmemory-policy', policy)
     client.config_set('maxmemory', int(client.info('memory')['used_memory'] * 0.85))
+
+
+def apply_one_segment_shrink_pressure(client):
+    """Set maxmemory so used_memory is over the shrink watermark by less than one segment:
+    the cron releases exactly one segment, after which the pressure is gone."""
+    used = int(client.info('memory')['used_memory'])
+    watermark = int(client.config_get('largeobj.scaling-shrink-watermark')
+                    ['largeobj.scaling-shrink-watermark']) / 100
+    segment = info_largeobj(client)['largeobj_dram_segment_size_bytes']
+    client.config_set('maxmemory-policy', 'noeviction')
+    client.config_set('maxmemory', int((used - segment / 2) / watermark))
 
 
 def apply_full_shrink_pressure(client, policy='noeviction'):
@@ -548,7 +571,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
 
         client.config_set('maxmemory', 0)
         # At zero segments the wait above passes trivially (0 == 0), possibly before the
-        # last re-register finishes; a GET in that window skips promotion. Retry the GET.
+        # last rebuild finishes; a GET in that window skips promotion. Retry the GET.
         wait_for_true(lambda: client.execute_command('BLOB.TCP_GET', 'tshrink_0') is not None
                       and info_largeobj(client)['largeobj_dram_objects'] == 1,
                       timeout=self.TIMEOUT_S)
@@ -727,16 +750,18 @@ class TieredBudget(Budget):
     names, unless they pin one down."""
 
     OBJ = 512 * 1024
-    DISK_PER_OBJ = OBJ + 4096  # the ledger also charges the file's one-page header
+    DISK_PER_OBJ = OBJ  # the header is an xattr, so the file is exactly the payload
     PER_BUDGET = 8
     BUDGET = PER_BUDGET * DISK_PER_OBJ
     FULL = 'disk-maxmemory'
     EVICTS_EXACTLY = True
 
     def get_module_args(self, data_dir, direct_io):
-        return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET}"
+        # One byte over BUDGET: still PER_BUDGET objects, but an object of BUDGET + 1 bytes is
+        # allowed by max-object-size and pads past disk-maxmemory.
+        return (f"operating-mode Tiered disk-dir {data_dir} disk-maxmemory {self.BUDGET + 1}"
                 f" disk-staging-size {2 * self.BUDGET} segment-size {2 * self.BUDGET}"
-                f" max-object-size {self.BUDGET} max-promote-size {self.BUDGET}"
+                f" max-object-size {self.BUDGET + 1} max-promote-size {self.BUDGET}"
                 f" scaling-poll-ms {self.POLL_MS} reaper-poll-ms {self.POLL_MS}"
                 f" bench-mode no direct-io no")
 
@@ -749,14 +774,16 @@ class TieredBudget(Budget):
         return client
 
     def object_files(self):
-        """Lowest oid first (file names are zero-padded hex oids): the oldest write first."""
-        return sorted(name for name in os.listdir(self.data_dir) if OBJECT_FILE.match(name))
+        """Lowest oid first (file names are zero-padded hex oids): the oldest write first. Paths are
+        relative to data_dir, across its shard subdirectories."""
+        files = [os.path.join(os.path.relpath(root, self.data_dir), name)
+                 for root, _, names in os.walk(self.data_dir) for name in names if OBJECT_FILE.match(name)]
+        return sorted(files, key=os.path.basename)
 
     def first_in_line(self, payloads):
         """The key LRU eviction takes first when none was read: the oldest write (lowest oid),
         found by its file's first payload word, which differs for every tag."""
         with open(os.path.join(self.data_dir, self.object_files()[0]), 'rb') as f:
-            f.seek(4096)
             head = f.read(4)
         return next(key for key, payload in payloads.items() if payload[:4] == head)
 
@@ -901,7 +928,7 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         """No eviction makes room for more than the cap."""
         client = self.new_client()
         payloads = set_objects(client, 'obj_', self.PER_BUDGET, self.OBJ)
-        self.assert_refused(client, 'huge', position_pattern(self.BUDGET, 'H'))
+        self.assert_refused(client, 'huge', position_pattern(self.BUDGET + 1, 'H'))
         info = info_largeobj(client)
         assert info['largeobj_evictions'] == 0
         assert info['largeobj_disk_capacity_exceeded'] == 1
@@ -1234,3 +1261,175 @@ class TestDramEvictionPolicy(EvictionPolicyTests, DramBudget):
 
 class TestTieredEvictionPolicy(EvictionPolicyTests, TieredBudget):
     pass
+
+
+# ─── Rebuild of the DRAM ring's buffer table vs in-progress promotions ────────
+
+PROMOTION_PAUSE_SECS = 3
+
+
+class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
+    """An expand or a shrink rebuilds the DRAM ring's io_uring buffer table, and the
+    rebuild blocks that ring. A promotion already in progress must finish first (its reads
+    would otherwise queue behind the rebuild), and a GET arriving while the rebuild is pending
+    is served from NVMe instead of promoting. test-pause-during-promotion-ms holds a promotion
+    in progress, between admission and its disk reads."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (TIERED_ARGS.format(data_dir=data_dir)
+                + " scaling-expand-watermark 95"
+                + f" test-pause-during-promotion-ms {PROMOTION_PAUSE_SECS * 1000}")
+
+    def _start_promotion(self, key):
+        """GET `key` on its own client and thread: its promotion pauses before its reads.
+        Returns the thread and the dict its reply (or error) lands in."""
+        result = {}
+
+        def promoting_get():
+            try:
+                result['reply'] = self.server.get_new_client().execute_command('BLOB.TCP_GET', key)
+            except Exception as e:
+                result['error'] = e
+
+        thread = threading.Thread(target=promoting_get)
+        thread.start()
+        return thread, result
+
+    def _wait_rebuild_pending(self, pending_before):
+        """Wait for the DRAM poller to take the rebuild request. INFO shows the new segment count
+        before the request, sent from a tokio task, reaches the poller."""
+        wait_for_true(lambda: log_count(self.server, REBUILD_PENDING_LOG) > pending_before)
+
+    def _assert_rebuild_still_pending(self, promotion, rebuilt_before):
+        """The rebuild still waits on the paused promotion, so everything checked since it
+        became pending ran before the rebuild. The poller logs a rebuild before clearing the
+        pending flag, so no new line means it has not run."""
+        assert promotion.is_alive(), "the paused promotion finished before the checks ran"
+        assert log_count(self.server, REBUILT_LOG) == rebuilt_before
+
+    @staticmethod
+    def _assert_promotion_finishes(thread, result, payload):
+        thread.join(timeout=PROMOTION_PAUSE_SECS + 10)
+        assert not thread.is_alive(), "the paused promotion never finished"
+        assert 'error' not in result, result.get('error')
+        assert result['reply'] == payload
+
+    def test_rebuild_waits_for_in_progress_promotion(self):
+        client = self.server.get_new_client()
+        payloads = {key: position_pattern(SEGMENT_FILLING_SIZE, key[-1]) for key in
+                    ('key_a', 'key_b', 'key_c')}
+        for key, payload in payloads.items():
+            client.execute_command('BLOB.TCP_SET', key, payload)
+
+        # key_a's promotion takes the only DRAM segment and pauses before its reads.
+        promotion, in_progress = self._start_promotion('key_a')
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == 1)
+
+        # key_b finds the pool full: it is served from NVMe and starts an expand, whose
+        # rebuild must wait for key_a's promotion.
+        pending_before = log_count(self.server, REBUILD_PENDING_LOG)
+        rebuilt_before = log_count(self.server, REBUILT_LOG)
+        assert client.execute_command('BLOB.TCP_GET', 'key_b') == payloads['key_b']
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 2)
+        self._wait_rebuild_pending(pending_before)
+
+        # While the rebuild is pending, a GET is served from NVMe and not promoted, and the
+        # new segment is not in the table yet.
+        assert client.execute_command('BLOB.TCP_GET', 'key_c') == payloads['key_c']
+        assert client.execute_command('BLOB.INFO', 'key_c', 'TIER') != b'dram'
+        self._assert_rebuild_still_pending(promotion, rebuilt_before)
+        assert info_largeobj(client)['largeobj_dram_uring_registered_segments'] == 1
+
+        # The promotion completes with correct bytes, then the rebuild runs (woken by the
+        # promotion finishing: nothing else uses the DRAM ring here).
+        self._assert_promotion_finishes(promotion, in_progress, payloads['key_a'])
+        wait_uring_registered_matches_segments(client)
+
+        # Promotion resumes into the new segment.
+        promote(client, ['key_a', 'key_c'])
+        assert client.execute_command('BLOB.TCP_GET', 'key_c') == payloads['key_c']
+
+    def test_shrink_rebuild_waits_for_promotion_into_a_segment_it_renumbers(self):
+        """Releasing a middle segment rebuilds the dense table, moving the last segment from
+        index 2 to 1. A promotion into that segment already in progress finishes first, and
+        a promotion after the rebuild reads into it at its new index."""
+        client = self.server.get_new_client()
+        payloads = {
+            'renum_first': position_pattern(SEGMENT_FILLING_SIZE, 1),  # fills segment 0
+            'renum_middle': position_pattern(SEGMENT_FILLING_SIZE, 2),  # fills segment 1
+            'renum_last': position_pattern(400 * 1024, 3),  # segment 2
+            'renum_during': position_pattern(250 * 1024, 4),  # segment 2, across the rebuild
+            'renum_after': position_pattern(250 * 1024, 5),  # segment 2, after the rebuild
+            'renum_probe': position_pattern(100 * 1024, 6),
+        }
+        for key, payload in payloads.items():
+            assert client.execute_command('BLOB.TCP_SET', key, payload) == b'OK'
+        promote(client, ['renum_first', 'renum_middle', 'renum_last'])
+        assert info_largeobj(client)['largeobj_dram_segments'] == 3
+
+        # renum_during's promotion takes room in segment 2 (the only one with room) and pauses.
+        # It must be admitted before the middle segment empties, or it would land there.
+        promotion, in_progress = self._start_promotion('renum_during')
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == 4)
+
+        # An empty middle segment is the least loaded, so it is the one the shrink releases.
+        client.delete('renum_middle')
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == 3)
+        before = info_largeobj(client)
+        pending_before = log_count(self.server, REBUILD_PENDING_LOG)
+        rebuilt_before = log_count(self.server, REBUILT_LOG)
+        apply_one_segment_shrink_pressure(client)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_dram_segments'] == 2)
+        client.config_set('maxmemory', 0)
+        self._wait_rebuild_pending(pending_before)
+
+        # While the rebuild is pending, a GET is served from NVMe and not promoted.
+        assert client.execute_command('BLOB.TCP_GET', 'renum_probe') == payloads['renum_probe']
+        assert client.execute_command('BLOB.INFO', 'renum_probe', 'TIER') != b'dram'
+        self._assert_rebuild_still_pending(promotion, rebuilt_before)
+
+        self._assert_promotion_finishes(promotion, in_progress, payloads['renum_during'])
+        assert (info_largeobj(client)['largeobj_dram_scaling_shrinks']
+                == before['largeobj_dram_scaling_shrinks'] + 1)
+
+        # After the rebuild, renum_after fits only segment 2, now at index 1. No expand.
+        promote(client, ['renum_first', 'renum_last', 'renum_during', 'renum_after'])
+        after = info_largeobj(client)
+        assert after['largeobj_dram_segments'] == 2
+        assert after['largeobj_dram_scaling_expands'] == before['largeobj_dram_scaling_expands']
+        for key in ('renum_first', 'renum_last', 'renum_during', 'renum_after'):
+            assert client.execute_command('BLOB.TCP_GET', key) == payloads[key]
+        wait_uring_registered_matches_segments(client)
+
+
+# ─── Reaper pace ─────────────────────────────────────────────────────────────
+
+
+class TestTieredReaperPace(TieredBudget):
+    """No server maxmemory, and enough other keys that a scan pass takes about 15 1ms ticks on a
+    fast host: too many for the 1-2 ticks a `scaling-poll-ms` re-arm leaves, and few enough that
+    a host 100x slower (ASAN) still finishes well inside the timeout."""
+
+    POLL_MS = 1000
+    FILLER = 20_000
+
+    def get_module_args(self, data_dir, direct_io):
+        # Only configs the base args do not set: Valkey builds differ on which copy of a
+        # repeated module arg wins.
+        return super().get_module_args(data_dir, direct_io) + " reaper-scan-budget-us 1000"
+
+    def test_ghosts_drain_on_the_reaper_tick_without_a_server_maxmemory(self):
+        """With ghosts left, the cron re-arms at `reaper-poll-ms` (10ms) on the no-maxmemory exit
+        too. `scaling-poll-ms` goes to 60s once the ghosts exist, so a re-arm there would get one
+        more tick at most before the timeout."""
+        client = self.new_client()
+        client.config_set('largeobj.reaper-poll-ms', 10)
+        client.execute_command('DEBUG', 'POPULATE', self.FILLER, 'filler', 8)
+        payloads = set_objects(client, 'obj_', 2 * self.PER_BUDGET, self.OBJ)
+        assert self.evictions(client) == self.PER_BUDGET
+        client.config_set('largeobj.scaling-poll-ms', 60_000)
+        wait_for_true(lambda: pending_evictions(client) == 0, timeout=30,
+                      on_failure=lambda: print(f"pending={pending_evictions(client)} "
+                                               f"evictions={self.evictions(client)} dbsize={client.dbsize()}"))
+        assert client.dbsize() == self.FILLER + self.PER_BUDGET
+        assert len(surviving(client, payloads)) == self.PER_BUDGET

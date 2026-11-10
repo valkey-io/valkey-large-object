@@ -33,7 +33,7 @@ pub use object_file::{ObjectFile, UnevictableOID};
 pub use nvme::{
     object_disk_len, open_nvme_file_for_write, read_and_verify_file_header,
     validate_and_clean_disk_dir, write_file_header, FileHeader, FILE_HEADER_MAGIC,
-    FILE_HEADER_SIZE, FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN,
+    FILE_HEADER_VERSION, FILE_HEADER_WIRE_LEN, FILE_HEADER_XATTR,
 };
 
 pub use dram_pool::DRAMPool;
@@ -178,7 +178,17 @@ pub fn init(
     // module range before any is opened, or they stop new clients being served.
     if mode == crate::OperatingMode::Tiered {
         fd_placement::raise_module_start(ctx)?;
+        // disk-dir was just reset to empty, and object files live in its shard
+        // subdirectories. Created here rather than in the reset, which also runs at shutdown.
+        crate::data_type::create_disk_dir_shards(disk_dir)
+            .map_err(|e| format!("failed to create disk-dir shards under {disk_dir}: {e}"))?;
     }
+    // Disk usage charges each file in the filesystem's allocation unit.
+    let disk_alloc_unit = if mode == crate::OperatingMode::Tiered {
+        nvme::init_disk_alloc_unit(disk_dir)?
+    } else {
+        0
+    };
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.
     let nvme_pool = if mode == crate::OperatingMode::Tiered {
@@ -254,9 +264,10 @@ pub fn init(
         }
     }
     Ok(format!(
-        "mode={:?} disk_dir={} dram_segments={}x{}MB nvme_staging={}MB",
+        "mode={:?} disk_dir={} disk_alloc_unit={}B dram_segments={}x{}MB nvme_staging={}MB",
         mode,
         disk_dir,
+        disk_alloc_unit,
         dram_segment_count,
         seg_size / (1024 * 1024),
         nvme_staging / (1024 * 1024),
@@ -292,12 +303,12 @@ pub fn all_segment_slices() -> Vec<&'static [u8]> {
 /// Rebuild ONE pool's dense io_uring fixed-buffer table from its segments,
 /// reassigning each a dense pool-local `iovec_index`, marking it registered, and
 /// returning the iovec array for that ring's `register_buffers`. Dense because
-/// 5.10 can only re-register the whole table. Only `PoolType::Dram` re-registers
-/// in practice; NVMe is fixed-size.
+/// 5.10 can only register a whole table. Only `PoolType::Dram` rebuilds in
+/// practice; NVMe is fixed-size.
 pub fn rebuild_dense_iovecs_for(pool: uring::PoolType) -> Vec<libc::iovec> {
     match pool {
         uring::PoolType::Dram => get_dram_pool().rebuild_dense_iovecs(),
-        uring::PoolType::Nvme => unreachable!("NVMe ring never reregisters"),
+        uring::PoolType::Nvme => unreachable!("NVMe ring never rebuilds"),
     }
 }
 

@@ -121,15 +121,15 @@ pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
 pub struct ObjectFile {
     /// Identity; the file path is *derived* (`ObjectId::file_path`), never stored.
     object_id: ObjectId,
-    /// True on-disk size, used for NVMe utilization accounting.
+    /// File length; NVMe utilization accounting charges its `nvme::allocated_disk_bytes`.
     disk_len: u64,
 }
 
 impl ObjectFile {
     /// Construct the handle for a newly committed object version whose file already
     /// exists on NVMe. No read fd is open yet — it opens lazily on the first GET via
-    /// `ensure_open`. `disk_len` is the true on-disk size; `Drop` releases exactly
-    /// that many bytes.
+    /// `ensure_open`. `disk_len` is the file length; `Drop` releases the
+    /// `allocated_disk_bytes` reserved for it.
     pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
         super::eviction_candidates::insert(object_id);
         Self {
@@ -164,9 +164,10 @@ impl ObjectFile {
     pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
         let dir = crate::disk_dir();
         let disk_len = self.disk_len;
+        let disk_bytes = super::nvme::allocated_disk_bytes(disk_len);
         // We do not allow the eviction of the source or the new file mid-copy.
         let _source = UnevictableOID::new(self.object_id);
-        if !super::nvme::try_reserve_nvme_disk_usage(disk_len) {
+        if !super::nvme::try_reserve_nvme_disk_usage(disk_bytes) {
             return None;
         }
         let new_oid = ObjectId::next();
@@ -176,7 +177,7 @@ impl ObjectFile {
             Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
             Err(e) => {
                 super::nvme::unlink(new_oid);
-                super::nvme::decrease_nvme_disk_usage(disk_len);
+                super::nvme::decrease_nvme_disk_usage(disk_bytes);
                 valkey_module::logging::log_warning(format!(
                     "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
                     self.object_id
@@ -186,7 +187,7 @@ impl ObjectFile {
         }
     }
 
-    /// Header write + payload copy for `copy`. Buffered I/O on purpose: this runs off
+    /// Payload copy + header write for `copy`. Buffered I/O on purpose: this runs off
     /// the io_uring path, and the destination is not yet visible to any reader.
     fn copy_file(
         &self,
@@ -195,15 +196,14 @@ impl ObjectFile {
         len: u64,
         crc32c: Crc,
     ) -> std::io::Result<()> {
-        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::io::AsRawFd;
         let mut src = std::fs::File::open(self.object_id.file_path(&crate::disk_dir()))?;
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(dst_path)?;
-        dst.write_all(&super::FileHeader::new(new_oid, len, crc32c).to_page())?;
-        src.seek(SeekFrom::Start(super::FILE_HEADER_SIZE))?;
         std::io::copy(&mut src, &mut dst)?;
+        super::write_file_header(dst.as_raw_fd(), new_oid, len, crc32c)?;
         dst.sync_all()
     }
 }
@@ -238,7 +238,9 @@ impl Drop for ObjectFile {
             } else {
                 super::nvme::unlink(object_id);
                 // Release exactly what create added — no stat, so it can't drift.
-                crate::storage::nvme::decrease_nvme_disk_usage(disk_len);
+                crate::storage::nvme::decrease_nvme_disk_usage(
+                    crate::storage::nvme::allocated_disk_bytes(disk_len),
+                );
             }
         };
 
