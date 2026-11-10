@@ -886,7 +886,7 @@ async fn cmd_set_tiered_run(
     let nvme_pool = storage::get_nvme_pool();
     let mut chunk_iter = chunk_iter;
     let disk_len = storage::object_disk_len(&mut chunk_iter);
-    if !nvme::try_reserve_nvme_disk_usage(disk_len) {
+    if !nvme::try_reserve_nvme_disk_usage(nvme::allocated_disk_bytes(disk_len)) {
         reply_err(
             &thread_ctx,
             &info::DISK_CAPACITY_EXCEEDED,
@@ -903,7 +903,7 @@ async fn cmd_set_tiered_run(
             // The open may have created the file before failing (fd placement, fallocate).
             // ENOENT is fine; like COPY's cleanup, any other unlink error aborts the node.
             nvme::unlink(object_id);
-            nvme::decrease_nvme_disk_usage(disk_len);
+            nvme::decrease_nvme_disk_usage(nvme::allocated_disk_bytes(disk_len));
             reply_err(
                 &thread_ctx,
                 &info::DISK_WRITE_ERRORS,

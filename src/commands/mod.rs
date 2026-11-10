@@ -119,6 +119,20 @@ fn parse_optional_crc(
     }
 }
 
+/// Whether `addr` is a well-formed sockaddr for the tcp provider: a sockaddr_in
+/// (16 bytes, AF_INET) or sockaddr_in6 (28 bytes, AF_INET6). fi_av_insert reads the
+/// family to pick the address length, so anything else is an over-read.
+fn is_valid_sockaddr(addr: &[u8]) -> bool {
+    let Some(family) = addr.get(..2).map(|b| u16::from_ne_bytes([b[0], b[1]])) else {
+        return false;
+    };
+    let family = libc::c_int::from(family);
+    matches!(
+        (addr.len(), family),
+        (16, libc::AF_INET) | (28, libc::AF_INET6)
+    )
+}
+
 // ─── BLOB.RDMA_HELLO ───────────────────────────────────────────────────────────
 //
 // Establishes a fabric session with the client.
@@ -138,13 +152,17 @@ pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
     let rdma_address = decode_hex(args[1].as_slice())
         .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RDMA_ADDR_HEX))?;
-    // An EFA address is exactly 32 bytes; a tcp one is a sockaddr, opaque beyond being non-empty.
+    // An EFA address is exactly 32 bytes; a tcp one must be a well-formed sockaddr, so
+    // fi_av_insert never reads past the bytes the client sent.
     match crate::fabric_provider() {
         FabricProvider::EfaDirect if rdma_address.len() != 32 => {
             return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_LEN));
         }
         FabricProvider::Emulated if rdma_address.is_empty() => {
             return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_EMPTY));
+        }
+        FabricProvider::Emulated if !is_valid_sockaddr(&rdma_address) => {
+            return Err(ValkeyError::Str(errors::ERR_RDMA_ADDR_FORMAT));
         }
         FabricProvider::EfaDirect | FabricProvider::Emulated => {}
     }

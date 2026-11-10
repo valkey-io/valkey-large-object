@@ -185,6 +185,12 @@ pub fn init(
         // Key hints name dbs by token; SWAPDB must move the tokens.
         reclaim::subscribe_swapdb(ctx)?;
     }
+    // Disk usage charges each file in the filesystem's allocation unit.
+    let disk_alloc_unit = if mode == crate::OperatingMode::Tiered {
+        nvme::init_disk_alloc_unit(disk_dir)?
+    } else {
+        0
+    };
     // ── Create all resources as locals (no OnceLock yet) ──
     // NVMePool + FdPool: only needed in Tiered mode.
     let nvme_pool = if mode == crate::OperatingMode::Tiered {
@@ -260,9 +266,10 @@ pub fn init(
         }
     }
     Ok(format!(
-        "mode={:?} disk_dir={} dram_segments={}x{}MB nvme_staging={}MB",
+        "mode={:?} disk_dir={} disk_alloc_unit={}B dram_segments={}x{}MB nvme_staging={}MB",
         mode,
         disk_dir,
+        disk_alloc_unit,
         dram_segment_count,
         seg_size / (1024 * 1024),
         nvme_staging / (1024 * 1024),
