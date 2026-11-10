@@ -29,12 +29,20 @@ static NVME_DISK_USAGE: AtomicU64 = AtomicU64::new(0);
 /// `init_disk_alloc_unit`. One `IO_ALIGN` block until then, and in Dram mode.
 static DISK_ALLOC_UNIT: AtomicU64 = AtomicU64::new(super::IO_ALIGN as u64);
 
-/// Bytes the filesystem allocates for a file of `len` bytes: `len` rounded up to the
-/// allocation unit. On a striped XFS every file starts on a stripe-unit boundary, so
-/// the rest of its last stripe unit can't hold another file. Charging only `len` lets
-/// the filesystem fill up before disk-maxmemory is reached.
+/// Bytes the filesystem allocates for a file of `len` bytes. On a striped XFS, a file
+/// of at least one stripe unit starts on a stripe-unit boundary, so the rest of its
+/// last stripe unit can't hold another such file: charge `len` rounded up to the unit.
+/// Charging only `len` lets the filesystem fill up before disk-maxmemory is reached.
+/// XFS aligns only allocations of at least one stripe unit (`xfs_bmapi_allocate`),
+/// and the SET path allocates each file in one `fallocate`, so a shorter file takes
+/// only its own blocks: charge `len`, already `IO_ALIGN`-aligned.
 pub fn allocated_disk_bytes(len: u64) -> u64 {
-    len.next_multiple_of(DISK_ALLOC_UNIT.load(Ordering::Relaxed))
+    let unit = DISK_ALLOC_UNIT.load(Ordering::Relaxed);
+    if len >= unit {
+        len.next_multiple_of(unit)
+    } else {
+        len
+    }
 }
 
 /// `_IOR('X', 100, struct xfs_fsop_geom_v1)`: fills the 112-byte geometry struct
@@ -640,15 +648,17 @@ mod tests {
 
     // ─── allocated_disk_bytes ────────────────────────────────────────────
 
-    // On a 1 MiB stripe unit, a file takes whole stripe units: a 1 MiB + 4 KiB file
-    // takes 2 MiB.
+    // On a 1 MiB stripe unit, a file of at least 1 MiB takes whole stripe units (a
+    // 1 MiB + 4 KiB file takes 2 MiB); a shorter file is not aligned and takes its
+    // own length.
     #[test]
     fn test_allocated_disk_bytes_rounds_to_stripe_unit() {
         let _g = lock();
         let unit = DISK_ALLOC_UNIT.swap(1 << 20, Ordering::Relaxed);
         assert_eq!(allocated_disk_bytes(1 << 20), 1 << 20);
         assert_eq!(allocated_disk_bytes((1 << 20) + 4096), 2 << 20);
-        assert_eq!(allocated_disk_bytes(4096), 1 << 20);
+        assert_eq!(allocated_disk_bytes(8192), 8192);
+        assert_eq!(allocated_disk_bytes((1 << 20) - 4096), (1 << 20) - 4096);
         DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
     }
 
