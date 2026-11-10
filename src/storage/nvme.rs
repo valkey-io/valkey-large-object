@@ -79,6 +79,14 @@ pub fn init_disk_alloc_unit(dir: &str) -> Result<u64, String> {
             ));
         }
         stripe = geometry[XFS_GEOM_SUNIT] as u64 * geometry[XFS_GEOM_BLOCKSIZE] as u64;
+        valkey_module::logging::log_notice(format!(
+            "largeobj: disk-dir {dir} is on XFS, stripe unit {stripe} B (0 = not striped)"
+        ));
+    } else {
+        valkey_module::logging::log_warning(format!(
+            "largeobj: disk-dir {dir} is not on XFS; disk usage is charged in {} B blocks",
+            super::IO_ALIGN
+        ));
     }
     let unit = stripe.max(super::IO_ALIGN as u64);
     DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
