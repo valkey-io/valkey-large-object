@@ -281,7 +281,7 @@ lazy_static::lazy_static! {
         ValkeyGILGuard::new(ValkeyString::create(None, ""));
     static ref FABRIC_INTERFACES: Mutex<String> = Mutex::new(String::new());
 
-    /// Transfers each fabric service keeps in flight. Default: the crate's provider-derived default.
+    /// Transfers each fabric service keeps in flight. Default: 256. 0 = the crate's provider-derived default.
     pub static ref CFG_FABRIC_MAX_IN_FLIGHT: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_MAX_IN_FLIGHT);
 
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
