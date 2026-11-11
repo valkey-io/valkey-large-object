@@ -910,7 +910,7 @@ async fn cmd_set_tiered_run(
         }
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
-    let mut object_file = ObjectFile::new(object_id, disk_len);
+    let object_file = ObjectFile::new(object_id, disk_len);
     let job = crate::stream::StreamJob::for_nvme(
         fd.as_raw_fd(),
         obj_len,
@@ -973,7 +973,7 @@ async fn cmd_set_tiered_run(
     // error; ObjectFile Drop unlinks the file and releases the budget.
     let hint = storage::KeyHint::new(thread_ctx.db as u32, &key_name);
     if object_file
-        .write_header(fd.as_raw_fd(), obj_len, crc, &hint)
+        .write_header(fd.as_raw_fd(), disk_len, obj_len, crc, &hint)
         .is_err()
     {
         crate::stream::reply_stream_err(&thread_ctx, crate::stream::StreamError::NvmeWrite);

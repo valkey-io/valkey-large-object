@@ -113,6 +113,14 @@ pub fn remove(oid: ObjectId) -> Option<u64> {
     }
 }
 
+/// Add `bytes` to a candidate's `disk_bytes`, keeping its place in the eviction order.
+/// False if `oid` is not a candidate.
+pub fn add_disk_bytes(oid: ObjectId, bytes: u64) -> bool {
+    match &mut *candidates() {
+        EvictionCandidates::Lru(lru) => lru.all.get_mut(&oid).map(|b| *b += bytes).is_some(),
+    }
+}
+
 /// Up to `n` eviction candidates `take` accepts, in eviction order, among the objects
 /// the policy allows: under `volatile-*`, those whose key has a TTL. The candidates lock
 /// is held while `take` runs, so it must not touch the candidates.
