@@ -10,9 +10,9 @@
 //!   eviction finds its file already gone (a stale directory entry).
 //!
 //! The reaper (the scaling cron) deletes each victim's key one of two ways:
-//! - By name (Tiered): an eviction lists the victim by name, then reads its key hint
+//! - By name (Tiered): an eviction lists the victim awaiting its key name, then reads it
 //!   (its key's name and db when it was written, from the file header) before the
-//!   unlink and queues it (`queue_by_name`).
+//!   unlink (`set_key_name`).
 //! - By scan: the fallback for ghost keys with no usable hint (Dram, renamed, copied, a
 //!   key over the hint cap). The scan runs only while such a ghost key is listed.
 //!
@@ -41,8 +41,8 @@ pub static RECLAIM_LIST: LazyLock<ReclaimList> = LazyLock::new(ReclaimList::defa
 /// How the reaper deletes a listed oid's key.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum KeyState {
-    /// Queued on `by_name` (an eviction queues it once it has read the hint), which the
-    /// reaper empties before it scans: never the scan's.
+    /// Queued on `by_name` (an eviction queues it once it has read its key name), which
+    /// the reaper empties before it scans: never the scan's.
     ByName,
     /// Found by scan: no hint, or its key no longer held it when looked up by name.
     ByScan,
@@ -61,8 +61,28 @@ struct GhostKeys {
 }
 
 impl GhostKeys {
-    /// List `oid` by name, unqueued until `queue_by_name`. False if already listed.
-    fn insert_by_name(&mut self, oid: ObjectId) -> bool {
+    /// List `oid`: by name if `hint` is given, else by scan. False if already listed.
+    fn insert(&mut self, oid: ObjectId, hint: Option<KeyHint>) -> bool {
+        if self.states.contains_key(&oid) {
+            return false;
+        }
+        let state = match hint {
+            Some(hint) => {
+                self.by_name.push_back((oid, hint));
+                KeyState::ByName
+            }
+            None => {
+                self.num_by_scan += 1;
+                KeyState::ByScan
+            }
+        };
+        self.states.insert(oid, state);
+        true
+    }
+
+    /// List `oid` before its key name is known: `ByName`, but not queued until
+    /// `set_key_name`. False if already listed.
+    fn insert_awaiting_key_name(&mut self, oid: ObjectId) -> bool {
         if self.states.contains_key(&oid) {
             return false;
         }
@@ -70,23 +90,15 @@ impl GhostKeys {
         true
     }
 
-    /// List `oid`: by name if `hint` is given, else by scan. False if already listed.
-    fn insert(&mut self, oid: ObjectId, hint: Option<KeyHint>) -> bool {
-        let inserted = self.insert_by_name(oid);
-        if inserted {
-            self.queue_by_name(oid, hint);
-        }
-        inserted
-    }
-
-    /// Queue a `ByName` `oid` with its hint; with no hint it is the scan's. No-op if it
-    /// left the list: its key was deleted and its value freed.
-    fn queue_by_name(&mut self, oid: ObjectId, hint: Option<KeyHint>) {
+    /// Give an `insert_awaiting_key_name` oid its key name: queued to be deleted by name,
+    /// or, with none, left to the scan. No-op if it left the list: its key was deleted and
+    /// its value freed.
+    fn set_key_name(&mut self, oid: ObjectId, key_name: Option<KeyHint>) {
         if self.states.get(&oid) != Some(&KeyState::ByName) {
             return;
         }
-        match hint {
-            Some(hint) => self.by_name.push_back((oid, hint)),
+        match key_name {
+            Some(key_name) => self.by_name.push_back((oid, key_name)),
             None => self.set_state(oid, KeyState::ByScan),
         }
     }
@@ -156,18 +168,20 @@ impl ReclaimList {
         inserted
     }
 
-    /// Add `oid` to the reclaim list by name, unqueued until `queue_by_name`, so neither
-    /// the by-name pass nor the scan takes it yet. False if it was already there.
-    pub fn insert_by_name(&self, oid: ObjectId) -> bool {
+    /// Add `oid` to the reclaim list before its key name is known (an eviction's claim):
+    /// neither the by-name pass nor the scan takes it until `set_key_name`. False if it
+    /// was already there.
+    pub fn insert_awaiting_key_name(&self, oid: ObjectId) -> bool {
         let mut ghost_keys = self.lock();
-        let inserted = ghost_keys.insert_by_name(oid);
+        let inserted = ghost_keys.insert_awaiting_key_name(oid);
         self.len.store(ghost_keys.states.len(), Ordering::Release);
         inserted
     }
 
-    /// Queue a by-name `oid` with its key hint; with no hint it is the scan's.
-    pub fn queue_by_name(&self, oid: ObjectId, hint: Option<KeyHint>) {
-        self.lock().queue_by_name(oid, hint);
+    /// Give an `insert_awaiting_key_name` oid its key name: deleted by name, or, with
+    /// none, by scan.
+    pub fn set_key_name(&self, oid: ObjectId, key_name: Option<KeyHint>) {
+        self.lock().set_key_name(oid, key_name);
     }
 
     pub fn contains(&self, oid: &ObjectId) -> bool {
@@ -419,32 +433,32 @@ mod tests {
     }
 
     #[test]
-    fn test_a_by_name_entry_is_neither_ways_until_queued() {
+    fn test_an_entry_awaiting_its_key_name_is_neither_ways_until_set() {
         let list = ReclaimList::default();
-        let (hinted, no_hint, gone) = (ObjectId(1), ObjectId(2), ObjectId(3));
-        for oid in [hinted, no_hint, gone] {
-            assert!(list.insert_by_name(oid));
+        let (named, unnamed, gone) = (ObjectId(1), ObjectId(2), ObjectId(3));
+        for oid in [named, unnamed, gone] {
+            assert!(list.insert_awaiting_key_name(oid));
         }
-        assert!(!list.insert_by_name(hinted), "already listed");
+        assert!(!list.insert_awaiting_key_name(named), "already listed");
         // Listed, so commands see the keys as missing, but the reaper skips them.
-        assert!(list.contains(&hinted));
+        assert!(list.contains(&named));
         assert_eq!(list.num_by_scan(), 0);
         assert_eq!(popped(&list), None);
 
-        list.queue_by_name(hinted, Some(KeyHint::new(0, b"k")));
-        list.queue_by_name(no_hint, None);
-        // Its value was freed first: the late hint does nothing.
+        list.set_key_name(named, Some(KeyHint::new(0, b"k")));
+        list.set_key_name(unnamed, None);
+        // Its value was freed first: the late key name does nothing.
         list.remove(&gone);
-        list.queue_by_name(gone, Some(KeyHint::new(0, b"k")));
+        list.set_key_name(gone, Some(KeyHint::new(0, b"k")));
         assert!(!list.contains(&gone));
-        assert_eq!(popped(&list), Some(hinted));
+        assert_eq!(popped(&list), Some(named));
         assert_eq!(popped(&list), None);
         assert_eq!(list.num_by_scan(), 1);
-        // Once the scan's, a hint does not take it back.
-        list.queue_by_name(no_hint, Some(KeyHint::new(0, b"k")));
+        // Once the scan's, a key name does not take it back.
+        list.set_key_name(unnamed, Some(KeyHint::new(0, b"k")));
         assert_eq!(popped(&list), None);
-        list.remove(&hinted);
-        list.remove(&no_hint);
+        list.remove(&named);
+        list.remove(&unnamed);
         assert_eq!(list.num_by_scan(), 0);
     }
 }

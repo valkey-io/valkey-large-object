@@ -112,7 +112,7 @@ pub fn claim_victims(need: u64) -> Vec<(Arc<UnevictableOID>, u64)> {
         .into_iter()
         .map(|(oid, disk_bytes)| {
             // Only a claim lists a file's oid, and it takes the oid off the candidates first.
-            let listed = super::reclaim::RECLAIM_LIST.insert_by_name(oid);
+            let listed = super::reclaim::RECLAIM_LIST.insert_awaiting_key_name(oid);
             assert!(
                 listed,
                 "largeobj: eviction candidate {oid:?} is already on the reclaim list"
