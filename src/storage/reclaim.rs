@@ -10,8 +10,9 @@
 //!   eviction finds its file already gone (a stale directory entry).
 //!
 //! The reaper (the scaling cron) deletes each victim's key one of two ways:
-//! - By name (Tiered): an eviction reads the victim's key hint (its key's name and db
-//!   when it was written, from the file header) and queues it with the claim.
+//! - By name (Tiered): an eviction claims the victim with its key hint pending, then
+//!   reads the hint (its key's name and db when it was written, from the file header)
+//!   before the unlink and queues it (`set_hint`).
 //! - By scan: the fallback for ghost keys with no usable hint (Dram, renamed, copied, a
 //!   key over the hint cap). The scan runs only while such a ghost key is listed.
 //!
@@ -40,6 +41,9 @@ pub static RECLAIM_LIST: LazyLock<ReclaimList> = LazyLock::new(ReclaimList::defa
 /// How the reaper deletes a listed oid's key.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum KeyState {
+    /// Claimed by an eviction that has not read its key hint yet: neither way's until
+    /// `set_hint`.
+    HintPending,
     /// Queued on `by_name`, which the reaper empties before it scans: never the scan's.
     ByName,
     /// Found by scan: no hint, or its key no longer held it when looked up by name.
@@ -59,23 +63,37 @@ struct GhostKeys {
 }
 
 impl GhostKeys {
-    /// List `oid`: by name if `hint` is given, else by scan. False if already listed.
-    fn insert(&mut self, oid: ObjectId, hint: Option<KeyHint>) -> bool {
+    /// List `oid` with its key hint pending (`set_hint`). False if already listed.
+    fn insert_pending(&mut self, oid: ObjectId) -> bool {
         if self.states.contains_key(&oid) {
             return false;
         }
-        let state = match hint {
+        self.states.insert(oid, KeyState::HintPending);
+        true
+    }
+
+    /// List `oid`: by name if `hint` is given, else by scan. False if already listed.
+    fn insert(&mut self, oid: ObjectId, hint: Option<KeyHint>) -> bool {
+        let inserted = self.insert_pending(oid);
+        if inserted {
+            self.set_hint(oid, hint);
+        }
+        inserted
+    }
+
+    /// Give a `HintPending` `oid` its hint: by name if given, else by scan. No-op if it
+    /// is not pending: its key was deleted and its value freed, so it left the list.
+    fn set_hint(&mut self, oid: ObjectId, hint: Option<KeyHint>) {
+        if self.states.get(&oid) != Some(&KeyState::HintPending) {
+            return;
+        }
+        match hint {
             Some(hint) => {
                 self.by_name.push_back((oid, hint));
-                KeyState::ByName
+                self.states.insert(oid, KeyState::ByName);
             }
-            None => {
-                self.num_by_scan += 1;
-                KeyState::ByScan
-            }
-        };
-        self.states.insert(oid, state);
-        true
+            None => self.set_state(oid, KeyState::ByScan),
+        }
     }
 
     /// Move a listed `oid` to `to`. No-op if it is not listed.
@@ -141,6 +159,20 @@ impl ReclaimList {
         let inserted = ghost_keys.insert(oid, hint);
         self.len.store(ghost_keys.states.len(), Ordering::Release);
         inserted
+    }
+
+    /// Add `oid` to the reclaim list with its key hint pending: deleted by neither way
+    /// until `set_hint`. False if it was already there.
+    pub fn insert_pending(&self, oid: ObjectId) -> bool {
+        let mut ghost_keys = self.lock();
+        let inserted = ghost_keys.insert_pending(oid);
+        self.len.store(ghost_keys.states.len(), Ordering::Release);
+        inserted
+    }
+
+    /// Give a pending `oid` its key hint: deleted by name if given, else by scan.
+    pub fn set_hint(&self, oid: ObjectId, hint: Option<KeyHint>) {
+        self.lock().set_hint(oid, hint);
     }
 
     pub fn contains(&self, oid: &ObjectId) -> bool {
@@ -389,5 +421,35 @@ mod tests {
         // The last unlisting clears whatever is still queued.
         list.remove(&ObjectId(3));
         assert_eq!(list.lock().by_name.len(), 0);
+    }
+
+    #[test]
+    fn test_a_pending_hint_is_neither_ways_until_set() {
+        let list = ReclaimList::default();
+        let (hinted, no_hint, gone) = (ObjectId(1), ObjectId(2), ObjectId(3));
+        for oid in [hinted, no_hint, gone] {
+            assert!(list.insert_pending(oid));
+        }
+        assert!(!list.insert_pending(hinted), "already listed");
+        // Listed, so commands see the keys as missing, but the reaper skips them.
+        assert!(list.contains(&hinted));
+        assert_eq!(list.num_by_scan(), 0);
+        assert_eq!(popped(&list), None);
+
+        list.set_hint(hinted, Some(KeyHint::new(0, b"k")));
+        list.set_hint(no_hint, None);
+        // Its value was freed first: the late hint does nothing.
+        list.remove(&gone);
+        list.set_hint(gone, Some(KeyHint::new(0, b"k")));
+        assert!(!list.contains(&gone));
+        assert_eq!(popped(&list), Some(hinted));
+        assert_eq!(popped(&list), None);
+        assert_eq!(list.num_by_scan(), 1);
+        // A set hint is final.
+        list.set_hint(no_hint, Some(KeyHint::new(0, b"k")));
+        assert_eq!(popped(&list), None);
+        list.remove(&hinted);
+        list.remove(&no_hint);
+        assert_eq!(list.num_by_scan(), 0);
     }
 }

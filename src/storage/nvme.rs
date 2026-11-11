@@ -183,9 +183,6 @@ pub fn nvme_disk_usage() -> u64 {
 
 // ─── NVMe Eviction ───────────────────────────────────────────────────────────
 
-/// Candidates picked per eviction.
-const EVICT_BATCH: usize = 64;
-
 /// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
 /// tokio task) take it. Never call off main while holding it: it would deadlock.
 fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
@@ -214,24 +211,8 @@ fn evict_and_reserve(bytes: u64) -> bool {
     let taken = bytes.min(max.saturating_sub(prev));
     // Also evict for any usage already above the cap (metadata blocks are charged uncapped).
     let need = (prev + bytes).saturating_sub(max);
-    let mut victims = Vec::new();
-    let mut covered = 0;
-    for oid in super::eviction_candidates::pick(EVICT_BATCH, |_| true) {
-        if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
-            break;
-        }
-        // Read off the server lock, before the claim queues it.
-        let hint = read_key_hint(oid);
-        // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
-        // Credits what the file was charged (its eviction-candidate entry).
-        let Some((unevictable, victim_disk_bytes)) =
-            with_server_lock(|_| super::object_file::claim_victim(oid, hint))
-        else {
-            continue;
-        };
-        covered += victim_disk_bytes;
-        victims.push((unevictable, victim_disk_bytes));
-    }
+    // Server lock -> UNEVICTABLE -> eviction candidates, then RECLAIM_LIST.
+    let victims = with_server_lock(|_| super::object_file::claim_victims(need));
     // No lock.
     let freed = evict(victims);
     // One update, so a competing reservation cannot take the freed bytes.
@@ -250,6 +231,8 @@ fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
     let mut freed = 0;
     for (unevictable, size) in victims {
         let oid = unevictable.oid();
+        // Before the unlink, which takes the header with the file.
+        super::reclaim::RECLAIM_LIST.set_hint(oid, read_key_hint(oid));
         if let Some(pool) = super::FD_POOL.get() {
             pool.remove(oid);
         }
@@ -436,9 +419,8 @@ fn read_field<const N: usize>(r: &mut &[u8]) -> Result<[u8; N], String> {
 
 /// The key hint in `oid`'s file header, if it records a key. `None` means the reaper
 /// finds the key by scan instead. Reads by path, so the caller needs no open fd.
-/// - Expected, silent: the file is gone (torn down since the pick), it has no header
-///   yet (a SET still writing it, which the claim then refuses), or no key was recorded
-///   (a COPY, or a key over `KEY_HINT_MAX_LEN`).
+/// - Expected, silent: no key was recorded (a COPY, or a key over `KEY_HINT_MAX_LEN`).
+///   Called on a claimed victim, whose file is complete and only its eviction unlinks.
 /// - Disk or kernel fault, logged: any other read error. The hint is only a shortcut,
 ///   so the key is left to the scan.
 /// - Bug, panics: a corrupt header, or a header for another object. Disk-dir is wiped

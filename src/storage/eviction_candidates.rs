@@ -72,6 +72,36 @@ impl Lru {
             first(&mut self.all.keys())
         }
     }
+
+    fn take(
+        &mut self,
+        volatile: bool,
+        need: u64,
+        max: usize,
+        mut accept: impl FnMut(ObjectId) -> bool,
+    ) -> Vec<(ObjectId, u64)> {
+        let mut taken = Vec::new();
+        let mut covered = 0;
+        let oids: Box<dyn Iterator<Item = &ObjectId>> = if volatile {
+            Box::new(self.ttl.iter())
+        } else {
+            Box::new(self.all.keys())
+        };
+        for &oid in oids {
+            if covered >= need || taken.len() == max {
+                break;
+            }
+            if accept(oid) {
+                let disk_bytes = self.all[&oid];
+                covered += disk_bytes;
+                taken.push((oid, disk_bytes));
+            }
+        }
+        for &(oid, _) in &taken {
+            self.remove(oid);
+        }
+        taken
+    }
 }
 
 enum EvictionCandidates {
@@ -129,6 +159,22 @@ pub fn pick(n: usize, take: impl FnMut(ObjectId) -> bool) -> Vec<ObjectId> {
         EvictionCandidates::Lru(lru) => {
             lru.oldest(POLICY.load(Ordering::Relaxed) == VOLATILE, n, take)
         }
+    }
+}
+
+/// Take candidates `accept` accepts, in eviction order among the objects the policy
+/// allows, until their `disk_bytes` cover `need` or `max` are taken. They leave the
+/// candidates in the same lock hold, so concurrent evictions take disjoint victims.
+/// Returns each oid with its `disk_bytes`. The candidates lock is held while `accept`
+/// runs, so it must not touch the candidates.
+pub fn take(need: u64, max: usize, accept: impl FnMut(ObjectId) -> bool) -> Vec<(ObjectId, u64)> {
+    match &mut *candidates() {
+        EvictionCandidates::Lru(lru) => lru.take(
+            POLICY.load(Ordering::Relaxed) == VOLATILE,
+            need,
+            max,
+            accept,
+        ),
     }
 }
 
@@ -247,5 +293,32 @@ mod tests {
         assert_eq!(oldest(&lru, true), [1]);
         lru.remove(ObjectId(1));
         assert!(oldest(&lru, true).is_empty());
+    }
+
+    #[test]
+    fn take_removes_the_oldest_accepted_until_need_or_max() {
+        let mut lru = Lru::default();
+        for oid in 0..6 {
+            lru.all.insert(ObjectId(oid), 10);
+        }
+        lru.set_ttl(ObjectId(4), true);
+        // 0 is refused (in use); 1 and 2 cover 15 bytes.
+        assert_eq!(
+            lru.take(false, 15, usize::MAX, |oid| oid.0 != 0),
+            [(ObjectId(1), 10), (ObjectId(2), 10)]
+        );
+        assert_eq!(oldest(&lru, false), [0, 3, 5, 4], "taken ones are gone");
+        // `max` stops it before `need` is covered.
+        assert_eq!(lru.take(false, 100, 1, |_| true), [(ObjectId(0), 10)]);
+        // Volatile takes only keys with a TTL, and a taken one leaves both orders.
+        assert_eq!(
+            lru.take(true, 100, usize::MAX, |_| true),
+            [(ObjectId(4), 10)]
+        );
+        assert_eq!(oldest(&lru, false), [3, 5]);
+        assert!(
+            lru.take(false, 0, usize::MAX, |_| true).is_empty(),
+            "nothing needed"
+        );
     }
 }
