@@ -232,7 +232,7 @@ fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
     for (unevictable, size) in victims {
         let oid = unevictable.oid();
         // Before the unlink, which takes the header with the file.
-        super::reclaim::RECLAIM_LIST.set_hint(oid, read_key_hint(oid));
+        super::reclaim::RECLAIM_LIST.queue_by_name(oid, read_key_hint(oid));
         if let Some(pool) = super::FD_POOL.get() {
             pool.remove(oid);
         }

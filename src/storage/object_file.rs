@@ -96,7 +96,7 @@ pub fn unevictable_count() -> usize {
 
 /// Claim the oldest evictable candidates whose `disk_bytes` cover `need`, at most
 /// `RECLAIM_MAX_VICTIMS`: take them off the eviction candidates and add them to the
-/// reclaim list, key hint pending, and to the unevictable list. Returns each claim and
+/// reclaim list by name, and to the unevictable list. Returns each claim and
 /// the `disk_bytes` its eviction credits. One `UNEVICTABLE` critical section, so a
 /// teardown either takes an oid off the candidates first (it is not claimed) or finds it
 /// in the reclaim list, and concurrent claims take disjoint victims. Call under the
@@ -112,7 +112,7 @@ pub fn claim_victims(need: u64) -> Vec<(Arc<UnevictableOID>, u64)> {
         .into_iter()
         .map(|(oid, disk_bytes)| {
             // Only a claim lists a file's oid, and it takes the oid off the candidates first.
-            let listed = super::reclaim::RECLAIM_LIST.insert_pending(oid);
+            let listed = super::reclaim::RECLAIM_LIST.insert_by_name(oid);
             assert!(
                 listed,
                 "largeobj: eviction candidate {oid:?} is already on the reclaim list"
