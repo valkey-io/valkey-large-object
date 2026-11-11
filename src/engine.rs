@@ -910,7 +910,7 @@ async fn cmd_set_tiered_run(
         }
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
-    let object_file = ObjectFile::new(object_id, disk_len);
+    let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
     let job = crate::stream::StreamJob::for_nvme(
         fd.as_raw_fd(),
         obj_len,
@@ -980,7 +980,7 @@ async fn cmd_set_tiered_run(
         return;
     }
     test_pause_before_finalize().await;
-    let lo_value = LoValue::new(object_id, obj_len, crc, Some(Arc::new(object_file)));
+    let lo_value = LoValue::new(object_id, obj_len, crc, Some(object_file));
     let outcome = commit_lo_value(&thread_ctx.lock(), &key_name, object_id, lo_value);
     match outcome {
         Ok(CommitOutcome::ValueSet) => {

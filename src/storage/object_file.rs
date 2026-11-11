@@ -157,19 +157,27 @@ impl ObjectFile {
     }
 
     /// Write the file's header through `fd`, its last write once the payload is
-    /// written, then add the blocks the file took beyond its `disk_len` bytes of data
-    /// (`metadata_disk_bytes`) to its charge. Charged without a disk-maxmemory check:
-    /// the blocks are already allocated, and the next reservation evicts for them. On
-    /// error, `Drop` still unlinks the file and releases what was charged.
+    /// written, then charge what the file took beyond what `new` reserved.
+    /// - `disk_len`: the file's length, the payload with each chunk padded to
+    ///   `IO_ALIGN` (`object_disk_len`), which the caller reserved and preallocated.
+    /// - `obj_len`, `crc32c`, `hint`: the object's length, CRC and key, which the header
+    ///   records.
+    ///
+    /// The reservation already covers the data and the inode (`allocated_disk_bytes`).
+    /// The `fstat` measures what only exists once the file is written: blocks beyond
+    /// the data, such as an xattr block if the header does not fit in the inode
+    /// (`metadata_disk_bytes`). Charged without a disk-maxmemory check: the blocks are
+    /// already allocated, and the next reservation evicts for them. On error, `Drop`
+    /// still unlinks the file and releases what was charged.
     pub fn write_header(
         &self,
         fd: RawFd,
         disk_len: u64,
-        len: u64,
+        obj_len: u64,
         crc32c: Crc,
         hint: &super::KeyHint,
     ) -> std::io::Result<()> {
-        super::write_file_header(fd, self.object_id, len, crc32c, hint)?;
+        super::write_file_header(fd, self.object_id, obj_len, crc32c, hint)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `st` is the struct fstat writes.
         if unsafe { libc::fstat(fd, &mut st) } != 0 {

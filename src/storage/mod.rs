@@ -182,7 +182,7 @@ pub fn init(
         crate::data_type::create_disk_dir_shards(disk_dir)
             .map_err(|e| format!("failed to create disk-dir shards under {disk_dir}: {e}"))?;
     }
-    // Disk usage charges each file what the filesystem allocates for it.
+    // Read disk-dir's allocation unit and inode size, which disk usage charges each file by.
     let disk_alloc_unit = if mode == crate::OperatingMode::Tiered {
         nvme::init_disk_geometry(disk_dir)?
     } else {
