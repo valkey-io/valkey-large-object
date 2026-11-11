@@ -955,16 +955,6 @@ async fn cmd_set_tiered_run(
             return;
         }
     };
-    // A failure is an NVMe write error; ObjectFile Drop unlinks the file and releases
-    // the budget.
-    let hint = storage::KeyHint::new(thread_ctx.db as u32, &key_name);
-    if object_file
-        .write_header(fd.as_raw_fd(), obj_len, crc, &hint)
-        .is_err()
-    {
-        crate::stream::reply_stream_err(&thread_ctx, crate::stream::StreamError::NvmeWrite);
-        return;
-    }
     // Optional end-to-end CRC verification: reject before commit
     // so no corrupted data is persisted. ObjectFile Drop handles
     // NVMe file removal and disk budget; StreamingContext Drop
@@ -978,6 +968,16 @@ async fn cmd_set_tiered_run(
             );
             return;
         }
+    }
+    // After the CRC check, so a rejected SET skips it. A failure is an NVMe write
+    // error; ObjectFile Drop unlinks the file and releases the budget.
+    let hint = storage::KeyHint::new(thread_ctx.db as u32, &key_name);
+    if object_file
+        .write_header(fd.as_raw_fd(), obj_len, crc, &hint)
+        .is_err()
+    {
+        crate::stream::reply_stream_err(&thread_ctx, crate::stream::StreamError::NvmeWrite);
+        return;
     }
     test_pause_before_finalize().await;
     let lo_value = LoValue::new(object_id, obj_len, crc, Some(Arc::new(object_file)));
