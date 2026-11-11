@@ -216,18 +216,11 @@ impl ObjectFile {
     pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
         // We do not allow the eviction of the source or the new file mid-copy.
         let _source = UnevictableOID::new(self.object_id);
-        // The source's data length, no inode: its `write_header` asserted it.
-        let src_path = self.object_id.file_path(&crate::disk_dir());
-        let disk_len = match std::fs::metadata(&src_path) {
-            Ok(meta) => meta.len(),
-            Err(e) => {
-                valkey_module::logging::log_warning(format!(
-                    "largeobj: Tiered COPY {:?}: cannot stat {src_path}: {e}",
-                    self.object_id
-                ));
-                return None;
-            }
-        };
+        // The source's file length, as its SET wrote it: `object_disk_len` aligns each
+        // chunk, and every chunk but the last is a whole `chunk-size`, which config
+        // validation keeps a multiple of `IO_ALIGN`, so the total is `align_up(len)` for
+        // any valid chunk size (`test_object_disk_len_is_the_aligned_length`).
+        let disk_len = super::align_up(len as usize) as u64;
         if !super::nvme::try_reserve_nvme_disk_usage(super::nvme::allocated_disk_bytes(disk_len)) {
             return None;
         }

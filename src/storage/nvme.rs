@@ -840,6 +840,32 @@ mod tests {
         assert_eq!(object_disk_len(&mut iter), 8192 + 8192 + 4096);
     }
 
+    /// COPY sizes its file as `align_up(len)` instead of reading the source's length:
+    /// that holds for every chunk size config validation allows (a multiple of IO_ALIGN).
+    #[test]
+    fn test_object_disk_len_is_the_aligned_length() {
+        let io = super::super::IO_ALIGN;
+        for chunk_size in [io, 2 * io, 64 * io, 256 * io] {
+            for len in [
+                1,
+                io - 1,
+                io,
+                io + 1,
+                chunk_size - 1,
+                chunk_size,
+                chunk_size + 1,
+                3 * chunk_size + 7,
+            ] {
+                let mut iter = super::super::ChunkIterator::new(len as u64, chunk_size, 1, None);
+                assert_eq!(
+                    object_disk_len(&mut iter),
+                    super::super::align_up(len) as u64,
+                    "len {len}, chunk_size {chunk_size}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_open_for_write_preallocates_disk_len() {
         use std::os::unix::fs::MetadataExt;
