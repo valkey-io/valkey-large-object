@@ -99,8 +99,12 @@ pub fn unevictable_count() -> usize {
 /// `UNEVICTABLE` critical section, so a teardown either adds `oid` to the unevictable
 /// list first (the claim fails) or finds it in the reclaim list. Call under the server
 /// lock.
+///
+/// `hint`: the victim's key hint, if its file has one. A claimed victim's hint is
+/// queued for the reaper here, in the same server-lock hold as the reclaim-list insert,
+/// so no reaper tick sees the victim listed without it.
 #[must_use]
-pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
+pub fn claim_victim(oid: ObjectId, hint: Option<super::KeyHint>) -> Option<Arc<UnevictableOID>> {
     let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
     if unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0)
         || !super::reclaim::RECLAIM_LIST.insert(oid)
@@ -109,7 +113,14 @@ pub fn claim_victim(oid: ObjectId) -> Option<Arc<UnevictableOID>> {
     }
     // Claimed: no later eviction may pick it.
     super::eviction_candidates::remove(oid);
-    Some(UnevictableOID::insert(&mut unevictable, oid))
+    let claim = UnevictableOID::insert(&mut unevictable, oid);
+    // Queue after UNEVICTABLE is released, so its lock is never held with the queue's.
+    // The caller's server lock still covers the reclaim-list insert and this push.
+    drop(unevictable);
+    if let Some(hint) = hint {
+        super::reclaim::queue_delete_by_name(oid, hint);
+    }
+    Some(claim)
 }
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
@@ -149,8 +160,14 @@ impl ObjectFile {
     /// disk-maxmemory check: the blocks are already allocated, and the next
     /// reservation evicts for them. On error, `Drop` still unlinks the file and
     /// releases what was charged.
-    pub fn write_header(&mut self, fd: RawFd, len: u64, crc32c: Crc) -> std::io::Result<()> {
-        super::write_file_header(fd, self.object_id, len, crc32c)?;
+    pub fn write_header(
+        &mut self,
+        fd: RawFd,
+        len: u64,
+        crc32c: Crc,
+        hint: &super::KeyHint,
+    ) -> std::io::Result<()> {
+        super::write_file_header(fd, self.object_id, len, crc32c, hint)?;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `st` is the struct fstat writes.
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
@@ -235,7 +252,9 @@ impl ObjectFile {
         super::nvme::preallocate(dst.as_raw_fd(), self.disk_len)?;
         std::io::copy(&mut src, &mut dst)?;
         dst.sync_all()?;
-        copy.write_header(dst.as_raw_fd(), len, crc32c)
+        // No key hint: the copy callback doesn't know the destination db, so an evicted
+        // copy's key is found by scan.
+        copy.write_header(dst.as_raw_fd(), len, crc32c, &super::KeyHint::default())
     }
 }
 
@@ -289,10 +308,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_claimed_victim_leaves_the_eviction_candidates() {
+    fn test_a_claimed_victim_leaves_the_eviction_candidates() {
         let oid = ObjectId(9_500);
         eviction_candidates::insert(oid);
-        let claim = claim_victim(oid).expect("not claimed yet");
+        let claim = claim_victim(oid, None).expect("not claimed yet");
         assert!(eviction_candidates::pick(usize::MAX, |o| o == oid).is_empty());
         drop(claim);
         RECLAIM_LIST.remove(&oid);

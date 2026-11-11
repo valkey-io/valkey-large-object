@@ -957,8 +957,9 @@ async fn cmd_set_tiered_run(
     };
     // A failure is an NVMe write error; ObjectFile Drop unlinks the file and releases
     // the budget.
+    let hint = storage::KeyHint::new(thread_ctx.db as u32, &key_name);
     if object_file
-        .write_header(fd.as_raw_fd(), obj_len, crc)
+        .write_header(fd.as_raw_fd(), obj_len, crc, &hint)
         .is_err()
     {
         crate::stream::reply_stream_err(&thread_ctx, crate::stream::StreamError::NvmeWrite);

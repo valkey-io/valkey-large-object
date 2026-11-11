@@ -9,17 +9,55 @@
 //! - Tiered: when its file is torn down (`ObjectFile::drop`), or when an NVMe
 //!   eviction finds its file already gone (a stale directory entry).
 //!
+//! Tiered: the reaper (the scaling cron) deletes each victim's key one of two ways:
+//! - By name: an eviction reads the victim's key hint (its key's name and db when it
+//!   was written, from the file header) and queues it on `DELETE_BY_NAME_QUEUE`.
+//! - By scan: the fallback for victims with no usable hint (renamed, copied, a key
+//!   over the hint cap). The scan finds every key whose oid is in `RECLAIM_LIST`.
+//!
 //! Lock order: `RECLAIM_LIST` before `DRAMPool.objects` when both are held.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use valkey_module::{raw, Context, KeysCursor, ValkeyString};
 
+use super::nvme::KeyHint;
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
+
+/// INFO: evicted keys the reaper deleted by name, and by scan.
+pub static EVICTED_KEYS_BY_NAME: AtomicU64 = AtomicU64::new(0);
+pub static EVICTED_KEYS_BY_SCAN: AtomicU64 = AtomicU64::new(0);
+
+/// Tiered victims whose keys the reaper deletes by name, oldest first: each victim's
+/// oid and key hint. A shortcut into `RECLAIM_LIST`, never the only record of a victim:
+/// - Pushed by an eviction, in the same server-lock hold as its claim, so a reaper
+///   tick (which empties this queue before it scans) never scans for a queued victim.
+/// - Popped by the reaper. An entry whose oid already left `RECLAIM_LIST` (its key was
+///   deleted another way) is skipped; one whose key no longer holds the victim is left
+///   to the scan.
+/// - Cleared when `RECLAIM_LIST` empties: every entry left then is stale.
+static DELETE_BY_NAME_QUEUE: LazyLock<Mutex<VecDeque<(ObjectId, KeyHint)>>> =
+    LazyLock::new(Mutex::default);
+
+fn delete_by_name_queue() -> MutexGuard<'static, VecDeque<(ObjectId, KeyHint)>> {
+    DELETE_BY_NAME_QUEUE
+        .lock()
+        .expect("DELETE_BY_NAME_QUEUE lock unavailable")
+}
+
+/// Queue a claimed victim's key for deletion by name. Call under the claim's server lock.
+pub fn queue_delete_by_name(oid: ObjectId, hint: KeyHint) {
+    delete_by_name_queue().push_back((oid, hint));
+}
+
+/// INFO: victims queued for deletion by name.
+pub fn pending_evictions_by_name() -> usize {
+    delete_by_name_queue().len()
+}
 
 pub static RECLAIM_LIST: LazyLock<ReclaimList> = LazyLock::new(ReclaimList::default);
 
@@ -94,19 +132,29 @@ thread_local! {
 }
 
 /// Delete keys whose oids are on the reclaim list, spending at most
-/// `reaper-scan-budget-us` of main-thread time per tick. Scans db by db,
-/// resuming across ticks, until the reclaim list is empty. Dram: an oid leaves the
-/// list when its key is deleted, here or via `lo_free`. Tiered: when its `ObjectFile`
-/// drops. Either way the scan cannot outlive its keys.
+/// `reaper-scan-budget-us` of main-thread time per tick: first the victims with a
+/// key hint, by name, then the rest by scan.
 ///
 /// Cross-slot deletion is safe here: a timer callback runs outside command
 /// execution (`server.current_client` is NULL), so key lookups hash each key's
 /// own slot instead of reusing a command's cached slot.
 pub fn delete_reclaimed_keys(ctx: &Context) {
     if RECLAIM_LIST.is_empty() {
+        // Every victim's key is gone, so every queued entry is stale. An eviction
+        // queues only under the server lock, which this tick holds.
+        delete_by_name_queue().clear();
         return;
     }
     let deadline = Instant::now() + Duration::from_micros(crate::reaper_scan_budget_us());
+    delete_keys_by_name(ctx, deadline);
+    delete_keys_by_scan(ctx, deadline);
+}
+
+/// Delete, by scan, the keys whose oids are on the reclaim list, until `deadline`.
+/// Goes db by db, resuming across ticks, until the reclaim list is empty. Dram: an
+/// oid leaves the list when its key is deleted, here or via `lo_free`. Tiered: when
+/// its `ObjectFile` drops. Either way the scan cannot outlive its keys.
+fn delete_keys_by_scan(ctx: &Context, deadline: Instant) {
     RECLAIM_SCAN_CURSOR.with_borrow_mut(|scan| {
         while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
             // Past the last db: one full pass done. At most one pass per tick
@@ -117,7 +165,11 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
             }
             let (listed_keys, more) = listed_keys_in_next_bucket(ctx, &scan.cursor);
             for (name, oid) in listed_keys {
-                let _ = ctx.open_key_writable(&name).unlink();
+                // Unlink fails only on a key not opened for writing (VM_UnlinkKey).
+                ctx.open_key_writable(&name)
+                    .unlink()
+                    .expect("a key opened for writing unlinks");
+                EVICTED_KEYS_BY_SCAN.fetch_add(1, Ordering::Relaxed);
                 // Same keyspace event core fires for its own evictions.
                 ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
                 // Tiered Mode: Do not touch the RECLAIM_LIST. ObjectFile's drop uses
@@ -137,6 +189,46 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
             }
         }
     });
+}
+
+/// Delete, by name, the keys of victims in `DELETE_BY_NAME_QUEUE`, until `deadline`.
+/// A key is deleted only if it still holds its victim: oids are never reused, so a key
+/// that was renamed, moved, swapped to another db, overwritten or replaced since holds
+/// another oid, or is gone. Such a victim is left to the scan. Runs on the main thread,
+/// like every keyspace change, so nothing moves the key between the check and the delete.
+fn delete_keys_by_name(ctx: &Context, deadline: Instant) {
+    while Instant::now() < deadline {
+        let Some((oid, hint)) = delete_by_name_queue().pop_front() else {
+            return;
+        };
+        // Torn down since the eviction: its key is gone already.
+        if !RECLAIM_LIST.contains(&oid) {
+            continue;
+        }
+        // Fails only for a db outside 0..databases (selectDb). The hint holds a client's
+        // selected db from this run, and databases cannot change at runtime.
+        assert!(
+            select_db(ctx, hint.db as i32),
+            "largeobj: key hint of object {oid:?} names db {}, which does not exist",
+            hint.db
+        );
+        let name = ValkeyString::create_from_slice(ctx.get_raw(), &hint.key);
+        let key = ctx.open_key_writable(&name);
+        // Gone, another type, or another object: the key moved on since the write (a
+        // rename, overwrite or delete), so it is not the victim's. Left to the scan.
+        let holds_victim = matches!(
+            key.get_value::<LoValue>(&LO_TYPE),
+            Ok(Some(lo)) if lo.object_id == oid
+        );
+        if !holds_victim {
+            continue;
+        }
+        // Unlink fails only on a key not opened for writing (VM_UnlinkKey).
+        key.unlink().expect("a key opened for writing unlinks");
+        EVICTED_KEYS_BY_NAME.fetch_add(1, Ordering::Relaxed);
+        // Same keyspace event core fires for its own evictions.
+        ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
+    }
 }
 
 /// Scan the next hashtable bucket of the selected db. Returns the bucket's keys

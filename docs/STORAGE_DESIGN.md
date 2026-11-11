@@ -437,19 +437,24 @@ payload, from offset 0):**
 ```rust
 // consts in storage/nvme.rs
 pub const FILE_HEADER_XATTR: &CStr = c"user.lobj";
-pub const FILE_HEADER_VERSION: u8 = 1;  // first wire byte; enables future format changes
-// Packed wire size (21 bytes), derived from field types (NOT hand-counted):
-pub const FILE_HEADER_WIRE_LEN: usize =
-    size_of::<u8>() + size_of::<u64>() + size_of::<u64>() + size_of::<Crc>();
+pub const FILE_HEADER_VERSION: u8 = 1;
+// Packed size of the fixed fields, derived from field types (NOT hand-counted): 26.
+pub const FILE_HEADER_FIXED_LEN: usize = size_of::<u8>() + size_of::<u64>()
+    + size_of::<u64>() + size_of::<u32>() + size_of::<u32>() + size_of::<u8>();
+pub const KEY_HINT_MAX_LEN: usize = 128;
 
 pub struct FileHeader {
+    pub version: u8,        // 1 — enables future format changes
     pub object_id: u64,     // Matches LoValue.object_id
     pub len: u64,           // True object length (before O_DIRECT padding)
     pub crc32c: Crc,        // Integrity checksum (same as LoValue.crc32c)
+    pub hint: KeyHint,      // db: u32, then key_len: u8 and the key bytes
 }
 ```
 
-The header is serialized to `FILE_HEADER_WIRE_LEN` bytes, the version first, on write; on read it must be exactly that length and that version. It is never byte-cast, so no `#[repr(C)]` is needed. SET writes it with `fsetxattr` after the payload; every NVMe GET reads it with `fgetxattr` and checks it against the key's `LoValue` before the data reads. It is small enough for XFS to keep inside the inode, so it takes no data block.
+The header is serialized to `FILE_HEADER_FIXED_LEN` bytes plus the key on write and deserialized on read, checking the version and that the length matches `key_len`. Only the module writes `user.lobj`, so the name alone identifies the value; there is no magic. It is never byte-cast, so no `#[repr(C)]` is needed. SET writes it with `fsetxattr` after the payload; every NVMe GET reads it with `fgetxattr` and checks `object_id`, `len` and `crc32c` against the key's `LoValue` before the data reads, never the key hint. At most 154 bytes, it stays inside a default 512-byte XFS inode (measured: inline up to 223 bytes next to a 33-byte SELinux label), so it takes no data block.
+
+The key hint is the key's name and db when the object was written, for the reaper: after an eviction it deletes that key by name if the key still holds the victim's `object_id`, instead of scanning the keyspace. RENAME, MOVE and SWAPDB never rewrite it, so a stale hint is caught by that check and the key is left to the scan. A COPY, and a key longer than `KEY_HINT_MAX_LEN`, record no key and are always found by scan.
 
 **File layout:**
 ```
@@ -1534,7 +1539,7 @@ this section owns the semantics.
 | `max-object-size` | `512MB` | `1` | i64::MAX | Live | Global per-object cap; SET rejected above it (detail: §4.6, §7.7) |
 | `chunk-size` | `1MB` | `4096` | `256MB` | Immutable | I/O chunk / allocation unit; must be a multiple of 4096 (detail: §7.2) |
 | `max-buffers-per-op` / `min-buffers-per-op` | 64 / 2 | 2 / 1 | 1024 / 1024 | Live | Streaming pipeline depth (detail: §7.3.6) |
-| `worker-threads` | `4` | `1` | `32` | Immutable | tokio worker threads |
+| `worker-threads` | `8` | `1` | `32` | Immutable | tokio worker threads |
 | `scaling-poll-ms` | `5000` | `1000` | `60000` | Live | Scaling cron interval: how often it checks utilization and memory pressure |
 | `scaling-expand-watermark` | `80` | `50` | `95` | Live | Pool utilization % above which the cron adds a segment in the background |
 | `scaling-shrink-watermark` | `90` | `50` | `95` | Live | Server `used_memory / maxmemory` % above which the cron shrinks a segment; also the ceiling expand may not cross |
@@ -1544,7 +1549,7 @@ this section owns the semantics.
 | `smartlog-poll-secs` | `60` | `0` (off) | `86400` | Immutable | NVMe SMART poll interval (Tiered) |
 | `fabric-provider` | `Emulated` | — | — | Immutable | libfabric provider: `Emulated` (tcp provider) or `EfaDirect` (EFA hardware) |
 | `fabric-interfaces` | `""` (all) | — | — | Immutable | Comma-separated fabric domains to open a service on |
-| `fabric-max-in-flight` | `0` (provider default) | `0` | `65536` | Immutable | Transfers each fabric service keeps in flight |
+| `fabric-max-in-flight` | `256` (`0` = provider default) | `0` | `65536` | Immutable | Transfers each fabric service keeps in flight |
 | `fabric-crc-pool-threads` | `2` | `1` | `1024` | Immutable | Threads hashing checksummed transfers off the fabric workers |
 
 **Segment size is capped at 1 GiB** for both `segment-size` and
