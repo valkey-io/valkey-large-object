@@ -971,10 +971,16 @@ async fn cmd_set_tiered_run(
     }
     // After the CRC check, so a rejected SET skips it. A failure is an NVMe write
     // error; ObjectFile Drop unlinks the file and releases the budget.
+    // direct-io no: writeback converts the preallocated extents later, which can change
+    // the file's extent-tree blocks after write_header charges them. Sync first, as COPY
+    // does, so eviction's stat credits what was charged. O_DIRECT writes are final.
+    // SAFETY: `fd` is this SET's open file.
+    let synced = crate::direct_io() || unsafe { libc::fdatasync(fd.as_raw_fd()) } == 0;
     let hint = storage::KeyHint::new(thread_ctx.db as u32, &key_name);
-    if object_file
-        .write_header(fd.as_raw_fd(), obj_len, crc, &hint)
-        .is_err()
+    if !synced
+        || object_file
+            .write_header(fd.as_raw_fd(), obj_len, crc, &hint)
+            .is_err()
     {
         crate::stream::reply_stream_err(&thread_ctx, crate::stream::StreamError::NvmeWrite);
         return;

@@ -154,9 +154,10 @@ impl ObjectFile {
         }
     }
 
-    /// Write the file's header through `fd`, its last write once the payload is
-    /// written, then charge the blocks the file took beyond its data
-    /// (`metadata_disk_bytes`), as eviction's stat credits them. Charged without a
+    /// Write the file's header through `fd`, its last write once the payload is on
+    /// disk (O_DIRECT, or synced, so its blocks are final), then charge the blocks the
+    /// file took beyond its data (`metadata_disk_bytes`), as eviction's stat credits
+    /// them. Charged without a
     /// disk-maxmemory check: the blocks are already allocated, and the next
     /// reservation evicts for them. On error, `Drop` still unlinks the file and
     /// releases what was charged.
