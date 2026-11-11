@@ -437,23 +437,24 @@ payload, from offset 0):**
 ```rust
 // consts in storage/nvme.rs
 pub const FILE_HEADER_XATTR: &CStr = c"user.lobj";
-pub const FILE_HEADER_MAGIC: &[u8; 4] = b"LOBJ";
 pub const FILE_HEADER_VERSION: u8 = 1;
-// Packed wire size, derived from field types (NOT hand-counted):
-pub const FILE_HEADER_WIRE_LEN: usize =
-    size_of::<[u8; 4]>() + size_of::<u8>() + size_of::<u64>()
-    + size_of::<u64>() + size_of::<u32>();
+// Packed size of the fixed fields, derived from field types (NOT hand-counted): 26.
+pub const FILE_HEADER_FIXED_LEN: usize = size_of::<u8>() + size_of::<u64>()
+    + size_of::<u64>() + size_of::<u32>() + size_of::<u32>() + size_of::<u8>();
+pub const KEY_HINT_MAX_LEN: usize = 128;
 
 pub struct FileHeader {
-    pub magic: [u8; 4],     // b"LOBJ" — identifies file as Large Object module data
     pub version: u8,        // 1 — enables future format changes
     pub object_id: u64,     // Matches LoValue.object_id
     pub len: u64,           // True object length (before O_DIRECT padding)
     pub crc32c: Crc,        // Integrity checksum (same as LoValue.crc32c)
+    pub hint: KeyHint,      // db: u32, then key_len: u8 and the key bytes
 }
 ```
 
-The header is serialized to `FILE_HEADER_WIRE_LEN` bytes on write and deserialized on read for magic/version validation. It is never byte-cast, so no `#[repr(C)]` is needed. SET writes it with `fsetxattr` after the payload; every NVMe GET reads it with `fgetxattr` and checks it against the key's `LoValue` before the data reads. It is small enough for XFS to keep inside the inode, so it takes no data block.
+The header is serialized to `FILE_HEADER_FIXED_LEN` bytes plus the key on write and deserialized on read, checking the version and that the length matches `key_len`. Only the module writes `user.lobj`, so the name alone identifies the value; there is no magic. It is never byte-cast, so no `#[repr(C)]` is needed. SET writes it with `fsetxattr` after the payload; every NVMe GET reads it with `fgetxattr` and checks `object_id`, `len` and `crc32c` against the key's `LoValue` before the data reads, never the key hint. At most 154 bytes, it stays inside a default 512-byte XFS inode (measured: inline up to 223 bytes next to a 33-byte SELinux label), so it takes no data block.
+
+The key hint is the key's name and db when the object was written, for the reaper: after an eviction it deletes that key by name if the key still holds the victim's `object_id`, instead of scanning the keyspace. RENAME, MOVE and SWAPDB never rewrite it, so a stale hint is caught by that check and the key is left to the scan. A COPY, and a key longer than `KEY_HINT_MAX_LEN`, record no key and are always found by scan.
 
 **File layout:**
 ```

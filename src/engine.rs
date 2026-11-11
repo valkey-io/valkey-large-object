@@ -911,7 +911,7 @@ async fn cmd_set_tiered_run(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
-    let job = crate::stream::StreamJob::for_nvme(
+    let mut job = crate::stream::StreamJob::for_nvme(
         fd.as_raw_fd(),
         obj_len,
         chunk_size,
@@ -919,6 +919,7 @@ async fn cmd_set_tiered_run(
         0,
         batch_width,
     );
+    job.key_hint = Some(storage::KeyHint::new(thread_ctx.db as u32, &key_name));
     let target = crate::stream::Target::NvmeWrite {
         buffers: &stream_ctx.buffers,
         pool: nvme_pool,
