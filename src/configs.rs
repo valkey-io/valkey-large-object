@@ -159,6 +159,10 @@ pub const MAX_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: i64 = 60_000;
 pub const DEFAULT_TEST_PAUSE_DURING_PROMOTION_MS: i64 = 0;
 pub const MIN_TEST_PAUSE_DURING_PROMOTION_MS: i64 = 0;
 pub const MAX_TEST_PAUSE_DURING_PROMOTION_MS: i64 = 60_000;
+// test-pause-after-evict-pick-ms
+pub const DEFAULT_TEST_PAUSE_AFTER_EVICT_PICK_MS: i64 = 0;
+pub const MIN_TEST_PAUSE_AFTER_EVICT_PICK_MS: i64 = 0;
+pub const MAX_TEST_PAUSE_AFTER_EVICT_PICK_MS: i64 = 60_000;
 // test-pause-after-promotion-failure-ms
 pub const DEFAULT_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS: i64 = 0;
 pub const MIN_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS: i64 = 0;
@@ -298,6 +302,11 @@ lazy_static::lazy_static! {
     /// Allows integration tests to inject a DEL in the mid-stream window
     /// and deterministically exercise the delete-during-SET race.
     pub static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);
+
+    /// Test-only: pause a Tiered eviction for this many milliseconds after it picks its
+    /// candidates and before it claims them. 0 = disabled. Lets an integration test take
+    /// the picked candidates away first.
+    pub static ref CFG_TEST_PAUSE_AFTER_EVICT_PICK_MS: AtomicI64 = AtomicI64::new(0);
 
     /// Test-only: pause the promotion leader for this many milliseconds after
     /// inserting the Filling ObjectContext but before starting NVMe reads.
@@ -520,6 +529,10 @@ pub fn min_buffers_per_op() -> usize {
 
 pub fn test_pause_before_finalize_set_ms() -> u64 {
     CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
+}
+
+pub fn test_pause_after_evict_pick_ms() -> u64 {
+    CFG_TEST_PAUSE_AFTER_EVICT_PICK_MS.load(std::sync::atomic::Ordering::Relaxed) as u64
 }
 
 pub fn test_pause_during_promotion_ms() -> u64 {

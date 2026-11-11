@@ -178,26 +178,43 @@ fn evict_and_reserve(bytes: u64) -> bool {
     // Claim, then stat: a claimed file cannot change under us.
     let mut victims = Vec::new();
     let mut covered = 0;
-    for oid in super::eviction_candidates::pick(EVICT_BATCH, |_| true) {
-        if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
+    // Concurrent writes pick the same oldest candidates, and only one claims each. A write
+    // whose picks were all claimed by others picks again, past every oid it has tried:
+    // each pick returns only untried oids, so the loop ends when enough is covered or no
+    // evictable candidate is left.
+    let mut tried = std::collections::HashSet::new();
+    'evict: while covered < need && victims.len() < super::cache_policy::RECLAIM_MAX_VICTIMS {
+        let batch = super::eviction_candidates::pick(EVICT_BATCH, |oid| !tried.contains(&oid));
+        if batch.is_empty() {
             break;
         }
-        // Read off the server lock, before the claim queues it.
-        let hint = read_key_hint(oid);
-        // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
-        let Some(unevictable) = with_server_lock(|_| super::object_file::claim_victim(oid, hint))
-        else {
-            continue;
-        };
-        match stat(oid) {
-            Some(len) => {
-                let bytes = allocated_disk_bytes(len);
-                covered += bytes;
-                victims.push((unevictable, bytes));
+        tried.extend(batch.iter().copied());
+        let pause_ms = crate::test_pause_after_evict_pick_ms();
+        if pause_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+        }
+        for oid in batch {
+            if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
+                break 'evict;
             }
-            // Torn down between the pick and the claim, so its key is gone.
-            None => {
-                super::reclaim::RECLAIM_LIST.remove(&oid);
+            // Read off the server lock, before the claim queues it.
+            let hint = read_key_hint(oid);
+            // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
+            let Some(unevictable) =
+                with_server_lock(|_| super::object_file::claim_victim(oid, hint))
+            else {
+                continue;
+            };
+            match stat(oid) {
+                Some(len) => {
+                    let bytes = allocated_disk_bytes(len);
+                    covered += bytes;
+                    victims.push((unevictable, bytes));
+                }
+                // Torn down between the pick and the claim, so its key is gone.
+                None => {
+                    super::reclaim::RECLAIM_LIST.remove(&oid);
+                }
             }
         }
     }
