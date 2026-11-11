@@ -911,7 +911,7 @@ async fn cmd_set_tiered_run(
     };
     // ObjectFile owns cleanup from here: Drop removes the file and releases disk budget.
     let object_file = Arc::new(ObjectFile::new(object_id, disk_len));
-    let mut job = crate::stream::StreamJob::for_nvme(
+    let job = crate::stream::StreamJob::for_nvme(
         fd.as_raw_fd(),
         obj_len,
         chunk_size,
@@ -919,7 +919,6 @@ async fn cmd_set_tiered_run(
         0,
         batch_width,
     );
-    job.key_hint = Some(storage::KeyHint::new(thread_ctx.db as u32, &key_name));
     let target = crate::stream::Target::NvmeWrite {
         buffers: &stream_ctx.buffers,
         pool: nvme_pool,
@@ -970,26 +969,17 @@ async fn cmd_set_tiered_run(
             return;
         }
     }
+    // After the CRC check, so a rejected SET skips it. A failure is an NVMe write
+    // error; ObjectFile Drop unlinks the file and releases the budget.
+    let hint = storage::KeyHint::new(thread_ctx.db as u32, &key_name);
+    if object_file
+        .write_header(fd.as_raw_fd(), disk_len, obj_len, crc, &hint)
+        .is_err()
+    {
+        crate::stream::reply_stream_err(&thread_ctx, crate::stream::StreamError::NvmeWrite);
+        return;
+    }
     test_pause_before_finalize().await;
-    // NVMe disk accounting stays with the NVMe caller (no file on the DRAM path).
-    let object_id = object_file.object_id();
-    let disk_len = object_file.disk_len();
-    let file_path = object_id.file_path(&crate::disk_dir());
-    let on_disk = std::fs::metadata(&file_path)
-        .unwrap_or_else(|e| {
-            panic!(
-                "NVMe accounting: cannot stat object {:?} at {} \
-                 to verify write size: {e}",
-                object_id, file_path
-            )
-        })
-        .len();
-    assert_eq!(
-        on_disk, disk_len,
-        "NVMe accounting: object {:?} on disk is {on_disk} B but we \
-         reserved {} B — write path and accounting have diverged",
-        object_id, disk_len
-    );
     let lo_value = LoValue::new(object_id, obj_len, crc, Some(object_file));
     let outcome = commit_lo_value(&thread_ctx.lock(), &key_name, object_id, lo_value);
     match outcome {

@@ -36,6 +36,7 @@ use super::fd_placement::ObjectFd;
 use super::fd_pool::FdPool;
 use super::Crc;
 use crate::data_type::ObjectId;
+use std::os::unix::io::RawFd;
 
 /// Unevictable list (Tiered): oids whose files are in use by a GET, SET, COPY,
 /// teardown or eviction, as oid -> the `Arc<UnevictableOID>` its holders share.
@@ -93,25 +94,33 @@ pub fn unevictable_count() -> usize {
         .count()
 }
 
-/// Claim `oid` for eviction: add it to the reclaim list and the unevictable list,
-/// unless it is in either already, and take it off the eviction candidates. One
-/// `UNEVICTABLE` critical section, so a teardown either adds `oid` to the unevictable
-/// list first (the claim fails) or finds it in the reclaim list. Call under the server
-/// lock.
+/// Claim `oid` for eviction: take it off the eviction candidates and add it to the
+/// reclaim list and the unevictable list. Returns the claim and the `disk_bytes` its
+/// eviction credits, or `None` if it is unevictable or no longer a candidate (torn down
+/// or claimed since the pick). One `UNEVICTABLE` critical section, so a teardown either
+/// takes `oid` off the candidates first (the claim fails) or finds it in the reclaim
+/// list. Call under the server lock.
 ///
 /// `hint`: the victim's key hint, if its file has one. A claimed victim's hint is
 /// queued for the reaper here, in the same server-lock hold as the reclaim-list insert,
 /// so no reaper tick sees the victim listed without it.
 #[must_use]
-pub fn claim_victim(oid: ObjectId, hint: Option<super::KeyHint>) -> Option<Arc<UnevictableOID>> {
+pub fn claim_victim(
+    oid: ObjectId,
+    hint: Option<super::KeyHint>,
+) -> Option<(Arc<UnevictableOID>, u64)> {
     let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
-    if unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0)
-        || !super::reclaim::RECLAIM_LIST.insert(oid)
-    {
+    if unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0) {
         return None;
     }
-    // Claimed: no later eviction may pick it.
-    super::eviction_candidates::remove(oid);
+    // Off the candidates, so no later eviction picks it.
+    let disk_bytes = super::eviction_candidates::remove(oid)?;
+    // Only a claim lists a file's oid, and it takes the oid off the candidates first.
+    let listed = super::reclaim::RECLAIM_LIST.insert(oid);
+    assert!(
+        listed,
+        "largeobj: eviction candidate {oid:?} is already on the reclaim list"
+    );
     let claim = UnevictableOID::insert(&mut unevictable, oid);
     // Queue after UNEVICTABLE is released, so its lock is never held with the queue's.
     // The caller's server lock still covers the reclaim-list insert and this push.
@@ -119,7 +128,7 @@ pub fn claim_victim(oid: ObjectId, hint: Option<super::KeyHint>) -> Option<Arc<U
     if let Some(hint) = hint {
         super::reclaim::queue_delete_by_name(oid, hint);
     }
-    Some(claim)
+    Some((claim, disk_bytes))
 }
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
@@ -127,34 +136,73 @@ pub fn claim_victim(oid: ObjectId, hint: Option<super::KeyHint>) -> Option<Arc<U
 /// Existence handle for one version of an object's NVMe file. Always held behind an
 /// `Arc`; its
 /// `Drop` deregisters the read fd from the pool and unlinks the file once, when the
-/// last reference goes away.
+/// last reference goes away. The disk usage charged for the file is its
+/// eviction-candidate entry's `disk_bytes`, from `new` until `Drop` or the eviction
+/// that claims it.
 #[derive(Debug)]
 pub struct ObjectFile {
     /// Identity; the file path is *derived* (`ObjectId::file_path`), never stored.
     object_id: ObjectId,
-    /// File length; NVMe utilization accounting charges its `nvme::allocated_disk_bytes`.
-    disk_len: u64,
 }
 
 impl ObjectFile {
     /// Construct the handle for a newly committed object version whose file already
     /// exists on NVMe. No read fd is open yet — it opens lazily on the first GET via
-    /// `ensure_open`. `disk_len` is the file length; `Drop` releases the
-    /// `allocated_disk_bytes` reserved for it.
+    /// `ensure_open`. `disk_len` is the file length: it becomes an eviction candidate
+    /// charged the `allocated_disk_bytes` reserved for it. The caller holds it
+    /// unevictable until `write_header`.
     pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
-        super::eviction_candidates::insert(object_id);
-        Self {
-            object_id,
-            disk_len,
+        super::eviction_candidates::insert(object_id, super::nvme::allocated_disk_bytes(disk_len));
+        Self { object_id }
+    }
+
+    /// Write the file's header through `fd`, its last write once the payload is
+    /// written, then charge what the file took beyond what `new` reserved.
+    /// - `disk_len`: the file's length, the payload with each chunk padded to
+    ///   `IO_ALIGN` (`object_disk_len`), which the caller reserved and preallocated.
+    /// - `obj_len`, `crc32c`, `hint`: the object's length, CRC and key, which the header
+    ///   records.
+    ///
+    /// The reservation already covers the data and the inode (`allocated_disk_bytes`).
+    /// The `fstat` measures what only exists once the file is written: blocks beyond
+    /// the data, such as an xattr block if the header does not fit in the inode
+    /// (`metadata_disk_bytes`). Charged without a disk-maxmemory check: the blocks are
+    /// already allocated, and the next reservation evicts for them. On error, `Drop`
+    /// still unlinks the file and releases what was charged.
+    pub fn write_header(
+        &self,
+        fd: RawFd,
+        disk_len: u64,
+        obj_len: u64,
+        crc32c: Crc,
+        hint: &super::KeyHint,
+    ) -> std::io::Result<()> {
+        super::write_file_header(fd, self.object_id, obj_len, crc32c, hint)?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `st` is the struct fstat writes.
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        assert_eq!(
+            st.st_size as u64, disk_len,
+            "NVMe accounting: object {:?} on disk is {} B but we reserved {} B — write \
+             path and accounting have diverged",
+            self.object_id, st.st_size, disk_len
+        );
+        let bytes = super::nvme::metadata_disk_bytes(disk_len, st.st_blocks as u64);
+        super::nvme::increase_nvme_disk_usage(bytes);
+        // Unevictable since `new`, so no claim has taken its entry.
+        let recorded = super::eviction_candidates::add_disk_bytes(self.object_id, bytes);
+        assert!(
+            recorded,
+            "largeobj: object {:?} lost its eviction-candidate entry before its header",
+            self.object_id
+        );
+        Ok(())
     }
 
     pub fn object_id(&self) -> ObjectId {
         self.object_id
-    }
-
-    pub fn disk_len(&self) -> u64 {
-        self.disk_len
     }
 
     /// Returns a cloned `Arc<ObjectFd>`. Calls into the `FdPool`, which owns the fd and
@@ -164,31 +212,31 @@ impl ObjectFile {
         pool.get_or_open(self.object_id, dir)
     }
 
-    /// Copy this file into a new object version: allocates a fresh `ObjectId`, writes a
-    /// header carrying the new OID with this object's `len`/`crc32c`, then copies the
-    /// payload past the header byte-for-byte. `fsync`s before returning so the file is
-    /// durable before it is exposed to O_DIRECT reads via io_uring.
+    /// Copy this file into a new object version: allocates a fresh `ObjectId`, copies the
+    /// payload byte-for-byte, then writes a header carrying the new OID with this
+    /// object's `len`/`crc32c`. `fsync`s the payload before the header, so the file is
+    /// on disk before it is exposed to O_DIRECT reads via io_uring.
     ///
-    /// Reserves `disk_len` against disk-maxmemory up front; the returned handle's `Drop`
-    /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
-    /// the command rather than aborting the node), leaving no partial file behind.
-    pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
-        let dir = crate::disk_dir();
-        let disk_len = self.disk_len;
-        let disk_bytes = super::nvme::allocated_disk_bytes(disk_len);
+    /// Reserves the source's length against disk-maxmemory up front; the returned
+    /// handle's `Drop` releases it. Returns `None` if the reservation or any I/O fails
+    /// (COPY then fails the command rather than aborting the node), leaving no partial
+    /// file behind.
+    pub fn copy(&self, obj_len: u64, crc32c: Crc) -> Option<ObjectFile> {
         // We do not allow the eviction of the source or the new file mid-copy.
         let _source = UnevictableOID::new(self.object_id);
-        if !super::nvme::try_reserve_nvme_disk_usage(disk_bytes) {
+        // The source's file length: chunk-size is a multiple of IO_ALIGN, so a SET's file
+        // is `align_up(obj_len)`.
+        let disk_len = super::align_up(obj_len as usize) as u64;
+        if !super::nvme::try_reserve_nvme_disk_usage(super::nvme::allocated_disk_bytes(disk_len)) {
             return None;
         }
         let new_oid = ObjectId::next();
         let _copy = UnevictableOID::new(new_oid);
-        let dst_path = new_oid.file_path(&dir);
-        match self.copy_file(&dst_path, new_oid, len, crc32c) {
-            Ok(()) => Some(ObjectFile::new(new_oid, disk_len)),
+        // Owns cleanup from here: Drop removes the file and releases disk budget.
+        let copy = ObjectFile::new(new_oid, disk_len);
+        match self.copy_file(&copy, disk_len, obj_len, crc32c) {
+            Ok(()) => Some(copy),
             Err(e) => {
-                super::nvme::unlink(new_oid);
-                super::nvme::decrease_nvme_disk_usage(disk_bytes);
                 valkey_module::logging::log_warning(format!(
                     "largeobj: Tiered COPY {:?} -> {new_oid:?} failed: {e}",
                     self.object_id
@@ -202,28 +250,30 @@ impl ObjectFile {
     /// the io_uring path, and the destination is not yet visible to any reader.
     fn copy_file(
         &self,
-        dst_path: &str,
-        new_oid: ObjectId,
-        len: u64,
+        copy: &ObjectFile,
+        disk_len: u64,
+        obj_len: u64,
         crc32c: Crc,
     ) -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
-        let mut src = std::fs::File::open(self.object_id.file_path(&crate::disk_dir()))?;
+        let dir = crate::disk_dir();
+        let mut src = std::fs::File::open(self.object_id.file_path(&dir))?;
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(dst_path)?;
+            .open(copy.object_id.file_path(&dir))?;
+        super::nvme::preallocate(dst.as_raw_fd(), disk_len)?;
         std::io::copy(&mut src, &mut dst)?;
+        dst.sync_all()?;
         // No key hint: the copy callback doesn't know the destination db, so an evicted
         // copy's key is found by scan.
-        super::write_file_header(
+        copy.write_header(
             dst.as_raw_fd(),
-            new_oid,
-            len,
+            disk_len,
+            obj_len,
             crc32c,
             &super::KeyHint::default(),
-        )?;
-        dst.sync_all()
+        )
     }
 }
 
@@ -233,9 +283,9 @@ impl Drop for ObjectFile {
         // remaining ObjectFile refs. Means "object gone" — deregister the fd and,
         // unless an eviction owns it, unlink the file.
         let object_id = self.object_id;
-        let disk_len = self.disk_len;
-        // Eviction must not pick a file that is being torn down.
-        super::eviction_candidates::remove(object_id);
+        // Off the candidates, so no eviction can claim a file being torn down. `None`:
+        // an eviction claimed it first, and owns its unlink and credit.
+        let disk_bytes = super::eviction_candidates::remove(object_id);
         // We do not allow the eviction of a file that is being torn down.
         let unevictable = UnevictableOID::new(object_id);
 
@@ -247,19 +297,22 @@ impl Drop for ObjectFile {
             if let Some(pool) = super::FD_POOL.get() {
                 pool.remove(object_id);
             }
-            // An eviction may have claimed this file. If so, it owns the unlink and the
-            // ledger credit (the ledger can't detect a second one); we only take the oid
-            // off the reclaim list, which only this teardown can do now that the key is
-            // gone. Otherwise we unlink and credit.
+            // A claim takes the candidate entry and then lists the oid, so the entry and
+            // the listing exclude each other. We take the oid off the reclaim list, which
+            // only this teardown can do now that the key is gone.
             let claimed_by_eviction = super::reclaim::RECLAIM_LIST.remove(&object_id);
-            if claimed_by_eviction {
+            match (disk_bytes, claimed_by_eviction) {
                 // The eviction unlinks the file and credits its bytes.
-            } else {
-                super::nvme::unlink(object_id);
-                // Release exactly what create added — no stat, so it can't drift.
-                crate::storage::nvme::decrease_nvme_disk_usage(
-                    crate::storage::nvme::allocated_disk_bytes(disk_len),
-                );
+                (None, true) => {}
+                (Some(disk_bytes), false) => {
+                    super::nvme::unlink(object_id);
+                    // Release exactly what was charged — no stat, so it can't drift.
+                    crate::storage::nvme::decrease_nvme_disk_usage(disk_bytes);
+                }
+                (disk_bytes, claimed) => panic!(
+                    "largeobj: object {object_id:?} torn down with candidate charge \
+                     {disk_bytes:?} and claimed_by_eviction={claimed}"
+                ),
             }
         };
 
@@ -281,8 +334,8 @@ mod tests {
     #[test]
     fn test_a_claimed_victim_leaves_the_eviction_candidates() {
         let oid = ObjectId(9_500);
-        eviction_candidates::insert(oid);
-        let claim = claim_victim(oid, None).expect("not claimed yet");
+        eviction_candidates::insert(oid, 0);
+        let (claim, _) = claim_victim(oid, None).expect("not claimed yet");
         assert!(eviction_candidates::pick(usize::MAX, |o| o == oid).is_empty());
         drop(claim);
         RECLAIM_LIST.remove(&oid);
