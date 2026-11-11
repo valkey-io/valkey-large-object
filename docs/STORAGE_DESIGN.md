@@ -428,7 +428,7 @@ configured `disk-dir`: `{disk-dir}/{oid % disk-dir-shards:04x}/{oid:016x}.dat` (
 startup. Every create and unlink
 takes its directory's inode lock exclusively, so one directory would serialize
 them across all SETs and evictions. The
-runtime handle is `ObjectFile { object_id, disk_len }` (held behind
+runtime handle is `ObjectFile { object_id }` (held behind
 `Arc<ObjectFile>`); it stores no path and no fd — the path is derived from the OID
 and the fd is managed separately by the FdPool (§6.4).
 
@@ -1424,7 +1424,7 @@ only same-segment operations serialize. Hold time ~10-50ns. Negligible contentio
 
 **Consistency with §9.2:** Main thread never allocs from NVMePool (all Tiered I/O goes through tokio). Main thread allocs from DRAMPool only for the first try of a DRAM-only SET, and for COPY. Main thread frees via Arc Drop in free callback (which may call the owning segment's talc.free if last ref).
 
-**NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `disk-maxmemory` and fails the SET if it would exceed the cap (`disk-maxmemory` of 0 = unlimited). Module-driven NVMe eviction (§8.1) frees space instead of failing when `maxmemory-policy` allows it. This is the only increment path in production (a separate `increase_nvme_disk_usage` exists but is test-only). Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length. Each charge is that length passed through `allocated_disk_bytes`, described next. Eviction credits each victim the same way.
+**NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `disk-maxmemory` and fails the SET if it would exceed the cap (`disk-maxmemory` of 0 = unlimited). Module-driven NVMe eviction (§8.1) frees space instead of failing when `maxmemory-policy` allows it. The only other increment is `ObjectFile::write_header`, which adds a file's metadata blocks with `increase_nvme_disk_usage`, uncapped: they are already allocated. Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length. Each charge is that length passed through `allocated_disk_bytes`, described next. A file's whole charge is recorded once, in its eviction-candidate entry, from `ObjectFile::new` (the reservation) through `write_header` (plus its metadata blocks); `Drop` and eviction both release that recorded value, never a recomputed one, and exactly one of them does: a claim takes the entry before it lists the oid on the reclaim list.
 
 **Charging a file's real disk use on a striped XFS (`allocated_disk_bytes`):** the counter must track the space the filesystem actually consumes. Otherwise the filesystem fills before disk-maxmemory is reached, and once only unusable gaps remain, every SET's `fallocate` searches them and GET and SET collapse together. (On an i8ge with a 256 KiB stripe unit and 1 MiB objects, throughput fell from ~397 to ~68 Gbps before any eviction.)
 
@@ -1438,7 +1438,14 @@ only same-segment operations serialize. Hold time ~10-50ns. Negligible contentio
 | exactly 1 MiB | yes | 1 MiB |
 | 8 KiB | no | 8 KiB |
 
-- **How the unit is read.** Once at startup, `init_disk_alloc_unit` calls `fstatfs` on disk-dir. On XFS it calls the `XFS_IOC_FSGEOMETRY_V1` ioctl (the call `xfs_info` uses) and takes `sunit × blocksize`, words 20 and 0 of the 112-byte `struct xfs_fsop_geom_v1` from the kernel's `xfs_fs.h`. If that ioctl fails, the module refuses to load rather than charge too little. On any other filesystem, or an XFS with no stripe unit, the unit is one `IO_ALIGN` block (4 KiB), which `object_disk_len` already pads every file to. The startup log reports it as `disk_alloc_unit=<bytes>B`.
+- **How the unit is read.** Once at startup, `init_disk_geometry` calls `fstatfs` on disk-dir and refuses to load unless the block size divides `IO_ALIGN`. On XFS it calls the `XFS_IOC_FSGEOMETRY_V1` ioctl (the call `xfs_info` uses) and takes `sunit × blocksize`, words 20 and 0 of the 112-byte `struct xfs_fsop_geom_v1` from the kernel's `xfs_fs.h`. If that ioctl fails, the module refuses to load rather than charge too little. On any other filesystem, or an XFS with no stripe unit, the unit is one `IO_ALIGN` block (4 KiB), which `object_disk_len` already pads every file to. The startup log reports it as `disk_alloc_unit=<bytes>B`.
+- **Inodes.** XFS allocates inodes from free space, so `allocated_disk_bytes` also charges every file its inode (`inodesize`, word 6 of the same geometry struct; 512 B by default). Other filesystems (ext4) set inodes aside at mkfs, so they charge none.
+- **Metadata blocks.** A file can also take blocks beyond its data. `st_blocks` counts, in 512-byte units (`ST_BLOCKS_UNIT`, whatever the block size), the file's data blocks and those of its metadata that live outside the inode; it never counts the inode itself, which `allocated_disk_bytes` already charges. Every object file is allocated in one `fallocate` (`preallocate`) of exactly its length, and every write lands inside it, so its data takes exactly that length and anything more is metadata (`metadata_disk_bytes`). There are two kinds:
+  - *An attribute block*, when the header xattr does not fit in the inode's free space. A 512-byte XFS inode keeps up to about 223 bytes inline (measured next to a 33-byte SELinux label), so the largest header (154 bytes) never spills there. ext4's 256-byte inode keeps only about 68 bytes, so a key over about 42 bytes spills to a 4 KiB block.
+  - *An extent-tree block*, when the file is in more extents than its inode can list (about 15-20 on a 512-byte XFS inode). One `fallocate` returns many extents when free space is fragmented, as on a nearly full disk where evictions leave holes, so this can happen on any filesystem.
+  - *Data padding the filesystem adds*: an XFS extent-size hint inherited from disk-dir rounds the allocation up to the hint, ext4 bigalloc allocates whole clusters, and without `fallocate` support (`EOPNOTSUPP`) extending writes may preallocate past EOF.
+
+  Because an extent-tree block can occur on a healthy server, the extra blocks are charged, not asserted to be zero. Only blocks beyond the data charge count (`metadata_disk_bytes` subtracts the length rounded up to the allocation unit, not the bare length), so stripe-unit padding is charged once whether or not the filesystem actually allocates it. The cost of that: on a striped XFS, a metadata block of a file at least one stripe unit long is not charged while it fits in that padding. SET and COPY charge the extra blocks after the header write, from the `fstat` they already make, without a disk-maxmemory check (they are already allocated), and add them to the file's recorded charge for `Drop` and eviction to release. Usage can therefore end above disk-maxmemory, so eviction makes room for everything above the cap once the new write is added (`(usage + bytes) - disk-maxmemory`), not only for the new write.
 - **Mixed object sizes.** A short file can land in the gap after a long one, so with mixed sizes the long files are slightly over-charged and eviction starts a little early. It never under-charges, so the filesystem cannot overfill.
 - **Tests.** The exact-capacity integration tests assume a 4 KiB unit, so the test base fails fast if disk-dir is on a striped XFS. CI runs the tests on an unstriped XFS loop mount so the XFS path is exercised.
 
@@ -1465,7 +1472,8 @@ lo_free(LoValue):
          - FdPool.remove(oid)      → drops the pool's Arc<ObjectFd> (fd closes when
                                       the last in-flight-read clone is also gone)
          - std::fs::remove_file(path)   (path derived from the ObjectId)
-         - decrease_nvme_disk_usage(disk_len)
+         - decrease_nvme_disk_usage(<its eviction-candidate entry's disk_bytes>),
+           unless an eviction claimed the file (it credits it instead)
      → Teardown runs inline on the dropping thread, EXCEPT if that thread is the
        Valkey main thread (is_main_thread()), in which case it is spawned onto
        tokio so the main thread never does blocking fs work.

@@ -368,7 +368,7 @@ impl DRAMPool {
             .expect("DRAMPool.objects lock unavailable")
             .insert(oid, ctx);
         if self.cache.is_none() {
-            eviction_candidates::insert(oid);
+            eviction_candidates::insert(oid, 0);
         }
     }
 

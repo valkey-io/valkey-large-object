@@ -1,6 +1,7 @@
 import array
 import os
 import errno
+import fcntl
 import functools
 import glob
 import sys
@@ -26,6 +27,29 @@ def direct_io_supported(directory):
         return False
     finally:
         os.unlink(path)
+
+
+def disk_inode_size(directory):
+    """Disk space the module charges each object file in `directory` for its inode: XFS's
+    inode size, from the geometry ioctl the module reads (`inodesize`, bytes 24..28 of
+    `struct xfs_fsop_geom_v1`); 0 on any other filesystem, which sets inodes aside at mkfs."""
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        geometry = fcntl.ioctl(fd, 0x80705864, bytes(112))  # XFS_IOC_FSGEOMETRY_V1
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+    return int.from_bytes(geometry[24:28], 'little')
+
+
+# Bytes per st_blocks unit: stat(2) counts allocated space in 512-byte units on every
+# filesystem (glibc's S_BLKSIZE; Python's os module does not export it).
+ST_BLOCKS_UNIT = 512
+
+# Every test keeps its files under test-data (the framework's testdir).
+os.makedirs("test-data", exist_ok=True)
+DISK_INODE = disk_inode_size("test-data")
 
 
 _TAG_STRIDE = 0x9E3779B1  # odd, so distinct tags give distinct offsets mod 2**32

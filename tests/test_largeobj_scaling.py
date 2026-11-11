@@ -29,7 +29,7 @@ from contextlib import contextmanager
 import pytest
 from valkey import OutOfMemoryError, ResponseError
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
+from valkey_largeobj_test_case import DISK_INODE, ST_BLOCKS_UNIT, ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
 
 # 900KB in a 1MB segment: one object of this size fills a segment by itself.
 SEGMENT_FILLING_SIZE = 900 * 1024
@@ -750,7 +750,8 @@ class TieredBudget(Budget):
     names, unless they pin one down."""
 
     OBJ = 512 * 1024
-    DISK_PER_OBJ = OBJ  # the header is an xattr, so the file is exactly the payload
+    # Each object is charged its file (the header is an xattr, so exactly the payload) and its inode.
+    DISK_PER_OBJ = OBJ + DISK_INODE
     PER_BUDGET = 8
     BUDGET = PER_BUDGET * DISK_PER_OBJ
     FULL = 'disk-maxmemory'
@@ -788,12 +789,13 @@ class TieredBudget(Budget):
         return next(key for key, payload in payloads.items() if payload[:4] == head)
 
     def settle(self, client, live, timeout=10):
-        """Every unevictable-list entry removed and every unlink done: the ledger equals the bytes
-        on disk, and the directory holds `live` objects."""
+        """Every unevictable-list entry removed and every unlink done: the ledger equals the disk
+        the files take (their blocks and inodes), and the directory holds `live` objects."""
         def settled():
             info = info_largeobj(client)
             files = self.object_files()
-            on_disk = sum(os.path.getsize(os.path.join(self.data_dir, name)) for name in files)
+            on_disk = sum(os.stat(os.path.join(self.data_dir, name)).st_blocks * ST_BLOCKS_UNIT + DISK_INODE
+                          for name in files)
             return (info['largeobj_disk_unevictable_objects'] == 0
                     and info['largeobj_disk_used_bytes'] == on_disk
                     and (live is None or len(files) == live))
@@ -1537,6 +1539,20 @@ class TestTieredEvictionKeyHints(TieredBudget):
         self.drain(client)
         assert self.reaped(client) == (1, 1)
         assert client.execute_command('EXISTS', at_cap, over_cap) == 0
+
+    def test_a_write_over_a_usage_past_the_cap_evicts_for_the_overshoot(self):
+        """A file's metadata blocks are charged without the cap, so usage can end above it. The
+        next write then evicts for that overshoot too, not only its own size, and succeeds."""
+        client = self.new_client()
+        set_objects(client, 'short_', self.PER_BUDGET, self.OBJ)
+        # A long name spills the header out of a small inode (ext4); a large one keeps it inline.
+        long_key = 'k' * 100
+        assert client.execute_command('BLOB.TCP_SET', long_key, position_pattern(self.OBJ, 'L')) == b'OK'
+        if info_largeobj(client)['largeobj_disk_used_bytes'] <= self.BUDGET + 1:
+            pytest.skip("the header fits in the inode here: no metadata block takes usage past the cap")
+        # Its one victim, the oldest short key, frees only its own size.
+        assert client.execute_command('BLOB.TCP_SET', 'after', position_pattern(self.OBJ, 'A')) == b'OK'
+        assert info_largeobj(client)['largeobj_disk_used_bytes'] <= self.BUDGET + 1
 
     def test_the_queue_is_cleared_once_no_evicted_key_is_left(self):
         """Keys deleted another way (here FLUSHALL) leave their queued entries stale. Once no
