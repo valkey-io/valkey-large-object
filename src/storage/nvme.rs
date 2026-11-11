@@ -27,67 +27,38 @@ static NVME_DISK_USAGE: AtomicU64 = AtomicU64::new(0);
 /// `init_disk_geometry`. One `IO_ALIGN` block until then, and in Dram mode.
 static DISK_ALLOC_UNIT: AtomicU64 = AtomicU64::new(super::IO_ALIGN as u64);
 
-/// Disk space each file's inode takes, set once at startup by `init_disk_geometry`.
-/// XFS allocates inodes from free space; other filesystems (ext4) set them aside at
-/// mkfs, so they take none. 0 until then, and in Dram mode.
+/// Disk space each file's inode takes, set once at startup by `init_disk_geometry`:
+/// XFS allocates inodes from free space, ext4 reserves them at mkfs (0). 0 in Dram mode.
 static DISK_INODE_SIZE: AtomicU64 = AtomicU64::new(0);
 
-/// Bytes the filesystem allocates for a file of `len` bytes: its data, plus its inode.
-/// On a striped XFS, a file of at least one stripe unit starts on a stripe-unit
-/// boundary, so the rest of its last stripe unit can't hold another such file: charge
-/// `len` rounded up to the unit. Charging only `len` lets the filesystem fill up before
-/// disk-maxmemory is reached. XFS aligns only allocations of at least one stripe unit
-/// (`xfs_bmapi_allocate`), and every object file is allocated in one `fallocate`
-/// (`preallocate`), so a shorter file takes only its own blocks: charge `len`, already
-/// `IO_ALIGN`-aligned.
-pub fn allocated_disk_bytes(len: u64) -> u64 {
-    data_disk_bytes(len) + DISK_INODE_SIZE.load(Ordering::Relaxed)
+/// What a file of `disk_len` bytes is charged before it is written: its data and its
+/// inode. On a striped XFS, a file of at least one stripe unit starts on a stripe-unit
+/// boundary, so the rest of its last stripe unit can't hold another such file: its data
+/// is charged rounded up to the unit. A shorter file takes only its own blocks.
+pub fn allocated_disk_bytes(disk_len: u64) -> u64 {
+    data_disk_bytes(disk_len) + DISK_INODE_SIZE.load(Ordering::Relaxed)
 }
 
-/// The data part of `allocated_disk_bytes`: `len`, rounded up to the allocation unit
-/// once it is at least one unit long.
-fn data_disk_bytes(len: u64) -> u64 {
+/// The data part of `allocated_disk_bytes`.
+fn data_disk_bytes(disk_len: u64) -> u64 {
     let unit = DISK_ALLOC_UNIT.load(Ordering::Relaxed);
-    if len >= unit {
-        len.next_multiple_of(unit)
+    if disk_len >= unit {
+        disk_len.next_multiple_of(unit)
     } else {
-        len
+        disk_len
     }
 }
 
-/// Bytes per `st_blocks` unit. `stat(2)` counts allocated space in 512-byte units on
-/// every filesystem, whatever its block size (glibc's `S_BLKSIZE`, which the `libc`
-/// crate does not export).
+/// Bytes per `st_blocks` unit, on every filesystem (glibc's `S_BLKSIZE`).
 pub const ST_BLOCKS_UNIT: u64 = 512;
 
-/// Bytes the filesystem allocated for a file of `len` bytes beyond what
-/// `allocated_disk_bytes` already charged for its data, from its `st_blocks`.
-/// `st_blocks` counts the file's data blocks and the blocks of its metadata that are not
-/// in the inode (XFS: `i_nblocks`, "direct & btree blocks"); it never counts the inode
-/// itself, which `allocated_disk_bytes` charges. Every object file is allocated in one
-/// `fallocate` of `len` (`preallocate`) in blocks that divide `IO_ALIGN`, and every
-/// write lands inside it, so its data takes `len` and anything more is one of:
-/// - An attribute block: the header xattr does not fit in the inode's free space. On a
-///   512-byte XFS inode it fits up to about 223 bytes (measured next to a 33-byte
-///   SELinux label), so the largest header (`FILE_HEADER_MAX_LEN`) never spills; on
-///   ext4 a 256-byte inode keeps only about 68 bytes inline, so a long key spills.
-/// - An extent-tree block: the file is in more extents than its inode can list (about
-///   15-20 on a 512-byte XFS inode). One `fallocate` returns many extents when free
-///   space is fragmented, as on a nearly full disk where evictions leave holes, so
-///   this can happen on any filesystem and is charged rather than asserted away.
-/// - Data padding the filesystem adds: an XFS extent-size hint (inherited from
-///   disk-dir) rounds the allocation up to the hint, ext4 bigalloc to its cluster, and
-///   without `fallocate` support (`EOPNOTSUPP`) extending writes may preallocate past
-///   EOF.
-///
-/// Only blocks beyond the data charge count, so padding up to the allocation unit,
-/// which `allocated_disk_bytes` charges whether or not the filesystem allocates it, is
-/// charged once. The cost of that: on a striped XFS, a metadata block of a file at
-/// least one unit long is not charged while it fits in that padding. Any error is an
-/// overcharge or such an absorbed block, never a credit beyond what was charged:
-/// `Drop` and eviction release the recorded charge.
-pub fn metadata_disk_bytes(len: u64, blocks: u64) -> u64 {
-    (blocks * ST_BLOCKS_UNIT).saturating_sub(data_disk_bytes(len))
+/// What a written file of `disk_len` bytes takes beyond its data charge, from its
+/// `st_blocks` (which never counts the inode). Usually 0. Nonzero for an xattr block
+/// when the header does not fit in the inode, extent-tree blocks when `fallocate`
+/// returns many extents (fragmented free space), or padding the filesystem adds past
+/// the allocation unit (an extent-size hint, ext4 bigalloc).
+pub fn metadata_disk_bytes(disk_len: u64, blocks: u64) -> u64 {
+    (blocks * ST_BLOCKS_UNIT).saturating_sub(data_disk_bytes(disk_len))
 }
 
 /// `_IOR('X', 100, struct xfs_fsop_geom_v1)`: fills the 112-byte geometry struct
@@ -241,9 +212,7 @@ fn evict_and_reserve(bytes: u64) -> bool {
         cur + bytes.min(max.saturating_sub(cur))
     });
     let taken = bytes.min(max.saturating_sub(prev));
-    // Everything above the cap once `bytes` is added, so a usage already over it (a
-    // file's metadata blocks are charged uncapped) is evicted for too. Equals
-    // `bytes - taken` while `prev <= max`.
+    // Also evict for any usage already above the cap (metadata blocks are charged uncapped).
     let need = (prev + bytes).saturating_sub(max);
     let mut victims = Vec::new();
     let mut covered = 0;
@@ -254,14 +223,14 @@ fn evict_and_reserve(bytes: u64) -> bool {
         // Read off the server lock, before the claim queues it.
         let hint = read_key_hint(oid);
         // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
-        // Credits what the file was charged (its ObjectFile's `disk_bytes`).
-        let Some((unevictable, victim_bytes)) =
+        // Credits what the file was charged (its eviction-candidate entry).
+        let Some((unevictable, victim_disk_bytes)) =
             with_server_lock(|_| super::object_file::claim_victim(oid, hint))
         else {
             continue;
         };
-        covered += victim_bytes;
-        victims.push((unevictable, victim_bytes));
+        covered += victim_disk_bytes;
+        victims.push((unevictable, victim_disk_bytes));
     }
     // No lock.
     let freed = evict(victims);
@@ -592,13 +561,12 @@ pub fn open_nvme_file_for_write(
     Ok(fd)
 }
 
-/// Allocate all `len` bytes of a new object file in one `fallocate`, so its data blocks
-/// are exactly `len` (`allocated_disk_bytes`, `metadata_disk_bytes`) and every O_DIRECT
-/// chunk write lands inside EOF. Extending writes make XFS take the inode IOLOCK
-/// exclusive (serializing the object's parallel chunk writes), allocate extents inside
-/// each write, and preallocate past EOF. EOPNOTSUPP keeps extending writes.
-pub fn preallocate(fd: RawFd, len: u64) -> std::io::Result<()> {
-    if unsafe { libc::fallocate(fd, 0, 0, len as libc::off_t) } != 0 {
+/// Allocate all `disk_len` bytes of a new object file in one `fallocate`, so every
+/// O_DIRECT chunk write lands inside EOF. Extending writes make XFS take the inode
+/// IOLOCK exclusive (serializing the object's parallel chunk writes), allocate extents
+/// inside each write, and preallocate past EOF. EOPNOTSUPP keeps extending writes.
+pub fn preallocate(fd: RawFd, disk_len: u64) -> std::io::Result<()> {
+    if unsafe { libc::fallocate(fd, 0, 0, disk_len as libc::off_t) } != 0 {
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::EOPNOTSUPP) {
             return Err(e);
@@ -753,12 +721,12 @@ mod tests {
         let _g = lock();
         let unit = DISK_ALLOC_UNIT.swap(1 << 20, Ordering::Relaxed);
         let blocks = |bytes: u64| bytes / ST_BLOCKS_UNIT;
-        let len = (1 << 20) + 4096;
+        let disk_len = (1 << 20) + 4096;
         // An extent-size hint padded the allocation to the unit `allocated_disk_bytes`
         // already charged: nothing more.
-        assert_eq!(metadata_disk_bytes(len, blocks(2 << 20)), 0);
+        assert_eq!(metadata_disk_bytes(disk_len, blocks(2 << 20)), 0);
         // Padded to two units: the second is charged once, here.
-        assert_eq!(metadata_disk_bytes(len, blocks(3 << 20)), 1 << 20);
+        assert_eq!(metadata_disk_bytes(disk_len, blocks(3 << 20)), 1 << 20);
         // Below one unit nothing is padded: an attribute block is charged.
         assert_eq!(metadata_disk_bytes(8192, blocks(8192 + 4096)), 4096);
         DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);

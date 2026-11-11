@@ -221,14 +221,14 @@ impl ObjectFile {
     /// handle's `Drop` releases it. Returns `None` if the reservation or any I/O fails
     /// (COPY then fails the command rather than aborting the node), leaving no partial
     /// file behind.
-    pub fn copy(&self, len: u64, crc32c: Crc) -> Option<ObjectFile> {
+    pub fn copy(&self, obj_len: u64, crc32c: Crc) -> Option<ObjectFile> {
         // We do not allow the eviction of the source or the new file mid-copy.
         let _source = UnevictableOID::new(self.object_id);
         // The source's file length, as its SET wrote it: `object_disk_len` aligns each
         // chunk, and every chunk but the last is a whole `chunk-size`, which config
-        // validation keeps a multiple of `IO_ALIGN`, so the total is `align_up(len)` for
+        // validation keeps a multiple of `IO_ALIGN`, so the total is `align_up(obj_len)` for
         // any valid chunk size (`test_object_disk_len_is_the_aligned_length`).
-        let disk_len = super::align_up(len as usize) as u64;
+        let disk_len = super::align_up(obj_len as usize) as u64;
         if !super::nvme::try_reserve_nvme_disk_usage(super::nvme::allocated_disk_bytes(disk_len)) {
             return None;
         }
@@ -236,7 +236,7 @@ impl ObjectFile {
         let _copy = UnevictableOID::new(new_oid);
         // Owns cleanup from here: Drop removes the file and releases disk budget.
         let copy = ObjectFile::new(new_oid, disk_len);
-        match self.copy_file(&copy, disk_len, len, crc32c) {
+        match self.copy_file(&copy, disk_len, obj_len, crc32c) {
             Ok(()) => Some(copy),
             Err(e) => {
                 valkey_module::logging::log_warning(format!(
@@ -254,7 +254,7 @@ impl ObjectFile {
         &self,
         copy: &ObjectFile,
         disk_len: u64,
-        len: u64,
+        obj_len: u64,
         crc32c: Crc,
     ) -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
@@ -272,7 +272,7 @@ impl ObjectFile {
         copy.write_header(
             dst.as_raw_fd(),
             disk_len,
-            len,
+            obj_len,
             crc32c,
             &super::KeyHint::default(),
         )
@@ -287,7 +287,7 @@ impl Drop for ObjectFile {
         let object_id = self.object_id;
         // Off the candidates, so no eviction can claim a file being torn down. `None`:
         // an eviction claimed it first, and owns its unlink and credit.
-        let charged = super::eviction_candidates::remove(object_id);
+        let disk_bytes = super::eviction_candidates::remove(object_id);
         // We do not allow the eviction of a file that is being torn down.
         let unevictable = UnevictableOID::new(object_id);
 
@@ -303,7 +303,7 @@ impl Drop for ObjectFile {
             // the listing exclude each other. We take the oid off the reclaim list, which
             // only this teardown can do now that the key is gone.
             let claimed_by_eviction = super::reclaim::RECLAIM_LIST.remove(&object_id);
-            match (charged, claimed_by_eviction) {
+            match (disk_bytes, claimed_by_eviction) {
                 // The eviction unlinks the file and credits its bytes.
                 (None, true) => {}
                 (Some(disk_bytes), false) => {
@@ -311,9 +311,9 @@ impl Drop for ObjectFile {
                     // Release exactly what was charged — no stat, so it can't drift.
                     crate::storage::nvme::decrease_nvme_disk_usage(disk_bytes);
                 }
-                (charged, claimed) => panic!(
+                (disk_bytes, claimed) => panic!(
                     "largeobj: object {object_id:?} torn down with candidate charge \
-                     {charged:?} and claimed_by_eviction={claimed}"
+                     {disk_bytes:?} and claimed_by_eviction={claimed}"
                 ),
             }
         };
