@@ -1507,6 +1507,20 @@ class TestTieredEvictionKeyHints(TieredBudget):
         assert self.reaped(client) == (1, 1)
         assert client.execute_command('EXISTS', at_cap, over_cap) == 0
 
+    def test_a_write_over_a_usage_past_the_cap_evicts_for_the_overshoot(self):
+        """A file's metadata blocks are charged without the cap, so usage can end above it. The
+        next write then evicts for that overshoot too, not only its own size, and succeeds."""
+        client = self.new_client()
+        set_objects(client, 'short_', self.PER_BUDGET, self.OBJ)
+        # A long name spills the header out of a small inode (ext4); a large one keeps it inline.
+        long_key = 'k' * 100
+        assert client.execute_command('BLOB.TCP_SET', long_key, position_pattern(self.OBJ, 'L')) == b'OK'
+        if info_largeobj(client)['largeobj_disk_used_bytes'] <= self.BUDGET + 1:
+            pytest.skip("the header fits in the inode here: no metadata block takes usage past the cap")
+        # Its one victim, the oldest short key, frees only its own size.
+        assert client.execute_command('BLOB.TCP_SET', 'after', position_pattern(self.OBJ, 'A')) == b'OK'
+        assert info_largeobj(client)['largeobj_disk_used_bytes'] <= self.BUDGET + 1
+
     def test_the_queue_is_cleared_once_no_evicted_key_is_left(self):
         """Keys deleted another way (here FLUSHALL) leave their queued entries stale. Once no
         evicted key is left, the reaper drops them instead of keeping them until the next

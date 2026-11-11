@@ -41,13 +41,18 @@ static DISK_INODE_SIZE: AtomicU64 = AtomicU64::new(0);
 /// (`preallocate`), so a shorter file takes only its own blocks: charge `len`, already
 /// `IO_ALIGN`-aligned.
 pub fn allocated_disk_bytes(len: u64) -> u64 {
+    data_disk_bytes(len) + DISK_INODE_SIZE.load(Ordering::Relaxed)
+}
+
+/// The data part of `allocated_disk_bytes`: `len`, rounded up to the allocation unit
+/// once it is at least one unit long.
+fn data_disk_bytes(len: u64) -> u64 {
     let unit = DISK_ALLOC_UNIT.load(Ordering::Relaxed);
-    let data = if len >= unit {
+    if len >= unit {
         len.next_multiple_of(unit)
     } else {
         len
-    };
-    data + DISK_INODE_SIZE.load(Ordering::Relaxed)
+    }
 }
 
 /// Bytes per `st_blocks` unit. `stat(2)` counts allocated space in 512-byte units on
@@ -55,13 +60,13 @@ pub fn allocated_disk_bytes(len: u64) -> u64 {
 /// crate does not export).
 pub const ST_BLOCKS_UNIT: u64 = 512;
 
-/// Bytes the filesystem allocated for a file of `len` bytes beyond its data, from its
-/// `st_blocks`. `st_blocks` counts the file's data blocks and the blocks of its metadata
-/// that are not in the inode (XFS: `i_nblocks`, "direct & btree blocks"); it never
-/// counts the inode itself, which `allocated_disk_bytes` charges. Every object file is
-/// allocated in full (`preallocate`, one `fallocate` of `len`) in blocks that divide
-/// `IO_ALIGN`, and every write lands inside it, so its data takes exactly `len` and
-/// anything more is metadata. Two kinds:
+/// Bytes the filesystem allocated for a file of `len` bytes beyond what
+/// `allocated_disk_bytes` already charged for its data, from its `st_blocks`.
+/// `st_blocks` counts the file's data blocks and the blocks of its metadata that are not
+/// in the inode (XFS: `i_nblocks`, "direct & btree blocks"); it never counts the inode
+/// itself, which `allocated_disk_bytes` charges. Every object file is allocated in one
+/// `fallocate` of `len` (`preallocate`) in blocks that divide `IO_ALIGN`, and every
+/// write lands inside it, so its data takes `len` and anything more is one of:
 /// - An attribute block: the header xattr does not fit in the inode's free space. On a
 ///   512-byte XFS inode it fits up to about 223 bytes (measured next to a 33-byte
 ///   SELinux label), so the largest header (`FILE_HEADER_MAX_LEN`) never spills; on
@@ -70,8 +75,19 @@ pub const ST_BLOCKS_UNIT: u64 = 512;
 ///   15-20 on a 512-byte XFS inode). One `fallocate` returns many extents when free
 ///   space is fragmented, as on a nearly full disk where evictions leave holes, so
 ///   this can happen on any filesystem and is charged rather than asserted away.
+/// - Data padding the filesystem adds: an XFS extent-size hint (inherited from
+///   disk-dir) rounds the allocation up to the hint, ext4 bigalloc to its cluster, and
+///   without `fallocate` support (`EOPNOTSUPP`) extending writes may preallocate past
+///   EOF.
+///
+/// Only blocks beyond the data charge count, so padding up to the allocation unit,
+/// which `allocated_disk_bytes` charges whether or not the filesystem allocates it, is
+/// charged once. The cost of that: on a striped XFS, a metadata block of a file at
+/// least one unit long is not charged while it fits in that padding. Any error is an
+/// overcharge or such an absorbed block, never a credit beyond what was charged:
+/// `Drop` and eviction release the recorded charge.
 pub fn metadata_disk_bytes(len: u64, blocks: u64) -> u64 {
-    (blocks * ST_BLOCKS_UNIT).saturating_sub(len)
+    (blocks * ST_BLOCKS_UNIT).saturating_sub(data_disk_bytes(len))
 }
 
 /// `_IOR('X', 100, struct xfs_fsop_geom_v1)`: fills the 112-byte geometry struct
@@ -222,7 +238,10 @@ fn evict_and_reserve(bytes: u64) -> bool {
         cur + bytes.min(max.saturating_sub(cur))
     });
     let taken = bytes.min(max.saturating_sub(prev));
-    let need = bytes - taken;
+    // Everything above the cap once `bytes` is added, so a usage already over it (a
+    // file's metadata blocks are charged uncapped) is evicted for too. Equals
+    // `bytes - taken` while `prev <= max`.
+    let need = (prev + bytes).saturating_sub(max);
     let mut victims = Vec::new();
     let mut covered = 0;
     for oid in super::eviction_candidates::pick(EVICT_BATCH, |_| true) {
@@ -727,7 +746,25 @@ mod tests {
     }
 
     #[test]
+    fn test_metadata_disk_bytes_charges_data_padding_once() {
+        let _g = lock();
+        let unit = DISK_ALLOC_UNIT.swap(1 << 20, Ordering::Relaxed);
+        let blocks = |bytes: u64| bytes / ST_BLOCKS_UNIT;
+        let len = (1 << 20) + 4096;
+        // An extent-size hint padded the allocation to the unit `allocated_disk_bytes`
+        // already charged: nothing more.
+        assert_eq!(metadata_disk_bytes(len, blocks(2 << 20)), 0);
+        // Padded to two units: the second is charged once, here.
+        assert_eq!(metadata_disk_bytes(len, blocks(3 << 20)), 1 << 20);
+        // Below one unit nothing is padded: an attribute block is charged.
+        assert_eq!(metadata_disk_bytes(8192, blocks(8192 + 4096)), 4096);
+        DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
+    }
+
+    #[test]
     fn test_metadata_disk_bytes_counts_blocks_beyond_the_data() {
+        // It reads DISK_ALLOC_UNIT, which other tests swap.
+        let _g = lock();
         // A directory of its own, so the test never touches another run's file.
         let dir = std::env::temp_dir().join(format!("lo-metadata-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
