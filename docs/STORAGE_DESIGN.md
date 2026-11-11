@@ -428,7 +428,7 @@ configured `disk-dir`: `{disk-dir}/{oid % disk-dir-shards:04x}/{oid:016x}.dat` (
 startup. Every create and unlink
 takes its directory's inode lock exclusively, so one directory would serialize
 them across all SETs and evictions. The
-runtime handle is `ObjectFile { object_id, disk_len }` (held behind
+runtime handle is `ObjectFile { object_id }` (held behind
 `Arc<ObjectFile>`); it stores no path and no fd — the path is derived from the OID
 and the fd is managed separately by the FdPool (§6.4).
 
@@ -1472,7 +1472,8 @@ lo_free(LoValue):
          - FdPool.remove(oid)      → drops the pool's Arc<ObjectFd> (fd closes when
                                       the last in-flight-read clone is also gone)
          - std::fs::remove_file(path)   (path derived from the ObjectId)
-         - decrease_nvme_disk_usage(disk_len)
+         - decrease_nvme_disk_usage(<its eviction-candidate entry's disk_bytes>),
+           unless an eviction claimed the file (it credits it instead)
      → Teardown runs inline on the dropping thread, EXCEPT if that thread is the
        Valkey main thread (is_main_thread()), in which case it is spawned onto
        tokio so the main thread never does blocking fs work.

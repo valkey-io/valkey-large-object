@@ -124,7 +124,9 @@ pub fn init_disk_geometry(dir: &str) -> Result<u64, String> {
     let block = fs.f_bsize as u64;
     if !io_align.is_multiple_of(block) {
         return Err(format!(
-            "disk-dir {dir} block size {block} B does not divide {io_align} B"
+            "disk-dir {dir} has a block size of {block} B, which does not divide the \
+             {io_align} B I/O alignment; put disk-dir on a filesystem with a block size of \
+             {io_align} B or less"
         ));
     }
     let mut stripe = 0;
@@ -155,7 +157,8 @@ pub fn init_disk_geometry(dir: &str) -> Result<u64, String> {
     Ok(unit)
 }
 
-/// Increment NVMe disk usage after a file is created.
+/// Increment NVMe disk usage, without the disk-maxmemory check: a file's metadata
+/// blocks, already allocated (`ObjectFile::write_header`).
 pub fn increase_nvme_disk_usage(bytes: u64) {
     NVME_DISK_USAGE.fetch_add(bytes, Ordering::Relaxed);
 }
@@ -252,13 +255,13 @@ fn evict_and_reserve(bytes: u64) -> bool {
         let hint = read_key_hint(oid);
         // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
         // Credits what the file was charged (its ObjectFile's `disk_bytes`).
-        let Some((unevictable, bytes)) =
+        let Some((unevictable, victim_bytes)) =
             with_server_lock(|_| super::object_file::claim_victim(oid, hint))
         else {
             continue;
         };
-        covered += bytes;
-        victims.push((unevictable, bytes));
+        covered += victim_bytes;
+        victims.push((unevictable, victim_bytes));
     }
     // No lock.
     let freed = evict(victims);
@@ -384,7 +387,7 @@ impl KeyHint {
 /// On-disk file header for NVMe object files, stored in the `FILE_HEADER_XATTR`
 /// xattr. The file itself holds only the payload, starting at offset 0.
 ///
-/// The struct's in-memory layout does NOT match the on-disk wire format --
+/// The struct's in-memory layout does NOT match the on-disk wire format —
 /// the compiler inserts padding for natural field alignment. Serialization
 /// is handled by `to_bytes` (sequential writes) and `from_bytes` (sequential
 /// reads with validation). Do not attempt to byte-cast this struct.

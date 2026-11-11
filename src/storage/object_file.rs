@@ -116,8 +116,9 @@ pub fn claim_victim(
     // Off the candidates, so no later eviction picks it.
     let disk_bytes = super::eviction_candidates::remove(oid)?;
     // Only a claim lists a file's oid, and it takes the oid off the candidates first.
+    let listed = super::reclaim::RECLAIM_LIST.insert(oid);
     assert!(
-        super::reclaim::RECLAIM_LIST.insert(oid),
+        listed,
         "largeobj: eviction candidate {oid:?} is already on the reclaim list"
     );
     let claim = UnevictableOID::insert(&mut unevictable, oid);
@@ -135,12 +136,12 @@ pub fn claim_victim(
 /// Existence handle for one version of an object's NVMe file. Always held behind an
 /// `Arc`; its
 /// `Drop` deregisters the read fd from the pool and unlinks the file once, when the
-/// last reference goes away.
+/// last reference goes away. The disk usage charged for the file is its
+/// eviction-candidate entry's `disk_bytes`, from `new` until `Drop` or the eviction
+/// that claims it.
 #[derive(Debug)]
 pub struct ObjectFile {
     /// Identity; the file path is *derived* (`ObjectId::file_path`), never stored.
-    /// The disk usage charged for the file is its eviction-candidate entry's
-    /// `disk_bytes`, from `new` until `Drop` or the eviction that claims it.
     object_id: ObjectId,
 }
 
@@ -183,8 +184,9 @@ impl ObjectFile {
         let bytes = super::nvme::metadata_disk_bytes(disk_len, st.st_blocks as u64);
         super::nvme::increase_nvme_disk_usage(bytes);
         // Unevictable since `new`, so no claim has taken its entry.
+        let recorded = super::eviction_candidates::add_disk_bytes(self.object_id, bytes);
         assert!(
-            super::eviction_candidates::add_disk_bytes(self.object_id, bytes),
+            recorded,
             "largeobj: object {:?} lost its eviction-candidate entry before its header",
             self.object_id
         );
