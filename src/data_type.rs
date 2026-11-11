@@ -321,7 +321,7 @@ unsafe extern "C" fn lo_rdb_load(
         );
     }
     let placeholder = LoValue::new(ObjectId::next(), 0, 0, None);
-    crate::storage::reclaim::RECLAIM_LIST.insert(placeholder.object_id);
+    crate::storage::reclaim::RECLAIM_LIST.insert(placeholder.object_id, None);
     Box::into_raw(Box::new(placeholder)) as *mut std::ffi::c_void
 }
 

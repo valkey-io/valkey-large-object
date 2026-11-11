@@ -101,9 +101,8 @@ pub fn unevictable_count() -> usize {
 /// takes `oid` off the candidates first (the claim fails) or finds it in the reclaim
 /// list. Call under the server lock.
 ///
-/// `hint`: the victim's key hint, if its file has one. A claimed victim's hint is
-/// queued for the reaper here, in the same server-lock hold as the reclaim-list insert,
-/// so no reaper tick sees the victim listed without it.
+/// `hint`: the victim's key hint, if its file has one. The reaper then deletes the key
+/// by name, else by scan.
 #[must_use]
 pub fn claim_victim(
     oid: ObjectId,
@@ -116,19 +115,12 @@ pub fn claim_victim(
     // Off the candidates, so no later eviction picks it.
     let disk_bytes = super::eviction_candidates::remove(oid)?;
     // Only a claim lists a file's oid, and it takes the oid off the candidates first.
-    let listed = super::reclaim::RECLAIM_LIST.insert(oid);
+    let listed = super::reclaim::RECLAIM_LIST.insert(oid, hint);
     assert!(
         listed,
         "largeobj: eviction candidate {oid:?} is already on the reclaim list"
     );
-    let claim = UnevictableOID::insert(&mut unevictable, oid);
-    // Queue after UNEVICTABLE is released, so its lock is never held with the queue's.
-    // The caller's server lock still covers the reclaim-list insert and this push.
-    drop(unevictable);
-    if let Some(hint) = hint {
-        super::reclaim::queue_delete_by_name(oid, hint);
-    }
-    Some((claim, disk_bytes))
+    Some((UnevictableOID::insert(&mut unevictable, oid), disk_bytes))
 }
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────

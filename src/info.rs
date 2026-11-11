@@ -97,12 +97,14 @@ fn evictions_section(ctx: &InfoContext) -> ValkeyResult<()> {
     ctx.builder()
         .add_section("evictions")
         .field("evictions", EVICTIONS.load(Ordering::Relaxed) as i64)?
-        // Evicted objects whose keys are not deleted yet.
+        // Ghost keys not yet freed: evicted objects (and RDB-load placeholders), including
+        // keys already deleted.
         .field(
             "pending_evictions",
             storage::reclaim::RECLAIM_LIST.len() as i64,
         )?
-        // Of those, queued for deletion by name (Tiered).
+        // Queued for deletion by name (Tiered). May include entries whose ghost key is
+        // already gone, until the reaper pops them.
         .field(
             "pending_evictions_by_name",
             storage::reclaim::pending_evictions_by_name() as i64,
