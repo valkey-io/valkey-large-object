@@ -303,9 +303,9 @@ lazy_static::lazy_static! {
     /// and deterministically exercise the delete-during-SET race.
     pub static ref CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS: AtomicI64 = AtomicI64::new(0);
 
-    /// Test-only: pause a Tiered eviction for this many milliseconds after it picks its
-    /// candidates and before it claims them. 0 = disabled. Lets an integration test take
-    /// the picked candidates away first.
+    /// Test-only: pause a Tiered eviction for this many milliseconds after each pick, before
+    /// it claims the picked candidate. 0 = disabled. Lets an integration test take the
+    /// picked candidate away first.
     pub static ref CFG_TEST_PAUSE_AFTER_EVICT_PICK_MS: AtomicI64 = AtomicI64::new(0);
 
     /// Test-only: pause the promotion leader for this many milliseconds after

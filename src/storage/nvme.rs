@@ -183,9 +183,6 @@ pub fn nvme_disk_usage() -> u64 {
 
 // ─── NVMe Eviction ───────────────────────────────────────────────────────────
 
-/// Candidates picked per eviction.
-const EVICT_BATCH: usize = 64;
-
 /// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
 /// tokio task) take it. Never call off main while holding it: it would deadlock.
 fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
@@ -216,37 +213,33 @@ fn evict_and_reserve(bytes: u64) -> bool {
     let need = (prev + bytes).saturating_sub(max);
     let mut victims = Vec::new();
     let mut covered = 0;
-    // Concurrent writes pick the same oldest candidates, and only one claims each. A write
-    // whose picks were all claimed by others picks again, past every oid it has tried:
-    // each pick returns only untried oids, so the loop ends when enough is covered or no
-    // evictable candidate is left.
+    // Oids whose claim failed. A claimed or torn-down oid leaves the candidates, but an
+    // unevictable one stays, so the next pick must skip it. Each pick returns an untried
+    // oid, so the loop ends once no evictable candidate is left.
     let mut tried = std::collections::HashSet::new();
-    'evict: while covered < need && victims.len() < super::cache_policy::RECLAIM_MAX_VICTIMS {
-        let batch = super::eviction_candidates::pick(EVICT_BATCH, |oid| !tried.contains(&oid));
-        if batch.is_empty() {
+    while covered < need && victims.len() < super::cache_policy::RECLAIM_MAX_VICTIMS {
+        // The oldest untried candidate, picked afresh each time: concurrent writes pick the
+        // same oldest one and only one claims it, so the others move on to the next.
+        let Some(oid) = super::eviction_candidates::pick(1, |oid| !tried.contains(&oid)).pop()
+        else {
             break;
-        }
-        tried.extend(batch.iter().copied());
+        };
+        tried.insert(oid);
         let pause_ms = crate::test_pause_after_evict_pick_ms();
         if pause_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(pause_ms));
         }
-        for oid in batch {
-            if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
-                break 'evict;
-            }
-            // Read off the server lock, before the claim queues it.
-            let hint = read_key_hint(oid);
-            // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
-            // Credits what the file was charged (its eviction-candidate entry).
-            let Some((unevictable, victim_disk_bytes)) =
-                with_server_lock(|_| super::object_file::claim_victim(oid, hint))
-            else {
-                continue;
-            };
-            covered += victim_disk_bytes;
-            victims.push((unevictable, victim_disk_bytes));
-        }
+        // Read off the server lock, before the claim queues it.
+        let hint = read_key_hint(oid);
+        // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
+        // Credits what the file was charged (its eviction-candidate entry).
+        let Some((unevictable, victim_disk_bytes)) =
+            with_server_lock(|_| super::object_file::claim_victim(oid, hint))
+        else {
+            continue;
+        };
+        covered += victim_disk_bytes;
+        victims.push((unevictable, victim_disk_bytes));
     }
     // No lock.
     let freed = evict(victims);

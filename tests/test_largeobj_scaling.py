@@ -1460,7 +1460,7 @@ class TestTieredEvictionRepick(TieredBudget):
 
         writer = threading.Thread(target=late_write)
         writer.start()
-        time.sleep(0.5)  # it has picked the old objects and is paused
+        time.sleep(0.5)  # it has picked the oldest object and is paused
         # Take every picked candidate away, then fill the cap with new ones. The paused write
         # still holds the 1 byte of headroom it took.
         client.execute_command('DEL', *old)
