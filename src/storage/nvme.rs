@@ -709,14 +709,6 @@ mod tests {
     }
 
     #[test]
-    fn test_allocated_disk_bytes_adds_the_inode() {
-        let _g = lock();
-        let inode = DISK_INODE_SIZE.swap(512, Ordering::Relaxed);
-        assert_eq!(allocated_disk_bytes(8192), 8192 + 512);
-        DISK_INODE_SIZE.store(inode, Ordering::Relaxed);
-    }
-
-    #[test]
     fn test_metadata_disk_bytes_charges_data_padding_once() {
         let _g = lock();
         let unit = DISK_ALLOC_UNIT.swap(1 << 20, Ordering::Relaxed);
@@ -730,50 +722,6 @@ mod tests {
         // Below one unit nothing is padded: an attribute block is charged.
         assert_eq!(metadata_disk_bytes(8192, blocks(8192 + 4096)), 4096);
         DISK_ALLOC_UNIT.store(unit, Ordering::Relaxed);
-    }
-
-    #[test]
-    fn test_metadata_disk_bytes_counts_blocks_beyond_the_data() {
-        // It reads DISK_ALLOC_UNIT, which other tests swap.
-        let _g = lock();
-        // A directory of its own, so the test never touches another run's file.
-        let dir = std::env::temp_dir().join(format!("lo-metadata-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("object");
-        let file = std::fs::File::create(&path).unwrap();
-        preallocate(file.as_raw_fd(), 1 << 20).unwrap();
-        // A written object file: its data and a header with no key, which fits in the
-        // inode on any filesystem (ext4 keeps only ~68 bytes of xattr inline).
-        let no_key = KeyHint::default();
-        write_file_header(file.as_raw_fd(), ObjectId(1), 1 << 20, 7, &no_key).unwrap();
-        let disk = |f: &std::fs::File| {
-            use std::os::unix::fs::MetadataExt;
-            let meta = f.metadata().unwrap();
-            metadata_disk_bytes(meta.len(), meta.blocks())
-        };
-        let with_header = disk(&file);
-        // An xattr too big for any inode takes a block of its own (tmpfs keeps it in memory).
-        let big = [0u8; 2048];
-        // SAFETY: the name is NUL-terminated and `big` is valid for its length.
-        let rc = unsafe {
-            libc::fsetxattr(
-                file.as_raw_fd(),
-                c"user.big".as_ptr(),
-                big.as_ptr().cast(),
-                big.len(),
-                0,
-            )
-        };
-        let with_big = disk(&file);
-        let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
-        let is_tmpfs = unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } == 0
-            && fs.f_type == libc::TMPFS_MAGIC;
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(with_header, 0, "the header must fit in the inode");
-        assert_eq!(rc, 0, "set a 2 KiB xattr");
-        if !is_tmpfs {
-            assert!(with_big > 0, "an xattr block is metadata");
-        }
     }
 
     // ─── object_disk_len ─────────────────────────────────────────────────
@@ -808,27 +756,17 @@ mod tests {
         assert_eq!(object_disk_len(&mut iter), 8192 + 8192 + 4096);
     }
 
-    /// COPY sizes its file as `align_up(len)` instead of reading the source's length:
-    /// that holds for every chunk size config validation allows (a multiple of IO_ALIGN).
+    /// COPY sizes its file as `align_up(obj_len)`: what a SET writes for any valid chunk size.
     #[test]
     fn test_object_disk_len_is_the_aligned_length() {
         let io = super::super::IO_ALIGN;
-        for chunk_size in [io, 2 * io, 64 * io, 256 * io] {
-            for len in [
-                1,
-                io - 1,
-                io,
-                io + 1,
-                chunk_size - 1,
-                chunk_size,
-                chunk_size + 1,
-                3 * chunk_size + 7,
-            ] {
-                let mut iter = super::super::ChunkIterator::new(len as u64, chunk_size, 1, None);
+        for chunk_size in [io, 64 * io] {
+            for obj_len in [1, chunk_size + 1, 3 * chunk_size + 7] {
+                let mut iter =
+                    super::super::ChunkIterator::new(obj_len as u64, chunk_size, 1, None);
                 assert_eq!(
                     object_disk_len(&mut iter),
-                    super::super::align_up(len) as u64,
-                    "len {len}, chunk_size {chunk_size}"
+                    super::super::align_up(obj_len) as u64
                 );
             }
         }

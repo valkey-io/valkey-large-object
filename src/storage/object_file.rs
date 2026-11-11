@@ -224,10 +224,8 @@ impl ObjectFile {
     pub fn copy(&self, obj_len: u64, crc32c: Crc) -> Option<ObjectFile> {
         // We do not allow the eviction of the source or the new file mid-copy.
         let _source = UnevictableOID::new(self.object_id);
-        // The source's file length, as its SET wrote it: `object_disk_len` aligns each
-        // chunk, and every chunk but the last is a whole `chunk-size`, which config
-        // validation keeps a multiple of `IO_ALIGN`, so the total is `align_up(obj_len)` for
-        // any valid chunk size (`test_object_disk_len_is_the_aligned_length`).
+        // The source's file length: chunk-size is a multiple of IO_ALIGN, so a SET's file
+        // is `align_up(obj_len)`.
         let disk_len = super::align_up(obj_len as usize) as u64;
         if !super::nvme::try_reserve_nvme_disk_usage(super::nvme::allocated_disk_bytes(disk_len)) {
             return None;
