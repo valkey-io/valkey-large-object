@@ -8,6 +8,7 @@ import pytest
 from valkey import ResponseError, Valkey
 from valkey_largeobj_test_case import (
     DISK_INODE,
+    ST_BLOCKS_UNIT,
     MIB,
     ORDER_CHUNK_SIZE,
     ORDER_OBJECT_LEN,
@@ -100,7 +101,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert length == len(payload_multi)
         assert (db, header[26:]) == (0, b'rt_multi') and key_len == len(b'rt_multi')
         st = os.stat(dat_files[-1])
-        assert st.st_blocks * 512 == st.st_size, "object file has a metadata block"
+        assert st.st_blocks * ST_BLOCKS_UNIT == st.st_size, "object file has a metadata block"
         with open(dat_files[-1], 'rb') as f:
             data_on_disk = f.read(len(payload_multi))
             assert data_on_disk == payload_multi, "On-disk data at offset 0 mismatch"

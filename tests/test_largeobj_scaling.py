@@ -29,7 +29,7 @@ from contextlib import contextmanager
 import pytest
 from valkey import OutOfMemoryError, ResponseError
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import DISK_INODE, ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
+from valkey_largeobj_test_case import DISK_INODE, ST_BLOCKS_UNIT, ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
 
 # 900KB in a 1MB segment: one object of this size fills a segment by itself.
 SEGMENT_FILLING_SIZE = 900 * 1024
@@ -794,7 +794,7 @@ class TieredBudget(Budget):
         def settled():
             info = info_largeobj(client)
             files = self.object_files()
-            on_disk = sum(os.stat(os.path.join(self.data_dir, name)).st_blocks * 512 + DISK_INODE
+            on_disk = sum(os.stat(os.path.join(self.data_dir, name)).st_blocks * ST_BLOCKS_UNIT + DISK_INODE
                           for name in files)
             return (info['largeobj_disk_unevictable_objects'] == 0
                     and info['largeobj_disk_used_bytes'] == on_disk

@@ -50,14 +50,28 @@ pub fn allocated_disk_bytes(len: u64) -> u64 {
     data + DISK_INODE_SIZE.load(Ordering::Relaxed)
 }
 
-/// Blocks the filesystem allocated for a file of `len` bytes in `blocks` 512-byte
-/// units (`st_blocks`) beyond its data: an xattr block if the header doesn't fit in
-/// the inode, or an extent-tree block if the file is in too many extents to list in
-/// the inode. Charged on top of `allocated_disk_bytes`. Every object file is allocated
-/// in full (`preallocate`) in blocks that divide `IO_ALIGN`, so its data blocks are
-/// exactly its length.
+/// Bytes per `st_blocks` unit. `stat(2)` counts allocated space in 512-byte units on
+/// every filesystem, whatever its block size (glibc's `S_BLKSIZE`, which the `libc`
+/// crate does not export).
+pub const ST_BLOCKS_UNIT: u64 = 512;
+
+/// Bytes the filesystem allocated for a file of `len` bytes beyond its data, from its
+/// `st_blocks`. `st_blocks` counts the file's data blocks and the blocks of its metadata
+/// that are not in the inode (XFS: `i_nblocks`, "direct & btree blocks"); it never
+/// counts the inode itself, which `allocated_disk_bytes` charges. Every object file is
+/// allocated in full (`preallocate`, one `fallocate` of `len`) in blocks that divide
+/// `IO_ALIGN`, and every write lands inside it, so its data takes exactly `len` and
+/// anything more is metadata. Two kinds:
+/// - An attribute block: the header xattr does not fit in the inode's free space. On a
+///   512-byte XFS inode it fits up to about 223 bytes (measured next to a 33-byte
+///   SELinux label), so the largest header (`FILE_HEADER_MAX_LEN`) never spills; on
+///   ext4 a 256-byte inode keeps only about 68 bytes inline, so a long key spills.
+/// - An extent-tree block: the file is in more extents than its inode can list (about
+///   15-20 on a 512-byte XFS inode). One `fallocate` returns many extents when free
+///   space is fragmented, as on a nearly full disk where evictions leave holes, so
+///   this can happen on any filesystem and is charged rather than asserted away.
 pub fn metadata_disk_bytes(len: u64, blocks: u64) -> u64 {
-    (blocks * 512).saturating_sub(len)
+    (blocks * ST_BLOCKS_UNIT).saturating_sub(len)
 }
 
 /// `_IOR('X', 100, struct xfs_fsop_geom_v1)`: fills the 112-byte geometry struct
@@ -801,7 +815,7 @@ mod tests {
         let meta = meta.expect("open for write").expect("stat");
         assert_eq!(meta.len(), disk_len);
         assert!(
-            meta.blocks() * 512 >= disk_len,
+            meta.blocks() * ST_BLOCKS_UNIT >= disk_len,
             "blocks are reserved at open"
         );
     }

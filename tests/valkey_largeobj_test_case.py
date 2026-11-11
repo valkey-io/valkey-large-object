@@ -43,6 +43,10 @@ def disk_inode_size(directory):
     return int.from_bytes(geometry[24:28], 'little')
 
 
+# Bytes per st_blocks unit: stat(2) counts allocated space in 512-byte units on every
+# filesystem (glibc's S_BLKSIZE; Python's os module does not export it).
+ST_BLOCKS_UNIT = 512
+
 # Every test keeps its files under test-data (the framework's testdir).
 os.makedirs("test-data", exist_ok=True)
 DISK_INODE = disk_inode_size("test-data")
