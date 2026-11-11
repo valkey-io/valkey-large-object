@@ -40,7 +40,7 @@ pub static RECLAIM_LIST: LazyLock<ReclaimList> = LazyLock::new(ReclaimList::defa
 /// How the reaper deletes a listed oid's key.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum KeyState {
-    /// Queued on `by_name`; the scan does not run for it.
+    /// Queued on `by_name`, which the reaper empties before it scans: never the scan's.
     ByName,
     /// Found by scan: no hint, or its key no longer held it when looked up by name.
     ByScan,
@@ -292,7 +292,7 @@ fn delete_keys_by_name(ctx: &Context, deadline: Instant) {
 }
 
 /// Scan the next hashtable bucket of the selected db. Returns the bucket's keys
-/// whose oids are listed and not yet deleted, and whether the db has more buckets.
+/// whose oids are `ByScan`, and whether the db has more buckets.
 ///
 /// Only collects, never deletes: core reads each scanned value after the scan
 /// callback returns (`moduleCloseKey`), so unlinking a key inside the callback
@@ -312,11 +312,7 @@ fn listed_keys_in_next_bucket(
         let Some(Ok(Some(lo))) = key.map(|k| k.get_value::<LoValue>(&LO_TYPE)) else {
             return;
         };
-        // A `ByName` key found first is deleted here too.
-        if matches!(
-            ghost_keys.states.get(&lo.object_id),
-            Some(KeyState::ByName | KeyState::ByScan)
-        ) {
+        if ghost_keys.states.get(&lo.object_id) == Some(&KeyState::ByScan) {
             listed.borrow_mut().push((name, lo.object_id));
         }
     });
