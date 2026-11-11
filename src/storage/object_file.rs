@@ -94,25 +94,32 @@ pub fn unevictable_count() -> usize {
         .count()
 }
 
-/// Claim `oid` for eviction: add it to the reclaim list and the unevictable list,
-/// unless it is in either already, and take it off the eviction candidates. One
-/// `UNEVICTABLE` critical section, so a teardown either adds `oid` to the unevictable
-/// list first (the claim fails) or finds it in the reclaim list. Call under the server
-/// lock.
+/// Claim `oid` for eviction: take it off the eviction candidates and add it to the
+/// reclaim list and the unevictable list. Returns the claim and the `disk_bytes` its
+/// eviction credits, or `None` if it is unevictable or no longer a candidate (torn down
+/// or claimed since the pick). One `UNEVICTABLE` critical section, so a teardown either
+/// takes `oid` off the candidates first (the claim fails) or finds it in the reclaim
+/// list. Call under the server lock.
 ///
 /// `hint`: the victim's key hint, if its file has one. A claimed victim's hint is
 /// queued for the reaper here, in the same server-lock hold as the reclaim-list insert,
 /// so no reaper tick sees the victim listed without it.
 #[must_use]
-pub fn claim_victim(oid: ObjectId, hint: Option<super::KeyHint>) -> Option<Arc<UnevictableOID>> {
+pub fn claim_victim(
+    oid: ObjectId,
+    hint: Option<super::KeyHint>,
+) -> Option<(Arc<UnevictableOID>, u64)> {
     let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
-    if unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0)
-        || !super::reclaim::RECLAIM_LIST.insert(oid)
-    {
+    if unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0) {
         return None;
     }
-    // Claimed: no later eviction may pick it.
-    super::eviction_candidates::remove(oid);
+    // Off the candidates, so no later eviction picks it.
+    let disk_bytes = super::eviction_candidates::remove(oid)?;
+    // Only a claim lists a file's oid, and it takes the oid off the candidates first.
+    assert!(
+        super::reclaim::RECLAIM_LIST.insert(oid),
+        "largeobj: eviction candidate {oid:?} is already on the reclaim list"
+    );
     let claim = UnevictableOID::insert(&mut unevictable, oid);
     // Queue after UNEVICTABLE is released, so its lock is never held with the queue's.
     // The caller's server lock still covers the reclaim-list insert and this push.
@@ -120,7 +127,7 @@ pub fn claim_victim(oid: ObjectId, hint: Option<super::KeyHint>) -> Option<Arc<U
     if let Some(hint) = hint {
         super::reclaim::queue_delete_by_name(oid, hint);
     }
-    Some(claim)
+    Some((claim, disk_bytes))
 }
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
@@ -135,8 +142,9 @@ pub struct ObjectFile {
     object_id: ObjectId,
     /// File length.
     disk_len: u64,
-    /// Disk usage charged for the file, released on `Drop`: its `allocated_disk_bytes`,
-    /// plus its `metadata_disk_bytes` once `write_header` has run.
+    /// Disk usage charged for the file: its `allocated_disk_bytes`, plus its
+    /// `metadata_disk_bytes` once `write_header` has run. Released by `Drop`, or by the
+    /// eviction that claims the file, which reads it from the eviction candidates.
     disk_bytes: u64,
 }
 
@@ -144,9 +152,9 @@ impl ObjectFile {
     /// Construct the handle for a newly committed object version whose file already
     /// exists on NVMe. No read fd is open yet — it opens lazily on the first GET via
     /// `ensure_open`. `disk_len` is the file length; `Drop` releases the
-    /// `allocated_disk_bytes` reserved for it.
+    /// `allocated_disk_bytes` reserved for it. Not an eviction candidate until
+    /// `write_header`.
     pub fn new(object_id: ObjectId, disk_len: u64) -> Self {
-        super::eviction_candidates::insert(object_id);
         Self {
             object_id,
             disk_len,
@@ -154,13 +162,13 @@ impl ObjectFile {
         }
     }
 
-    /// Write the file's header through `fd`, its last write once the payload is on
-    /// disk (O_DIRECT, or synced, so its blocks are final), then charge the blocks the
-    /// file took beyond its data (`metadata_disk_bytes`), as eviction's stat credits
-    /// them. Charged without a
-    /// disk-maxmemory check: the blocks are already allocated, and the next
-    /// reservation evicts for them. On error, `Drop` still unlinks the file and
-    /// releases what was charged.
+    /// Write the file's header through `fd`, its last write once the payload is
+    /// written, then charge the blocks the file took beyond its data
+    /// (`metadata_disk_bytes`) and make it an eviction candidate with the whole charge,
+    /// so `Drop` and eviction release the same amount. Charged without a disk-maxmemory
+    /// check: the blocks are already allocated, and the next reservation evicts for
+    /// them. The caller holds the file unevictable until then. On error, `Drop` still
+    /// unlinks the file and releases what was charged.
     pub fn write_header(
         &mut self,
         fd: RawFd,
@@ -183,6 +191,7 @@ impl ObjectFile {
         let bytes = super::nvme::metadata_disk_bytes(self.disk_len, st.st_blocks as u64);
         super::nvme::increase_nvme_disk_usage(bytes);
         self.disk_bytes += bytes;
+        super::eviction_candidates::insert(self.object_id, self.disk_bytes);
         Ok(())
     }
 
@@ -204,8 +213,7 @@ impl ObjectFile {
     /// Copy this file into a new object version: allocates a fresh `ObjectId`, copies the
     /// payload byte-for-byte, then writes a header carrying the new OID with this
     /// object's `len`/`crc32c`. `fsync`s the payload before the header, so the file is
-    /// on disk before it is exposed to O_DIRECT reads via io_uring, and its blocks are
-    /// final when the header write charges them.
+    /// on disk before it is exposed to O_DIRECT reads via io_uring.
     ///
     /// Reserves `disk_len` against disk-maxmemory up front; the returned handle's `Drop`
     /// releases it. Returns `None` if the reservation or any I/O fails (COPY then fails
@@ -305,8 +313,8 @@ mod tests {
     #[test]
     fn test_a_claimed_victim_leaves_the_eviction_candidates() {
         let oid = ObjectId(9_500);
-        eviction_candidates::insert(oid);
-        let claim = claim_victim(oid, None).expect("not claimed yet");
+        eviction_candidates::insert(oid, 0);
+        let (claim, _) = claim_victim(oid, None).expect("not claimed yet");
         assert!(eviction_candidates::pick(usize::MAX, |o| o == oid).is_empty());
         drop(claim);
         RECLAIM_LIST.remove(&oid);

@@ -18,29 +18,30 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use hashlink::LinkedHashSet;
+use hashlink::{LinkedHashMap, LinkedHashSet};
 use valkey_module::{Context, NotifyEvent};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 
-/// Exact least-recently-used order: the least recently used oid is first in each set.
-/// `ttl` holds the oids of `all` whose key has a TTL.
+/// Exact least-recently-used order: the least recently used oid is first in each.
+/// `all` maps every oid to its `disk_bytes` (`insert`); `ttl` holds the oids of `all`
+/// whose key has a TTL.
 #[derive(Default)]
 struct Lru {
-    all: LinkedHashSet<ObjectId>,
+    all: LinkedHashMap<ObjectId, u64>,
     ttl: LinkedHashSet<ObjectId>,
 }
 
 impl Lru {
     fn touch(&mut self, oid: ObjectId) {
-        if self.all.to_back(&oid) {
+        if self.all.to_back(&oid).is_some() {
             self.ttl.to_back(&oid);
         }
     }
 
     /// A TTL change is a use, as in core (EXPIRE and PERSIST touch the key).
     fn set_ttl(&mut self, oid: ObjectId, has_ttl: bool) {
-        if !self.all.to_back(&oid) {
+        if self.all.to_back(&oid).is_none() {
             // Evicted: the key lingers until the reclaim cron deletes it.
             return;
         }
@@ -51,9 +52,9 @@ impl Lru {
         }
     }
 
-    fn remove(&mut self, oid: ObjectId) {
-        self.all.remove(&oid);
+    fn remove(&mut self, oid: ObjectId) -> Option<u64> {
         self.ttl.remove(&oid);
+        self.all.remove(&oid)
     }
 
     fn oldest(
@@ -62,12 +63,14 @@ impl Lru {
         n: usize,
         mut take: impl FnMut(ObjectId) -> bool,
     ) -> Vec<ObjectId> {
-        let list = if volatile { &self.ttl } else { &self.all };
-        list.iter()
-            .copied()
-            .filter(|&oid| take(oid))
-            .take(n)
-            .collect()
+        let mut first = |oids: &mut dyn Iterator<Item = &ObjectId>| -> Vec<ObjectId> {
+            oids.copied().filter(|&oid| take(oid)).take(n).collect()
+        };
+        if volatile {
+            first(&mut self.ttl.iter())
+        } else {
+            first(&mut self.all.keys())
+        }
     }
 }
 
@@ -85,10 +88,12 @@ fn candidates() -> MutexGuard<'static, EvictionCandidates> {
 }
 
 /// A new object exists: Dram, its buffers are in the DRAMPool; Tiered, its file is on NVMe.
-pub fn insert(oid: ObjectId) {
+/// `disk_bytes`: Tiered, the disk usage charged for its file, which its eviction credits
+/// back; Dram, 0 (eviction frees segments, not disk).
+pub fn insert(oid: ObjectId, disk_bytes: u64) {
     match &mut *candidates() {
         EvictionCandidates::Lru(lru) => {
-            lru.all.insert(oid);
+            lru.all.insert(oid, disk_bytes);
         }
     }
 }
@@ -100,8 +105,9 @@ pub fn touch(oid: ObjectId) {
     }
 }
 
-/// The object is evicted or gone: no eviction may pick it again.
-pub fn remove(oid: ObjectId) {
+/// The object is evicted or gone: no eviction may pick it again. Returns its `disk_bytes`,
+/// or `None` if it was not a candidate.
+pub fn remove(oid: ObjectId) -> Option<u64> {
     match &mut *candidates() {
         EvictionCandidates::Lru(lru) => lru.remove(oid),
     }
@@ -195,7 +201,7 @@ mod tests {
     fn lru(oids: std::ops::Range<u64>) -> Lru {
         let mut lru = Lru::default();
         for oid in oids {
-            lru.all.insert(ObjectId(oid));
+            lru.all.insert(ObjectId(oid), 0);
         }
         lru
     }

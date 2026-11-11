@@ -209,7 +209,6 @@ fn evict_and_reserve(bytes: u64) -> bool {
     });
     let taken = bytes.min(max.saturating_sub(prev));
     let need = bytes - taken;
-    // Claim, then stat: a claimed file cannot change under us.
     let mut victims = Vec::new();
     let mut covered = 0;
     for oid in super::eviction_candidates::pick(EVICT_BATCH, |_| true) {
@@ -219,24 +218,14 @@ fn evict_and_reserve(bytes: u64) -> bool {
         // Read off the server lock, before the claim queues it.
         let hint = read_key_hint(oid);
         // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
-        let Some(unevictable) = with_server_lock(|_| super::object_file::claim_victim(oid, hint))
+        // Credits what the file was charged (its ObjectFile's `disk_bytes`).
+        let Some((unevictable, bytes)) =
+            with_server_lock(|_| super::object_file::claim_victim(oid, hint))
         else {
             continue;
         };
-        match stat(oid) {
-            Some(meta) => {
-                // What the file was charged: its ObjectFile's `disk_bytes`.
-                use std::os::unix::fs::MetadataExt;
-                let bytes = allocated_disk_bytes(meta.len())
-                    + metadata_disk_bytes(meta.len(), meta.blocks());
-                covered += bytes;
-                victims.push((unevictable, bytes));
-            }
-            // Torn down between the pick and the claim, so its key is gone.
-            None => {
-                super::reclaim::RECLAIM_LIST.remove(&oid);
-            }
-        }
+        covered += bytes;
+        victims.push((unevictable, bytes));
     }
     // No lock.
     let freed = evict(victims);
@@ -284,26 +273,6 @@ pub(crate) fn unlink(oid: ObjectId) {
         Ok(()) => {}
         Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {}
         Err(e) => panic!("largeobj: failed to unlink object file {path}: {e}"),
-    }
-}
-
-/// Metadata of `oid`'s file.
-/// - `None` if it is gone (`ENOENT`).
-/// - A `transient` error is retried once.
-/// - Any other error, or a second transient one, aborts the server.
-fn stat(oid: ObjectId) -> Option<std::fs::Metadata> {
-    let path = oid.file_path(&crate::disk_dir());
-    let meta = std::fs::metadata(&path).or_else(|e| {
-        if transient(&e) {
-            std::fs::metadata(&path)
-        } else {
-            Err(e)
-        }
-    });
-    match meta {
-        Ok(meta) => Some(meta),
-        Err(e) if e.raw_os_error() == Some(libc::ENOENT) => None,
-        Err(e) => panic!("largeobj: failed to stat object file {path}: {e}"),
     }
 }
 
