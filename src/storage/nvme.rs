@@ -183,9 +183,6 @@ pub fn nvme_disk_usage() -> u64 {
 
 // ─── NVMe Eviction ───────────────────────────────────────────────────────────
 
-/// Candidates picked per eviction.
-const EVICT_BATCH: usize = 64;
-
 /// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
 /// tokio task) take it. Never call off main while holding it: it would deadlock.
 fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
@@ -216,9 +213,21 @@ fn evict_and_reserve(bytes: u64) -> bool {
     let need = (prev + bytes).saturating_sub(max);
     let mut victims = Vec::new();
     let mut covered = 0;
-    for oid in super::eviction_candidates::pick(EVICT_BATCH, |_| true) {
-        if covered >= need || victims.len() == super::cache_policy::RECLAIM_MAX_VICTIMS {
+    // Oids whose claim failed. A claimed or torn-down oid leaves the candidates, but an
+    // unevictable one stays, so the next pick must skip it. Each pick returns an untried
+    // oid, so the loop ends once no evictable candidate is left.
+    let mut tried = std::collections::HashSet::new();
+    while covered < need && victims.len() < super::cache_policy::RECLAIM_MAX_VICTIMS {
+        // The oldest untried candidate, picked afresh each time: concurrent writes pick the
+        // same oldest one and only one claims it, so the others move on to the next.
+        let Some(oid) = super::eviction_candidates::pick(1, |oid| !tried.contains(&oid)).pop()
+        else {
             break;
+        };
+        tried.insert(oid);
+        let pause_ms = crate::test_pause_after_evict_pick_ms();
+        if pause_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
         }
         // Read off the server lock, before the claim queues it.
         let hint = read_key_hint(oid);

@@ -1437,6 +1437,39 @@ class TestTieredReaperPace(TieredBudget):
         assert len(surviving(client, payloads)) == self.PER_BUDGET
 
 
+class TestTieredEvictionRepick(TieredBudget):
+    """Every eviction pauses after picking its candidates, so the test can take them away first."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return super().get_module_args(data_dir, direct_io) + " test-pause-after-evict-pick-ms 2000"
+
+    def test_a_write_whose_picks_are_taken_picks_again(self):
+        """Concurrent writes pick the same oldest candidates, and only one claims each. A write
+        that finds all its picks gone, while the cap holds other evictable objects, picks again
+        rather than failing."""
+        client = self.new_client()
+        old = set_objects(client, 'old_', self.PER_BUDGET, self.OBJ)
+        outcome = {}
+
+        def late_write():
+            try:
+                outcome['reply'] = self.server.get_new_client().execute_command(
+                    'BLOB.TCP_SET', 'late', position_pattern(self.OBJ, 'L'))
+            except ResponseError as e:
+                outcome['error'] = str(e)
+
+        writer = threading.Thread(target=late_write)
+        writer.start()
+        time.sleep(0.5)  # it has picked the oldest object and is paused
+        # Take every picked candidate away, then fill the cap with new ones. The paused write
+        # still holds the 1 byte of headroom it took.
+        client.execute_command('DEL', *old)
+        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_used_bytes'] <= 1, timeout=10)
+        set_objects(client, 'new_', self.PER_BUDGET, self.OBJ)
+        writer.join(timeout=15)
+        assert outcome.get('reply') == b'OK', outcome
+
+
 # ─── Eviction key hints ──────────────────────────────────────────────────────
 
 
