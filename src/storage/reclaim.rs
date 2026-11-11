@@ -5,20 +5,23 @@
 //! Commands check it upfront and treat a key in the list as missing; the scaling
 //! cron deletes the keys. An oid leaves the list:
 //! - Dram: when its object is removed (`DRAMPool::remove_object`, reached from
-//!   `lo_free` once the key is deleted), or when the cron deletes its key.
+//!   `lo_free` once the key is deleted).
 //! - Tiered: when its file is torn down (`ObjectFile::drop`), or when an NVMe
 //!   eviction finds its file already gone (a stale directory entry).
 //!
-//! Tiered: the reaper (the scaling cron) deletes each victim's key one of two ways:
-//! - By name: an eviction reads the victim's key hint (its key's name and db when it
-//!   was written, from the file header) and queues it on `DELETE_BY_NAME_QUEUE`.
-//! - By scan: the fallback for victims with no usable hint (renamed, copied, a key
-//!   over the hint cap). The scan finds every key whose oid is in `RECLAIM_LIST`.
+//! The reaper (the scaling cron) deletes each victim's key one of two ways:
+//! - By name (Tiered): an eviction reads the victim's key hint (its key's name and db
+//!   when it was written, from the file header) and queues it with the claim.
+//! - By scan: the fallback for ghost keys with no usable hint (Dram, renamed, copied, a
+//!   key over the hint cap). The scan runs only while such a ghost key is listed.
+//!
+//! A deleted key's oid stays listed until its value is freed (`lo_free`, on a BIO
+//! thread), marked `KeyState::Deleted` so neither way spends work on it.
 //!
 //! Lock order: `RECLAIM_LIST` before `DRAMPool.objects` when both are held.
 
 use std::cell::RefCell;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -32,67 +35,116 @@ use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 pub static EVICTED_KEYS_BY_NAME: AtomicU64 = AtomicU64::new(0);
 pub static EVICTED_KEYS_BY_SCAN: AtomicU64 = AtomicU64::new(0);
 
-/// Tiered victims whose keys the reaper deletes by name, oldest first: each victim's
-/// oid and key hint. A shortcut into `RECLAIM_LIST`, never the only record of a victim:
-/// - Pushed by an eviction, in the same server-lock hold as its claim, so a reaper
-///   tick (which empties this queue before it scans) never scans for a queued victim.
-/// - Popped by the reaper. An entry whose oid already left `RECLAIM_LIST` (its key was
-///   deleted another way) is skipped; one whose key no longer holds the victim is left
-///   to the scan.
-/// - Cleared when `RECLAIM_LIST` empties: every entry left then is stale.
-static DELETE_BY_NAME_QUEUE: LazyLock<Mutex<VecDeque<(ObjectId, KeyHint)>>> =
-    LazyLock::new(Mutex::default);
-
-fn delete_by_name_queue() -> MutexGuard<'static, VecDeque<(ObjectId, KeyHint)>> {
-    DELETE_BY_NAME_QUEUE
-        .lock()
-        .expect("DELETE_BY_NAME_QUEUE lock unavailable")
-}
-
-/// Queue a claimed victim's key for deletion by name. Call under the claim's server lock.
-pub fn queue_delete_by_name(oid: ObjectId, hint: KeyHint) {
-    delete_by_name_queue().push_back((oid, hint));
-}
-
-/// INFO: victims queued for deletion by name.
-pub fn pending_evictions_by_name() -> usize {
-    delete_by_name_queue().len()
-}
-
 pub static RECLAIM_LIST: LazyLock<ReclaimList> = LazyLock::new(ReclaimList::default);
+
+/// How the reaper deletes a listed oid's key.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KeyState {
+    /// Queued on `by_name`; the scan does not run for it.
+    ByName,
+    /// Found by scan: no hint, or its key no longer held it when looked up by name.
+    ByScan,
+    /// Key deleted; listed until its value is freed.
+    Deleted,
+}
+
+#[derive(Default)]
+struct GhostKeys {
+    states: HashMap<ObjectId, KeyState>,
+    /// The `ByName` ghost keys, oldest first, with their hints. A popped entry whose oid
+    /// is no longer `ByName` is skipped. Empty whenever `states` is.
+    by_name: VecDeque<(ObjectId, KeyHint)>,
+    /// How many of `states` are `ByScan`.
+    num_by_scan: usize,
+}
+
+impl GhostKeys {
+    /// List `oid`: by name if `hint` is given, else by scan. False if already listed.
+    fn insert(&mut self, oid: ObjectId, hint: Option<KeyHint>) -> bool {
+        if self.states.contains_key(&oid) {
+            return false;
+        }
+        let state = match hint {
+            Some(hint) => {
+                self.by_name.push_back((oid, hint));
+                KeyState::ByName
+            }
+            None => {
+                self.num_by_scan += 1;
+                KeyState::ByScan
+            }
+        };
+        self.states.insert(oid, state);
+        true
+    }
+
+    /// Move a listed `oid` to `to`. No-op if it is not listed.
+    fn set_state(&mut self, oid: ObjectId, to: KeyState) {
+        let Some(state) = self.states.get_mut(&oid) else {
+            return;
+        };
+        let was = std::mem::replace(state, to);
+        if was == KeyState::ByScan {
+            self.num_by_scan -= 1;
+        }
+        if to == KeyState::ByScan {
+            self.num_by_scan += 1;
+        }
+    }
+
+    /// Unlist `oid`; false if it was not listed.
+    fn remove(&mut self, oid: &ObjectId) -> bool {
+        let Some(state) = self.states.remove(oid) else {
+            return false;
+        };
+        if state == KeyState::ByScan {
+            self.num_by_scan -= 1;
+        }
+        if self.states.is_empty() {
+            // Every queued entry left is stale.
+            self.by_name.clear();
+        }
+        true
+    }
+}
 
 #[derive(Default)]
 pub struct ReclaimList {
-    oids: Mutex<HashSet<ObjectId>>,
-    /// `oids.len()`. Store only under the `oids` lock, or it can read 0 for a non-empty set.
+    ghost_keys: Mutex<GhostKeys>,
+    /// `ghost_keys.states.len()`. Store only under the lock, or it can read 0 for a non-empty list.
     len: AtomicUsize,
 }
 
 impl ReclaimList {
-    /// Private so every change goes through `add_with` / `insert` / `remove`, which update `len`.
-    fn lock(&self) -> MutexGuard<'_, HashSet<ObjectId>> {
-        self.oids.lock().expect("RECLAIM_LIST lock unavailable")
+    /// Private so every change goes through the methods below, which update `len`.
+    fn lock(&self) -> MutexGuard<'_, GhostKeys> {
+        self.ghost_keys
+            .lock()
+            .expect("RECLAIM_LIST lock unavailable")
     }
 
-    /// Adds the oids returned by `f` to the reclaim set, which stays locked while
-    /// `f` runs. Call with the server lock held (main thread, or
+    /// Adds the oids returned by `f` to the reclaim list, found by scan. The list stays
+    /// locked while `f` runs. Call with the server lock held (main thread, or
     /// `ThreadSafeContext::lock()`).
     pub fn add_with<I: IntoIterator<Item = ObjectId>>(&self, f: impl FnOnce() -> I) {
-        let mut oids = self.lock();
-        oids.extend(f());
-        self.len.store(oids.len(), Ordering::Release);
+        let mut ghost_keys = self.lock();
+        for oid in f() {
+            ghost_keys.insert(oid, None);
+        }
+        self.len.store(ghost_keys.states.len(), Ordering::Release);
     }
 
-    /// Add `oid` to the reclaim list. False if it was already there.
-    pub fn insert(&self, oid: ObjectId) -> bool {
-        let mut oids = self.lock();
-        let inserted = oids.insert(oid);
-        self.len.store(oids.len(), Ordering::Release);
+    /// Add `oid` to the reclaim list: deleted by name if `hint` is given, else by scan.
+    /// False if it was already there.
+    pub fn insert(&self, oid: ObjectId, hint: Option<KeyHint>) -> bool {
+        let mut ghost_keys = self.lock();
+        let inserted = ghost_keys.insert(oid, hint);
+        self.len.store(ghost_keys.states.len(), Ordering::Release);
         inserted
     }
 
     pub fn contains(&self, oid: &ObjectId) -> bool {
-        !self.is_empty() && self.lock().contains(oid)
+        !self.is_empty() && self.lock().states.contains_key(oid)
     }
 
     pub fn len(&self) -> usize {
@@ -106,13 +158,39 @@ impl ReclaimList {
     /// Remove `oid` from the list; false if it was not there. Always locks:
     /// `remove_object` must wait for an eviction that is adding this oid.
     pub fn remove(&self, oid: &ObjectId) -> bool {
-        let mut oids = self.lock();
-        let removed = oids.remove(oid);
-        if removed {
-            self.len.store(oids.len(), Ordering::Release);
-        }
+        let mut ghost_keys = self.lock();
+        let removed = ghost_keys.remove(oid);
+        self.len.store(ghost_keys.states.len(), Ordering::Release);
         removed
     }
+
+    /// Move a listed `oid` to `to`. No-op if it already left the list.
+    fn set_state(&self, oid: ObjectId, to: KeyState) {
+        self.lock().set_state(oid, to);
+    }
+
+    /// Ghost keys left to the scan.
+    fn num_by_scan(&self) -> usize {
+        self.lock().num_by_scan
+    }
+
+    /// The oldest ghost key still to delete by name, and its hint. Skips stale entries.
+    /// None when none is left, or `deadline` has passed.
+    fn pop_by_name(&self, deadline: Instant) -> Option<(ObjectId, KeyHint)> {
+        let mut ghost_keys = self.lock();
+        while Instant::now() < deadline {
+            let (oid, hint) = ghost_keys.by_name.pop_front()?;
+            if ghost_keys.states.get(&oid) == Some(&KeyState::ByName) {
+                return Some((oid, hint));
+            }
+        }
+        None
+    }
+}
+
+/// INFO: ghost keys queued for deletion by name.
+pub fn pending_evictions_by_name() -> usize {
+    RECLAIM_LIST.lock().by_name.len()
 }
 
 /// Select db `db` on `ctx`. False past the last db.
@@ -132,7 +210,7 @@ thread_local! {
 }
 
 /// Delete keys whose oids are on the reclaim list, spending at most
-/// `reaper-scan-budget-us` of main-thread time per tick: first the victims with a
+/// `reaper-scan-budget-us` of main-thread time per tick: first the ghost keys with a
 /// key hint, by name, then the rest by scan.
 ///
 /// Cross-slot deletion is safe here: a timer callback runs outside command
@@ -140,9 +218,6 @@ thread_local! {
 /// own slot instead of reusing a command's cached slot.
 pub fn delete_reclaimed_keys(ctx: &Context) {
     if RECLAIM_LIST.is_empty() {
-        // Every victim's key is gone, so every queued entry is stale. An eviction
-        // queues only under the server lock, which this tick holds.
-        delete_by_name_queue().clear();
         return;
     }
     let deadline = Instant::now() + Duration::from_micros(crate::reaper_scan_budget_us());
@@ -150,13 +225,12 @@ pub fn delete_reclaimed_keys(ctx: &Context) {
     delete_keys_by_scan(ctx, deadline);
 }
 
-/// Delete, by scan, the keys whose oids are on the reclaim list, until `deadline`.
-/// Goes db by db, resuming across ticks, until the reclaim list is empty. Dram: an
-/// oid leaves the list when its key is deleted, here or via `lo_free`. Tiered: when
-/// its `ObjectFile` drops. Either way the scan cannot outlive its keys.
+/// Delete, by scan, the `ByScan` ghost keys, until `deadline`. Goes db by db,
+/// resuming across ticks, while one is listed: a ghost key stops being `ByScan` once its
+/// key is deleted, here, by name, or by any command.
 fn delete_keys_by_scan(ctx: &Context, deadline: Instant) {
     RECLAIM_SCAN_CURSOR.with_borrow_mut(|scan| {
-        while !RECLAIM_LIST.is_empty() && Instant::now() < deadline {
+        while RECLAIM_LIST.num_by_scan() > 0 && Instant::now() < deadline {
             // Past the last db: one full pass done. At most one pass per tick
             // so a key moved behind the cursor can't spin us.
             if !select_db(ctx, scan.db) {
@@ -169,19 +243,10 @@ fn delete_keys_by_scan(ctx: &Context, deadline: Instant) {
                 ctx.open_key_writable(&name)
                     .unlink()
                     .expect("a key opened for writing unlinks");
+                RECLAIM_LIST.set_state(oid, KeyState::Deleted);
                 EVICTED_KEYS_BY_SCAN.fetch_add(1, Ordering::Relaxed);
                 // Same keyspace event core fires for its own evictions.
                 ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
-                // Tiered Mode: Do not touch the RECLAIM_LIST. ObjectFile's drop uses
-                // presence in the list to determine if the file was claimed by eviction.
-                // This is necessary in order to not double-free evicted items.
-                // DRAM Mode: Calls to remove the oid from the RECLAIM_LIST happen both
-                // here and in lo_free (initiated by the unlink call above). This removal
-                // is redundant, but removing it here allows the main thread to exit the
-                // reclaim loop instead of waiting for the bio thread or deadline timeout.
-                if crate::operating_mode() == crate::OperatingMode::Dram {
-                    RECLAIM_LIST.remove(&oid);
-                }
             }
             if !more {
                 scan.cursor.restart();
@@ -191,20 +256,13 @@ fn delete_keys_by_scan(ctx: &Context, deadline: Instant) {
     });
 }
 
-/// Delete, by name, the keys of victims in `DELETE_BY_NAME_QUEUE`, until `deadline`.
+/// Delete, by name, the `ByName` ghost keys, until `deadline`.
 /// A key is deleted only if it still holds its victim: oids are never reused, so a key
 /// that was renamed, moved, swapped to another db, overwritten or replaced since holds
 /// another oid, or is gone. Such a victim is left to the scan. Runs on the main thread,
 /// like every keyspace change, so nothing moves the key between the check and the delete.
 fn delete_keys_by_name(ctx: &Context, deadline: Instant) {
-    while Instant::now() < deadline {
-        let Some((oid, hint)) = delete_by_name_queue().pop_front() else {
-            return;
-        };
-        // Torn down since the eviction: its key is gone already.
-        if !RECLAIM_LIST.contains(&oid) {
-            continue;
-        }
+    while let Some((oid, hint)) = RECLAIM_LIST.pop_by_name(deadline) {
         // Fails only for a db outside 0..databases (selectDb). The hint holds a client's
         // selected db from this run, and databases cannot change at runtime.
         assert!(
@@ -221,10 +279,12 @@ fn delete_keys_by_name(ctx: &Context, deadline: Instant) {
             Ok(Some(lo)) if lo.object_id == oid
         );
         if !holds_victim {
+            RECLAIM_LIST.set_state(oid, KeyState::ByScan);
             continue;
         }
         // Unlink fails only on a key not opened for writing (VM_UnlinkKey).
         key.unlink().expect("a key opened for writing unlinks");
+        RECLAIM_LIST.set_state(oid, KeyState::Deleted);
         EVICTED_KEYS_BY_NAME.fetch_add(1, Ordering::Relaxed);
         // Same keyspace event core fires for its own evictions.
         ctx.notify_keyspace_event(raw::NotifyEvent::EVICTED, "evicted", &name);
@@ -232,7 +292,7 @@ fn delete_keys_by_name(ctx: &Context, deadline: Instant) {
 }
 
 /// Scan the next hashtable bucket of the selected db. Returns the bucket's keys
-/// whose oids are on the reclaim list, and whether the db has more buckets.
+/// whose oids are listed and not yet deleted, and whether the db has more buckets.
 ///
 /// Only collects, never deletes: core reads each scanned value after the scan
 /// callback returns (`moduleCloseKey`), so unlinking a key inside the callback
@@ -246,15 +306,92 @@ fn listed_keys_in_next_bucket(
     cursor: &KeysCursor,
 ) -> (Vec<(ValkeyString, ObjectId)>, bool) {
     let listed = RefCell::new(Vec::new());
-    let oids = RECLAIM_LIST.lock();
+    let ghost_keys = RECLAIM_LIST.lock();
     // scan() calls this once per key in the bucket.
     let more = cursor.scan(ctx, &|_ctx, name, key| {
         let Some(Ok(Some(lo))) = key.map(|k| k.get_value::<LoValue>(&LO_TYPE)) else {
             return;
         };
-        if oids.contains(&lo.object_id) {
+        // A `ByName` key found first is deleted here too.
+        if matches!(
+            ghost_keys.states.get(&lo.object_id),
+            Some(KeyState::ByName | KeyState::ByScan)
+        ) {
             listed.borrow_mut().push((name, lo.object_id));
         }
     });
     (listed.into_inner(), more)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
+
+    fn popped(list: &ReclaimList) -> Option<ObjectId> {
+        list.pop_by_name(later()).map(|(oid, _)| oid)
+    }
+
+    #[test]
+    fn test_only_ghost_keys_left_to_scan_need_the_scan() {
+        let list = ReclaimList::default();
+        let (hinted, renamed, no_hint) = (ObjectId(1), ObjectId(2), ObjectId(3));
+        let hint = || Some(KeyHint::new(0, b"k"));
+        assert!(list.insert(hinted, hint()));
+        assert!(list.insert(renamed, hint()));
+        assert!(list.insert(no_hint, None));
+        assert!(!list.insert(no_hint, hint()), "already listed");
+        assert_eq!(list.num_by_scan(), 1);
+
+        // Deleted by name: listed until its value is freed, but nobody's work.
+        assert_eq!(popped(&list), Some(hinted));
+        list.set_state(hinted, KeyState::Deleted);
+        // Not found by name: the scan's.
+        assert_eq!(popped(&list), Some(renamed));
+        list.set_state(renamed, KeyState::ByScan);
+        assert_eq!(list.num_by_scan(), 2);
+        assert!(list.contains(&hinted));
+
+        list.set_state(renamed, KeyState::Deleted);
+        list.set_state(no_hint, KeyState::Deleted);
+        assert_eq!(list.num_by_scan(), 0);
+        assert_eq!(list.len(), 3);
+        for oid in [hinted, renamed, no_hint] {
+            assert!(list.remove(&oid));
+        }
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn test_add_with_keeps_an_oid_that_is_already_listed() {
+        let list = ReclaimList::default();
+        list.insert(ObjectId(1), Some(KeyHint::new(0, b"k")));
+        list.add_with(|| [ObjectId(1), ObjectId(2)]);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.num_by_scan(), 1, "only oid 2 is the scan's");
+        assert_eq!(popped(&list), Some(ObjectId(1)));
+        list.remove(&ObjectId(1));
+        list.remove(&ObjectId(2));
+        assert_eq!(list.num_by_scan(), 0);
+    }
+
+    #[test]
+    fn test_a_stale_queued_entry_is_skipped_and_cleared() {
+        let list = ReclaimList::default();
+        for oid in 1..=3 {
+            list.insert(ObjectId(oid), Some(KeyHint::new(0, b"k")));
+        }
+        // Its key was deleted by a command and its value freed before the reaper ran.
+        list.remove(&ObjectId(1));
+        // A passed deadline pops nothing and keeps the entries.
+        assert_eq!(list.pop_by_name(Instant::now()), None);
+        assert_eq!(popped(&list), Some(ObjectId(2)));
+        list.remove(&ObjectId(2));
+        // The last unlisting clears whatever is still queued.
+        list.remove(&ObjectId(3));
+        assert_eq!(list.lock().by_name.len(), 0);
+    }
 }
