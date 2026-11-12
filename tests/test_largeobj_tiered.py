@@ -102,6 +102,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert (db, header[26:]) == (0, b'rt_multi') and key_len == len(b'rt_multi')
         st = os.stat(dat_files[-1])
         assert st.st_blocks * ST_BLOCKS_UNIT == st.st_size, "object file has a metadata block"
+        assert info_largeobj(client)['largeobj_disk_metadata_spills'] == 0
         with open(dat_files[-1], 'rb') as f:
             data_on_disk = f.read(len(payload_multi))
             assert data_on_disk == payload_multi, "On-disk data at offset 0 mismatch"

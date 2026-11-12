@@ -1550,6 +1550,7 @@ class TestTieredEvictionKeyHints(TieredBudget):
         assert client.execute_command('BLOB.TCP_SET', long_key, position_pattern(self.OBJ, 'L')) == b'OK'
         if info_largeobj(client)['largeobj_disk_used_bytes'] <= self.BUDGET + 1:
             pytest.skip("the header fits in the inode here: no metadata block takes usage past the cap")
+        assert info_largeobj(client)['largeobj_disk_metadata_spills'] == 1
         # Its one victim, the oldest short key, frees only its own size.
         assert client.execute_command('BLOB.TCP_SET', 'after', position_pattern(self.OBJ, 'A')) == b'OK'
         assert info_largeobj(client)['largeobj_disk_used_bytes'] <= self.BUDGET + 1
