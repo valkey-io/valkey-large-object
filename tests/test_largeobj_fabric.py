@@ -157,9 +157,11 @@ def start_target(*flags, split=None, object_len=None):
         command.append('--split=' + ','.join(str(size) for size in split))
     # stdin piped: after verifying a payload the target keeps acknowledging writes until
     # stdin closes, which `communicate()` does.
+    # The target is a test peer, so its coverage is noise: send a coverage-instrumented
+    # build's profile to /dev/null instead of a default_*.profraw in the cwd.
     process = subprocess.Popen(
         command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True,
+        text=True, env={**os.environ, 'LLVM_PROFILE_FILE': '/dev/null'},
     )
     regions = []
     for _ in range(1 if split is None else len(split)):

@@ -404,7 +404,7 @@ class TestDramNoShrink(ValkeyLargeObjTestCaseBase):
         before = info_largeobj(client)
 
         apply_shrink_pressure(client, policy)
-        time.sleep(3)  # three cron ticks at scaling-poll-ms 1000
+        time.sleep(1.5)  # one cron tick at scaling-poll-ms 1000, plus margin
 
         after = info_largeobj(client)
         assert after['largeobj_dram_scaling_shrinks'] == before['largeobj_dram_scaling_shrinks']
@@ -420,7 +420,7 @@ class TestDramNoShrink(ValkeyLargeObjTestCaseBase):
         shrinks = info_largeobj(client)['largeobj_dram_scaling_shrinks']
 
         client.config_set('maxmemory-policy', 'allkeys-lru')
-        time.sleep(3)  # three cron ticks at scaling-poll-ms 1000
+        time.sleep(1.5)  # one cron tick at scaling-poll-ms 1000, plus margin
 
         assert info_largeobj(client)['largeobj_dram_scaling_shrinks'] == shrinks
         for key, payload in self.PAYLOADS.items():
@@ -542,7 +542,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         self._write_and_promote(client)
         before = info_largeobj(client)
 
-        time.sleep(3)  # three cron ticks at scaling-poll-ms 1000
+        time.sleep(1.5)  # one cron tick at scaling-poll-ms 1000, plus margin
 
         after = info_largeobj(client)
         assert after['largeobj_dram_scaling_shrinks'] == before['largeobj_dram_scaling_shrinks']
@@ -1121,7 +1121,7 @@ class EvictionPolicyTests:
         self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
 
         client.execute_command('DEL', f'obj_{self.PER_BUDGET - 1}')
-        wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
+        wait_for_true(lambda: client.info('memory').get('lazyfree_pending_objects', 0) == 0)
         self.settle(client, self.PER_BUDGET - 1)
         assert client.execute_command('EXPIRE', 'obj_1', 1000) == 1
         assert client.execute_command('COPY', 'obj_1', 'copy_1') == 1
@@ -1157,7 +1157,7 @@ class EvictionPolicyTests:
     def free_a_slot(self, client, key):
         """DEL `key` and wait until its object is freed, leaving room for exactly one write."""
         client.execute_command('DEL', key)
-        wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
+        wait_for_true(lambda: client.info('memory').get('lazyfree_pending_objects', 0) == 0)
         self.settle(client, self.PER_BUDGET - 1)
 
     def test_every_expire_variant_marks_the_key_evictable(self):
@@ -1198,7 +1198,7 @@ class EvictionPolicyTests:
         assert client.execute_command('EXPIRE', 'obj_0', 1000) == 1
         self.free_a_slot(client, f'obj_{self.PER_BUDGET - 1}')
         assert client.execute_command('BLOB.TCP_SET', 'obj_0', position_pattern(self.OBJ, 'O')) == b'OK'
-        wait_for_true(lambda: client.info('stats').get('lazyfree_pending_objects', 0) == 0)
+        wait_for_true(lambda: client.info('memory').get('lazyfree_pending_objects', 0) == 0)
         self.settle(client, self.PER_BUDGET - 1)
         assert client.execute_command('BLOB.TCP_SET', 'fill', position_pattern(self.OBJ, 'F')) == b'OK'
         self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
