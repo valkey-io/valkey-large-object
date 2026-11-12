@@ -22,11 +22,10 @@ use valkey_module::{Context, NotifyEvent};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 
-/// A least-recently-used order: a list of oids, least recently used first, linked through a
-/// map from each oid to its neighbours and a value. The map is a griddle map, which grows
-/// incrementally: each insert moves a few entries into the larger table, so no operation
-/// rehashes every entry. A map that rehashed all at once held the candidates lock for
-/// seconds at 100M objects, stalling every GET and write.
+/// An exact least-recently-used order of oids, each with a value: a list, least recently used
+/// first, linked through a map from each oid to its neighbours. The map is a griddle map,
+/// which grows incrementally: each insert moves a few entries into the larger table, so no
+/// operation rehashes every entry while the candidates lock is held.
 struct Order<V> {
     nodes: griddle::HashMap<ObjectId, Node<V>>,
     head: u64,
@@ -61,16 +60,15 @@ impl<V> Order<V> {
             *self.get_mut(&oid).expect("just moved") = value;
             return;
         }
-        let prev = std::mem::replace(&mut self.tail, oid.0);
-        self.nodes.insert(
-            oid,
-            Node {
-                prev,
-                next: NIL,
-                value,
-            },
-        );
-        self.set_next(prev, oid.0);
+        let tail = self.tail;
+        let node = Node {
+            prev: tail,
+            next: NIL,
+            value,
+        };
+        self.nodes.insert(oid, node);
+        self.set_next(tail, oid.0);
+        self.tail = oid.0;
     }
 
     /// Move `oid` to the back. False if it is not listed.
@@ -81,12 +79,9 @@ impl<V> Order<V> {
         };
         if oid.0 != tail {
             let (prev, next) = (node.prev, node.next);
-            node.prev = tail;
-            node.next = NIL;
-            self.set_next(prev, next);
-            // Not the tail, so it has a next.
-            self.link(next).prev = prev;
-            self.link(tail).next = oid.0;
+            (node.prev, node.next) = (tail, NIL);
+            self.detach(prev, next);
+            self.set_next(tail, oid.0);
             self.tail = oid.0;
         }
         true
@@ -94,12 +89,7 @@ impl<V> Order<V> {
 
     fn remove(&mut self, oid: &ObjectId) -> Option<V> {
         let node = self.nodes.remove(oid)?;
-        self.set_next(node.prev, node.next);
-        if node.next == NIL {
-            self.tail = node.prev;
-        } else {
-            self.link(node.next).prev = node.prev;
-        }
+        self.detach(node.prev, node.next);
         Some(node.value)
     }
 
@@ -120,19 +110,34 @@ impl<V> Order<V> {
         })
     }
 
-    fn link(&mut self, oid: u64) -> &mut Node<V> {
+    /// Join the neighbours of an oid that left its place.
+    fn detach(&mut self, prev: u64, next: u64) {
+        self.set_next(prev, next);
+        self.set_prev(next, prev);
+    }
+
+    /// Point `oid`'s next at `next`; with `oid` `NIL`, the head.
+    fn set_next(&mut self, oid: u64, next: u64) {
+        if oid == NIL {
+            self.head = next;
+        } else {
+            self.node(oid).next = next;
+        }
+    }
+
+    /// Point `oid`'s prev at `prev`; with `oid` `NIL`, the tail.
+    fn set_prev(&mut self, oid: u64, prev: u64) {
+        if oid == NIL {
+            self.tail = prev;
+        } else {
+            self.node(oid).prev = prev;
+        }
+    }
+
+    fn node(&mut self, oid: u64) -> &mut Node<V> {
         self.nodes
             .get_mut(&ObjectId(oid))
             .expect("eviction candidate is listed")
-    }
-
-    /// Point `prev`'s next (or the head, if `prev` is `NIL`) at `next`.
-    fn set_next(&mut self, prev: u64, next: u64) {
-        if prev == NIL {
-            self.head = next;
-        } else {
-            self.link(prev).next = next;
-        }
     }
 }
 
@@ -365,44 +370,50 @@ mod tests {
     #[test]
     fn order_matches_a_list_model_through_incremental_resizes() {
         let mut order = Order::default();
-        let mut model: Vec<u64> = Vec::new();
+        // (oid, value), least recently used first.
+        let mut model: Vec<(u64, u64)> = Vec::new();
+        let listed = |order: &Order<u64>| -> Vec<(u64, u64)> {
+            order
+                .iter()
+                .map(|oid| (oid.0, order.nodes[&oid].value))
+                .collect()
+        };
         let mut next = 0;
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-        // Thousands of entries cross several resizes, each moving entries over many inserts.
+        // Inserts outnumber removes, so the map crosses several resizes, each of which moves
+        // entries over many later inserts.
         for step in 0..20_000 {
             rng ^= rng << 13;
             rng ^= rng >> 7;
             rng ^= rng << 17;
-            let pick = (!model.is_empty()).then(|| model[(rng >> 8) as usize % model.len()]);
-            match (rng % 5, pick) {
-                (0, Some(oid)) => {
-                    assert_eq!(order.remove(&ObjectId(oid)), Some(oid));
-                    model.retain(|&o| o != oid);
+            let i = (rng >> 8) as usize % model.len().max(1);
+            match rng % 5 {
+                0 if !model.is_empty() => {
+                    let (oid, value) = model.remove(i);
+                    assert_eq!(order.remove(&ObjectId(oid)), Some(value));
                 }
-                (1, Some(oid)) => {
-                    assert!(order.move_to_back(&ObjectId(oid)));
-                    model.retain(|&o| o != oid);
-                    model.push(oid);
+                1 if !model.is_empty() => {
+                    let entry = model.remove(i);
+                    assert!(order.move_to_back(&ObjectId(entry.0)));
+                    model.push(entry);
                 }
-                (2, Some(oid)) => {
-                    // Re-insert: moves to the back and takes the new value.
-                    order.insert(ObjectId(oid), oid + 1);
-                    assert_eq!(order.get_mut(&ObjectId(oid)), Some(&mut (oid + 1)));
-                    *order.get_mut(&ObjectId(oid)).unwrap() = oid;
-                    model.retain(|&o| o != oid);
-                    model.push(oid);
+                2 if !model.is_empty() => {
+                    // A re-insert moves to the back and takes the new value.
+                    let (oid, _) = model.remove(i);
+                    order.insert(ObjectId(oid), step);
+                    model.push((oid, step));
                 }
                 _ => {
-                    order.insert(ObjectId(next), next);
-                    model.push(next);
+                    order.insert(ObjectId(next), step);
+                    model.push((next, step));
                     next += 1;
                 }
             }
             if step % 1_000 == 0 {
-                assert!(order.iter().map(|oid| oid.0).eq(model.iter().copied()));
+                assert_eq!(listed(&order), model);
             }
         }
-        assert!(order.iter().map(|oid| oid.0).eq(model.iter().copied()));
+        assert_eq!(listed(&order), model);
         assert!(!order.move_to_back(&ObjectId(next)));
         assert_eq!(order.remove(&ObjectId(next)), None);
     }
