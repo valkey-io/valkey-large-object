@@ -185,7 +185,7 @@ pub fn nvme_disk_usage() -> u64 {
 
 /// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
 /// tokio task) take it. Never call off main while holding it: it would deadlock.
-fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
+pub(crate) fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
     if crate::is_main_thread() {
         f(&valkey_module::Context::dummy())
     } else {

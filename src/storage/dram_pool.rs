@@ -238,8 +238,9 @@ impl DRAMPool {
         if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
             return Poll::Ready(Some(bufs));
         }
-        // Null ctx is accepted by the memory watermark check.
-        if self.grow_in_background(&valkey_module::Context::dummy()) {
+        // The memory watermark check reads server state (`server_memory`), so it needs the
+        // server lock: this runs on a tokio worker, which takes it here.
+        if super::nvme::with_server_lock(|ctx| self.grow_in_background(ctx)) {
             return Poll::Pending;
         }
         // The pool may not expand, but room can have appeared since the miss above: a free
@@ -425,7 +426,8 @@ impl DRAMPool {
     ) -> Option<std::sync::Arc<super::context::ObjectContext>> {
         // Alloc BEFORE write lock -- talc scan under memory pressure
         // won't block GET readers waiting on get_object().
-        // Promotion runs on tokio workers -- null ctx is accepted by RM_GetServerInfo.
+        // Promotion starts on the main thread, which holds the server lock -- null ctx is
+        // accepted by RM_GetServerInfo.
         let dummy = valkey_module::Context::dummy();
         let buffers = match self.alloc_exact(obj_len) {
             Some(bufs) => bufs,
@@ -575,8 +577,8 @@ impl DRAMPool {
         self.pool.release_all_releasable();
     }
 
-    /// Whether the pool may take another segment. Needs `ctx` (reads server memory), so it
-    /// runs on the caller's thread.
+    /// Whether the pool may take another segment. Reads server memory through `ctx`, so the
+    /// caller must hold the server lock: the main thread, or `nvme::with_server_lock`.
     fn may_expand(&self, ctx: &valkey_module::Context) -> bool {
         // Server-wide OOM guard: never grow into memory the shrink path would
         // immediately reclaim. No-op when the server has no maxmemory configured.

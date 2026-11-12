@@ -2030,3 +2030,55 @@ class TestTieredChunkSizeAlignment(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: server.server.poll() is not None)
         assert server.server.returncode != 0
         assert server.verify_string_in_logfile('chunk-size must be a multiple of 4096')
+
+
+class TestLoadArguments(ValkeyLargeObjTestCaseBase):
+    """`loadmodule` arguments: a name that is not a config, a numeric value outside its
+    range, or a staging pool too small for one write refuses the load."""
+
+    # A refused load leaks the crate's boxed config data (see
+    # test_unaligned_chunk_size_refuses_to_load).
+    @pytest.mark.skip_for_asan
+    @pytest.mark.parametrize('module_args, message', [
+        # A misspelled or removed config would otherwise load as if it had not been given.
+        ("operating-mode Dram dram-maxmemory 1073741824",
+         "unknown module argument 'dram-maxmemory'"),
+        ("operating-mode Dram segment-size",
+         "module arguments must be name value pairs"),
+        # Out of range: as CONFIG SET and the config file refuse them.
+        ("operating-mode Dram worker-threads 0",
+         "largeobj.worker-threads 0 must be between 1 and 32 inclusive"),
+        ("operating-mode Dram segment-size 2147483648",
+         "largeobj.segment-size 2147483648 must be between 16384 and 1073741824 inclusive"),
+        # A segment the size of a chunk cannot hold a chunk-size buffer: every write of a
+        # whole chunk would fail with "disk staging buffer pool exhausted".
+        ("operating-mode Tiered disk-dir {nvme} segment-size 1048576 disk-staging-size 8388608"
+         " chunk-size 1048576 max-promote-size 0 max-object-size 4194304",
+         "cannot hold the largeobj.chunk-size buffers a write needs"),
+    ])
+    def test_invalid_arguments_refuse_to_load(self, module_args, message):
+        testdir = os.path.abspath(os.path.join(self.testdir, 'refused-load'))
+        os.makedirs(testdir, exist_ok=True)
+        module_args = module_args.format(nvme=os.path.join(testdir, 'nvme'))
+        server, _ = self.create_server(
+            testdir=testdir,
+            server_path=self.server.valkey_path,
+            args={'loadmodule': f"{os.environ['MODULE_PATH']} fabric-provider Emulated {module_args}"},
+            connect_client=False)
+        wait_for_true(lambda: server.server.poll() is not None)
+        assert server.server.returncode != 0
+        assert server.verify_string_in_logfile(message)
+
+    def test_staging_constraint_holds_at_runtime(self):
+        """max-object-size and min-buffers-per-op are mutable: a CONFIG SET that would leave
+        the staging pool unable to hold one write's buffers is rejected."""
+        client = self.server.get_new_client()
+        # Default args: 1 MiB staging in one 1 MiB segment, 4 KiB chunks. Each buffer is
+        # charged 8 KiB (the chunk and its allocator tag), so 127 fit.
+        client.execute_command('CONFIG', 'SET', 'largeobj.max-buffers-per-op', '1024')
+        with pytest.raises(ResponseError, match='cannot hold the largeobj.chunk-size buffers'):
+            client.execute_command('CONFIG', 'SET', 'largeobj.min-buffers-per-op', '128')
+        client.execute_command('CONFIG', 'SET', 'largeobj.min-buffers-per-op', '127')
+        payload = position_pattern(200 * 4096, 'W')
+        assert client.execute_command('BLOB.TCP_SET', 'wide', payload) == b'OK'
+        assert client.execute_command('BLOB.TCP_GET', 'wide') == payload
