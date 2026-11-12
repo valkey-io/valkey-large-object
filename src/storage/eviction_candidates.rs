@@ -18,35 +18,148 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use hashlink::{LinkedHashMap, LinkedHashSet};
 use valkey_module::{Context, NotifyEvent};
 
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
+
+/// A least-recently-used order: a list of oids, least recently used first, linked through a
+/// map from each oid to its neighbours and a value. The map is a griddle map, which grows
+/// incrementally: each insert moves a few entries into the larger table, so no operation
+/// rehashes every entry. A map that rehashed all at once held the candidates lock for
+/// seconds at 100M objects, stalling every GET and write.
+struct Order<V> {
+    nodes: griddle::HashMap<ObjectId, Node<V>>,
+    head: u64,
+    tail: u64,
+}
+
+/// No neighbour. Oids come from a counter starting at 1, which never reaches it.
+const NIL: u64 = u64::MAX;
+
+/// An oid's neighbours, as raw oids or `NIL`, and its value.
+struct Node<V> {
+    prev: u64,
+    next: u64,
+    value: V,
+}
+
+impl<V> Default for Order<V> {
+    fn default() -> Self {
+        Self {
+            nodes: griddle::HashMap::new(),
+            head: NIL,
+            tail: NIL,
+        }
+    }
+}
+
+impl<V> Order<V> {
+    /// Add `oid` at the back with `value`. An oid already listed moves to the back and takes
+    /// `value`.
+    fn insert(&mut self, oid: ObjectId, value: V) {
+        if self.move_to_back(&oid) {
+            *self.get_mut(&oid).expect("just moved") = value;
+            return;
+        }
+        let prev = std::mem::replace(&mut self.tail, oid.0);
+        self.nodes.insert(
+            oid,
+            Node {
+                prev,
+                next: NIL,
+                value,
+            },
+        );
+        self.set_next(prev, oid.0);
+    }
+
+    /// Move `oid` to the back. False if it is not listed.
+    fn move_to_back(&mut self, oid: &ObjectId) -> bool {
+        let tail = self.tail;
+        let Some(node) = self.nodes.get_mut(oid) else {
+            return false;
+        };
+        if oid.0 != tail {
+            let (prev, next) = (node.prev, node.next);
+            node.prev = tail;
+            node.next = NIL;
+            self.set_next(prev, next);
+            // Not the tail, so it has a next.
+            self.link(next).prev = prev;
+            self.link(tail).next = oid.0;
+            self.tail = oid.0;
+        }
+        true
+    }
+
+    fn remove(&mut self, oid: &ObjectId) -> Option<V> {
+        let node = self.nodes.remove(oid)?;
+        self.set_next(node.prev, node.next);
+        if node.next == NIL {
+            self.tail = node.prev;
+        } else {
+            self.link(node.next).prev = node.prev;
+        }
+        Some(node.value)
+    }
+
+    fn get_mut(&mut self, oid: &ObjectId) -> Option<&mut V> {
+        self.nodes.get_mut(oid).map(|node| &mut node.value)
+    }
+
+    fn contains(&self, oid: &ObjectId) -> bool {
+        self.nodes.contains_key(oid)
+    }
+
+    /// The oids from the least recently used.
+    fn iter(&self) -> impl Iterator<Item = ObjectId> + '_ {
+        let first = (self.head != NIL).then_some(ObjectId(self.head));
+        std::iter::successors(first, |oid| {
+            let next = self.nodes[oid].next;
+            (next != NIL).then_some(ObjectId(next))
+        })
+    }
+
+    fn link(&mut self, oid: u64) -> &mut Node<V> {
+        self.nodes
+            .get_mut(&ObjectId(oid))
+            .expect("eviction candidate is listed")
+    }
+
+    /// Point `prev`'s next (or the head, if `prev` is `NIL`) at `next`.
+    fn set_next(&mut self, prev: u64, next: u64) {
+        if prev == NIL {
+            self.head = next;
+        } else {
+            self.link(prev).next = next;
+        }
+    }
+}
 
 /// Exact least-recently-used order: the least recently used oid is first in each.
 /// `all` maps every oid to its `disk_bytes` (`insert`); `ttl` holds the oids of `all`
 /// whose key has a TTL.
 #[derive(Default)]
 struct Lru {
-    all: LinkedHashMap<ObjectId, u64>,
-    ttl: LinkedHashSet<ObjectId>,
+    all: Order<u64>,
+    ttl: Order<()>,
 }
 
 impl Lru {
     fn touch(&mut self, oid: ObjectId) {
-        if self.all.to_back(&oid).is_some() {
-            self.ttl.to_back(&oid);
+        if self.all.move_to_back(&oid) {
+            self.ttl.move_to_back(&oid);
         }
     }
 
     /// A TTL change is a use, as in core (EXPIRE and PERSIST touch the key).
     fn set_ttl(&mut self, oid: ObjectId, has_ttl: bool) {
-        if self.all.to_back(&oid).is_none() {
+        if !self.all.move_to_back(&oid) {
             // Evicted: the key lingers until the reclaim cron deletes it.
             return;
         }
         if has_ttl {
-            self.ttl.insert(oid);
+            self.ttl.insert(oid, ());
         } else {
             self.ttl.remove(&oid);
         }
@@ -63,13 +176,13 @@ impl Lru {
         n: usize,
         mut take: impl FnMut(ObjectId) -> bool,
     ) -> Vec<ObjectId> {
-        let mut first = |oids: &mut dyn Iterator<Item = &ObjectId>| -> Vec<ObjectId> {
-            oids.copied().filter(|&oid| take(oid)).take(n).collect()
+        let mut first = |oids: &mut dyn Iterator<Item = ObjectId>| -> Vec<ObjectId> {
+            oids.filter(|&oid| take(oid)).take(n).collect()
         };
         if volatile {
             first(&mut self.ttl.iter())
         } else {
-            first(&mut self.all.keys())
+            first(&mut self.all.iter())
         }
     }
 }
@@ -247,5 +360,50 @@ mod tests {
         assert_eq!(oldest(&lru, true), [1]);
         lru.remove(ObjectId(1));
         assert!(oldest(&lru, true).is_empty());
+    }
+
+    #[test]
+    fn order_matches_a_list_model_through_incremental_resizes() {
+        let mut order = Order::default();
+        let mut model: Vec<u64> = Vec::new();
+        let mut next = 0;
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        // Thousands of entries cross several resizes, each moving entries over many inserts.
+        for step in 0..20_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let pick = (!model.is_empty()).then(|| model[(rng >> 8) as usize % model.len()]);
+            match (rng % 5, pick) {
+                (0, Some(oid)) => {
+                    assert_eq!(order.remove(&ObjectId(oid)), Some(oid));
+                    model.retain(|&o| o != oid);
+                }
+                (1, Some(oid)) => {
+                    assert!(order.move_to_back(&ObjectId(oid)));
+                    model.retain(|&o| o != oid);
+                    model.push(oid);
+                }
+                (2, Some(oid)) => {
+                    // Re-insert: moves to the back and takes the new value.
+                    order.insert(ObjectId(oid), oid + 1);
+                    assert_eq!(order.get_mut(&ObjectId(oid)), Some(&mut (oid + 1)));
+                    *order.get_mut(&ObjectId(oid)).unwrap() = oid;
+                    model.retain(|&o| o != oid);
+                    model.push(oid);
+                }
+                _ => {
+                    order.insert(ObjectId(next), next);
+                    model.push(next);
+                    next += 1;
+                }
+            }
+            if step % 1_000 == 0 {
+                assert!(order.iter().map(|oid| oid.0).eq(model.iter().copied()));
+            }
+        }
+        assert!(order.iter().map(|oid| oid.0).eq(model.iter().copied()));
+        assert!(!order.move_to_back(&ObjectId(next)));
+        assert_eq!(order.remove(&ObjectId(next)), None);
     }
 }

@@ -19,7 +19,7 @@ dma-libfabric-protocol = { version = "0.1.1" }
 ofi-libfabric-sys = { version = "0.2", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 indexmap = "2"
-hashlink = "0.12"
+griddle = "0.6"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 lazy_static = "1"
 nvme-telem = "0.3.3"
