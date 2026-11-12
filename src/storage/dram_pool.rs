@@ -238,8 +238,7 @@ impl DRAMPool {
         if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
             return Poll::Ready(Some(bufs));
         }
-        // Null ctx is accepted by the memory watermark check.
-        if self.grow_in_background(&valkey_module::Context::dummy()) {
+        if self.grow_in_background() {
             return Poll::Pending;
         }
         // The pool may not expand, but room can have appeared since the miss above: a free
@@ -425,12 +424,10 @@ impl DRAMPool {
     ) -> Option<std::sync::Arc<super::context::ObjectContext>> {
         // Alloc BEFORE write lock -- talc scan under memory pressure
         // won't block GET readers waiting on get_object().
-        // Promotion runs on tokio workers -- null ctx is accepted by RM_GetServerInfo.
-        let dummy = valkey_module::Context::dummy();
         let buffers = match self.alloc_exact(obj_len) {
             Some(bufs) => bufs,
             // A grow is running or just started: skip this promotion.
-            None if self.grow_in_background(&dummy) => return None,
+            None if self.grow_in_background() => return None,
             // The pool cannot grow: reclaim in one segment and allocate there. That can
             // still fail (talc fragmentation, or a racing alloc takes the room); then we
             // skip promotion and the GET is served from NVMe.
@@ -575,8 +572,8 @@ impl DRAMPool {
         self.pool.release_all_releasable();
     }
 
-    /// Whether the pool may take another segment. Needs `ctx` (reads server memory), so it
-    /// runs on the caller's thread.
+    /// Whether the pool may take another segment. Needs `ctx` (reads server memory), so the
+    /// caller holds the server lock.
     fn may_expand(&self, ctx: &valkey_module::Context) -> bool {
         // Server-wide OOM guard: never grow into memory the shrink path would
         // immediately reclaim. No-op when the server has no maxmemory configured.
@@ -619,11 +616,12 @@ impl DRAMPool {
     ///
     /// Returns whether an expand is now running: true if this call started one or one was already
     /// running, false if the pool may not expand (watermark, RDMA limit, `MAX_SEGMENTS`).
-    pub fn grow_in_background(&self, ctx: &valkey_module::Context) -> bool {
+    pub fn grow_in_background(&self) -> bool {
         // Join the expand that is running. Only an expand that really runs ever sets the
         // flag, so a caller that sees it set can wait for the wake that ends it.
         if !self.expanding.load(Ordering::Acquire) {
-            if !self.may_expand(ctx) {
+            // may_expand reads server memory: off the main thread that needs the server lock.
+            if !super::nvme::with_server_lock(|ctx| self.may_expand(ctx)) {
                 return false;
             }
             // Lost the race to another caller: that one runs the expand, this one joins it.

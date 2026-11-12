@@ -37,24 +37,31 @@ cargo build --release
 
 ### Dram mode (default)
 ```bash
-valkey-server --port 7380 \
+valkey-server --port 7380 --maxmemory 4gb \
     --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Dram \
-        dram-maxmemory 1gb \
-        segment-size 64mb
+        segment-size 67108864 \
+        max-object-size 33554432
 ```
+
+The DRAM pool grows one `segment-size` segment at a time, up to the server's `maxmemory`
+(unbounded when `maxmemory` is 0). An object must fit in one segment, so `max-object-size`
+has to be lowered along with `segment-size`.
 
 ### Tiered mode (DRAM cache + NVMe persistence)
 ```bash
-valkey-server --port 7380 \
+valkey-server --port 7380 --maxmemory 4gb \
     --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Tiered \
         disk-dir /mnt/nvme-data \
-        dram-maxmemory 1gb \
-        segment-size 64mb \
-        disk-maxmemory 10gb \
-        disk-staging-size 64mb
+        segment-size 67108864 \
+        max-promote-size 33554432 \
+        disk-maxmemory 10737418240 \
+        disk-staging-size 67108864
 ```
+
+Arguments after the module path are `name value` pairs. Sizes given here are plain byte
+counts: memory notation (`64mb`) is only understood in the config file and by `CONFIG SET`.
 
 ## Naming conventions
 
@@ -76,7 +83,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `operating-mode` | `Dram` | Immutable | `Dram` (DRAM-only) or `Tiered` (DRAM cache + NVMe). |
 | `disk-dir` | (empty) | Immutable | Directory for NVMe object files. Required in Tiered mode. Must support O_DIRECT. |
 | `disk-dir-shards` | 1024 | Immutable | Tiered: subdirectories of `disk-dir` that object files are spread over, by OID, so creates and unlinks do not all serialize on one directory lock. Min 1, max 65536. |
-| `segment-size` | 1gb | Immutable | Size of each DRAMPool segment. Min 1mb, max 1gb. |
+| `segment-size` | 1gb | Immutable | Size of each DRAMPool and disk staging segment. Min 1mb, max 1gb. Must be at least twice `chunk-size`. |
 | `disk-maxmemory` | 0 (unlimited) | Yes | Max NVMe disk usage, counting each file rounded up to the filesystem's allocation unit (the stripe unit on a striped XFS). 0 = unlimited. |
 | `disk-staging-size` | 1gb | Immutable | Size of NVMe staging buffer. Min 1mb. |
 | `max-object-size` | 512mb | Yes | Maximum allowed object size for BLOB.TCP_SET / BLOB.RDMA_SET. Min 1 byte. |
@@ -104,7 +111,8 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `fabric-max-in-flight` | 256 | Immutable | Transfers each fabric service keeps in flight. 0 = provider default. Max 65536. |
 | `fabric-crc-pool-threads` | 2 | Immutable | Threads hashing checksummed transfers. Min 1, max 1024. |
 
-All size parameters accept memory notation (`64mb`, `1gb`, etc.).
+In the config file (`largeobj.segment-size 64mb`) and in `CONFIG SET`, size parameters accept
+memory notation (`64mb`, `1gb`, etc.). As `loadmodule` arguments they are plain byte counts.
 
 ## Test
 

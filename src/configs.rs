@@ -210,11 +210,11 @@ lazy_static::lazy_static! {
     pub static ref CFG_SCALING_POLL_MS: AtomicI64 = AtomicI64::new(DEFAULT_SCALING_POLL_MS);
 
     /// Main-thread time, in microseconds, one scaling-cron tick may spend
-    /// scanning for and deleting evicted keys. Default: 1000us.
+    /// scanning for and deleting evicted keys. Default: 2000us.
     pub static ref CFG_REAPER_SCAN_BUDGET_US: AtomicI64 = AtomicI64::new(DEFAULT_REAPER_SCAN_BUDGET_US);
 
     /// Scaling cron poll interval, in milliseconds, while evicted keys wait to be
-    /// deleted. Default: 100ms.
+    /// deleted. Default: 25ms.
     pub static ref CFG_REAPER_POLL_MS: AtomicI64 = AtomicI64::new(DEFAULT_REAPER_POLL_MS);
 
     /// NVMe SMART poll interval in seconds (Tiered mode). 0 disables polling
@@ -333,11 +333,11 @@ lazy_static::lazy_static! {
 
     // ─── Streaming Configs ───────────────────────────────────────────────
 
-    /// Chunk size for multi-buffer streaming I/O. Default: 8MB.
+    /// Chunk size for multi-buffer streaming I/O. Default: 1MiB.
     /// Determines allocation unit for all I/O operations.
     pub static ref CFG_CHUNK_SIZE: AtomicI64 = AtomicI64::new(DEFAULT_CHUNK_SIZE);
 
-    /// Max buffers per streaming operation (batch size / pipeline depth). Default: 8.
+    /// Max buffers per streaming operation (batch size / pipeline depth). Default: 64.
     pub static ref CFG_MAX_BUFFERS_PER_OP: AtomicI64 = AtomicI64::new(DEFAULT_MAX_BUFFERS_PER_OP);
 
     /// Min buffers to start a streaming operation. Below this → reject. Default: 2.
@@ -636,8 +636,9 @@ fn config_constraints() -> &'static [ConfigConstraint] {
                 parent: &CFG_SEGMENT_SIZE,
                 child: &CFG_CHUNK_SIZE,
                 enforce_condition: || true,
-                validator: None,
-                error_msg: errors::ERR_SEGMENT_GE_CHUNK,
+                // A segment the size of a chunk cannot hold a chunk-size buffer.
+                validator: Some(|segment, chunk| segment >= chunk.saturating_mul(2)),
+                error_msg: errors::ERR_SEGMENT_GE_TWO_CHUNKS,
             },
             ConfigConstraint {
                 parent: &CFG_SEGMENT_SIZE,
@@ -877,7 +878,27 @@ mod tests {
                     (&CFG_DISK_STAGING_SIZE, chunk - 1),
                     (&CFG_MAX_OBJECT_SIZE, chunk - 1),
                 ],
-                Some("largeobj.segment-size must be >= largeobj.chunk-size"),
+                Some("largeobj.segment-size must be >= 2 * largeobj.chunk-size"),
+            ),
+            (
+                "segment_eq_chunk_rejected",
+                OperatingMode::Tiered,
+                vec![
+                    (&CFG_SEGMENT_SIZE, chunk),
+                    (&CFG_DISK_STAGING_SIZE, 8 * chunk),
+                    (&CFG_MAX_PROMOTE_SIZE, 0),
+                ],
+                Some("largeobj.segment-size must be >= 2 * largeobj.chunk-size"),
+            ),
+            (
+                "segment_twice_chunk_ok",
+                OperatingMode::Tiered,
+                vec![
+                    (&CFG_SEGMENT_SIZE, 2 * chunk),
+                    (&CFG_DISK_STAGING_SIZE, 8 * chunk),
+                    (&CFG_MAX_PROMOTE_SIZE, 0),
+                ],
+                None,
             ),
             (
                 "segment_lt_max_obj_rejected",
