@@ -183,6 +183,10 @@ pub fn nvme_disk_usage() -> u64 {
 
 // ─── NVMe Eviction ───────────────────────────────────────────────────────────
 
+/// Victims claimed per server-lock hold, which this bounds. A write takes as many holds
+/// as it needs. The DRAM cache keeps its own `RECLAIM_MAX_VICTIMS` per reclaim.
+const VICTIMS_PER_LOCK_HOLD: usize = 1024;
+
 /// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
 /// tokio task) take it. Never call off main while holding it: it would deadlock.
 pub(crate) fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
@@ -211,35 +215,20 @@ fn evict_and_reserve(bytes: u64) -> bool {
     let taken = bytes.min(max.saturating_sub(prev));
     // Also evict for any usage already above the cap (metadata blocks are charged uncapped).
     let need = (prev + bytes).saturating_sub(max);
+    // Server lock -> UNEVICTABLE -> eviction candidates, then RECLAIM_LIST. A batch per
+    // hold, so other clients get the lock between batches. Each non-empty batch takes
+    // candidates off a finite list, and an empty one means none evictable is left.
     let mut victims = Vec::new();
     let mut covered = 0;
-    // Oids whose claim failed. A claimed or torn-down oid leaves the candidates, but an
-    // unevictable one stays, so the next pick must skip it. Each pick returns an untried
-    // oid, so the loop ends once no evictable candidate is left.
-    let mut tried = std::collections::HashSet::new();
-    while covered < need && victims.len() < super::cache_policy::RECLAIM_MAX_VICTIMS {
-        // The oldest untried candidate, picked afresh each time: concurrent writes pick the
-        // same oldest one and only one claims it, so the others move on to the next.
-        let Some(oid) = super::eviction_candidates::pick(1, |oid| !tried.contains(&oid)).pop()
-        else {
+    while covered < need {
+        let batch = with_server_lock(|_| {
+            super::object_file::claim_victims(need - covered, VICTIMS_PER_LOCK_HOLD)
+        });
+        if batch.is_empty() {
             break;
-        };
-        tried.insert(oid);
-        let pause_ms = crate::test_pause_after_evict_pick_ms();
-        if pause_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(pause_ms));
         }
-        // Read off the server lock, before the claim queues it.
-        let hint = read_key_hint(oid);
-        // Server lock -> UNEVICTABLE -> RECLAIM_LIST.
-        // Credits what the file was charged (its eviction-candidate entry).
-        let Some((unevictable, victim_disk_bytes)) =
-            with_server_lock(|_| super::object_file::claim_victim(oid, hint))
-        else {
-            continue;
-        };
-        covered += victim_disk_bytes;
-        victims.push((unevictable, victim_disk_bytes));
+        covered += batch.iter().map(|(_, disk_bytes)| disk_bytes).sum::<u64>();
+        victims.extend(batch);
     }
     // No lock.
     let freed = evict(victims);
@@ -259,6 +248,8 @@ fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
     let mut freed = 0;
     for (unevictable, size) in victims {
         let oid = unevictable.oid();
+        // Before the unlink, which takes the header with the file.
+        super::reclaim::RECLAIM_LIST.set_key_name(oid, read_key_hint(oid));
         if let Some(pool) = super::FD_POOL.get() {
             pool.remove(oid);
         }
@@ -445,9 +436,8 @@ fn read_field<const N: usize>(r: &mut &[u8]) -> Result<[u8; N], String> {
 
 /// The key hint in `oid`'s file header, if it records a key. `None` means the reaper
 /// finds the key by scan instead. Reads by path, so the caller needs no open fd.
-/// - Expected, silent: the file is gone (torn down since the pick), it has no header
-///   yet (a SET still writing it, which the claim then refuses), or no key was recorded
-///   (a COPY, or a key over `KEY_HINT_MAX_LEN`).
+/// - Expected, silent: no key was recorded (a COPY, or a key over `KEY_HINT_MAX_LEN`).
+///   Called on a claimed victim, whose file is complete and only its eviction unlinks.
 /// - Disk or kernel fault, logged: any other read error. The hint is only a shortcut,
 ///   so the key is left to the scan.
 /// - Bug, panics: a corrupt header, or a header for another object. Disk-dir is wiped

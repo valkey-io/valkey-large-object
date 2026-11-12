@@ -951,15 +951,16 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         self.assert_refused(client, 'refused', position_pattern(self.OBJ, 'R'))
         assert self.evictions(client) == 2
 
-    def test_a_write_that_needs_more_than_16_victims_is_refused_but_they_stay_evicted(self):
-        """A claim is never undone."""
+    def test_a_write_that_needs_more_than_16_victims_evicts_them(self):
+        """The DRAM cache's 16-victim reclaim cap does not limit NVMe eviction."""
         client = self.new_client()
         set_objects(client, 's_', 64, 60 * 1024)  # 64KB on disk each: they fill the budget
-        self.assert_refused(client, 'big', position_pattern(int(self.BUDGET * 0.6), 'B'))
+        assert client.execute_command(
+            'BLOB.TCP_SET', 'big', position_pattern(int(self.BUDGET * 0.6), 'B')) == b'OK'
         info = info_largeobj(client)
-        assert info['largeobj_evictions'] == 16
-        assert info['largeobj_disk_capacity_exceeded'] == 1
-        self.settle(client, 64 - 16)
+        assert info['largeobj_evictions'] > 16
+        assert info['largeobj_disk_capacity_exceeded'] == 0
+        self.settle(client, 64 - info['largeobj_evictions'] + 1)
 
     def test_files_that_are_not_objects_are_never_victims(self):
         client = self.new_client()
@@ -1437,39 +1438,6 @@ class TestTieredReaperPace(TieredBudget):
         assert len(surviving(client, payloads)) == self.PER_BUDGET
 
 
-class TestTieredEvictionRepick(TieredBudget):
-    """Every eviction pauses after picking its candidates, so the test can take them away first."""
-
-    def get_module_args(self, data_dir, direct_io):
-        return super().get_module_args(data_dir, direct_io) + " test-pause-after-evict-pick-ms 2000"
-
-    def test_a_write_whose_picks_are_taken_picks_again(self):
-        """Concurrent writes pick the same oldest candidates, and only one claims each. A write
-        that finds all its picks gone, while the cap holds other evictable objects, picks again
-        rather than failing."""
-        client = self.new_client()
-        old = set_objects(client, 'old_', self.PER_BUDGET, self.OBJ)
-        outcome = {}
-
-        def late_write():
-            try:
-                outcome['reply'] = self.server.get_new_client().execute_command(
-                    'BLOB.TCP_SET', 'late', position_pattern(self.OBJ, 'L'))
-            except ResponseError as e:
-                outcome['error'] = str(e)
-
-        writer = threading.Thread(target=late_write)
-        writer.start()
-        time.sleep(0.5)  # it has picked the oldest object and is paused
-        # Take every picked candidate away, then fill the cap with new ones. The paused write
-        # still holds the 1 byte of headroom it took.
-        client.execute_command('DEL', *old)
-        wait_for_true(lambda: info_largeobj(client)['largeobj_disk_used_bytes'] <= 1, timeout=10)
-        set_objects(client, 'new_', self.PER_BUDGET, self.OBJ)
-        writer.join(timeout=15)
-        assert outcome.get('reply') == b'OK', outcome
-
-
 # ─── Eviction key hints ──────────────────────────────────────────────────────
 
 
@@ -1565,3 +1533,28 @@ class TestTieredEvictionKeyHints(TieredBudget):
         wait_for_true(lambda: pending_evictions(client) == 0, timeout=15)
         wait_for_true(lambda: info_largeobj(client)['largeobj_pending_evictions_by_name'] == 0,
                       timeout=15)
+
+
+# ─── NVMe eviction past one lock hold ────────────────────────────────────────
+
+
+class TestTieredEvictionManyVictims(TieredBudget):
+    """A budget of more small objects than one server-lock hold claims (1024)."""
+
+    SMALL = 4096
+    COUNT = 1100
+    BUDGET = COUNT * (SMALL + DISK_INODE)
+
+    def test_a_write_among_small_objects_evicts_as_many_as_it_needs(self):
+        """A large write at a cap full of small objects (say, keys left over from another
+        workload) needs more victims than one hold claims. It takes more holds and succeeds."""
+        client = self.new_client()
+        set_objects(client, 's_', self.COUNT, self.SMALL)  # exactly fills the budget
+        assert self.evictions(client) == 0
+        # Charged more than 1024 small objects, so it needs at least 1025 victims.
+        big = 1025 * (self.SMALL + DISK_INODE)
+        assert client.execute_command('BLOB.TCP_SET', 'big', position_pattern(big, 'B')) == b'OK'
+        info = info_largeobj(client)
+        assert info['largeobj_evictions'] > 1024
+        assert info['largeobj_disk_capacity_exceeded'] == 0
+        self.settle(client, self.COUNT - info['largeobj_evictions'] + 1)
