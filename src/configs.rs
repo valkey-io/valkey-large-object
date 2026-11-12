@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicI64};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use valkey_module::configuration::ConfigurationContext;
 use valkey_module::enum_configuration;
@@ -170,10 +170,11 @@ lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     /// String configs are registered as a `ValkeyGILGuard<ValkeyString>`, the type whose
     /// `CONFIG GET` path the crate does not leak. `on_string_config_set` copies the value
-    /// into `DISK_DIR`, which is what the rest of the module reads.
+    /// into `DISK_DIR_AT_LOAD`; a successful load then commits it to `DISK_DIR`
+    /// (`commit_disk_dir`), which is what the rest of the module reads.
     pub static ref CFG_DISK_DIR: ValkeyGILGuard<ValkeyString> =
         ValkeyGILGuard::new(ValkeyString::create(None, ""));
-    static ref DISK_DIR: Mutex<String> = Mutex::new(String::new());
+    static ref DISK_DIR_AT_LOAD: Mutex<String> = Mutex::new(String::new());
 
     /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 1GiB.
     /// Used in Tiered mode for read/write staging. Split into uniform
@@ -349,12 +350,35 @@ pub static MODULE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
-pub fn disk_dir() -> String {
-    DISK_DIR.lock().expect("DISK_DIR lock unavailable").clone()
+/// `disk-dir` once the module has loaded: immutable from then on, so every command reads
+/// it here without a lock or a copy. Unset until `commit_disk_dir`.
+static DISK_DIR: OnceLock<String> = OnceLock::new();
+
+/// `disk-dir` as given at load. Only for `initialize`, which runs before `commit_disk_dir`:
+/// the set handler can run more than once while the configs load, so this one is locked.
+pub fn disk_dir_at_load() -> String {
+    DISK_DIR_AT_LOAD
+        .lock()
+        .expect("DISK_DIR_AT_LOAD lock unavailable")
+        .clone()
+}
+
+/// Fix `disk-dir` for the life of the process. Called once, when the module load succeeds:
+/// the config is immutable, so the value never changes after that.
+pub fn commit_disk_dir(dir: String) {
+    if DISK_DIR.set(dir).is_err() {
+        panic!("disk-dir already committed");
+    }
+}
+
+/// The committed `disk-dir`. Empty before the module has loaded (and in Dram mode, which
+/// has none).
+pub fn disk_dir() -> &'static str {
+    DISK_DIR.get().map_or("", String::as_str)
 }
 
 /// Set handler for the string configs: copies the new value out of the Valkey-owned
-/// string into the Rust-side `Mutex<String>` the accessors read.
+/// string into its Rust-side `Mutex<String>`.
 pub fn on_string_config_set(
     config_ctx: &ConfigurationContext,
     name: &str,
@@ -363,7 +387,7 @@ pub fn on_string_config_set(
     // Reject invalid UTF-8: a lossy copy would make the mirror differ from what CONFIG GET reports.
     let value = val.lock(config_ctx).try_as_str()?.to_owned();
     let mirror = match name {
-        "disk-dir" => &*DISK_DIR,
+        "disk-dir" => &*DISK_DIR_AT_LOAD,
         "fabric-interfaces" => &*FABRIC_INTERFACES,
         _ => return Err(ValkeyError::Str("Unknown configuration parameter")),
     };

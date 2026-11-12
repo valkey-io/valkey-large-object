@@ -126,7 +126,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
-    let dir = disk_dir();
+    let dir = disk_dir_at_load();
 
     // Validate cross-config constraints now that all configs are finalized.
     // Per-config callbacks skip validation at load time (non-deterministic processing
@@ -208,6 +208,8 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     if RUNTIME.set(rt).is_err() {
         panic!("Runtime already initialized");
     }
+    // Commands, which read disk-dir, can only run once this function returns.
+    commit_disk_dir(dir);
 
     // Cache maxmemory-policy; `CONFIG SET` keeps it current.
     storage::eviction_candidates::refresh_policy(ctx);
@@ -247,7 +249,7 @@ fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     smartlog::signal_shutdown();
     transport::shutdown();
     let dir = disk_dir();
-    if let Err(e) = storage::validate_and_clean_disk_dir(operating_mode(), &dir) {
+    if let Err(e) = storage::validate_and_clean_disk_dir(operating_mode(), dir) {
         ctx.log_warning(&format!(
             "largeobj: shutdown cleanup failed to reset disk-dir {}: {}",
             dir, e
