@@ -208,7 +208,6 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     if RUNTIME.set(rt).is_err() {
         panic!("Runtime already initialized");
     }
-    // Commands, which read disk-dir, can only run once this function returns.
     commit_disk_dir(dir);
 
     // Cache maxmemory-policy; `CONFIG SET` keeps it current.

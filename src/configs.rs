@@ -170,8 +170,7 @@ lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     /// String configs are registered as a `ValkeyGILGuard<ValkeyString>`, the type whose
     /// `CONFIG GET` path the crate does not leak. `on_string_config_set` copies the value
-    /// into `DISK_DIR_AT_LOAD`; a successful load then commits it to `DISK_DIR`
-    /// (`commit_disk_dir`), which is what the rest of the module reads.
+    /// into `DISK_DIR_AT_LOAD`; a successful load commits it to `DISK_DIR`.
     pub static ref CFG_DISK_DIR: ValkeyGILGuard<ValkeyString> =
         ValkeyGILGuard::new(ValkeyString::create(None, ""));
     static ref DISK_DIR_AT_LOAD: Mutex<String> = Mutex::new(String::new());
@@ -350,12 +349,10 @@ pub static MODULE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
-/// `disk-dir` once the module has loaded: immutable from then on, so every command reads
-/// it here without a lock or a copy. Unset until `commit_disk_dir`.
+/// `disk-dir`, immutable once the module has loaded.
 static DISK_DIR: OnceLock<String> = OnceLock::new();
 
-/// `disk-dir` as given at load. Only for `initialize`, which runs before `commit_disk_dir`:
-/// the set handler can run more than once while the configs load, so this one is locked.
+/// `disk-dir` as given at load, for `initialize`.
 pub fn disk_dir_at_load() -> String {
     DISK_DIR_AT_LOAD
         .lock()
@@ -363,16 +360,14 @@ pub fn disk_dir_at_load() -> String {
         .clone()
 }
 
-/// Fix `disk-dir` for the life of the process. Called once, when the module load succeeds:
-/// the config is immutable, so the value never changes after that.
+/// Called once, when the module load succeeds.
 pub fn commit_disk_dir(dir: String) {
     if DISK_DIR.set(dir).is_err() {
         panic!("disk-dir already committed");
     }
 }
 
-/// The committed `disk-dir`. Empty before the module has loaded (and in Dram mode, which
-/// has none).
+/// The committed `disk-dir`; empty before the module has loaded.
 pub fn disk_dir() -> &'static str {
     DISK_DIR.get().map_or("", String::as_str)
 }
