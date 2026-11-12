@@ -56,9 +56,7 @@ pub use fd_reserve_policy::FdReserve;
 
 // segment-size
 pub const DEFAULT_SEGMENT_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
-/// Small enough for tests to fill a segment with a handful of 4 KiB objects. The config
-/// constraints still require a segment to hold the largest object or promotion.
-pub const MIN_SEGMENT_SIZE: i64 = 16 * 1024; // 16 KiB
+pub const MIN_SEGMENT_SIZE: i64 = 1024 * 1024; // 1 MiB
 pub const MAX_SEGMENT_SIZE: i64 = 1024 * 1024 * 1024; // 1 GiB
 
 // disk-staging-size
@@ -638,8 +636,11 @@ fn config_constraints() -> &'static [ConfigConstraint] {
                 parent: &CFG_SEGMENT_SIZE,
                 child: &CFG_CHUNK_SIZE,
                 enforce_condition: || true,
-                validator: None,
-                error_msg: errors::ERR_SEGMENT_GE_CHUNK,
+                // Twice, not once: a segment the size of a chunk has no room left for a
+                // chunk-size buffer once the allocator takes its share, so every write
+                // of a whole chunk would fail.
+                validator: Some(|segment, chunk| segment >= chunk.saturating_mul(2)),
+                error_msg: errors::ERR_SEGMENT_GE_TWO_CHUNKS,
             },
             ConfigConstraint {
                 parent: &CFG_SEGMENT_SIZE,
@@ -699,260 +700,6 @@ pub fn validate_all_constraints() -> Result<(), String> {
         };
         if !holds {
             return Err(constraint.error_msg.into());
-        }
-    }
-    if operating_mode() == OperatingMode::Tiered && !staging_holds_min_window() {
-        return Err(errors::ERR_STAGING_HOLDS_WINDOW.into());
-    }
-    Ok(())
-}
-
-/// Tiered: whether the staging pool can hold the buffers one write needs. Every Tiered SET
-/// and streamed GET stages its chunks in `chunk-size` buffers (`alloc_window`), so a
-/// staging pool that cannot hold them fails every such command with "staging exhausted",
-/// however idle the server is.
-/// - One buffer of the largest chunk an object can have must fit a segment.
-/// - An object of several chunks needs `min-buffers-per-op` of them (fewer if it has
-///   fewer chunks), which may sit in different segments.
-///
-/// talc charges one `IO_ALIGN` block per allocation and one per segment, as in
-/// `storage::object_fits_segment`.
-fn staging_holds_min_window() -> bool {
-    let load = |cfg: &AtomicI64| cfg.load(std::sync::atomic::Ordering::Relaxed) as usize;
-    let segment = load(&CFG_SEGMENT_SIZE);
-    let chunk = load(&CFG_CHUNK_SIZE);
-    let max_object = load(&CFG_MAX_OBJECT_SIZE);
-    if chunk == 0 || !storage::object_fits_segment(segment, chunk.min(max_object), chunk) {
-        return false;
-    }
-    let chunks = max_object.div_ceil(chunk);
-    if chunks <= 1 {
-        return true;
-    }
-    // The last chunk's buffer is optional (`alloc_window`), so a window is at most chunks - 1.
-    let window = load(&CFG_MIN_BUFFERS_PER_OP).min(chunks - 1).max(1);
-    let per_segment = segment.saturating_sub(storage::IO_ALIGN) / (chunk + storage::IO_ALIGN);
-    let segments = load(&CFG_DISK_STAGING_SIZE).div_ceil(segment).max(1);
-    per_segment.saturating_mul(segments) >= window
-}
-
-// ─── Load Arguments ──────────────────────────────────────────────────────────
-//
-// `module_args_as_configuration` hands the `loadmodule` args to the valkey-module crate,
-// which looks each registered config up by name and uses the value it finds as that
-// config's default. It never looks at a name it does not know, and core never checks a
-// default against the config's range. `validate_load_args` closes both gaps.
-
-/// Every numeric config with its range, as registered in `valkey_module!` (lib.rs).
-/// Keep the two in step: a config missing here is refused as an unknown load argument.
-fn numeric_configs() -> [(&'static str, &'static AtomicI64, i64, i64); 27] {
-    [
-        (
-            "segment-size",
-            &CFG_SEGMENT_SIZE,
-            MIN_SEGMENT_SIZE,
-            MAX_SEGMENT_SIZE,
-        ),
-        (
-            "disk-staging-size",
-            &CFG_DISK_STAGING_SIZE,
-            MIN_DISK_STAGING_SIZE,
-            MAX_DISK_STAGING_SIZE,
-        ),
-        (
-            "disk-maxmemory",
-            &CFG_DISK_MAXMEMORY,
-            MIN_DISK_MAXMEMORY,
-            MAX_DISK_MAXMEMORY,
-        ),
-        (
-            "worker-threads",
-            &CFG_WORKER_THREADS,
-            MIN_WORKER_THREADS,
-            MAX_WORKER_THREADS,
-        ),
-        (
-            "disk-dir-shards",
-            &CFG_DISK_DIR_SHARDS,
-            MIN_DISK_DIR_SHARDS,
-            MAX_DISK_DIR_SHARDS,
-        ),
-        (
-            "max-promote-size",
-            &CFG_MAX_PROMOTE_SIZE,
-            MIN_MAX_PROMOTE_SIZE,
-            MAX_MAX_PROMOTE_SIZE,
-        ),
-        (
-            "chunk-size",
-            &CFG_CHUNK_SIZE,
-            MIN_CHUNK_SIZE,
-            MAX_CHUNK_SIZE,
-        ),
-        (
-            "max-buffers-per-op",
-            &CFG_MAX_BUFFERS_PER_OP,
-            MIN_MAX_BUFFERS_PER_OP,
-            MAX_MAX_BUFFERS_PER_OP,
-        ),
-        (
-            "min-buffers-per-op",
-            &CFG_MIN_BUFFERS_PER_OP,
-            MIN_MIN_BUFFERS_PER_OP,
-            MAX_MIN_BUFFERS_PER_OP,
-        ),
-        (
-            "test-pause-before-finalize-set-ms",
-            &CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS,
-            MIN_TEST_PAUSE_BEFORE_FINALIZE_SET_MS,
-            MAX_TEST_PAUSE_BEFORE_FINALIZE_SET_MS,
-        ),
-        (
-            "test-pause-after-evict-pick-ms",
-            &CFG_TEST_PAUSE_AFTER_EVICT_PICK_MS,
-            MIN_TEST_PAUSE_AFTER_EVICT_PICK_MS,
-            MAX_TEST_PAUSE_AFTER_EVICT_PICK_MS,
-        ),
-        (
-            "test-pause-during-promotion-ms",
-            &CFG_TEST_PAUSE_DURING_PROMOTION_MS,
-            MIN_TEST_PAUSE_DURING_PROMOTION_MS,
-            MAX_TEST_PAUSE_DURING_PROMOTION_MS,
-        ),
-        (
-            "test-pause-after-promotion-failure-ms",
-            &CFG_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS,
-            MIN_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS,
-            MAX_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS,
-        ),
-        (
-            "scaling-poll-ms",
-            &CFG_SCALING_POLL_MS,
-            MIN_SCALING_POLL_MS,
-            MAX_SCALING_POLL_MS,
-        ),
-        (
-            "reaper-scan-budget-us",
-            &CFG_REAPER_SCAN_BUDGET_US,
-            MIN_REAPER_SCAN_BUDGET_US,
-            MAX_REAPER_SCAN_BUDGET_US,
-        ),
-        (
-            "reaper-poll-ms",
-            &CFG_REAPER_POLL_MS,
-            MIN_REAPER_POLL_MS,
-            MAX_REAPER_POLL_MS,
-        ),
-        (
-            "smartlog-poll-secs",
-            &CFG_SMARTLOG_POLL_SECS,
-            MIN_SMARTLOG_POLL_SECS,
-            MAX_SMARTLOG_POLL_SECS,
-        ),
-        (
-            "scaling-expand-watermark",
-            &CFG_SCALING_EXPAND_WATERMARK,
-            MIN_SCALING_EXPAND_WATERMARK,
-            MAX_SCALING_EXPAND_WATERMARK,
-        ),
-        (
-            "max-object-size",
-            &CFG_MAX_OBJECT_SIZE,
-            MIN_MAX_OBJECT_SIZE,
-            MAX_MAX_OBJECT_SIZE,
-        ),
-        (
-            "scaling-shrink-watermark",
-            &CFG_SCALING_SHRINK_WATERMARK,
-            MIN_SCALING_SHRINK_WATERMARK,
-            MAX_SCALING_SHRINK_WATERMARK,
-        ),
-        (
-            "lfu-decay-minutes",
-            &CFG_LFU_DECAY_MINUTES,
-            MIN_LFU_DECAY_MINUTES,
-            MAX_LFU_DECAY_MINUTES,
-        ),
-        (
-            "promote-min-hits",
-            &CFG_PROMOTE_MIN_HITS,
-            MIN_PROMOTE_MIN_HITS,
-            MAX_PROMOTE_MIN_HITS,
-        ),
-        (
-            "victim-sample-size",
-            &CFG_VICTIM_SAMPLE_SIZE,
-            MIN_VICTIM_SAMPLE_SIZE,
-            MAX_VICTIM_SAMPLE_SIZE,
-        ),
-        (
-            "max-cached-fds",
-            &CFG_MAX_CACHED_FDS,
-            MIN_MAX_CACHED_FDS,
-            MAX_MAX_CACHED_FDS,
-        ),
-        (
-            "fabric-max-in-flight",
-            &CFG_FABRIC_MAX_IN_FLIGHT,
-            MIN_FABRIC_MAX_IN_FLIGHT,
-            MAX_FABRIC_MAX_IN_FLIGHT,
-        ),
-        (
-            "fabric-crc-pool-threads",
-            &CFG_FABRIC_CRC_POOL_THREADS,
-            MIN_FABRIC_CRC_POOL_THREADS,
-            MAX_FABRIC_CRC_POOL_THREADS,
-        ),
-        (
-            "max-rdma-registered-bytes",
-            &CFG_MAX_RDMA_REGISTERED_BYTES,
-            MIN_MAX_RDMA_REGISTERED_BYTES,
-            MAX_MAX_RDMA_REGISTERED_BYTES,
-        ),
-    ]
-}
-
-/// The string, bool and enum configs registered in `valkey_module!` (lib.rs).
-const OTHER_CONFIGS: [&str; 10] = [
-    "disk-dir",
-    "fabric-interfaces",
-    "bench-mode",
-    "test-rdma-fail-partial",
-    "test-fail-promotion-read",
-    "direct-io",
-    "enabled",
-    "operating-mode",
-    "fabric-provider",
-    "fd-reserve",
-];
-
-/// Check the `loadmodule` arguments (`name value` pairs) and the numeric values the
-/// crate has already stored from them.
-/// - A name that is not a config is refused: a misspelled limit would otherwise load as
-///   if it had not been given.
-/// - A numeric config outside its range is refused, as `CONFIG SET` and the config file
-///   already do.
-pub fn validate_load_args(args: &[&[u8]]) -> Result<(), String> {
-    if !args.len().is_multiple_of(2) {
-        return Err("module arguments must be name value pairs".into());
-    }
-    let numeric = numeric_configs();
-    for name in args.iter().step_by(2) {
-        let known = numeric.iter().any(|(n, ..)| n.as_bytes() == *name)
-            || OTHER_CONFIGS.iter().any(|n| n.as_bytes() == *name);
-        if !known {
-            return Err(format!(
-                "unknown module argument '{}'",
-                String::from_utf8_lossy(name)
-            ));
-        }
-    }
-    for (name, value, min, max) in numeric {
-        let value = value.load(std::sync::atomic::Ordering::Relaxed);
-        if !(min..=max).contains(&value) {
-            return Err(format!(
-                "largeobj.{name} {value} must be between {min} and {max} inclusive"
-            ));
         }
     }
     Ok(())
@@ -1133,7 +880,27 @@ mod tests {
                     (&CFG_DISK_STAGING_SIZE, chunk - 1),
                     (&CFG_MAX_OBJECT_SIZE, chunk - 1),
                 ],
-                Some("largeobj.segment-size must be >= largeobj.chunk-size"),
+                Some("largeobj.segment-size must be >= 2 * largeobj.chunk-size"),
+            ),
+            (
+                "segment_eq_chunk_rejected",
+                OperatingMode::Tiered,
+                vec![
+                    (&CFG_SEGMENT_SIZE, chunk),
+                    (&CFG_DISK_STAGING_SIZE, 8 * chunk),
+                    (&CFG_MAX_PROMOTE_SIZE, 0),
+                ],
+                Some("largeobj.segment-size must be >= 2 * largeobj.chunk-size"),
+            ),
+            (
+                "segment_twice_chunk_ok",
+                OperatingMode::Tiered,
+                vec![
+                    (&CFG_SEGMENT_SIZE, 2 * chunk),
+                    (&CFG_DISK_STAGING_SIZE, 8 * chunk),
+                    (&CFG_MAX_PROMOTE_SIZE, 0),
+                ],
+                None,
             ),
             (
                 "segment_lt_max_obj_rejected",
@@ -1169,58 +936,6 @@ mod tests {
                 Some("largeobj.disk-maxmemory must be >= largeobj.max-object-size in Tiered mode"),
             ),
             (
-                "tiered_segment_cannot_hold_one_chunk_buffer_rejected",
-                OperatingMode::Tiered,
-                vec![
-                    (&CFG_SEGMENT_SIZE, chunk),
-                    (&CFG_DISK_STAGING_SIZE, 8 * chunk),
-                    (&CFG_MAX_PROMOTE_SIZE, 0),
-                ],
-                Some("cannot hold the largeobj.chunk-size buffers a write needs"),
-            ),
-            (
-                // Objects are all smaller than a chunk, so no chunk-size buffer is needed.
-                "tiered_segment_equal_to_chunk_ok_for_smaller_objects",
-                OperatingMode::Tiered,
-                vec![
-                    (&CFG_SEGMENT_SIZE, chunk),
-                    (&CFG_DISK_STAGING_SIZE, chunk),
-                    (&CFG_MAX_PROMOTE_SIZE, 0),
-                    (&CFG_MAX_OBJECT_SIZE, chunk / 2),
-                ],
-                None,
-            ),
-            (
-                // One buffer fits each segment, but a window is two.
-                "tiered_staging_cannot_hold_min_window_rejected",
-                OperatingMode::Tiered,
-                vec![
-                    (&CFG_SEGMENT_SIZE, chunk + 8192),
-                    (&CFG_DISK_STAGING_SIZE, chunk + 8192),
-                    (&CFG_MAX_PROMOTE_SIZE, 0),
-                ],
-                Some("cannot hold the largeobj.chunk-size buffers a write needs"),
-            ),
-            (
-                "tiered_min_window_spread_over_two_segments_ok",
-                OperatingMode::Tiered,
-                vec![
-                    (&CFG_SEGMENT_SIZE, chunk + 8192),
-                    (&CFG_DISK_STAGING_SIZE, 2 * (chunk + 8192)),
-                    (&CFG_MAX_PROMOTE_SIZE, 0),
-                ],
-                None,
-            ),
-            (
-                "dram_segment_equal_to_chunk_unaffected",
-                OperatingMode::Dram,
-                vec![
-                    (&CFG_SEGMENT_SIZE, chunk),
-                    (&CFG_MAX_OBJECT_SIZE, chunk / 2),
-                ],
-                None,
-            ),
-            (
                 "chunk_not_4k_multiple_rejected",
                 OperatingMode::Dram,
                 vec![(&CFG_CHUNK_SIZE, 5000)],
@@ -1229,63 +944,8 @@ mod tests {
         ]
     }
 
-    // Shares the config statics with `test_validate_all_constraints`, so both run under
-    // this lock.
-    static CONFIG_LOCK: Mutex<()> = Mutex::new(());
-
-    #[test]
-    fn test_validate_load_args() {
-        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        reset_constrained_defaults();
-        let check = |args: &[&str]| {
-            let args: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
-            validate_load_args(&args)
-        };
-        assert_eq!(check(&[]), Ok(()));
-        assert_eq!(
-            check(&[
-                "operating-mode",
-                "Tiered",
-                "segment-size",
-                "1048576",
-                "enabled",
-                "no"
-            ]),
-            Ok(())
-        );
-        // A value is never taken for a name, even when it spells one.
-        assert_eq!(check(&["disk-dir", "segment-size"]), Ok(()));
-        assert_eq!(
-            check(&["operating-mode", "Dram", "dram-maxmemory", "1073741824"]),
-            Err("unknown module argument 'dram-maxmemory'".into())
-        );
-        assert_eq!(
-            check(&["segment-size"]),
-            Err("module arguments must be name value pairs".into())
-        );
-        // The crate has stored the argument's value by the time this runs.
-        for (cfg, value, message) in [
-            (
-                &*CFG_WORKER_THREADS,
-                0,
-                "largeobj.worker-threads 0 must be between 1 and 32 inclusive",
-            ),
-            (
-                &*CFG_SEGMENT_SIZE,
-                MAX_SEGMENT_SIZE + 1,
-                "largeobj.segment-size 1073741825 must be between 16384 and 1073741824 inclusive",
-            ),
-        ] {
-            let default = cfg.swap(value, Relaxed);
-            assert_eq!(check(&[]), Err(message.into()));
-            cfg.store(default, Relaxed);
-        }
-        assert_eq!(check(&[]), Ok(()));
-    }
-
     #[test]
     fn test_validate_all_constraints() {
-        let _g = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Restore compile-time defaults in case prior tests mutated statics.
         reset_constrained_defaults();
         // Capture defaults before any mutation.

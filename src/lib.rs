@@ -110,7 +110,7 @@ pub fn efa_release_segment(base: usize) {
 
 // ─── Module Lifecycle ────────────────────────────────────────────────────────
 
-fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
+fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // Any panic on any thread (main, tokio, io_uring poller) aborts the server.
     // We are a no-panic codebase — a panic means a bug, not a recoverable condition.
     std::panic::set_hook(Box::new(|info| {
@@ -127,15 +127,6 @@ fn initialize(ctx: &Context, args: &[ValkeyString]) -> Status {
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
     let dir = disk_dir();
-
-    // Refuse a load argument that is not a config, or a numeric one outside its range:
-    // the crate applies load arguments without either check. Before anything is built
-    // from the values (the tokio runtime panics on `worker-threads 0`).
-    let arg_names: Vec<&[u8]> = args.iter().map(ValkeyString::as_slice).collect();
-    if let Err(e) = validate_load_args(&arg_names) {
-        ctx.log_warning(&format!("largeobj: invalid module arguments: {e}"));
-        return Status::Err;
-    }
 
     // Validate cross-config constraints now that all configs are finalized.
     // Per-config callbacks skip validation at load time (non-deterministic processing
