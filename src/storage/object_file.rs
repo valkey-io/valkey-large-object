@@ -95,19 +95,18 @@ pub fn unevictable_count() -> usize {
 }
 
 /// Claim the oldest evictable candidates whose `disk_bytes` cover `need`, at most
-/// `RECLAIM_MAX_VICTIMS`: take them off the eviction candidates and add them to the
+/// `max`: take them off the eviction candidates and add them to the
 /// reclaim list by name, and to the unevictable list. Returns each claim and
 /// the `disk_bytes` its eviction credits. One `UNEVICTABLE` critical section, so a
 /// teardown either takes an oid off the candidates first (it is not claimed) or finds it
 /// in the reclaim list, and concurrent claims take disjoint victims. Call under the
 /// server lock.
 #[must_use]
-pub fn claim_victims(need: u64) -> Vec<(Arc<UnevictableOID>, u64)> {
+pub fn claim_victims(need: u64, max: usize) -> Vec<(Arc<UnevictableOID>, u64)> {
     let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
-    let taken =
-        super::eviction_candidates::take(need, super::cache_policy::RECLAIM_MAX_VICTIMS, |oid| {
-            !unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0)
-        });
+    let taken = super::eviction_candidates::take(need, max, |oid| {
+        !unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0)
+    });
     taken
         .into_iter()
         .map(|(oid, disk_bytes)| {

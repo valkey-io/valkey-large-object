@@ -183,6 +183,10 @@ pub fn nvme_disk_usage() -> u64 {
 
 // ─── NVMe Eviction ───────────────────────────────────────────────────────────
 
+/// Victims claimed per server-lock hold, which this bounds. A write takes as many holds
+/// as it needs. The DRAM cache keeps its own `RECLAIM_MAX_VICTIMS` per reclaim.
+const VICTIMS_PER_LOCK_HOLD: usize = 1024;
+
 /// Run `f` under the server lock: COPY already holds it on main; off main (a SET's
 /// tokio task) take it. Never call off main while holding it: it would deadlock.
 fn with_server_lock<R>(f: impl FnOnce(&valkey_module::Context) -> R) -> R {
@@ -211,8 +215,21 @@ fn evict_and_reserve(bytes: u64) -> bool {
     let taken = bytes.min(max.saturating_sub(prev));
     // Also evict for any usage already above the cap (metadata blocks are charged uncapped).
     let need = (prev + bytes).saturating_sub(max);
-    // Server lock -> UNEVICTABLE -> eviction candidates, then RECLAIM_LIST.
-    let victims = with_server_lock(|_| super::object_file::claim_victims(need));
+    // Server lock -> UNEVICTABLE -> eviction candidates, then RECLAIM_LIST. A batch per
+    // hold, so other clients get the lock between batches. Each non-empty batch takes
+    // candidates off a finite list, and an empty one means none evictable is left.
+    let mut victims = Vec::new();
+    let mut covered = 0;
+    while covered < need {
+        let batch = with_server_lock(|_| {
+            super::object_file::claim_victims(need - covered, VICTIMS_PER_LOCK_HOLD)
+        });
+        if batch.is_empty() {
+            break;
+        }
+        covered += batch.iter().map(|(_, disk_bytes)| disk_bytes).sum::<u64>();
+        victims.extend(batch);
+    }
     // No lock.
     let freed = evict(victims);
     // One update, so a competing reservation cannot take the freed bytes.
