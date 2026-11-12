@@ -572,8 +572,8 @@ impl DRAMPool {
         self.pool.release_all_releasable();
     }
 
-    /// Whether the pool may take another segment. Reads server memory through `ctx`, so the
-    /// caller must hold the server lock: the main thread, or `nvme::with_server_lock`.
+    /// Whether the pool may take another segment. Needs `ctx` (reads server memory), so the
+    /// caller holds the server lock.
     fn may_expand(&self, ctx: &valkey_module::Context) -> bool {
         // Server-wide OOM guard: never grow into memory the shrink path would
         // immediately reclaim. No-op when the server has no maxmemory configured.
@@ -616,16 +616,11 @@ impl DRAMPool {
     ///
     /// Returns whether an expand is now running: true if this call started one or one was already
     /// running, false if the pool may not expand (watermark, RDMA limit, `MAX_SEGMENTS`).
-    ///
-    /// Any thread may call it. Only the `may_expand` check needs the server lock, and only
-    /// when no expand is running: a caller joining one never waits for the lock, and the
-    /// expand itself runs without it.
     pub fn grow_in_background(&self) -> bool {
         // Join the expand that is running. Only an expand that really runs ever sets the
         // flag, so a caller that sees it set can wait for the wake that ends it.
         if !self.expanding.load(Ordering::Acquire) {
-            // A SET's tokio task reaches this without the server lock, which reading
-            // server memory needs.
+            // may_expand reads server memory: off the main thread that needs the server lock.
             if !super::nvme::with_server_lock(|ctx| self.may_expand(ctx)) {
                 return false;
             }

@@ -636,9 +636,7 @@ fn config_constraints() -> &'static [ConfigConstraint] {
                 parent: &CFG_SEGMENT_SIZE,
                 child: &CFG_CHUNK_SIZE,
                 enforce_condition: || true,
-                // Twice, not once: a segment the size of a chunk has no room left for a
-                // chunk-size buffer once the allocator takes its share, so every write
-                // of a whole chunk would fail.
+                // A segment the size of a chunk cannot hold a chunk-size buffer.
                 validator: Some(|segment, chunk| segment >= chunk.saturating_mul(2)),
                 error_msg: errors::ERR_SEGMENT_GE_TWO_CHUNKS,
             },

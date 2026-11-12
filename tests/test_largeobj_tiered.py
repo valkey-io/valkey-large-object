@@ -2033,12 +2033,9 @@ class TestTieredChunkSizeAlignment(ValkeyLargeObjTestCaseBase):
 
 
 class TestSegmentHoldsAChunk(ValkeyLargeObjTestCaseBase):
-    """segment-size must be at least twice chunk-size. A segment the size of a chunk cannot
-    hold a chunk-size buffer, so every write of a whole chunk would fail with "disk staging
-    buffer pool exhausted" however idle the server is."""
+    """segment-size must be at least twice chunk-size."""
 
-    # A refused load leaks the crate's boxed config data (see
-    # test_unaligned_chunk_size_refuses_to_load).
+    # A refused load leaks (see test_unaligned_chunk_size_refuses_to_load).
     @pytest.mark.skip_for_asan
     def test_segment_the_size_of_a_chunk_refuses_to_load(self):
         testdir = os.path.abspath(os.path.join(self.testdir, 'segment-eq-chunk'))
