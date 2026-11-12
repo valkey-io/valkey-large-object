@@ -238,8 +238,9 @@ impl DRAMPool {
         if let Some(bufs) = self.pool.alloc_exact(obj_len as usize) {
             return Poll::Ready(Some(bufs));
         }
-        // Null ctx is accepted by the memory watermark check.
-        if self.grow_in_background(&valkey_module::Context::dummy()) {
+        // The memory watermark check reads INFO (RM_GetServerInfo), which needs the server
+        // lock: this runs on a SET's tokio task.
+        if super::nvme::with_server_lock(|ctx| self.grow_in_background(ctx)) {
             return Poll::Pending;
         }
         // The pool may not expand, but room can have appeared since the miss above: a free
