@@ -180,6 +180,9 @@ impl ObjectFile {
             self.object_id, st.st_size, disk_len
         );
         let bytes = super::nvme::metadata_disk_bytes(disk_len, st.st_blocks as u64);
+        if bytes > 0 {
+            crate::info::DISK_METADATA_SPILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         super::nvme::increase_nvme_disk_usage(bytes);
         // Unevictable since `new`, so no claim has taken its entry.
         let recorded = super::eviction_candidates::add_disk_bytes(self.object_id, bytes);

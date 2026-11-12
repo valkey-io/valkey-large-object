@@ -36,6 +36,10 @@ pub static EVICTIONS: AtomicU64 = AtomicU64::new(0);
 /// GETs that coalesced behind a promotion leader instead of issuing their own read.
 pub static COALESCED_READS: AtomicU64 = AtomicU64::new(0);
 
+/// Object files that did not fit in their inode and took blocks beyond their data:
+/// an xattr block for the header, or an extent-tree block for a fragmented file.
+pub static DISK_METADATA_SPILLS: AtomicU64 = AtomicU64::new(0);
+
 /// RDMA payload bytes of successful transfers. Reads pull client memory (the SET
 /// path); writes push into it (the GET path).
 pub static RDMA_READ_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -251,6 +255,10 @@ fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
         .field(
             "disk_unevictable_objects",
             storage::object_file::unevictable_count() as i64,
+        )?
+        .field(
+            "disk_metadata_spills",
+            DISK_METADATA_SPILLS.load(Ordering::Relaxed) as i64,
         )?
         .build_section()?
         .build_info()
