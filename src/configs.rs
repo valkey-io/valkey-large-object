@@ -100,7 +100,7 @@ pub const DEFAULT_LFU_DECAY_MINUTES: i64 = 1;
 pub const MIN_LFU_DECAY_MINUTES: i64 = 0;
 pub const MAX_LFU_DECAY_MINUTES: i64 = 65_535;
 // promote-min-hits
-pub const DEFAULT_PROMOTE_MIN_HITS: i64 = 2;
+pub const DEFAULT_PROMOTE_MIN_HITS: i64 = 1;
 pub const MIN_PROMOTE_MIN_HITS: i64 = 1;
 pub const MAX_PROMOTE_MIN_HITS: i64 = 255;
 // victim-sample-size

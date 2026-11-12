@@ -1066,7 +1066,7 @@ class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
 
 
 class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
-    """Default admission: promote-min-hits 2."""
+    """Admission at promote-min-hits 2."""
 
     def get_module_args(self, data_dir, direct_io):
         return (
@@ -1075,6 +1075,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
             f" disk-staging-size 4194304"
             f" segment-size 4194304"
             f" max-promote-size 1048576"
+            f" promote-min-hits 2"
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
