@@ -1052,11 +1052,13 @@ fn cmd_get_from_dram(
                 let chunk_size = crate::chunk_size();
                 let chunk_iter =
                     ChunkIterator::new(obj_len, chunk_size, obj_ctx.buffers.len(), Some(addrs));
+                // Cap the window like the NVMe GET paths: a whole-object batch floods
+                // the fabric's shared in-flight queue and starves concurrent SET reads.
                 let job = crate::stream::StreamJob::for_dram(
                     obj_len,
                     chunk_size,
                     crc32c,
-                    obj_ctx.buffers.len(),
+                    obj_ctx.buffers.len().min(crate::max_buffers_per_op()),
                 );
                 let source = crate::stream::Source::DramResident {
                     buffers: &obj_ctx.buffers,
