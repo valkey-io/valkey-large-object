@@ -249,12 +249,12 @@ impl ObjectFile {
         crc32c: Crc,
     ) -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
-        let dir = crate::disk_dir();
-        let mut src = std::fs::File::open(self.object_id.file_path(&dir))?;
+        let dir = crate::storage::disk_dir();
+        let mut src = std::fs::File::open(self.object_id.file_path(dir))?;
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(copy.object_id.file_path(&dir))?;
+            .open(copy.object_id.file_path(dir))?;
         super::nvme::preallocate(dst.as_raw_fd(), disk_len)?;
         std::io::copy(&mut src, &mut dst)?;
         dst.sync_all()?;

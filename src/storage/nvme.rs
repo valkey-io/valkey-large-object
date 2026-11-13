@@ -266,7 +266,7 @@ fn evict(victims: Vec<(Arc<super::UnevictableOID>, u64)>) -> u64 {
 /// - A `transient` error is retried once.
 /// - Any other error, or a second transient one, aborts the server.
 pub(crate) fn unlink(oid: ObjectId) {
-    let path = oid.file_path(&crate::disk_dir());
+    let path = oid.file_path(crate::storage::disk_dir());
     let removed = std::fs::remove_file(&path).or_else(|e| {
         if transient(&e) {
             std::fs::remove_file(&path)
@@ -443,7 +443,7 @@ fn read_field<const N: usize>(r: &mut &[u8]) -> Result<[u8; N], String> {
 /// - Bug, panics: a corrupt header, or a header for another object. Disk-dir is wiped
 ///   at startup, so every header was written by this run, to its own object's file.
 pub fn read_key_hint(oid: ObjectId) -> Option<KeyHint> {
-    let path = oid.file_path(&crate::disk_dir());
+    let path = oid.file_path(crate::storage::disk_dir());
     let c_path = std::ffi::CString::new(path.as_str()).expect("object file paths have no NUL");
     let mut bytes = [0u8; FILE_HEADER_MAX_LEN];
     // SAFETY: both names are NUL-terminated and `bytes` is valid for `bytes.len()`.

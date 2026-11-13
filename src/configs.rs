@@ -169,11 +169,10 @@ pub const MAX_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS: i64 = 60_000;
 lazy_static::lazy_static! {
     /// Data directory for NVMe object files. Required. Immutable after load.
     /// String configs are registered as a `ValkeyGILGuard<ValkeyString>`, the type whose
-    /// `CONFIG GET` path the crate does not leak. `on_string_config_set` copies the value
-    /// into `DISK_DIR`, which is what the rest of the module reads.
+    /// `CONFIG GET` path the crate does not leak. `initialize` reads it once and
+    /// `storage::init` commits it; the module reads `storage::disk_dir()`.
     pub static ref CFG_DISK_DIR: ValkeyGILGuard<ValkeyString> =
         ValkeyGILGuard::new(ValkeyString::create(None, ""));
-    static ref DISK_DIR: Mutex<String> = Mutex::new(String::new());
 
     /// Total NVMe staging capacity (DRAM for I/O buffers). Default: 1GiB.
     /// Used in Tiered mode for read/write staging. Split into uniform
@@ -349,25 +348,18 @@ pub static MODULE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 // ─── Config Accessors ────────────────────────────────────────────────────────
 
-pub fn disk_dir() -> String {
-    DISK_DIR.lock().expect("DISK_DIR lock unavailable").clone()
-}
-
-/// Set handler for the string configs: copies the new value out of the Valkey-owned
-/// string into the Rust-side `Mutex<String>` the accessors read.
-pub fn on_string_config_set(
+/// Set handler for `fabric-interfaces`: copies the new value out of the Valkey-owned
+/// string into `FABRIC_INTERFACES`.
+pub fn on_fabric_interfaces_set(
     config_ctx: &ConfigurationContext,
-    name: &str,
+    _name: &str,
     val: &'static ValkeyGILGuard<ValkeyString>,
 ) -> Result<(), ValkeyError> {
     // Reject invalid UTF-8: a lossy copy would make the mirror differ from what CONFIG GET reports.
     let value = val.lock(config_ctx).try_as_str()?.to_owned();
-    let mirror = match name {
-        "disk-dir" => &*DISK_DIR,
-        "fabric-interfaces" => &*FABRIC_INTERFACES,
-        _ => return Err(ValkeyError::Str("Unknown configuration parameter")),
-    };
-    *mirror.lock().expect("string config lock unavailable") = value;
+    *FABRIC_INTERFACES
+        .lock()
+        .expect("FABRIC_INTERFACES lock unavailable") = value;
     Ok(())
 }
 
