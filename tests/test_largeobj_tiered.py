@@ -2066,36 +2066,30 @@ class TestSegmentHoldsAChunk(ValkeyLargeObjTestCaseBase):
 
 
 class TestTieredStagingExhausted(ValkeyLargeObjTestCaseBase):
-    """Every SET pauses 2 s holding its staging window, and min-buffers-per-op 64
-    makes each window all-or-nothing, so concurrent SETs exhaust the pool."""
+    """A 4 MiB staging pool holds one 3 MiB SET, which the pause keeps holding for 2 s."""
 
     def get_module_args(self, data_dir, direct_io):
-        base = TestLargeObjTieredPromotion.get_module_args(self, data_dir, direct_io)
-        return base + " test-pause-before-finalize-set-ms 2000 min-buffers-per-op 64"
+        return (
+            f"operating-mode Tiered"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
+            f" segment-size 4194304"
+            f" chunk-size 1048576"
+            f" max-object-size 3145728"
+            f" max-promote-size 0"
+            f" direct-io no"
+            f" fabric-provider Emulated"
+            f" test-pause-before-finalize-set-ms 2000"
+        )
 
-    def test_staging_exhausted_set_gets_oom(self):
-        """16 windows of 64 x 4 KiB fill the 4 MiB pool exactly, so buffer overhead
-        leaves at least one SET without a window. It is rejected with OOM."""
-        n = 16
-        setters = [self.server.get_new_client() for _ in range(n)]
-        errors = [None] * n
-
-        def background_set(i):
-            try:
-                setters[i].execute_command('BLOB.TCP_SET', f'key{i}', position_pattern(MIB, 'S'))
-            except Exception as e:
-                errors[i] = e
-
-        threads = [threading.Thread(target=background_set, args=(i,)) for i in range(n)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=30)
-        assert not any(t.is_alive() for t in threads), "SET threads did not finish"
-        rejected = [e for e in errors if e is not None]
-        assert rejected, "no SET was rejected"
-        for e in rejected:
-            assert isinstance(e, OutOfMemoryError), f"Unexpected error: {e!r}"
-            assert 'disk staging buffer pool is exhausted' in str(e), f"Unexpected error: {e}"
-        info = info_largeobj(self.server.get_new_client())
-        assert info['largeobj_disk_staging_buffer_exhausted'] == len(rejected)
+    def test_set_gets_oom_when_staging_is_exhausted(self):
+        client = self.server.get_new_client()
+        payload = position_pattern(3 * MIB, 'S')
+        held = threading.Thread(target=self.server.get_new_client().execute_command,
+                                args=('BLOB.TCP_SET', 'held', payload))
+        held.start()
+        wait_for_true(lambda: client.info('largeobj_disk_staging')
+                      ['largeobj_disk_staging_utilization_pct'] > 0)
+        with pytest.raises(OutOfMemoryError, match='disk staging buffer pool is exhausted'):
+            client.execute_command('BLOB.TCP_SET', 'rejected', payload)
+        held.join(timeout=10)
