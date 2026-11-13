@@ -63,22 +63,20 @@ fn parse_efa_addresses(
     if n_addrs > MAX_EFA_ADDRESSES {
         return Err(ValkeyError::Str(errors::ERR_TOO_MANY_MEMORY_ADDRESSES));
     }
+    // Parse in place from the arg bytes: no String per number.
+    let parse = |arg: &ValkeyString, err: &'static str| {
+        std::str::from_utf8(arg.as_slice())
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or(ValkeyError::Str(err))
+    };
     let mut addrs = Vec::with_capacity(n_addrs);
     let mut total_addr_len: u64 = 0;
     for i in 0..n_addrs {
         let base = i * 3;
-        let rkey: u64 = tail[base]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_RKEY))?;
-        let addr: u64 = tail[base + 1]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR))?;
-        let len: u64 = tail[base + 2]
-            .to_string_lossy()
-            .parse()
-            .map_err(|_| ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR_LEN))?;
+        let rkey = parse(&tail[base], errors::ERR_INVALID_RKEY)?;
+        let addr = parse(&tail[base + 1], errors::ERR_INVALID_MEMORY_ADDR)?;
+        let len = parse(&tail[base + 2], errors::ERR_INVALID_MEMORY_ADDR_LEN)?;
         // A zero-length address can never absorb bytes
         if 0 == len {
             return Err(ValkeyError::Str(errors::ERR_INVALID_MEMORY_ADDR_LEN));

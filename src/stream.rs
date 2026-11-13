@@ -513,6 +513,9 @@ async fn drive_window(
     let window = job.batch_width;
     let mut chunks_done: u32 = 0;
     let mut target_err: Option<StreamError> = None;
+    // Both sides drain to empty every batch, so one of each serves the whole loop.
+    let mut produce = FuturesUnordered::new();
+    let mut consume = FuturesUnordered::new();
 
     while chunks_done < total_chunks {
         if let Some(p) = progress {
@@ -522,28 +525,19 @@ async fn drive_window(
         }
         let batch_count = window.min((total_chunks - chunks_done) as usize);
 
-        // Snapshot this batch's chunks (advances the iterator by batch_count).
-        // next_chunk() lazily computes the per-chunk EFA addrs; clone each out of
-        // the borrowed iterator so it can move into a per-chunk future below.
-        let mut batch: Vec<ChunkRef> = Vec::with_capacity(batch_count);
+        // Per-chunk ready stream: fan out this batch's source.produce (advancing the
+        // iterator by batch_count), and as each resolves, immediately run
+        // target.consume — that IS the interleave. Each chunk (with its EFA addrs,
+        // mapped by next_chunk) flows produce → (record CRC) → consume, moving by value.
         for _ in 0..batch_count {
-            let c = chunk_iter
+            let chunk = chunk_iter
                 .next_chunk()
                 .expect("ChunkIterator out of bounds");
-            batch.push(c.clone());
-        }
-
-        // Per-chunk ready stream: fan out every source.produce, and as each
-        // resolves, immediately run target.consume — that IS the interleave.
-        // Each chunk flows produce → (record CRC) → consume, moving by value.
-        let mut produce = FuturesUnordered::new();
-        for chunk in batch.into_iter() {
             produce.push(async move {
                 let r = source.produce(job.fd, &chunk, job.chunk_size).await;
                 (chunk, r)
             });
         }
-        let mut consume = FuturesUnordered::new();
         let mut source_err: Option<StreamError> = None;
 
         while let Some((chunk, produced)) = produce.next().await {
