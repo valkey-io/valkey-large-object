@@ -37,24 +37,31 @@ cargo build --release
 
 ### Dram mode (default)
 ```bash
-valkey-server --port 7380 \
+valkey-server --port 7380 --maxmemory 4gb \
     --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Dram \
-        dram-maxmemory 1gb \
-        segment-size 64mb
+        segment-size 67108864 \
+        max-object-size 33554432
 ```
+
+The DRAM pool grows one `segment-size` segment at a time, up to the server's `maxmemory`
+(unbounded when `maxmemory` is 0). An object must fit in one segment, so `max-object-size`
+has to be lowered along with `segment-size`.
 
 ### Tiered mode (DRAM cache + NVMe persistence)
 ```bash
-valkey-server --port 7380 \
+valkey-server --port 7380 --maxmemory 4gb \
     --loadmodule ./target/release/libvalkey_large_object.so \
         operating-mode Tiered \
         disk-dir /mnt/nvme-data \
-        dram-maxmemory 1gb \
-        segment-size 64mb \
-        disk-maxmemory 10gb \
-        disk-staging-size 64mb
+        segment-size 67108864 \
+        max-promote-size 33554432 \
+        disk-maxmemory 10737418240 \
+        disk-staging-size 67108864
 ```
+
+Arguments after the module path are `name value` pairs. Sizes given here are plain byte
+counts: memory notation (`64mb`) is only understood in the config file and by `CONFIG SET`.
 
 ## Naming conventions
 
@@ -76,7 +83,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `operating-mode` | `Dram` | Immutable | `Dram` (DRAM-only) or `Tiered` (DRAM cache + NVMe). |
 | `disk-dir` | (empty) | Immutable | Directory for NVMe object files. Required in Tiered mode. Must support O_DIRECT. |
 | `disk-dir-shards` | 1024 | Immutable | Tiered: subdirectories of `disk-dir` that object files are spread over, by OID, so creates and unlinks do not all serialize on one directory lock. Min 1, max 65536. |
-| `segment-size` | 1gb | Immutable | Size of each DRAMPool segment. Min 1mb, max 1gb. |
+| `segment-size` | 1gb | Immutable | Size of each DRAMPool and disk staging segment. Min 1mb, max 1gb. Must be at least twice `chunk-size`. |
 | `disk-maxmemory` | 0 (unlimited) | Yes | Max NVMe disk usage, counting each file rounded up to the filesystem's allocation unit (the stripe unit on a striped XFS). 0 = unlimited. |
 | `disk-staging-size` | 1gb | Immutable | Size of NVMe staging buffer. Min 1mb. |
 | `max-object-size` | 512mb | Yes | Maximum allowed object size for BLOB.TCP_SET / BLOB.RDMA_SET. Min 1 byte. |
@@ -91,7 +98,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `reaper-poll-ms` | 25 | Yes | Scaling cron poll interval in milliseconds while evicted keys wait to be deleted. Min 10, max 60000. |
 | `reaper-scan-budget-us` | 2000 | Yes | Microseconds per tick for deleting evicted keys; one uninterruptible event-loop stall, and over `reaper-poll-ms` the share of a core reclaim gets. Min 100, max 100000. |
 | `victim-sample-size` | 5 | Yes | Entries sampled per victim search (eviction, DRAM cache drop, fd close); the lowest LFU score goes. Min 1, max 64. |
-| `promote-min-hits` | 2 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Min 1, max 255. |
+| `promote-min-hits` | 1 | Yes | Tiered: misses an object needs before a GET promotes it to DRAM. 1 = promote on first GET. Min 1, max 255. |
 | `lfu-decay-minutes` | 1 | Yes | Minutes per one-point decay of the LFU score used to rank DRAM objects and fds for eviction. 0 = no decay. Max 65535. |
 | `max-cached-fds` | 16384 | Yes | Tiered: how many read fds to keep cached. 0..1048576; 0 caches nothing. The fd cache max entries is the smaller of this and the fd limit minus `2 x maxclients + 128`; a larger value is clamped with a warning. |
 | `fd-reserve` | Lenient | Immutable | Tiered: what happens when the open-file limit is below `2 x maxclients + 128` (module start plus the command reserve). `Lenient` loads with object-file fd placement and the fd cache off; `Strict` also needs `max-cached-fds` to fit (`2 x maxclients + 128 + max-cached-fds`): it refuses to load otherwise, rejects a `CONFIG SET max-cached-fds` that does not fit, and aborts the server on a `CONFIG SET maxclients` that breaks the reserve or squeezes the cache. See `docs/OBJECT_FD_PLACEMENT_DESIGN.md`. |
@@ -104,7 +111,8 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `fabric-max-in-flight` | 256 | Immutable | Transfers each fabric service keeps in flight. 0 = provider default. Max 65536. |
 | `fabric-crc-pool-threads` | 2 | Immutable | Threads hashing checksummed transfers. Min 1, max 1024. |
 
-All size parameters accept memory notation (`64mb`, `1gb`, etc.).
+In the config file (`largeobj.segment-size 64mb`) and in `CONFIG SET`, size parameters accept
+memory notation (`64mb`, `1gb`, etc.). As `loadmodule` arguments they are plain byte counts.
 
 ## Test
 

@@ -44,7 +44,7 @@ pub fn scaling_cron(ctx: &Context) {
     // 3. Proactive expand: grow before the pool fills so promotions don't
     //    stall on segment creation + EFA registration on the hot path.
     let util = pool.utilization_ratio();
-    let expanding = util > expand_watermark && pool.grow_in_background(ctx);
+    let expanding = util > expand_watermark && pool.grow_in_background();
     if expanding {
         ctx.log_notice(&format!(
             "largeobj: scaling — pool utilization {:.1}% > {:.0}%, adding one DRAM segment",

@@ -83,13 +83,16 @@ class TestLargeObjFabric(ValkeyLargeObjTestCaseBase):
             client, 'BLOB.RDMA_GET key 999 0 4096', 'no RDMA session (call BLOB.RDMA_HELLO first)')
 
     def test_rdma_arity_and_malformed_triples_are_refused(self):
-        """RDMA commands reject too-few args and incomplete triples.
+        """RDMA commands reject wrong arg counts and incomplete triples.
+        RDMA_HELLO: exactly 2 args (the client rdma address).
         RDMA_GET: >=5 args (key + at least one triplet). Incomplete triples are refused.
         RDMA_SET: >=6 args (key + total_len + at least one triplet). Incomplete triples are refused.
         """
         client = self.server.get_new_client()
         client.execute_command('BLOB.TCP_SET', 'key', position_pattern(4096, 'A'))
-        for command in ('BLOB.RDMA_GET key 999',
+        for command in ('BLOB.RDMA_HELLO',
+                        f'BLOB.RDMA_HELLO {PEER_ADDRESS} extra',
+                        'BLOB.RDMA_GET key 999',
                         'BLOB.RDMA_GET key 999 0',
                         'BLOB.RDMA_SET key 4096 999',
                         'BLOB.RDMA_SET key 4096 999 0'):

@@ -94,33 +94,31 @@ pub fn unevictable_count() -> usize {
         .count()
 }
 
-/// Claim `oid` for eviction: take it off the eviction candidates and add it to the
-/// reclaim list and the unevictable list. Returns the claim and the `disk_bytes` its
-/// eviction credits, or `None` if it is unevictable or no longer a candidate (torn down
-/// or claimed since the pick). One `UNEVICTABLE` critical section, so a teardown either
-/// takes `oid` off the candidates first (the claim fails) or finds it in the reclaim
-/// list. Call under the server lock.
-///
-/// `hint`: the victim's key hint, if its file has one. The reaper then deletes the key
-/// by name, else by scan.
+/// Claim the oldest evictable candidates whose `disk_bytes` cover `need`, at most
+/// `max`: take them off the eviction candidates and add them to the
+/// reclaim list by name, and to the unevictable list. Returns each claim and
+/// the `disk_bytes` its eviction credits. One `UNEVICTABLE` critical section, so a
+/// teardown either takes an oid off the candidates first (it is not claimed) or finds it
+/// in the reclaim list, and concurrent claims take disjoint victims. Call under the
+/// server lock.
 #[must_use]
-pub fn claim_victim(
-    oid: ObjectId,
-    hint: Option<super::KeyHint>,
-) -> Option<(Arc<UnevictableOID>, u64)> {
+pub fn claim_victims(need: u64, max: usize) -> Vec<(Arc<UnevictableOID>, u64)> {
     let mut unevictable = UNEVICTABLE.lock().expect("UNEVICTABLE lock unavailable");
-    if unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0) {
-        return None;
-    }
-    // Off the candidates, so no later eviction picks it.
-    let disk_bytes = super::eviction_candidates::remove(oid)?;
-    // Only a claim lists a file's oid, and it takes the oid off the candidates first.
-    let listed = super::reclaim::RECLAIM_LIST.insert(oid, hint);
-    assert!(
-        listed,
-        "largeobj: eviction candidate {oid:?} is already on the reclaim list"
-    );
-    Some((UnevictableOID::insert(&mut unevictable, oid), disk_bytes))
+    let taken = super::eviction_candidates::take(need, max, |oid| {
+        !unevictable.get(&oid).is_some_and(|w| w.strong_count() > 0)
+    });
+    taken
+        .into_iter()
+        .map(|(oid, disk_bytes)| {
+            // Only a claim lists a file's oid, and it takes the oid off the candidates first.
+            let listed = super::reclaim::RECLAIM_LIST.insert_awaiting_key_name(oid);
+            assert!(
+                listed,
+                "largeobj: eviction candidate {oid:?} is already on the reclaim list"
+            );
+            (UnevictableOID::insert(&mut unevictable, oid), disk_bytes)
+        })
+        .collect()
 }
 
 // ─── ObjectFile ────────────────────────────────────────────────────────────────
@@ -182,6 +180,9 @@ impl ObjectFile {
             self.object_id, st.st_size, disk_len
         );
         let bytes = super::nvme::metadata_disk_bytes(disk_len, st.st_blocks as u64);
+        if bytes > 0 {
+            crate::info::DISK_METADATA_SPILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         super::nvme::increase_nvme_disk_usage(bytes);
         // Unevictable since `new`, so no claim has taken its entry.
         let recorded = super::eviction_candidates::add_disk_bytes(self.object_id, bytes);
@@ -315,21 +316,5 @@ impl Drop for ObjectFile {
         } else {
             teardown();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::{eviction_candidates, reclaim::RECLAIM_LIST};
-    use super::*;
-
-    #[test]
-    fn test_a_claimed_victim_leaves_the_eviction_candidates() {
-        let oid = ObjectId(9_500);
-        eviction_candidates::insert(oid, 0);
-        let (claim, _) = claim_victim(oid, None).expect("not claimed yet");
-        assert!(eviction_candidates::pick(usize::MAX, |o| o == oid).is_empty());
-        drop(claim);
-        RECLAIM_LIST.remove(&oid);
     }
 }

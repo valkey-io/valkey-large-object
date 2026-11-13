@@ -155,7 +155,6 @@ async fn efa_write_to_client(session: Arc<Session>, buf_ptr: usize, len, rkey, r
 | Config | Default | Description |
 |--------|---------|-------------|
 | `operating-mode` | Dram | Enum: `Dram` or `Tiered` |
-| `dram-maxmemory` | 0 (no limit) | Total DRAM budget. 0 = grow on demand. |
 | `segment-size` | 64mb | Size of each DRAMPool segment |
 | `disk-dir` | (required if Tiered) | Dedicated, module-owned directory for .dat files. Wiped wholesale on startup and teardown, so it must NOT be shared with other files. |
 | `disk-dir-shards` | 1024 | Subdirectories of `disk-dir` that object files are spread over, by OID. Immutable. |

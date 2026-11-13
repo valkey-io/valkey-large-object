@@ -299,8 +299,6 @@ valkey_module! {
              ConfigurationFlags::DEFAULT, None, Some(Box::new(validate_config_constraint))],
             ["test-pause-before-finalize-set-ms", &*CFG_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, DEFAULT_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, MIN_TEST_PAUSE_BEFORE_FINALIZE_SET_MS, MAX_TEST_PAUSE_BEFORE_FINALIZE_SET_MS,
              ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
-            ["test-pause-after-evict-pick-ms", &*CFG_TEST_PAUSE_AFTER_EVICT_PICK_MS, DEFAULT_TEST_PAUSE_AFTER_EVICT_PICK_MS, MIN_TEST_PAUSE_AFTER_EVICT_PICK_MS, MAX_TEST_PAUSE_AFTER_EVICT_PICK_MS,
-             ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
             ["test-pause-during-promotion-ms", &*CFG_TEST_PAUSE_DURING_PROMOTION_MS, DEFAULT_TEST_PAUSE_DURING_PROMOTION_MS, MIN_TEST_PAUSE_DURING_PROMOTION_MS, MAX_TEST_PAUSE_DURING_PROMOTION_MS,
              ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None, None],
             ["test-pause-after-promotion-failure-ms", &*CFG_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS, DEFAULT_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS, MIN_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS, MAX_TEST_PAUSE_AFTER_PROMOTION_FAILURE_MS,

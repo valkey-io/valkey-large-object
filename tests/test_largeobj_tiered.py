@@ -102,6 +102,7 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert (db, header[26:]) == (0, b'rt_multi') and key_len == len(b'rt_multi')
         st = os.stat(dat_files[-1])
         assert st.st_blocks * ST_BLOCKS_UNIT == st.st_size, "object file has a metadata block"
+        assert info_largeobj(client)['largeobj_disk_metadata_spills'] == 0
         with open(dat_files[-1], 'rb') as f:
             data_on_disk = f.read(len(payload_multi))
             assert data_on_disk == payload_multi, "On-disk data at offset 0 mismatch"
@@ -1066,7 +1067,7 @@ class TestLargeObjSmartlogDisabled(ValkeyLargeObjTestCaseBase):
 
 
 class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
-    """Default admission: promote-min-hits 2."""
+    """Admission at promote-min-hits 2."""
 
     def get_module_args(self, data_dir, direct_io):
         return (
@@ -1075,6 +1076,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
             f" disk-staging-size 4194304"
             f" segment-size 4194304"
             f" max-promote-size 1048576"
+            f" promote-min-hits 2"
             f" bench-mode no"
             f" direct-io no"
             f" chunk-size 4096"
@@ -2030,3 +2032,31 @@ class TestTieredChunkSizeAlignment(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: server.server.poll() is not None)
         assert server.server.returncode != 0
         assert server.verify_string_in_logfile('chunk-size must be a multiple of 4096')
+
+
+class TestSegmentHoldsAChunk(ValkeyLargeObjTestCaseBase):
+    """segment-size must be at least twice chunk-size."""
+
+    # A refused load leaks (see test_unaligned_chunk_size_refuses_to_load).
+    @pytest.mark.skip_for_asan
+    def test_segment_the_size_of_a_chunk_refuses_to_load(self):
+        testdir = os.path.abspath(os.path.join(self.testdir, 'segment-eq-chunk'))
+        os.makedirs(testdir, exist_ok=True)
+        module_args = (
+            f"operating-mode Tiered"
+            f" disk-dir {os.path.join(testdir, 'nvme')}"
+            f" segment-size 1048576"
+            f" disk-staging-size 8388608"
+            f" chunk-size 1048576"
+            f" max-promote-size 0"
+            f" max-object-size 4194304"
+            f" fabric-provider Emulated"
+        )
+        server, _ = self.create_server(
+            testdir=testdir,
+            server_path=self.server.valkey_path,
+            args={'loadmodule': f"{os.environ['MODULE_PATH']} {module_args}"},
+            connect_client=False)
+        wait_for_true(lambda: server.server.poll() is not None)
+        assert server.server.returncode != 0
+        assert server.verify_string_in_logfile('segment-size must be >= 2 * largeobj.chunk-size')

@@ -1538,7 +1538,7 @@ this section owns the semantics.
 | `disk-dir` | `""` | — | — | Immutable | NVMe object directory (Tiered) |
 | `direct-io` | `yes` | — | — | Immutable | O_DIRECT on NVMe files (must be `no` on tmpfs) |
 | `max-promote-size` | `256MB` | `0` (disable) | `1TB` | Live | Promotion eligibility; objects above this never enter DRAMPool (detail: §7.5) |
-| `promote-min-hits` | `2` | `1` | `255` | Live | Admission-filter misses before a GET promotes an object |
+| `promote-min-hits` | `1` | `1` | `255` | Live | Admission-filter misses before a GET promotes an object |
 | `lfu-decay-minutes` | `1` | `0` (off) | `65535` | Live | LFU decay: minutes per one-point decrement |
 | `reclaim-sample-size` | `5` | `1` | `64` | Live | Objects sampled per cache-eviction round; the lowest LFU score is demoted |
 | `max-cached-fds` | `16384` | `0` (no cache) | `1048576` | Live | FdPool cap on cached read fds, clamped to what the fd limit allows (`fd-reserve` sets what happens when it does not fit; see `OBJECT_FD_PLACEMENT_DESIGN.md`) |

@@ -121,7 +121,7 @@ Default: 200. Auto-reduced for large objects when staging cap limits concurrency
 | `--clients` | 200 | Concurrent benchmark clients. |
 | `--duration` | 10 | Seconds per benchmark run. |
 | `--keys` | 500 | Base key count (scaled down for large objects). |
-| `--dram-maxmemory` | 34359738368 (32GB) | DRAM budget in bytes. |
+| `--maxmemory` | 34359738368 (32GB) | Server `maxmemory` in bytes; the DRAM pool scales up toward it. |
 | `--segment-size` | 67108864 (64MB) | Segment size in bytes. |
 | `--disk-maxmemory` | 107374182400 (100GB) | NVMe budget in bytes. |
 | `--worker-threads` | 8 | Tokio worker threads. |
