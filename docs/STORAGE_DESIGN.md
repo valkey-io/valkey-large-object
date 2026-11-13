@@ -832,7 +832,7 @@ but notifies no one today.
 Decision logic on NVMePool alloc:
 - Got X buffers → full pipeline speed (8 concurrent SQEs per batch)
 - Got ≥ Y but < X → proceed at reduced batch size (degrades gracefully)
-- Got < Y → reject with `ERR NVMe staging buffer pool exhausted`
+- Got < Y → reject with `OOM command not allowed when the disk staging buffer pool is exhausted.`
 
 Pool exhaustion mid-stream: impossible. Buffers are allocated once at the start of the operation and reused across batches. The loop never allocates mid-flight.
 
