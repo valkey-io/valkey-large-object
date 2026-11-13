@@ -5,7 +5,7 @@ import time
 import resource
 import threading
 import pytest
-from valkey import ResponseError, Valkey
+from valkey import OutOfMemoryError, ResponseError, Valkey
 from valkey_largeobj_test_case import (
     DISK_INODE,
     ST_BLOCKS_UNIT,
@@ -2060,3 +2060,42 @@ class TestSegmentHoldsAChunk(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: server.server.poll() is not None)
         assert server.server.returncode != 0
         assert server.verify_string_in_logfile('segment-size must be >= 2 * largeobj.chunk-size')
+
+
+# ─── Disk staging exhaustion ─────────────────────────────────────────────────
+
+
+class TestTieredStagingExhausted(ValkeyLargeObjTestCaseBase):
+    """Every SET pauses 2 s holding its staging window, and min-buffers-per-op 64
+    makes each window all-or-nothing, so concurrent SETs exhaust the pool."""
+
+    def get_module_args(self, data_dir, direct_io):
+        base = TestLargeObjTieredPromotion.get_module_args(self, data_dir, direct_io)
+        return base + " test-pause-before-finalize-set-ms 2000 min-buffers-per-op 64"
+
+    def test_staging_exhausted_set_gets_oom(self):
+        """16 windows of 64 x 4 KiB fill the 4 MiB pool exactly, so buffer overhead
+        leaves at least one SET without a window. It is rejected with OOM."""
+        n = 16
+        setters = [self.server.get_new_client() for _ in range(n)]
+        errors = [None] * n
+
+        def background_set(i):
+            try:
+                setters[i].execute_command('BLOB.TCP_SET', f'key{i}', position_pattern(MIB, 'S'))
+            except Exception as e:
+                errors[i] = e
+
+        threads = [threading.Thread(target=background_set, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not any(t.is_alive() for t in threads), "SET threads did not finish"
+        rejected = [e for e in errors if e is not None]
+        assert rejected, "no SET was rejected"
+        for e in rejected:
+            assert isinstance(e, OutOfMemoryError), f"Unexpected error: {e!r}"
+            assert 'disk staging buffer pool is exhausted' in str(e), f"Unexpected error: {e}"
+        info = info_largeobj(self.server.get_new_client())
+        assert info['largeobj_disk_staging_buffer_exhausted'] == len(rejected)
