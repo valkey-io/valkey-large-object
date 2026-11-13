@@ -679,7 +679,14 @@ fn cmd_set_dram(
         };
         // Move every chunk into the DRAM buffers via the ONE streaming driver
         // (source=TCP payload or EFA client, target=DRAM resident).
-        let job = crate::stream::StreamJob::for_dram(obj_len, chunk_size, 0, buffers.len());
+        // Cap the window like the other streams: a whole-object batch floods the
+        // fabric's shared in-flight queue and starves concurrent GET writes.
+        let job = crate::stream::StreamJob::for_dram(
+            obj_len,
+            chunk_size,
+            0,
+            buffers.len().min(crate::max_buffers_per_op()),
+        );
         let target = crate::stream::Target::DramResident;
         // The one per-transport branch: build the source + choose the object-CRC rule.
         let (result, client_crc) = match data_source {
