@@ -142,7 +142,7 @@ fn is_valid_sockaddr(addr: &[u8]) -> bool {
 
 pub fn lo_rdma_hello(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     check_module_enabled(ctx)?;
-    if args.len() < 2 {
+    if args.len() != 2 {
         return Err(ValkeyError::WrongArity);
     }
 
