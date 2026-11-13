@@ -249,7 +249,7 @@ impl ObjectFile {
         crc32c: Crc,
     ) -> std::io::Result<()> {
         use std::os::unix::io::AsRawFd;
-        let dir = crate::disk_dir();
+        let dir = crate::storage::disk_dir();
         let mut src = std::fs::File::open(self.object_id.file_path(dir))?;
         let mut dst = std::fs::OpenOptions::new()
             .write(true)

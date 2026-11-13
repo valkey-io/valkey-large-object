@@ -126,7 +126,13 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
 
     // Configs are already populated by the valkey_module! macro via module_args_as_configuration.
     let mode = operating_mode();
-    let dir = disk_dir_at_load();
+    let dir = match CFG_DISK_DIR.lock(ctx).try_as_str() {
+        Ok(dir) => dir.to_owned(),
+        Err(e) => {
+            ctx.log_warning(&format!("largeobj: invalid disk-dir: {e}"));
+            return Status::Err;
+        }
+    };
 
     // Validate cross-config constraints now that all configs are finalized.
     // Per-config callbacks skip validation at load time (non-deterministic processing
@@ -208,7 +214,6 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     if RUNTIME.set(rt).is_err() {
         panic!("Runtime already initialized");
     }
-    commit_disk_dir(dir);
 
     // Cache maxmemory-policy; `CONFIG SET` keeps it current.
     storage::eviction_candidates::refresh_policy(ctx);
@@ -247,7 +252,7 @@ fn deinitialize(_ctx: &Context) -> Status {
 fn on_server_shutdown(ctx: &Context, _subevent: u64) {
     smartlog::signal_shutdown();
     transport::shutdown();
-    let dir = disk_dir();
+    let dir = storage::disk_dir();
     if let Err(e) = storage::validate_and_clean_disk_dir(operating_mode(), dir) {
         ctx.log_warning(&format!(
             "largeobj: shutdown cleanup failed to reset disk-dir {}: {}",
@@ -334,8 +339,8 @@ valkey_module! {
              ConfigurationFlags::MEMORY, None, None],
         ],
         string: [
-            ["disk-dir", &*CFG_DISK_DIR, "", ConfigurationFlags::IMMUTABLE, None, Some(Box::new(on_string_config_set))],
-            ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None, Some(Box::new(on_string_config_set))],
+            ["disk-dir", &*CFG_DISK_DIR, "", ConfigurationFlags::IMMUTABLE, None, None],
+            ["fabric-interfaces", &*CFG_FABRIC_INTERFACES, "", ConfigurationFlags::IMMUTABLE, None, Some(Box::new(on_fabric_interfaces_set))],
         ],
         bool: [
             ["bench-mode", &*CFG_BENCH_MODE, false, ConfigurationFlags::HIDDEN | ConfigurationFlags::IMMUTABLE, None],

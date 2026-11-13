@@ -125,6 +125,12 @@ pub const MAX_SEGMENTS: usize = 16_384;
 pub(super) static DRAM_POOL: OnceLock<DRAMPool> = OnceLock::new();
 pub(super) static NVME_POOL: OnceLock<NVMePool> = OnceLock::new();
 pub(super) static FD_POOL: OnceLock<FdPool> = OnceLock::new();
+static DISK_DIR: OnceLock<String> = OnceLock::new();
+
+/// `disk-dir` as committed by `init`; empty before the module has loaded.
+pub fn disk_dir() -> &'static str {
+    DISK_DIR.get().map_or("", String::as_str)
+}
 
 pub fn get_dram_pool() -> &'static DRAMPool {
     DRAM_POOL.get().expect("DRAMPool not initialized")
@@ -235,6 +241,9 @@ pub fn init(
     }
     if DRAM_POOL.set(dram_pool).is_err() {
         panic!("DRAMPool already initialized");
+    }
+    if DISK_DIR.set(disk_dir.to_owned()).is_err() {
+        panic!("disk-dir already initialized");
     }
     if let Some((dram_engine, nvme_engine)) = engines {
         uring::set_engine(uring::PoolType::Dram, dram_engine);

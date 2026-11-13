@@ -359,7 +359,7 @@ fn cmd_get_tiered(
     };
     if let Some(obj_ctx) = promoted {
         let fd_pool = storage::get_fd_pool();
-        let fd = match file.ensure_open(fd_pool, crate::disk_dir()) {
+        let fd = match file.ensure_open(fd_pool, crate::storage::disk_dir()) {
             Some(fd) => fd,
             None => {
                 // remove_object drops the map's Arc; obj_ctx drops at end of scope
@@ -437,7 +437,7 @@ fn cmd_get_tiered(
     };
     let stream_ctx = storage::StreamingContext::new(buffers);
     let fd_pool = storage::get_fd_pool();
-    let fd = match file.ensure_open(fd_pool, crate::disk_dir()) {
+    let fd = match file.ensure_open(fd_pool, crate::storage::disk_dir()) {
         Some(fd) => fd,
         None => {
             reply_err(
@@ -900,7 +900,7 @@ async fn cmd_set_tiered_run(
     }
     // FdPool not used on SET: this write fd is short-lived and never cached.
     // FdPool caches read fds lazily on first GET via ensure_open.
-    let file_path = object_id.file_path(crate::disk_dir());
+    let file_path = object_id.file_path(crate::storage::disk_dir());
     let fd = match storage::open_nvme_file_for_write(&file_path, disk_len) {
         Ok(fd) => fd,
         Err(_e) => {
