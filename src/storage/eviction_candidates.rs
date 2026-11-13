@@ -15,34 +15,22 @@
 //! The `maxmemory-policy` also lives here: the module API has no getter for it, so it is read
 //! at load and again when a `CONFIG SET` changes it.
 
-use std::collections::HashMap;
-use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use valkey_module::{Context, NotifyEvent};
 
+use super::sharded_map::ShardedMap;
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
 
 /// An exact least-recently-used order of oids, each with a value: a list, least recently used
-/// first, linked through a map from each oid to its neighbours. The map is split into
-/// `SHARDS` maps: a map grows by rehashing all its entries at once, under the candidates
-/// lock, and a shard holds 1/`SHARDS` of them. Oids are a counter: `oid % SHARDS`, or a fast
-/// hash, spreads consecutive oids so evenly that the shards fill in lockstep and all rehash
-/// within the same few thousand inserts. A quality hash picks the shard instead, so shard
-/// sizes vary and their rehashes spread over millions of inserts.
+/// first, linked through a map from each oid to its neighbours. The map is a `ShardedMap`,
+/// so its rehashes never stall the server.
 struct Order<V> {
-    shards: Vec<Shard<V>>,
-    pick_shard: foldhash::quality::RandomState,
+    nodes: ShardedMap<ObjectId, Node<V>>,
     head: u64,
     tail: u64,
 }
-
-const SHARDS: usize = 1024;
-
-/// foldhash: the hasher hashbrown and hashlink default to. Oids are a counter, never chosen
-/// by a client, so the map needs no protection against crafted collisions.
-type Shard<V> = HashMap<ObjectId, Node<V>, foldhash::fast::RandomState>;
 
 /// No neighbour. Oids come from a counter starting at 1, which never reaches it.
 const NIL: u64 = u64::MAX;
@@ -57,8 +45,7 @@ struct Node<V> {
 impl<V> Default for Order<V> {
     fn default() -> Self {
         Self {
-            shards: (0..SHARDS).map(|_| Shard::default()).collect(),
-            pick_shard: Default::default(),
+            nodes: ShardedMap::default(),
             head: NIL,
             tail: NIL,
         }
@@ -79,7 +66,7 @@ impl<V> Order<V> {
             next: NIL,
             value,
         };
-        self.shard_mut(&oid).insert(oid, node);
+        self.nodes.insert(oid, node);
         self.set_next(tail, oid.0);
         self.tail = oid.0;
     }
@@ -87,7 +74,7 @@ impl<V> Order<V> {
     /// Move `oid` to the back. False if it is not listed.
     fn move_to_back(&mut self, oid: &ObjectId) -> bool {
         let tail = self.tail;
-        let Some(node) = self.shard_mut(oid).get_mut(oid) else {
+        let Some(node) = self.nodes.get_mut(oid) else {
             return false;
         };
         if oid.0 != tail {
@@ -101,28 +88,32 @@ impl<V> Order<V> {
     }
 
     fn remove(&mut self, oid: &ObjectId) -> Option<V> {
-        let node = self.shard_mut(oid).remove(oid)?;
+        let node = self.nodes.remove(oid)?;
         self.detach(node.prev, node.next);
         Some(node.value)
     }
 
     fn get(&self, oid: &ObjectId) -> Option<&V> {
-        self.shard(oid).get(oid).map(|node| &node.value)
+        self.nodes.get(oid).map(|node| &node.value)
     }
 
     fn get_mut(&mut self, oid: &ObjectId) -> Option<&mut V> {
-        self.shard_mut(oid).get_mut(oid).map(|node| &mut node.value)
+        self.nodes.get_mut(oid).map(|node| &mut node.value)
     }
 
     fn contains(&self, oid: &ObjectId) -> bool {
-        self.shard(oid).contains_key(oid)
+        self.nodes.contains_key(oid)
     }
 
     /// The oids from the least recently used.
     fn iter(&self) -> impl Iterator<Item = ObjectId> + '_ {
         let first = (self.head != NIL).then_some(ObjectId(self.head));
         std::iter::successors(first, |oid| {
-            let next = self.shard(oid)[oid].next;
+            let next = self
+                .nodes
+                .get(oid)
+                .expect("eviction candidate is listed")
+                .next;
             (next != NIL).then_some(ObjectId(next))
         })
     }
@@ -152,23 +143,9 @@ impl<V> Order<V> {
     }
 
     fn node(&mut self, oid: u64) -> &mut Node<V> {
-        let oid = ObjectId(oid);
-        self.shard_mut(&oid)
-            .get_mut(&oid)
+        self.nodes
+            .get_mut(&ObjectId(oid))
             .expect("eviction candidate is listed")
-    }
-
-    fn shard(&self, oid: &ObjectId) -> &Shard<V> {
-        &self.shards[self.shard_index(oid)]
-    }
-
-    fn shard_mut(&mut self, oid: &ObjectId) -> &mut Shard<V> {
-        let i = self.shard_index(oid);
-        &mut self.shards[i]
-    }
-
-    fn shard_index(&self, oid: &ObjectId) -> usize {
-        self.pick_shard.hash_one(oid) as usize % SHARDS
     }
 }
 
@@ -452,7 +429,7 @@ mod tests {
         let listed = |order: &Order<u64>| -> Vec<(u64, u64)> {
             order
                 .iter()
-                .map(|oid| (oid.0, order.shard(&oid)[&oid].value))
+                .map(|oid| (oid.0, *order.get(&oid).unwrap()))
                 .collect()
         };
         let mut next = 0;
