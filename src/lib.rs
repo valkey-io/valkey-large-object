@@ -142,17 +142,22 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
-    // Reset disk-dir before use (Tiered mode only; a no-op in Dram, which never
-    // touches disk): reclaim any object files a previous run left behind after an
-    // unclean exit — a hard crash / SIGKILL never reaches our shutdown handler.
-    // If the reset fails we can't guarantee a clean slate, so refuse to load
-    // rather than start dirty.
-    if let Err(e) = storage::validate_and_clean_disk_dir(mode, &dir) {
-        ctx.log_warning(&format!(
-            "largeobj: startup failed to reset disk-dir {}: {}; aborting module load",
-            dir, e
-        ));
-        return Status::Err;
+    // Clean up what a previous run left in disk-dir (Tiered mode only): one rename per
+    // shard moves it out of the way, then a background thread deletes it, charged
+    // against disk-maxmemory until then. On failure we can't guarantee a clean slate,
+    // so refuse to load rather than start dirty.
+    match storage::reclaim::clean_previous_run(mode, &dir) {
+        Ok(0) => {}
+        Ok(bytes) => ctx.log_notice(&format!(
+            "largeobj: deleting the previous run's files in {dir} in the background ({bytes} bytes)"
+        )),
+        Err(e) => {
+            ctx.log_warning(&format!(
+                "largeobj: failed to clean up the previous run in disk-dir {dir}: {e}; \
+                 aborting module load"
+            ));
+            return Status::Err;
+        }
     }
 
     // The module only registers host memory. libfabric's default initializes every HMEM
@@ -242,23 +247,13 @@ fn deinitialize(_ctx: &Context) -> Status {
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
-/// signal the SMART log poller to stop, drop the fabric services, and — in Tiered
-/// mode — wipe disk-dir so object files don't accumulate across server lifetimes.
+/// signal the SMART log poller to stop and drop the fabric services.
 /// The io_uring engines live in process-lifetime statics and are not torn down here.
 /// Process exit frees all remaining resources (pools, runtime, transport).
-/// A hard crash (SIGKILL / SIGSEGV / power loss) never reaches this handler;
-/// those leftovers are reclaimed by the startup reset in `initialize`.
 #[shutdown_event_handler]
-fn on_server_shutdown(ctx: &Context, _subevent: u64) {
+fn on_server_shutdown(_ctx: &Context, _subevent: u64) {
     smartlog::signal_shutdown();
     transport::shutdown();
-    let dir = storage::disk_dir();
-    if let Err(e) = storage::validate_and_clean_disk_dir(operating_mode(), dir) {
-        ctx.log_warning(&format!(
-            "largeobj: shutdown cleanup failed to reset disk-dir {}: {}",
-            dir, e
-        ));
-    }
 }
 
 valkey_module! {

@@ -31,8 +31,8 @@ pub use object_file::{ObjectFile, UnevictableOID};
 
 // Re-exports from nvme.rs
 pub use nvme::{
-    object_disk_len, open_nvme_file_for_write, read_and_verify_file_header,
-    validate_and_clean_disk_dir, write_file_header, KeyHint,
+    object_disk_len, open_nvme_file_for_write, read_and_verify_file_header, write_file_header,
+    KeyHint,
 };
 
 pub use dram_pool::DRAMPool;
@@ -183,8 +183,7 @@ pub fn init(
     // module range before any is opened, or they stop new clients being served.
     if mode == crate::OperatingMode::Tiered {
         fd_placement::raise_module_start(ctx)?;
-        // disk-dir was just reset to empty, and object files live in its shard
-        // subdirectories. Created here rather than in the reset, which also runs at shutdown.
+        // Object files live in disk-dir's shard subdirectories.
         crate::data_type::create_disk_dir_shards(disk_dir)
             .map_err(|e| format!("failed to create disk-dir shards under {disk_dir}: {e}"))?;
     }

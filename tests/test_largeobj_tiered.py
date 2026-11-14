@@ -1954,7 +1954,12 @@ class TestTieredDiskDirShards(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         assert client.config_get('largeobj.disk-dir-shards') == {
             'largeobj.disk-dir-shards': str(self.SHARDS)}
-        assert sorted(os.listdir(self.data_dir)) == [f'{s:04x}' for s in range(self.SHARDS)]
+        # A previous test's files are moved into a previous-run dir at startup and deleted
+        # in the background; only the shards remain once that is done.
+        remaining = lambda: client.info('largeobj_disk')['largeobj_disk_previous_run_remaining_bytes']
+        wait_for_equal(remaining, 0)
+        wait_for_equal(lambda: sorted(os.listdir(self.data_dir)),
+                       [f'{s:04x}' for s in range(self.SHARDS)])
         # Two objects per shard, so consecutive OIDs reach every shard whatever SHARDS is.
         count = 2 * self.SHARDS
         for i in range(count):
