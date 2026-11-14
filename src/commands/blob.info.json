@@ -1,0 +1,43 @@
+{
+    "BLOB.INFO": {
+        "summary": "Returns the length, CRC32C checksum, and storage tier of a large object",
+        "complexity": "O(1)",
+        "group": "large_object",
+        "module_since": "0.1.0",
+        "arity": -2,
+        "acl_categories": [
+            "READ",
+            "FAST",
+            "LARGEOBJ"
+        ],
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "field",
+                "type": "oneof",
+                "optional": true,
+                "arguments": [
+                    {
+                        "name": "len",
+                        "type": "pure-token",
+                        "token": "LEN"
+                    },
+                    {
+                        "name": "crc",
+                        "type": "pure-token",
+                        "token": "CRC"
+                    },
+                    {
+                        "name": "tier",
+                        "type": "pure-token",
+                        "token": "TIER"
+                    }
+                ]
+            }
+        ]
+    }
+}

@@ -1,0 +1,50 @@
+{
+    "BLOB.RDMA_SET": {
+        "summary": "Stores a large object at a key, with the payload read from client memory regions with RDMA",
+        "complexity": "O(N), where N is the size of the object in bytes.",
+        "group": "large_object",
+        "module_since": "0.1.0",
+        "arity": -6,
+        "acl_categories": [
+            "WRITE",
+            "FAST",
+            "LARGEOBJ"
+        ],
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "total-len",
+                "type": "integer"
+            },
+            {
+                "name": "crc32c",
+                "type": "integer",
+                "token": "CRC",
+                "optional": true
+            },
+            {
+                "name": "region",
+                "type": "block",
+                "multiple": true,
+                "arguments": [
+                    {
+                        "name": "rkey",
+                        "type": "integer"
+                    },
+                    {
+                        "name": "addr",
+                        "type": "integer"
+                    },
+                    {
+                        "name": "len",
+                        "type": "integer"
+                    }
+                ]
+            }
+        ]
+    }
+}

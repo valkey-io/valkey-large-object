@@ -1,0 +1,21 @@
+{
+    "BLOB.TCP_GET": {
+        "summary": "Returns the payload of a large object, sent inline over the connection",
+        "complexity": "O(N), where N is the size of the object in bytes.",
+        "group": "large_object",
+        "module_since": "0.1.0",
+        "arity": 2,
+        "acl_categories": [
+            "READ",
+            "FAST",
+            "LARGEOBJ"
+        ],
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            }
+        ]
+    }
+}
