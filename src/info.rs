@@ -251,6 +251,10 @@ fn disk_section(ctx: &InfoContext) -> ValkeyResult<()> {
     ctx.builder()
         .add_section("disk")
         .field("disk_used_bytes", used as i64)?
+        .field(
+            "disk_previous_run_remaining_bytes",
+            storage::reclaim::previous_run_remaining_bytes() as i64,
+        )?
         .field("disk_utilization_pct", pct(used, crate::nvme_maxmemory()))?
         .field(
             "disk_unevictable_objects",

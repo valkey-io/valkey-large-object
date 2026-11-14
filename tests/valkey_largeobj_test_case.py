@@ -178,8 +178,8 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     def setup_test(self, setup):
         module_path = os.getenv('MODULE_PATH')
         # Give the module a DEDICATED disk-dir under testdir (not testdir itself).
-        # The module owns this directory outright and wipes it wholesale on startup
-        # and teardown, so it must not be shared with the server's own files
+        # The module owns this directory outright and deletes everything in it at
+        # startup, so it must not be shared with the server's own files
         # (logfile, rdb) which live directly in testdir. Absolute path so file
         # assertions work regardless of cwd.
         data_dir = os.path.abspath(os.path.join(self.testdir, "nvme"))
