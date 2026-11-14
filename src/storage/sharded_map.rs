@@ -14,7 +14,7 @@ use std::hash::{BuildHasher, Hash};
 
 const SHARDS: usize = 1024;
 
-/// foldhash: the hasher hashbrown and hashlink default to. Keys are never chosen by a
+/// foldhash: the hasher hashbrown defaults to. Keys are never chosen by a
 /// client, so the maps need no protection against crafted collisions.
 type Shard<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
 

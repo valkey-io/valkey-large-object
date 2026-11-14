@@ -80,7 +80,7 @@ impl<V> Order<V> {
         if oid.0 != tail {
             let (prev, next) = (node.prev, node.next);
             (node.prev, node.next) = (tail, NIL);
-            self.detach(prev, next);
+            self.join(prev, next);
             self.set_next(tail, oid.0);
             self.tail = oid.0;
         }
@@ -89,7 +89,7 @@ impl<V> Order<V> {
 
     fn remove(&mut self, oid: &ObjectId) -> Option<V> {
         let node = self.nodes.remove(oid)?;
-        self.detach(node.prev, node.next);
+        self.join(node.prev, node.next);
         Some(node.value)
     }
 
@@ -118,8 +118,9 @@ impl<V> Order<V> {
         })
     }
 
-    /// Join the neighbours of an oid that left its place.
-    fn detach(&mut self, prev: u64, next: u64) {
+    /// Link `prev` and `next` to each other: the two neighbours of an oid that left its
+    /// place in the list. The caller has already unlinked or removed that oid.
+    fn join(&mut self, prev: u64, next: u64) {
         self.set_next(prev, next);
         self.set_prev(next, prev);
     }
