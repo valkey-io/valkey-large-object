@@ -424,13 +424,28 @@ struct StreamingContext {
 Each object version is one file, named directly from its `ObjectId` under the
 configured `disk-dir`: `{disk-dir}/{oid % disk-dir-shards:04x}/{oid:016x}.dat` (via
 `ObjectId::file_path`). `disk-dir` is the module-owned directory; its
-`disk-dir-shards` subdirectories (default 1024) are created when it is reset at
+`disk-dir-shards` subdirectories (default 1024) are created at
 startup. Every create and unlink
 takes its directory's inode lock exclusively, so one directory would serialize
 them across all SETs and evictions. The
 runtime handle is `ObjectFile { object_id }` (held behind
 `Arc<ObjectFile>`); it stores no path and no fd — the path is derived from the OID
 and the fd is managed separately by the FdPool (§6.4).
+
+**Previous-run cleanup (`storage/reclaim.rs`).** Whatever a previous run left in
+`disk-dir` (after any shutdown or crash) is deleted without blocking startup, whose cost
+would otherwise grow with the data on disk; OIDs restart at 1, so its paths would collide
+with this run's. `clean_previous_run` renames every entry in `disk-dir` into
+`disk-dir/previous-run-<nanos>/` (one rename per shard), then one `SCHED_IDLE` thread
+deletes it. Until then the space it holds is charged against
+`disk-maxmemory` (§9.3): what `statvfs` reports used beyond this run's charges, at most
+`disk-maxmemory` (the previous run never charged more), re-read after each file is
+deleted, and only ever lowered. It includes what the filesystem holds for itself (XFS
+reserves metadata space per allocation group and reports it used), so it is zeroed once
+the last file is deleted. A SET that does not fit deletes some of it inline before evicting
+anything. INFO `disk_previous_run_remaining_bytes` counts down to 0. Shutdown
+deletes nothing. One thread is enough: unlink throughput is bound by the filesystem's
+inode inactivation, not by the number of callers.
 
 **File header (in the `user.lobj` extended attribute; the file holds only the
 payload, from offset 0):**
@@ -1412,6 +1427,7 @@ Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a 
 | NVMe disk-usage counter | `AtomicU64` (NVME_DISK_USAGE) | lock-free atomic | Tokio (reserve on SET/COPY), any thread (decrement on ObjectFile::Drop / error rollback) |
 | Segment registry | `Mutex<SegmentState { slots: Vec<Option<Segment>> }>` (per pool) | Mutex | All threads take it briefly to reach a segment (alloc picker, free, buffer_ptr, iovec lookup). Slots are mutated by publish (the expand's last step, on any thread) and by release (main thread); the Tiered DRAM ring's poller rewrites `iovecs` and each segment's `iovec_index` during a rebuild (§8.6). Each segment's `refcount`/`allocated_bytes`/`draining` are atomics; its talc is a separate per-segment Mutex. |
 | Reclaim list | `RECLAIM_LIST: LazyLock<ReclaimList>` (`HashSet<ObjectId>` behind a `Mutex`) | Mutex | Main (add on eviction; `contains` on BLOB.TCP_GET/BLOB.RDMA_GET/INFO/COPY; cron scan + remove; INFO), BIO (`lo_free` → `remove_object` removes), tokio (refused EFA commit → `remove_object`). Lock order: reclaim list before `DRAMPool.objects`. All readers run on the main thread, so a RwLock would buy nothing. |
+| Previous-run cleanup | `reclaim::PREVIOUS_RUN_DIRS` (`Mutex<Vec<(PathBuf, ReadDir)>>`, the depth-first walk) + `PREVIOUS_RUN_BYTES: AtomicU64` | Mutex (held only to advance the walk; unlink outside it) | The `lo-prev-cleanup` thread, and any thread whose reserve does not fit (tokio, main on COPY). Each file is handed out once. |
 | Reclaim scan cursor | `thread_local! RECLAIM_SCAN` (db + `KeysCursor`) | none (main thread only) | Scaling cron |
 
 **Why RwLock for DRAMPool HashMap and FdPool:** GET hit is the hot path — main thread reads frequently. RwLock allows parallel reads. Writes (promotion insert from tokio, remove from main on free callback) are infrequent and take exclusive lock briefly.
@@ -1424,7 +1440,7 @@ only same-segment operations serialize. Hold time ~10-50ns. Negligible contentio
 
 **Consistency with §9.2:** Main thread never allocs from NVMePool (all Tiered I/O goes through tokio). Main thread allocs from DRAMPool only for the first try of a DRAM-only SET, and for COPY. Main thread frees via Arc Drop in free callback (which may call the owning segment's talc.free if last ref).
 
-**NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `disk-maxmemory` and fails the SET if it would exceed the cap (`disk-maxmemory` of 0 = unlimited). Module-driven NVMe eviction (§8.1) frees space instead of failing when `maxmemory-policy` allows it. The only other increment is `ObjectFile::write_header`, which adds a file's metadata blocks with `increase_nvme_disk_usage`, uncapped: they are already allocated. Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length. Each charge is that length passed through `allocated_disk_bytes`, described next. A file's whole charge is recorded once, in its eviction-candidate entry, from `ObjectFile::new` (the reservation) through `write_header` (plus its metadata blocks); `Drop` and eviction both release that recorded value, never a recomputed one, and exactly one of them does: a claim takes the entry before it lists the oid on the reclaim list.
+**NVMe disk-usage accounting:** a single process-global `AtomicU64` (`NVME_DISK_USAGE`) tracks bytes committed on NVMe. Writes reserve and increment in one atomic step via `try_reserve_nvme_disk_usage(disk_len)`, which does a checked `fetch_update` against `disk-maxmemory` and fails the SET if it would exceed the cap (`disk-maxmemory` of 0 = unlimited). The previous run's files still on disk are charged too (`live + previous_run + delta <= disk-maxmemory`, §6.3), and a SET that does not fit deletes some of them before anything else. Module-driven NVMe eviction (§8.1) then frees space instead of failing when `maxmemory-policy` allows it. The only other increment is `ObjectFile::write_header`, which adds a file's metadata blocks with `increase_nvme_disk_usage`, uncapped: they are already allocated. Decrements happen on `ObjectFile::Drop` (file deleted) and on every SET error/rollback path (write error, stale-version discard, open failure, RecvError). The written length is the O_DIRECT-aligned `object_disk_len(obj_len)`, not the raw object length. Each charge is that length passed through `allocated_disk_bytes`, described next. A file's whole charge is recorded once, in its eviction-candidate entry, from `ObjectFile::new` (the reservation) through `write_header` (plus its metadata blocks); `Drop` and eviction both release that recorded value, never a recomputed one, and exactly one of them does: a claim takes the entry before it lists the oid on the reclaim list.
 
 **Charging a file's real disk use on a striped XFS (`allocated_disk_bytes`):** the counter must track the space the filesystem actually consumes. Otherwise the filesystem fills before disk-maxmemory is reached, and once only unusable gaps remain, every SET's `fallocate` searches them and GET and SET collapse together. (On an i8ge with a 256 KiB stripe unit and 1 MiB objects, throughput fell from ~397 to ~68 Gbps before any eviction.)
 

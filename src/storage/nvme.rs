@@ -149,12 +149,27 @@ pub fn decrease_nvme_disk_usage(bytes: u64) {
     }
 }
 
-/// Reserve `bytes` of NVMe disk budget, evicting other objects to make room if it
-/// does not fit within disk-maxmemory. Returns true and increments the counter on
-/// success; returns false and leaves the counter unchanged otherwise.
-/// Returns true if disk-maxmemory is 0 (unlimited).
+/// Reserve `bytes` of NVMe disk budget. If it does not fit within disk-maxmemory,
+/// first delete files the previous run left in disk-dir, then evict other objects.
+/// Returns true and increments the counter on success; returns false and leaves the
+/// counter unchanged otherwise. Returns true if disk-maxmemory is 0 (unlimited).
 pub fn try_reserve_nvme_disk_usage(bytes: u64) -> bool {
-    reserve(bytes as i64) || evict_and_reserve(bytes)
+    reserve(bytes as i64) || delete_previous_run_and_reserve(bytes) || evict_and_reserve(bytes)
+}
+
+/// Delete the previous run's files until `bytes` fits, before touching live objects.
+/// Not an eviction of user data, so it runs under `noeviction` and on replicas too.
+fn delete_previous_run_and_reserve(bytes: u64) -> bool {
+    if bytes > crate::nvme_maxmemory() {
+        return false;
+    }
+    while super::reclaim::delete_previous_run_file() {
+        if reserve(bytes as i64) {
+            return true;
+        }
+    }
+    // The walk's end zeroes the charge (what the filesystem holds included): retry once.
+    reserve(bytes as i64)
 }
 
 /// Atomically add `delta` to the usage if the result fits within disk-maxmemory;
@@ -171,7 +186,9 @@ fn reserve(delta: i64) -> bool {
                 );
                 return None;
             };
-            (max == 0 || next <= max).then_some(next)
+            // The previous run's files still hold their space until deleted.
+            let charged = next.saturating_add(super::reclaim::previous_run_remaining_bytes());
+            (max == 0 || charged <= max).then_some(next)
         })
         .is_ok()
 }
@@ -440,8 +457,9 @@ fn read_field<const N: usize>(r: &mut &[u8]) -> Result<[u8; N], String> {
 ///   Called on a claimed victim, whose file is complete and only its eviction unlinks.
 /// - Disk or kernel fault, logged: any other read error. The hint is only a shortcut,
 ///   so the key is left to the scan.
-/// - Bug, panics: a corrupt header, or a header for another object. Disk-dir is wiped
-///   at startup, so every header was written by this run, to its own object's file.
+/// - Bug, panics: a corrupt header, or a header for another object. The previous run's
+///   files are moved out of disk-dir at startup, so every header was written by this run,
+///   to its own object's file.
 pub fn read_key_hint(oid: ObjectId) -> Option<KeyHint> {
     let path = oid.file_path(crate::storage::disk_dir());
     let c_path = std::ffi::CString::new(path.as_str()).expect("object file paths have no NUL");
@@ -599,35 +617,6 @@ pub fn write_file_header(
     } else {
         Err(std::io::Error::last_os_error())
     }
-}
-
-/// Reset the NVMe object directory (Tiered mode only): delete it and everything
-/// under it, then recreate it empty. `disk-dir` is a dedicated, module-owned
-/// directory (see the `disk-dir` config docs), so wiping it is safe. A no-op
-/// in Dram mode, which never touches disk.
-///
-/// Called both to reclaim a previous run's leftovers at startup and to clear
-/// this instance's files at shutdown. Returns `Ok(())` once disk-dir exists and
-/// is empty (or immediately, in Dram mode); `Err` if disk-dir is unset in Tiered
-/// mode, or the directory could not be removed or recreated.
-pub fn validate_and_clean_disk_dir(mode: crate::OperatingMode, dir: &str) -> std::io::Result<()> {
-    if mode != crate::OperatingMode::Tiered {
-        return Ok(());
-    }
-    if dir.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "disk-dir is required in Tiered operating mode",
-        ));
-    }
-    // remove_dir_all errors if `dir` is absent — but "absent" is already the
-    // state we want, so treat NotFound as success.
-    if let Err(e) = std::fs::remove_dir_all(dir) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(e);
-        }
-    }
-    std::fs::create_dir_all(dir)
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

@@ -20,12 +20,17 @@
 //! thread), marked `KeyState::Deleted` so neither way spends work on it.
 //!
 //! Lock order: `RECLAIM_LIST` before `DRAMPool.objects` when both are held.
+//!
+//! Also the previous run's disk-dir files, reclaimed at startup (below).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::fs::{self, ReadDir};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use valkey_module::{raw, Context, KeysCursor, ValkeyString};
 
@@ -360,6 +365,168 @@ fn listed_keys_in_next_bucket(
     (listed.into_inner(), more)
 }
 
+// ─── Previous-run cleanup ────────────────────────────────────────────────────
+//
+// Tiered: deleting disk-dir takes time proportional to what is in it, and OIDs restart
+// at 1 every run, so a new object would reuse an old object's path. So startup renames
+// everything in disk-dir into `disk-dir/previous-run-<nanos>/` (one rename per shard),
+// charges the space it holds against disk-maxmemory, and deletes it on a background
+// thread. A reservation that does not fit deletes some of it inline before evicting
+// live objects (`nvme::try_reserve_nvme_disk_usage`).
+
+/// Space still held by the previous run's files: what `statvfs` reports used beyond
+/// this run's charges, at most disk-maxmemory, and only ever lowered
+/// (`refresh_previous_run_bytes`). It includes what the filesystem holds for itself
+/// (XFS reserves metadata space per allocation group and reports it used), so only the
+/// end of the walk sets it to 0, and 0 means done.
+static PREVIOUS_RUN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// disk-dir, for `statvfs`. Set once the previous run is charged.
+static PREVIOUS_RUN_DISK_DIR: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+
+/// Directories still being deleted, depth-first, each with its open listing.
+static PREVIOUS_RUN_DIRS: Mutex<Vec<(PathBuf, ReadDir)>> = Mutex::new(Vec::new());
+
+/// Space still held by the previous run's files, charged against disk-maxmemory
+/// (INFO `disk_previous_run_remaining_bytes`).
+pub fn previous_run_remaining_bytes() -> u64 {
+    PREVIOUS_RUN_BYTES.load(Ordering::Relaxed)
+}
+
+/// Tiered mode: create disk-dir, move what a previous run left in it (including a
+/// `previous-run-*` dir a crash left half-deleted) out of the way, charge it, and start
+/// the thread that deletes it. Returns the bytes charged. A no-op in Dram mode.
+pub fn clean_previous_run(mode: crate::OperatingMode, dir: &str) -> io::Result<u64> {
+    if mode != crate::OperatingMode::Tiered {
+        return Ok(0);
+    }
+    if dir.is_empty() {
+        let msg = "disk-dir is required in Tiered operating mode";
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
+    }
+    fs::create_dir_all(dir)?;
+    let entries = fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()?;
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let dest = Path::new(dir).join(format!("previous-run-{}", nanos.as_nanos()));
+    fs::create_dir(&dest)?;
+    for entry in entries {
+        fs::rename(entry.path(), dest.join(entry.file_name()))?;
+    }
+    let listing = fs::read_dir(&dest)?;
+    PREVIOUS_RUN_DIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((dest.clone(), listing));
+    let path =
+        std::ffi::CString::new(dir).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // Nothing of this run is on disk yet, so every used byte is the previous run's (or
+    // the filesystem's own).
+    let bytes = previous_run_bytes_on_disk(&path)?.max(1);
+    let _ = PREVIOUS_RUN_DISK_DIR.set(path);
+    PREVIOUS_RUN_BYTES.store(bytes, Ordering::Relaxed);
+    std::thread::Builder::new()
+        .name("lo-prev-cleanup".into())
+        .spawn(move || delete_previous_run(&dest))?;
+    Ok(bytes)
+}
+
+/// What `statvfs` reports used beyond this run's charges, at most disk-maxmemory: the
+/// previous run never charged more than that.
+fn previous_run_bytes_on_disk(dir: &std::ffi::CStr) -> io::Result<u64> {
+    let bytes = fs_used_bytes(dir)?.saturating_sub(super::nvme::nvme_disk_usage());
+    let max = crate::nvme_maxmemory();
+    Ok(if max > 0 { bytes.min(max) } else { bytes })
+}
+
+/// Lower the charge to what is still on disk. It never rises: space a writer or an
+/// eviction released but the filesystem has not yet freed would otherwise count twice.
+pub fn refresh_previous_run_bytes() {
+    let Some(dir) = PREVIOUS_RUN_DISK_DIR.get() else {
+        return;
+    };
+    let Ok(on_disk) = previous_run_bytes_on_disk(dir) else {
+        return;
+    };
+    let _ = PREVIOUS_RUN_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+        (b > 0).then(|| b.min(on_disk.max(1)))
+    });
+}
+
+/// The cleanup thread, at `SCHED_IDLE`. One is enough: unlink throughput is bound by
+/// the filesystem's inode inactivation, not by the number of callers.
+fn delete_previous_run(dest: &Path) {
+    let param = libc::sched_param { sched_priority: 0 };
+    // SAFETY: pid 0 = the calling thread; param is a valid sched_param.
+    unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) };
+    let start = Instant::now();
+    while delete_previous_run_file() {}
+    // A directory whose last file a writer was still deleting stays behind. Anything that
+    // cannot be deleted stays on disk uncharged, so say so.
+    let left = fs::remove_dir_all(dest).err();
+    let took = start.elapsed();
+    let msg = match left.filter(|e| e.kind() != io::ErrorKind::NotFound) {
+        None => format!("largeobj: previous run cleanup done in {took:?}"),
+        Some(e) => format!(
+            "largeobj: previous run cleanup done in {took:?}, but {} could not be fully deleted: {e}",
+            dest.display()
+        ),
+    };
+    #[cfg(not(test))]
+    valkey_module::logging::log_notice(&msg);
+
+    #[cfg(test)]
+    let _ = msg;
+}
+
+/// Delete the previous run's next file; false once none is left. Safe from any
+/// thread: each file is handed out once, under `PREVIOUS_RUN_DIRS`. The charge is
+/// refreshed after each unlink, and set to 0 when the last file is handed out (dropping
+/// what the filesystem holds for itself).
+pub fn delete_previous_run_file() -> bool {
+    if previous_run_remaining_bytes() == 0 {
+        return false;
+    }
+    let path = {
+        let mut dirs = PREVIOUS_RUN_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let Some(next) = dirs.last_mut().map(|(_, listing)| listing.next()) else {
+                PREVIOUS_RUN_BYTES.store(0, Ordering::Relaxed);
+                return false;
+            };
+            match next {
+                Some(Ok(entry)) if entry.file_type().is_ok_and(|t| t.is_dir()) => {
+                    if let Ok(listing) = fs::read_dir(entry.path()) {
+                        dirs.push((entry.path(), listing));
+                    }
+                }
+                Some(Ok(entry)) => break entry.path(),
+                Some(Err(_)) => {}
+                None => {
+                    let (done, _) = dirs.pop().expect("last_mut was Some");
+                    let _ = fs::remove_dir(done);
+                }
+            }
+        }
+    };
+    let _ = fs::remove_file(&path);
+    refresh_previous_run_bytes();
+    true
+}
+
+fn fs_used_bytes(dir: &std::ffi::CStr) -> io::Result<u64> {
+    // SAFETY: statvfs fills a zeroed POD struct from a valid NUL-terminated path.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(dir.as_ptr(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((st.f_blocks as u64).saturating_sub(st.f_bfree as u64) * st.f_frsize as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +627,58 @@ mod tests {
         list.remove(&named);
         list.remove(&unnamed);
         assert_eq!(list.num_by_scan(), 0);
+    }
+
+    fn names(p: &Path) -> Vec<String> {
+        let entries = fs::read_dir(p).unwrap();
+        entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // Every shard and stray file (plus a half-deleted dir from a crash) is moved out of
+    // the way and deleted, and the charge drops to 0; a fresh disk-dir charges nothing.
+    #[test]
+    fn test_clean_previous_run() {
+        // A disk-dir with a space and non-ASCII characters, holding file names that are
+        // not valid UTF-8 as well.
+        let root = std::env::temp_dir().join(format!("lo-prev-run é 漢 {}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for f in [
+            "0000/a.dat",
+            "0001/b.dat",
+            "stray.dat",
+            "previous-run-1/0002/c.dat",
+        ] {
+            let path = root.join(f);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, [0u8; 4096]).unwrap();
+        }
+        let raw = |b: &[u8]| {
+            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(b.to_vec())
+        };
+        fs::write(root.join(raw(b"\xff\xfe.dat")), [0u8; 4096]).unwrap();
+        fs::write(root.join("0000").join(raw(b"\xc3.dat")), [0u8; 4096]).unwrap();
+        let dir = root.to_str().unwrap();
+        assert!(clean_previous_run(crate::OperatingMode::Tiered, dir).unwrap() > 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while previous_run_remaining_bytes() > 0 || !names(&root).is_empty() {
+            assert!(Instant::now() < deadline, "cleanup did not finish");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            clean_previous_run(crate::OperatingMode::Tiered, dir).unwrap(),
+            0
+        );
+        assert!(
+            names(&root).is_empty(),
+            "nothing created on a fresh disk-dir"
+        );
+        assert_eq!(
+            clean_previous_run(crate::OperatingMode::Dram, "").unwrap(),
+            0
+        );
+        assert!(clean_previous_run(crate::OperatingMode::Tiered, "").is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 }
