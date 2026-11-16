@@ -1,0 +1,20 @@
+{
+    "BLOB.RDMA_HELLO": {
+        "summary": "Establishes an RDMA session between the connection and the server fabric services",
+        "complexity": "O(N), where N is the number of server fabric services.",
+        "group": "large_object",
+        "module_since": "0.1.0",
+        "arity": 2,
+        "acl_categories": [
+            "CONNECTION",
+            "FAST",
+            "LARGEOBJ"
+        ],
+        "arguments": [
+            {
+                "name": "client-rdma-address",
+                "type": "string"
+            }
+        ]
+    }
+}
