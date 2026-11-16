@@ -128,7 +128,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | `largeobj.worker-threads` | 8 | No | Worker threads for asynchronous I/O tasks. Min 1, max 32. |
 | `largeobj.direct-io` | yes | No | Use O_DIRECT for NVMe files. Disable for ASAN builds. |
 | `largeobj.bench-mode` | no | No | BLOB.TCP_GET returns integer size instead of bulk data (isolates NVMe throughput). Hidden. |
-| `largeobj.fabric-provider` | `EfaDirect` | No | libfabric provider for the RDMA path: `Emulated` (libfabric over TCP, runs anywhere) or `EfaDirect` (EFA hardware RDMA). Case-sensitive. |
+| `largeobj.fabric-provider` | `EfaDirect` | No | libfabric provider for the RDMA path: `Emulated` (libfabric over TCP, runs anywhere) or `EfaDirect` (EFA hardware RDMA). |
 | `largeobj.fabric-interfaces` | (empty) | No | Comma-separated fabric domains (network devices as libfabric names them, for example `lo`) to serve on. Empty = every domain the provider discovers. |
 | `largeobj.fabric-max-in-flight` | 256 | No | Transfers each fabric service keeps in flight. 0 = provider default. Max 65536. |
 | `largeobj.fabric-crc-pool-threads` | 2 | No | Threads hashing checksummed transfers. Min 1, max 1024. |
