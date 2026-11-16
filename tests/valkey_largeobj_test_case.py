@@ -134,6 +134,23 @@ def info_largeobj(client):
     return result
 
 
+def blob_info(client, key, field=None):
+    """Run `BLOB.INFO key [field]` and parse the reply.
+
+    The reply is always a map (`len`/`crc`/`tier`), which a RESP2 client receives as a
+    flat `[name, value, ...]` array. Returns None for a missing key, the single value when
+    `field` is given, else a {name: value} dict of all fields.
+    """
+    args = ['BLOB.INFO', key] + ([field] if field is not None else [])
+    reply = client.execute_command(*args)
+    if reply is None:
+        return None
+    fields = {reply[i].decode(): reply[i + 1] for i in range(0, len(reply), 2)}
+    if field is not None:
+        return fields[field.lower()]
+    return fields
+
+
 class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     """Base test class for valkey-largeobj module integration tests.
 

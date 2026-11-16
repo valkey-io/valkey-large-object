@@ -1,7 +1,7 @@
 import os
-from valkey import ResponseError
+from valkey import ResponseError, Valkey
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, blob_info, info_largeobj, position_pattern
 
 
 class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
@@ -284,22 +284,44 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = position_pattern(4096)  # non-uniform so CRC is meaningful
         client.execute_command('BLOB.TCP_SET', 'infokey', payload)
-        # Check the specfic fields for info
-        assert client.execute_command('BLOB.INFO', 'infokey', 'LEN') == len(payload)
+        # A single field still comes back as a one-entry map, so the reply type is the
+        # same whether or not a field is given.
+        assert blob_info(client, 'infokey', 'LEN') == len(payload)
         # CRC is a u32: in range, stable across calls, and identical for identical payloads.
-        crc = client.execute_command('BLOB.INFO', 'infokey', 'CRC')
+        crc = blob_info(client, 'infokey', 'CRC')
         assert 0 <= crc <= 0xFFFFFFFF
-        assert client.execute_command('BLOB.INFO', 'infokey', 'CRC') == crc
+        assert blob_info(client, 'infokey', 'CRC') == crc
         client.execute_command('BLOB.TCP_SET', 'infokey2', payload)
-        assert client.execute_command('BLOB.INFO', 'infokey2', 'CRC') == crc
-        assert client.execute_command('BLOB.INFO', 'infokey', 'TIER') == b'dram'
-        # Check full info call
-        result = client.execute_command('BLOB.INFO', 'infokey')
-        assert result == [
-            b'len', len(payload),
-            b'crc', crc,
-            b'tier', b'dram',
-        ], f"Unexpected BLOB.INFO reply: {result!r}"
+        assert blob_info(client, 'infokey2', 'CRC') == crc
+        assert blob_info(client, 'infokey', 'TIER') == b'dram'
+        # The full reply is a map of all three fields.
+        assert blob_info(client, 'infokey') == {
+            'len': len(payload),
+            'crc': crc,
+            'tier': b'dram',
+        }, f"Unexpected BLOB.INFO reply: {blob_info(client, 'infokey')!r}"
+
+    def test_info_resp3_is_a_map(self):
+        """Under RESP3, BLOB.INFO returns a real map, not a flat array (issue #214).
+
+        A single-field query returns a one-entry map, so the reply type does not depend on
+        the arguments.
+        """
+        setter = self.server.get_new_client()
+        payload = position_pattern(4096)
+        setter.execute_command('BLOB.TCP_SET', 'resp3key', payload)
+        crc = blob_info(setter, 'resp3key', 'CRC')
+
+        resp3 = Valkey(host=self.server.bind_ip, port=self.server.port, protocol=3)
+        try:
+            full = resp3.execute_command('BLOB.INFO', 'resp3key')
+            assert isinstance(full, dict), f"RESP3 reply is not a map: {full!r}"
+            assert full == {b'len': len(payload), b'crc': crc, b'tier': b'dram'}, full
+            one = resp3.execute_command('BLOB.INFO', 'resp3key', 'TIER')
+            assert isinstance(one, dict), f"RESP3 single-field reply is not a map: {one!r}"
+            assert one == {b'tier': b'dram'}, one
+        finally:
+            resp3.close()
 
     def test_info_crc_changes_on_overwrite(self):
         """Overwriting a key updates LEN and CRC."""
@@ -307,21 +329,21 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         first = position_pattern(4096, 'A')
         second = position_pattern(8192, 'B')
         client.execute_command('BLOB.TCP_SET', 'owkey', first)
-        first_crc = client.execute_command('BLOB.INFO', 'owkey', 'CRC')
+        first_crc = blob_info(client, 'owkey', 'CRC')
         client.execute_command('BLOB.TCP_SET', 'owkey', second)
-        assert client.execute_command('BLOB.INFO', 'owkey', 'LEN') == 8192
-        assert client.execute_command('BLOB.INFO', 'owkey', 'CRC') != first_crc
+        assert blob_info(client, 'owkey', 'LEN') == 8192
+        assert blob_info(client, 'owkey', 'CRC') != first_crc
 
     def test_info_errors(self):
         """BLOB.INFO errors are correct"""
         client = self.server.get_new_client()
         # Nonexistent key returns nil
-        assert client.execute_command('BLOB.INFO', 'nokey') is None
-        assert client.execute_command('BLOB.INFO', 'nokey', 'LEN') is None
+        assert blob_info(client, 'nokey') is None
+        assert blob_info(client, 'nokey', 'LEN') is None
         # Wrong type error
         client.execute_command('SET', 'strkey', 'plain')
         try:
-            client.execute_command('BLOB.INFO', 'strkey')
+            blob_info(client, 'strkey')
             assert False, "Expected WRONGTYPE error"
         except ResponseError as e:
             assert str(e).startswith('WRONGTYPE'), f"Unexpected error: {e}"

@@ -7,9 +7,11 @@
 //! BLOB.RDMA_SET key total_len [CRC <crc32c>] rkey1 addr1 len1 [...]
 //! BLOB.INFO key [LEN|CRC|TIER]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use dma_libfabric_protocol::{decode_hex, encode_hex};
+use valkey_module::redisvalue::ValkeyValueKey;
 use valkey_module::{Context, ContextFlags, ValkeyError, ValkeyResult, ValkeyString, ValkeyValue};
 
 use crate::data_type::{LoValue, LO_TYPE};
@@ -343,7 +345,9 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 //
 // BLOB.INFO key [LEN | CRC | TIER]
 //
-// Parse args → resolve key → return metadata field or all fields as array.
+// Parse args → resolve key → return the requested field, or all fields, as a map.
+// Always a map so the reply type is the same whether or not a field is given, and so
+// RESP3 clients get a map (Valkey renders it as a flat array in RESP2).
 
 pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     check_module_enabled(ctx)?;
@@ -364,23 +368,20 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     let crc = ValkeyValue::Integer(i64::from(value.crc32c));
     let tier = ValkeyValue::SimpleStringStatic(value.tier().as_str());
 
+    let mut fields: BTreeMap<ValkeyValueKey, ValkeyValue> = BTreeMap::new();
     if args.len() == 2 {
-        return Ok(ValkeyValue::Array(vec![
-            ValkeyValue::SimpleStringStatic("len"),
-            len,
-            ValkeyValue::SimpleStringStatic("crc"),
-            crc,
-            ValkeyValue::SimpleStringStatic("tier"),
-            tier,
-        ]));
+        fields.insert("len".into(), len);
+        fields.insert("crc".into(), crc);
+        fields.insert("tier".into(), tier);
+    } else {
+        match args[2].to_string_lossy().to_uppercase().as_str() {
+            "LEN" => fields.insert("len".into(), len),
+            "CRC" => fields.insert("crc".into(), crc),
+            "TIER" => fields.insert("tier".into(), tier),
+            _ => return Err(ValkeyError::Str(errors::ERR_INVALID_INFO_FIELD)),
+        };
     }
-
-    match args[2].to_string_lossy().to_uppercase().as_str() {
-        "LEN" => Ok(len),
-        "CRC" => Ok(crc),
-        "TIER" => Ok(tier),
-        _ => Err(ValkeyError::Str(errors::ERR_INVALID_INFO_FIELD)),
-    }
+    Ok(ValkeyValue::OrderedMap(fields))
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

@@ -11,7 +11,7 @@ import os
 import pytest
 from valkey import ResponseError
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, blob_info, info_largeobj, position_pattern
 
 BLOB_TYPE = 'largeob-k'
 BLOBS = 4
@@ -90,7 +90,7 @@ class PersistenceHelpers:
     def assert_intact(self, client, blobs):
         for key, value in blobs.items():
             assert client.execute_command('BLOB.TCP_GET', key) == value
-            assert client.execute_command('BLOB.INFO', key, 'LEN') == len(value)
+            assert blob_info(client, key, 'LEN') == len(value)
 
     def assert_plain_intact(self, client):
         for i in range(BLOBS):
@@ -312,8 +312,8 @@ class TestLoadedPlaceholdersTiered(ValkeyLargeObjTestCaseBase, PersistenceHelper
             assert client.exists(key) == 1
             assert client.type(key) == BLOB_TYPE.encode()
             assert client.execute_command('BLOB.TCP_GET', key) is None
-            assert client.execute_command('BLOB.INFO', key) is None
-            assert client.execute_command('BLOB.INFO', key, 'TIER') is None
+            assert blob_info(client, key) is None
+            assert blob_info(client, key, 'TIER') is None
             with pytest.raises(ResponseError):
                 client.execute_command('COPY', key, f'copy:{i}')
             assert client.exists(f'copy:{i}') == 0
