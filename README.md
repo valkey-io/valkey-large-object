@@ -23,7 +23,7 @@ Storage is organized as segments (contiguous memory regions) managed by pool all
 | `BLOB.TCP_GET key` | Retrieve object over TCP. Returns a bulk string. |
 | `BLOB.RDMA_GET key rkey1 addr1 len1 ...` | Retrieve object by DMA into the client's memory addresses. Replies `[obj_len, crc32c]`. |
 | `BLOB.RDMA_HELLO client_efa_addr_hex` | Establish RDMA session for GPU-direct DMA transfers. |
-| `BLOB.INFO key [LEN\|CRC\|TIER]` | Object metadata. No transport involved. |
+| `BLOB.INFO key [LEN\|CRC\|TIER]` | Object metadata. With no field, a map of `crc`, `len`, `tier` (a flat array in RESP2). With a field, just that value. No transport involved. |
 | `DEL key` | Native Valkey DEL. Triggers module free callback (cleans up NVMe file + pool buffers). |
 
 ## Build

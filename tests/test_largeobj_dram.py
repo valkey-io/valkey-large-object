@@ -1,5 +1,5 @@
 import os
-from valkey import ResponseError
+from valkey import ResponseError, Valkey
 from valkeytestframework.util.waiters import wait_for_true
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
 
@@ -293,13 +293,12 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client.execute_command('BLOB.TCP_SET', 'infokey2', payload)
         assert client.execute_command('BLOB.INFO', 'infokey2', 'CRC') == crc
         assert client.execute_command('BLOB.INFO', 'infokey', 'TIER') == b'dram'
-        # Check full info call
-        result = client.execute_command('BLOB.INFO', 'infokey')
-        assert result == [
-            b'len', len(payload),
-            b'crc', crc,
-            b'tier', b'dram',
-        ], f"Unexpected BLOB.INFO reply: {result!r}"
+        # Full info call: a flat array in RESP2, a map in RESP3.
+        assert client.execute_command('BLOB.INFO', 'infokey') == [
+            b'crc', crc, b'len', len(payload), b'tier', b'dram']
+        resp3 = Valkey(host=self.server.bind_ip, port=self.server.port, protocol=3)
+        assert resp3.execute_command('BLOB.INFO', 'infokey') == {
+            b'crc': crc, b'len': len(payload), b'tier': b'dram'}
 
     def test_info_crc_changes_on_overwrite(self):
         """Overwriting a key updates LEN and CRC."""
