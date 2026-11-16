@@ -2,7 +2,7 @@ Valkey Large Object 0.1.0 release notes
 ========================
 
 ================================================================================
-Valkey Large Object 0.1.0 - Released Mon 16 Nov 2026
+Valkey Large Object 0.1.0  -  Released Mon 16 November 2026
 ================================================================================
 This is the first release of valkey-large-object, a Valkey module that adds a data type for storing large binary values, such as KV cache blocks and model data for LLM inference. The module runs in one of two modes. In Dram mode, all objects are kept in memory. In Tiered mode, each object is stored on local NVMe disk with a DRAM cache on top of this. Clients read and write objects in two ways: the TCP commands (BLOB.TCP_SET, BLOB.TCP_GET) carry the data over the normal Valkey connection, and the RDMA commands (BLOB.RDMA_SET, BLOB.RDMA_GET) move the data directly between client memory and server memory over the fabric, such as AWS EFA. Only the command and reply go over the Valkey connection.
 
