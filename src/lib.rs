@@ -58,7 +58,12 @@ use crate::data_type::LO_TYPE;
 use crate::transport::config::FabricProvider;
 
 pub const MODULE_NAME: &str = "largeobj";
-pub const MODULE_VERSION: i32 = 1;
+pub const MODULE_VERSION: i32 = 100;
+// The release stage is used in order to provide release status information.
+// In unstable branch the status is always "dev".
+// During release process the status will be set to rc1,rc2...rcN.
+// When the version is released the status will be "ga".
+pub const MODULE_RELEASE_STAGE: &str = "ga";
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
 

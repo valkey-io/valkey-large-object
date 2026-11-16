@@ -1,0 +1,31 @@
+Valkey Large Object 0.1.0 release notes
+========================
+
+================================================================================
+Valkey Large Object 0.1.0  -  Released Mon 16 November 2026
+================================================================================
+This is the first release of valkey-large-object, a Valkey module that adds a data type for storing large binary values, such as KV cache blocks and model data for LLM inference. The module runs in one of two modes. In Dram mode, all objects are kept in memory. In Tiered mode, each object is stored on local NVMe disk with a DRAM cache on top of this. Clients read and write objects in two ways: the TCP commands (BLOB.TCP_SET, BLOB.TCP_GET) carry the data over the normal Valkey connection, and the RDMA commands (BLOB.RDMA_SET, BLOB.RDMA_GET) move the data directly between client memory and server memory over the fabric, such as AWS EFA. Only the command and reply go over the Valkey connection.
+
+API and Interface changes
+=========================
+* Add the large object module data type ("largeob-k") which supports the following callbacks: free, copy, memory usage, free effort, and digest.
+* Add the following large object module commands: BLOB.TCP_SET, BLOB.TCP_GET, BLOB.RDMA_HELLO, BLOB.RDMA_SET, and BLOB.RDMA_GET for setting and getting data over TCP and RDMA respectively.
+* Add RDMA support through libfabric, where object data moves directly between client memory and server memory, with the EfaDirect (AWS EFA) provider and an Emulated provider for use without RDMA hardware
+* Add two operating modes: Dram, which keeps all objects in a DRAM pool, and Tiered, which stores each object on local NVMe and uses DRAM as a read cache for frequently read objects
+* Support eviction of large objects that follows the core maxmemory-policy, in both operating modes, with disk usage limited through the largeobj.disk-maxmemory config in Tiered mode. Currently, supports Global LRU based eviction and supports both volatile and non-volatile items.
+* Support key expiry (TTL) on large object keys
+* Create a large object specific ACL category (@largeobj) and add this to all large object module commands
+* Add two key space events: (1) large object creation and (2) large object update
+* Store a CRC32C checksum with every object, and support an optional CRC arg in BLOB.RDMA_SET for end-to-end verification
+* Support for the BLOB.INFO command and options including LEN, CRC, and TIER.
+* Add an INFO handler to add module metrics around objects, eviction, DRAM and disk usage, RDMA, errors, and NVMe SMART health
+* Add a 8.0 feature flag (min-valkey-compatibility-version-8-0) which builds the module to be compatible with Valkey 8.0 servers
+
+New configurations
+===========================
+* Add support for the following configurations: largeobj.operating-mode, largeobj.disk-dir, largeobj.disk-maxmemory, largeobj.segment-size, largeobj.disk-staging-size, largeobj.max-object-size, largeobj.max-promote-size, largeobj.promote-min-hits, largeobj.chunk-size, largeobj.worker-threads, largeobj.fabric-provider, largeobj.fabric-interfaces, largeobj.fabric-max-in-flight, largeobj.max-rdma-registered-bytes, and largeobj.enabled. The full list is in the README (https://github.com/valkey-io/valkey-large-object#configuration)
+
+Known limitations
+=================
+* Large objects are not persisted to RDB or AOF and are not replicated / migrated.
+* BLOB data commands cannot run in MULTI, scripts, or functions
