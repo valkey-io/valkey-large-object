@@ -5,8 +5,9 @@
 //! BLOB.RDMA_GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
 //! BLOB.TCP_SET key <data>
 //! BLOB.RDMA_SET key total_len [CRC <crc32c>] rkey1 addr1 len1 [...]
-//! BLOB.INFO key [LEN|CRC|TIER]
+//! BLOB.INFO key
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use dma_libfabric_protocol::{decode_hex, encode_hex};
@@ -341,13 +342,13 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 // ─── BLOB.INFO ─────────────────────────────────────────────────────────────────
 //
-// BLOB.INFO key [LEN | CRC | TIER]
+// BLOB.INFO key
 //
-// Parse args → resolve key → return metadata field or all fields as array.
+// Returns a map of len, crc, tier. RESP2 clients get it as a flat array.
 
 pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     check_module_enabled(ctx)?;
-    if !(2..=3).contains(&args.len()) {
+    if args.len() != 2 {
         return Err(ValkeyError::WrongArity);
     }
 
@@ -360,27 +361,14 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         _ => return Ok(ValkeyValue::Null),
     };
 
-    let len = ValkeyValue::Integer(value.len as i64);
-    let crc = ValkeyValue::Integer(i64::from(value.crc32c));
+    // BTreeMap keeps the reply order fixed: crc, len, tier.
     let tier = ValkeyValue::SimpleStringStatic(value.tier().as_str());
-
-    if args.len() == 2 {
-        return Ok(ValkeyValue::Array(vec![
-            ValkeyValue::SimpleStringStatic("len"),
-            len,
-            ValkeyValue::SimpleStringStatic("crc"),
-            crc,
-            ValkeyValue::SimpleStringStatic("tier"),
-            tier,
-        ]));
-    }
-
-    match args[2].to_string_lossy().to_uppercase().as_str() {
-        "LEN" => Ok(len),
-        "CRC" => Ok(crc),
-        "TIER" => Ok(tier),
-        _ => Err(ValkeyError::Str(errors::ERR_INVALID_INFO_FIELD)),
-    }
+    Ok(BTreeMap::from([
+        ("crc", ValkeyValue::Integer(i64::from(value.crc32c))),
+        ("len", ValkeyValue::Integer(value.len as i64)),
+        ("tier", tier),
+    ])
+    .into())
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ from valkey_largeobj_test_case import (
     ORDER_OBJECT_LEN,
     ValkeyLargeObjTestCaseBase,
     assert_bytes_equal,
+    blob_info,
     chunk_order_module_args,
     info_largeobj,
     position_pattern,
@@ -109,23 +110,23 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
 
     def test_promotion_caches_in_dram(self):
         """After a GET miss, the object is promoted to DRAMPool.
-        BLOB.INFO TIER observes the transition: nvme after SET, dram after the first GET."""
+        BLOB.INFO tier observes the transition: nvme after SET, dram after the first GET."""
         client = self.server.get_new_client()
         payload = position_pattern(4096, 'B')
         client.execute_command('BLOB.TCP_SET', 'promo_key', payload)
 
         # Freshly SET: on NVMe only, nothing cached yet.
-        assert client.execute_command('BLOB.INFO', 'promo_key', 'TIER') == b'disk'
+        assert blob_info(client, 'promo_key')['tier'] == b'disk'
 
         # First GET: DRAMPool miss -> NVMe read -> promote to DRAMPool.
         result1 = client.execute_command('BLOB.TCP_GET', 'promo_key')
         assert result1 == payload
-        assert client.execute_command('BLOB.INFO', 'promo_key', 'TIER') == b'dram'
+        assert blob_info(client, 'promo_key')['tier'] == b'dram'
 
         # Second GET: served from DRAMPool (promotion happened).
         result2 = client.execute_command('BLOB.TCP_GET', 'promo_key')
         assert result2 == payload
-        assert client.execute_command('BLOB.INFO', 'promo_key', 'TIER') == b'dram'
+        assert blob_info(client, 'promo_key')['tier'] == b'dram'
 
     def test_delete_removes_nvme_file(self):
         """DEL removes the NVMe file."""
@@ -152,8 +153,8 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', 'srckey') == payload
         assert client.execute_command('BLOB.TCP_GET', 'dstkey') == payload
         # COPY carries the CRC over unchanged.
-        assert (client.execute_command('BLOB.INFO', 'srckey', 'CRC')
-                == client.execute_command('BLOB.INFO', 'dstkey', 'CRC'))
+        assert (blob_info(client, 'srckey')['crc']
+                == blob_info(client, 'dstkey')['crc'])
         dat_files = glob.glob(os.path.join(self.data_dir, '*', '*.dat'))
         assert len(dat_files) >= 2, f"Expected at least 2 .dat files, got {len(dat_files)}"
         # COPY gets a new OID so digests differ
@@ -172,9 +173,9 @@ class TestLargeObjTieredPromotion(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_GET', 'srckey2') == payload
         #  The copy starts un-promoted even if the source is cached
         client.execute_command('BLOB.TCP_GET', 'srckey2')  # promote source
-        assert client.execute_command('BLOB.INFO', 'srckey2', 'TIER') == b'dram'
+        assert blob_info(client, 'srckey2')['tier'] == b'dram'
         client.execute_command('COPY', 'srckey2', 'dstkey3')
-        assert client.execute_command('BLOB.INFO', 'dstkey3', 'TIER') == b'disk'
+        assert blob_info(client, 'dstkey3')['tier'] == b'disk'
 
     # ─── MEMORY USAGE callback tests ──────────────────────────────────────
 
@@ -679,7 +680,7 @@ class TestLargeObjTieredNvmeOnly(ValkeyLargeObjTestCaseBase):
         for _ in range(5):
             result = client.execute_command('BLOB.TCP_GET', 'repeat_key')
             assert result == payload
-            assert client.execute_command('BLOB.INFO', 'repeat_key', 'TIER') == b'disk'
+            assert blob_info(client, 'repeat_key')['tier'] == b'disk'
 
     def test_reject_invalid_buffer_configs(self):
         """CONFIG SET rejects min-buffers-per-op > max-buffers-per-op and
@@ -1097,7 +1098,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
 
         # GET 1: rejected by admission, served transiently.
         assert client.execute_command('BLOB.TCP_GET', 'basic_key') == payload
-        assert client.execute_command('BLOB.INFO', 'basic_key', 'TIER') == b'disk'
+        assert blob_info(client, 'basic_key')['tier'] == b'disk'
         after1 = dram()
         assert after1['largeobj_cache_misses'] == 1
         assert after1['largeobj_cache_admission_rejects'] == 1
@@ -1106,7 +1107,7 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
 
         # GET 2: second touch, promoted. mark_ready runs before the reply.
         assert client.execute_command('BLOB.TCP_GET', 'basic_key') == payload
-        assert client.execute_command('BLOB.INFO', 'basic_key', 'TIER') == b'dram'
+        assert blob_info(client, 'basic_key')['tier'] == b'dram'
         after2 = dram()
         assert after2['largeobj_cache_misses'] == 2
         assert after2['largeobj_cache_admission_rejects'] == 1
@@ -1143,16 +1144,16 @@ class TestLargeObjTieredAdmission(ValkeyLargeObjTestCaseBase):
         client.execute_command('BLOB.TCP_SET', 'one_key', payload)
         rejects = client.info('largeobj_dram')['largeobj_cache_admission_rejects']
         assert client.execute_command('BLOB.TCP_GET', 'one_key') == payload
-        assert client.execute_command('BLOB.INFO', 'one_key', 'TIER') == b'dram'
+        assert blob_info(client, 'one_key')['tier'] == b'dram'
         assert client.info('largeobj_dram')['largeobj_cache_admission_rejects'] == rejects
 
         client.execute_command('CONFIG', 'SET', 'largeobj.promote-min-hits', '3')
         client.execute_command('BLOB.TCP_SET', 'three_key', payload)
         for _ in range(2):
             assert client.execute_command('BLOB.TCP_GET', 'three_key') == payload
-            assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'disk'
+            assert blob_info(client, 'three_key')['tier'] == b'disk'
         assert client.execute_command('BLOB.TCP_GET', 'three_key') == payload
-        assert client.execute_command('BLOB.INFO', 'three_key', 'TIER') == b'dram'
+        assert blob_info(client, 'three_key')['tier'] == b'dram'
 
     def test_lfu_decay_minutes_config(self):
         """lfu-decay-minutes defaults to 1, is runtime mutable (0 disables
@@ -1237,9 +1238,9 @@ class TestLargeObjTieredReclaim(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_dram_objects'] == 3
         assert info['largeobj_dram_segments'] == 1
         assert info['largeobj_dram_scaling_expands'] == 0
-        assert client.execute_command('BLOB.INFO', hot, 'TIER') == b'dram'
-        assert client.execute_command('BLOB.INFO', 'ev_new', 'TIER') == b'dram'
-        tiers = [client.execute_command('BLOB.INFO', k, 'TIER') for k in self.KEYS[1:]]
+        assert blob_info(client, hot)['tier'] == b'dram'
+        assert blob_info(client, 'ev_new')['tier'] == b'dram'
+        tiers = [blob_info(client, k)['tier'] for k in self.KEYS[1:]]
         assert tiers.count(b'disk') == 1, tiers
 
         # The reclaimed copy is still on NVMe and reads back intact.
@@ -1284,7 +1285,7 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
         # so read the key again until it is cached.
         def cached():
             assert client.execute_command('BLOB.TCP_GET', key) == payload
-            return client.execute_command('BLOB.INFO', key, 'TIER') == b'dram'
+            return blob_info(client, key)['tier'] == b'dram'
 
         wait_for_true(cached)
 
@@ -1321,9 +1322,9 @@ class TestLargeObjTieredReclaimOneSegment(ValkeyLargeObjTestCaseBase):
         assert info['largeobj_dram_objects'] == 7
         assert info['largeobj_dram_segments'] == 2
         assert info['largeobj_dram_scaling_expands'] == 1
-        assert client.execute_command('BLOB.INFO', 'C', 'TIER') == b'disk'
+        assert blob_info(client, 'C')['tier'] == b'disk'
         for k in ('A', 'B', 'D', 'E', 'H', 'F'):
-            assert client.execute_command('BLOB.INFO', k, 'TIER') == b'dram', k
+            assert blob_info(client, k)['tier'] == b'dram', k
         # The reclaimed copy still reads back from NVMe.
         assert client.execute_command('BLOB.TCP_GET', 'C') == position_pattern(self.OBJ, 'C')
 
@@ -1851,10 +1852,10 @@ class TestTieredTcpGetChunkOrder(ValkeyLargeObjTestCaseBase):
         for i in range(ORDER_REPEATS):
             key = f'ordered{i}'
             client.execute_command('BLOB.TCP_SET', key, payload)
-            assert client.execute_command('BLOB.INFO', key, 'TIER') == b'disk'
+            assert blob_info(client, key)['tier'] == b'disk'
             reply = client.execute_command('BLOB.TCP_GET', key)
             assert_bytes_equal(reply, payload, ORDER_CHUNK_SIZE)
-            assert client.execute_command('BLOB.INFO', key, 'TIER') == b'dram'
+            assert blob_info(client, key)['tier'] == b'dram'
             reply = client.execute_command('BLOB.TCP_GET', key)
             assert_bytes_equal(reply, payload, ORDER_CHUNK_SIZE)
 
@@ -1873,7 +1874,7 @@ class TestTieredTcpGetChunkOrderStreamed(ValkeyLargeObjTestCaseBase):
         for _ in range(ORDER_REPEATS):
             reply = client.execute_command('BLOB.TCP_GET', 'ordered')
             assert_bytes_equal(reply, payload, ORDER_CHUNK_SIZE)
-        assert client.execute_command('BLOB.INFO', 'ordered', 'TIER') == b'disk'
+        assert blob_info(client, 'ordered')['tier'] == b'disk'
 
 
 # ─── max-buffers-per-op at its cap ───────────────────────────────────────
@@ -1918,7 +1919,7 @@ class TestTieredMaxBuffersPerOpAtCap(ValkeyLargeObjTestCaseBase):
         assert client.execute_command('BLOB.TCP_SET', 'wide', WIDE_PAYLOAD) == b'OK'
         reply = client.execute_command('BLOB.TCP_GET', 'wide')
         assert_bytes_equal(reply, WIDE_PAYLOAD, WIDE_CHUNK)
-        assert client.execute_command('BLOB.INFO', 'wide', 'TIER') == b'dram'
+        assert blob_info(client, 'wide')['tier'] == b'dram'
         reply = client.execute_command('BLOB.TCP_GET', 'wide')
         assert_bytes_equal(reply, WIDE_PAYLOAD, WIDE_CHUNK)
 
@@ -1935,7 +1936,7 @@ class TestTieredMaxBuffersPerOpAtCapNoPromotion(ValkeyLargeObjTestCaseBase):
         for _ in range(5):
             reply = client.execute_command('BLOB.TCP_GET', 'wide')
             assert_bytes_equal(reply, WIDE_PAYLOAD, WIDE_CHUNK)
-        assert client.execute_command('BLOB.INFO', 'wide', 'TIER') == b'disk'
+        assert blob_info(client, 'wide')['tier'] == b'disk'
 
 
 # ─── disk-dir-shards ──────────────────────────────────────────────────────────
@@ -2012,9 +2013,9 @@ class TestTieredChunkSizeAlignment(ValkeyLargeObjTestCaseBase):
         full_chunks, tail = divmod(length, ALIGNED_CHUNK)
         disk_len = full_chunks * ALIGNED_CHUNK + self._align_up(tail)
         assert [os.path.getsize(f) for f in self._object_files()] == [disk_len]
-        assert client.execute_command('BLOB.INFO', 'unaligned', 'TIER') == b'disk'
+        assert blob_info(client, 'unaligned')['tier'] == b'disk'
         assert client.execute_command('BLOB.TCP_GET', 'unaligned') == payload
-        assert client.execute_command('BLOB.INFO', 'unaligned', 'TIER') == b'dram'
+        assert blob_info(client, 'unaligned')['tier'] == b'dram'
         assert client.execute_command('BLOB.TCP_GET', 'unaligned') == payload
 
     # A refused load makes Valkey drop its reference to the config data the valkey-module
