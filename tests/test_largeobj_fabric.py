@@ -10,7 +10,6 @@ from valkey_largeobj_test_case import (
     MIB,
     ORDER_OBJECT_LEN,
     ValkeyLargeObjTestCaseBase,
-    blob_info,
     chunk_order_module_args,
     info_largeobj,
     position_pattern,
@@ -240,7 +239,7 @@ class TestLargeObjFabricTransfer(ValkeyLargeObjTestCaseBase):
                 'BLOB.RDMA_SET', 'key', TARGET_LEN,
                 'CRC', expected_crc, *address_args(regions)) == b'OK'
             assert client.execute_command('BLOB.TCP_GET', 'key') == PATTERN
-            assert blob_info(client, 'key')['crc'] == expected_crc
+            assert client.execute_command('BLOB.INFO', 'key', 'CRC') == expected_crc
         finally:
             process.kill()
 
@@ -536,9 +535,9 @@ class TestFabricTieredGetChunkOrder(ValkeyLargeObjTestCaseBase):
         for i in range(ORDER_REPEATS):
             key = f'ordered{i}'
             client.execute_command('BLOB.TCP_SET', key, payload)
-            assert blob_info(client, key)['tier'] == b'disk'
+            assert client.execute_command('BLOB.INFO', key, 'TIER') == b'disk'
             efa_get_verified(self.server, key)
-            assert blob_info(client, key)['tier'] == b'dram'
+            assert client.execute_command('BLOB.INFO', key, 'TIER') == b'dram'
             efa_get_verified(self.server, key)
 
 
@@ -554,7 +553,7 @@ class TestFabricTieredGetChunkOrderStreamed(ValkeyLargeObjTestCaseBase):
         client.execute_command('BLOB.TCP_SET', 'ordered', position_pattern(ORDER_OBJECT_LEN))
         for _ in range(ORDER_REPEATS):
             efa_get_verified(self.server, 'ordered')
-        assert blob_info(client, 'ordered')['tier'] == b'disk'
+        assert client.execute_command('BLOB.INFO', 'ordered', 'TIER') == b'disk'
 
 
 # ─── DRAM EFA SET waiting for the pool to grow ───────────────────────────────

@@ -29,7 +29,7 @@ from contextlib import contextmanager
 import pytest
 from valkey import OutOfMemoryError, ResponseError
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import DISK_INODE, ST_BLOCKS_UNIT, ValkeyLargeObjTestCaseBase, blob_info, info_largeobj, position_pattern
+from valkey_largeobj_test_case import DISK_INODE, ST_BLOCKS_UNIT, ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
 
 # 900KB in a 1MB segment: one object of this size fills a segment by itself.
 SEGMENT_FILLING_SIZE = 900 * 1024
@@ -93,7 +93,7 @@ def promote(client, keys):
     for key in keys:
         def cached():
             client.execute_command('BLOB.TCP_GET', key)
-            return blob_info(client, key)['tier'] == b'dram'
+            return client.execute_command('BLOB.INFO', key, 'TIER') == b'dram'
         wait_for_true(cached)
     wait_for_true(lambda: info_largeobj(client)['largeobj_dram_objects'] == len(keys))
 
@@ -578,7 +578,7 @@ class TestTieredShrink(ValkeyLargeObjTestCaseBase):
         regrown = info_largeobj(client)
         assert regrown['largeobj_dram_scaling_expands'] == shrunk['largeobj_dram_scaling_expands'] + 1
         assert regrown['largeobj_dram_segments'] == 1
-        assert blob_info(client, 'tshrink_0')['tier'] == b'dram'
+        assert client.execute_command('BLOB.INFO', 'tshrink_0', 'TIER') == b'dram'
         assert client.execute_command('BLOB.TCP_GET', 'tshrink_0') == self.PAYLOADS['tshrink_0']
         wait_uring_registered_matches_segments(client, timeout=self.TIMEOUT_S)
 
@@ -1339,7 +1339,7 @@ class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
         # While the rebuild is pending, a GET is served from NVMe and not promoted, and the
         # new segment is not in the table yet.
         assert client.execute_command('BLOB.TCP_GET', 'key_c') == payloads['key_c']
-        assert blob_info(client, 'key_c')['tier'] != b'dram'
+        assert client.execute_command('BLOB.INFO', 'key_c', 'TIER') != b'dram'
         self._assert_rebuild_still_pending(promotion, rebuilt_before)
         assert info_largeobj(client)['largeobj_dram_uring_registered_segments'] == 1
 
@@ -1388,7 +1388,7 @@ class TestTieredRebuildWaitsForPromotion(ValkeyLargeObjTestCaseBase):
 
         # While the rebuild is pending, a GET is served from NVMe and not promoted.
         assert client.execute_command('BLOB.TCP_GET', 'renum_probe') == payloads['renum_probe']
-        assert blob_info(client, 'renum_probe')['tier'] != b'dram'
+        assert client.execute_command('BLOB.INFO', 'renum_probe', 'TIER') != b'dram'
         self._assert_rebuild_still_pending(promotion, rebuilt_before)
 
         self._assert_promotion_finishes(promotion, in_progress, payloads['renum_during'])

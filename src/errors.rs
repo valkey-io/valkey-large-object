@@ -35,6 +35,7 @@ define_errors! {
     ERR_MAX_OBJECT_SIZE_EXCEEDED => "ERR max object size exceeded",
     ERR_NO_RDMA_SESSION => "ERR no RDMA session (call BLOB.RDMA_HELLO first)",
     ERR_RDMA_SESSION_EXISTS => "ERR RDMA session already established",
+    ERR_INVALID_INFO_FIELD => "ERR invalid information field",
     ERR_MODULE_DISABLED => "DISABLED largeobj module is disabled",
     ERR_DENY_BLOCKING => "ERR command not allowed in MULTI, scripts or module calls",
 

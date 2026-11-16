@@ -1,7 +1,7 @@
 import os
 from valkey import ResponseError, Valkey
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, blob_info, info_largeobj, position_pattern
+from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
 
 
 class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
@@ -284,16 +284,16 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         payload = position_pattern(4096)  # non-uniform so CRC is meaningful
         client.execute_command('BLOB.TCP_SET', 'infokey', payload)
-        info = blob_info(client, 'infokey')
-        assert info['len'] == len(payload)
+        # Check the specfic fields for info
+        assert client.execute_command('BLOB.INFO', 'infokey', 'LEN') == len(payload)
         # CRC is a u32: in range, stable across calls, and identical for identical payloads.
-        crc = info['crc']
+        crc = client.execute_command('BLOB.INFO', 'infokey', 'CRC')
         assert 0 <= crc <= 0xFFFFFFFF
-        assert blob_info(client, 'infokey')['crc'] == crc
+        assert client.execute_command('BLOB.INFO', 'infokey', 'CRC') == crc
         client.execute_command('BLOB.TCP_SET', 'infokey2', payload)
-        assert blob_info(client, 'infokey2')['crc'] == crc
-        assert info['tier'] == b'dram'
-        # RESP2 gets a flat array, RESP3 gets a map. Same fields either way.
+        assert client.execute_command('BLOB.INFO', 'infokey2', 'CRC') == crc
+        assert client.execute_command('BLOB.INFO', 'infokey', 'TIER') == b'dram'
+        # Full info call: a flat array in RESP2, a map in RESP3.
         assert client.execute_command('BLOB.INFO', 'infokey') == [
             b'crc', crc, b'len', len(payload), b'tier', b'dram']
         resp3 = Valkey(host=self.server.bind_ip, port=self.server.port, protocol=3)
@@ -306,16 +306,17 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
         first = position_pattern(4096, 'A')
         second = position_pattern(8192, 'B')
         client.execute_command('BLOB.TCP_SET', 'owkey', first)
-        first_crc = blob_info(client, 'owkey')['crc']
+        first_crc = client.execute_command('BLOB.INFO', 'owkey', 'CRC')
         client.execute_command('BLOB.TCP_SET', 'owkey', second)
-        assert blob_info(client, 'owkey')['len'] == 8192
-        assert blob_info(client, 'owkey')['crc'] != first_crc
+        assert client.execute_command('BLOB.INFO', 'owkey', 'LEN') == 8192
+        assert client.execute_command('BLOB.INFO', 'owkey', 'CRC') != first_crc
 
     def test_info_errors(self):
         """BLOB.INFO errors are correct"""
         client = self.server.get_new_client()
         # Nonexistent key returns nil
         assert client.execute_command('BLOB.INFO', 'nokey') is None
+        assert client.execute_command('BLOB.INFO', 'nokey', 'LEN') is None
         # Wrong type error
         client.execute_command('SET', 'strkey', 'plain')
         try:
@@ -323,13 +324,19 @@ class TestLargeObjDram(ValkeyLargeObjTestCaseBase):
             assert False, "Expected WRONGTYPE error"
         except ResponseError as e:
             assert str(e).startswith('WRONGTYPE'), f"Unexpected error: {e}"
-        # Wrong number of arguments error. The old field argument is gone.
+        # Wrong number of arguments error
         client.execute_command('BLOB.TCP_SET', 'badkey', position_pattern(4096, 'x'))
         try:
-            client.execute_command('BLOB.INFO', 'badkey', 'LEN')
+            client.execute_command('BLOB.INFO', 'badkey', 'LEN', 'CRC')
             assert False, "Expected arity error"
         except ResponseError as e:
             assert 'wrong number of arguments' in str(e).lower(), f"Unexpected error: {e}"
+        # Bad field error
+        try:
+            client.execute_command('BLOB.INFO', 'badkey', 'NOTREAL')
+            assert False, "Expected wrong information field error"
+        except ResponseError as e:
+            assert 'invalid information field' in str(e).lower(), f"Unexpected error: {e}"
 
 
 class TestLargeObjDramCopyExhaustion(ValkeyLargeObjTestCaseBase):

@@ -134,17 +134,6 @@ def info_largeobj(client):
     return result
 
 
-def blob_info(client, key):
-    """Return BLOB.INFO as a dict with str keys, or None if the key is missing.
-    Accepts both the RESP3 map and the RESP2 flat array."""
-    reply = client.execute_command('BLOB.INFO', key)
-    if reply is None:
-        return None
-    if not isinstance(reply, dict):
-        reply = dict(zip(reply[::2], reply[1::2]))
-    return {k.decode(): v for k, v in reply.items()}
-
-
 class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     """Base test class for valkey-largeobj module integration tests.
 

@@ -1,5 +1,4 @@
 import binascii
-import crc32c
 
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase
 
@@ -32,7 +31,7 @@ class TestLargeObjACLCategory(ValkeyLargeObjTestCaseBase):
         large_obj_commands = [
             (['BLOB.TCP_SET', 'aclkey', 'val'], b'OK'),
             (['BLOB.TCP_GET', 'aclkey'], b'val'),
-            (['BLOB.INFO', 'aclkey'], [b'crc', crc32c.crc32c(b'val'), b'len', 3, b'tier', b'dram']),
+            (['BLOB.INFO', 'aclkey', 'LEN'], 3),
             (['BLOB.RDMA_HELLO', PEER_ADDRESS], HELLO_ADDRESSES),
         ]
         # RDMA_GET and RDMA_SET are registered but cannot be exercised without a

@@ -5,7 +5,7 @@
 //! BLOB.RDMA_GET key rkey1 addr1 len1 [rkey2 addr2 len2 ...]
 //! BLOB.TCP_SET key <data>
 //! BLOB.RDMA_SET key total_len [CRC <crc32c>] rkey1 addr1 len1 [...]
-//! BLOB.INFO key
+//! BLOB.INFO key [LEN|CRC|TIER]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -342,13 +342,13 @@ pub fn lo_rdma_set(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
 
 // ─── BLOB.INFO ─────────────────────────────────────────────────────────────────
 //
-// BLOB.INFO key
+// BLOB.INFO key [LEN | CRC | TIER]
 //
-// Returns a map of len, crc, tier. RESP2 clients get it as a flat array.
+// Parse args → resolve key → return metadata field or all fields as a map.
 
 pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
     check_module_enabled(ctx)?;
-    if args.len() != 2 {
+    if !(2..=3).contains(&args.len()) {
         return Err(ValkeyError::WrongArity);
     }
 
@@ -361,14 +361,21 @@ pub fn lo_info(ctx: &Context, args: Vec<ValkeyString>) -> ValkeyResult {
         _ => return Ok(ValkeyValue::Null),
     };
 
-    // BTreeMap keeps the reply order fixed: crc, len, tier.
+    let len = ValkeyValue::Integer(value.len as i64);
+    let crc = ValkeyValue::Integer(i64::from(value.crc32c));
     let tier = ValkeyValue::SimpleStringStatic(value.tier().as_str());
-    Ok(BTreeMap::from([
-        ("crc", ValkeyValue::Integer(i64::from(value.crc32c))),
-        ("len", ValkeyValue::Integer(value.len as i64)),
-        ("tier", tier),
-    ])
-    .into())
+
+    if args.len() == 2 {
+        // BTreeMap keeps the reply order fixed: crc, len, tier.
+        return Ok(BTreeMap::from([("crc", crc), ("len", len), ("tier", tier)]).into());
+    }
+
+    match args[2].to_string_lossy().to_uppercase().as_str() {
+        "LEN" => Ok(len),
+        "CRC" => Ok(crc),
+        "TIER" => Ok(tier),
+        _ => Err(ValkeyError::Str(errors::ERR_INVALID_INFO_FIELD)),
+    }
 }
 
 // ─── Unit Tests ──────────────────────────────────────────────────────────────
