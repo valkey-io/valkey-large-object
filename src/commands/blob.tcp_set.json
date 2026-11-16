@@ -1,0 +1,25 @@
+{
+    "BLOB.TCP_SET": {
+        "summary": "Stores a large object at a key, with the payload sent inline over the connection",
+        "complexity": "O(N), where N is the size of the object in bytes.",
+        "group": "large_object",
+        "module_since": "0.1.0",
+        "arity": 3,
+        "acl_categories": [
+            "WRITE",
+            "FAST",
+            "LARGEOBJ"
+        ],
+        "arguments": [
+            {
+                "name": "key",
+                "type": "key",
+                "key_spec_index": 0
+            },
+            {
+                "name": "value",
+                "type": "string"
+            }
+        ]
+    }
+}
