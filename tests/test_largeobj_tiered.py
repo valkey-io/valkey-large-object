@@ -2060,3 +2060,39 @@ class TestSegmentHoldsAChunk(ValkeyLargeObjTestCaseBase):
         wait_for_true(lambda: server.server.poll() is not None)
         assert server.server.returncode != 0
         assert server.verify_string_in_logfile('segment-size must be >= 2 * largeobj.chunk-size')
+
+
+# ─── Disk staging exhaustion ─────────────────────────────────────────────────
+
+
+class TestTieredStagingExhausted(ValkeyLargeObjTestCaseBase):
+    """A 4 MiB staging pool holds one 3 MiB SET, which the pause keeps holding for 2 s."""
+
+    def get_module_args(self, data_dir, direct_io):
+        return (
+            f"operating-mode Tiered"
+            f" disk-dir {data_dir}"
+            f" disk-staging-size 4194304"
+            f" segment-size 4194304"
+            f" chunk-size 1048576"
+            f" max-object-size 3145728"
+            f" max-promote-size 0"
+            f" direct-io no"
+            f" fabric-provider Emulated"
+            f" test-pause-before-finalize-set-ms 2000"
+        )
+
+    def test_set_rejected_with_retry_hint_when_staging_is_exhausted(self):
+        client = self.server.get_new_client()
+        payload = position_pattern(3 * MIB, 'S')
+        held = threading.Thread(target=self.server.get_new_client().execute_command,
+                                args=('BLOB.TCP_SET', 'held', payload))
+        held.start()
+        wait_for_true(lambda: client.info('largeobj_disk_staging')
+                      ['largeobj_disk_staging_utilization_pct'] > 0)
+        with pytest.raises(ResponseError, match='disk staging buffer pool exhausted; retry later') as exc:
+            client.execute_command('BLOB.TCP_SET', 'rejected', payload)
+        # Exactly ResponseError, not an OutOfMemoryError subclass: the error must
+        # keep the ERR prefix, not regress to OOM.
+        assert type(exc.value) is ResponseError, f"Expected ERR, got {type(exc.value).__name__}"
+        held.join(timeout=10)
