@@ -58,7 +58,7 @@ use crate::data_type::LO_TYPE;
 use crate::transport::config::FabricProvider;
 
 pub const MODULE_NAME: &str = "largeobj";
-pub const MODULE_VERSION: i32 = 1;
+pub const MODULE_VERSION: i32 = 100;
 
 // ─── Global Runtime ──────────────────────────────────────────────────────────
 
