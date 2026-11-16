@@ -65,7 +65,7 @@ In `Tiered` mode, the server replies only after the disk write is complete.
 | `OOM command not allowed when used disk space > 'largeobj.disk-maxmemory'.` | `Tiered` mode: no disk space, and eviction cannot free space. |
 | `ERR disk write failed` | `Tiered` mode: the disk write failed. |
 | `ERR failed to set key` | Rare: the server could not store the key after the write. Retry. |
-| `ERR disk staging buffer pool exhausted` | `Tiered` mode: no free disk staging buffers for the write. This is a limit on concurrent disk operations, not a lack of DRAM for data. The error is temporary: a retry later can succeed, after operations in progress finish. Each disk read or write holds `largeobj.min-buffers-per-op` to `largeobj.max-buffers-per-op` buffers of `largeobj.chunk-size` from the `largeobj.disk-staging-size` pool while it runs. Raise `largeobj.disk-staging-size` (needs a restart), lower `largeobj.max-buffers-per-op` so that each operation holds fewer buffers, or send fewer concurrent `Tiered` disk operations. The `largeobj_disk_staging_buffer_exhausted` counter in `INFO largeobj` counts these errors. |
+| `ERR disk staging buffer pool exhausted; retry later` | `Tiered` mode: no free disk staging buffers for the write. This is a limit on concurrent disk operations, not a lack of DRAM for data. The error is temporary: a retry later can succeed, after operations in progress finish. Each disk read or write holds `largeobj.min-buffers-per-op` to `largeobj.max-buffers-per-op` buffers of `largeobj.chunk-size` from the `largeobj.disk-staging-size` pool while it runs. Raise `largeobj.disk-staging-size` (needs a restart), lower `largeobj.max-buffers-per-op` so that each operation holds fewer buffers, or send fewer concurrent `Tiered` disk operations. The `largeobj_disk_staging_buffer_exhausted` counter in `INFO largeobj` counts these errors. |
 
 **Example:**
 
@@ -95,7 +95,7 @@ In `Tiered` mode, the server reads from the DRAM cache if a cached copy is ready
 | Error | Cause |
 |---|---|
 | `ERR disk read failed` | `Tiered` mode: the disk read failed. |
-| `ERR disk staging buffer pool exhausted` | `Tiered` mode: no free disk staging buffers for the read. This is a temporary concurrency limit; a retry later can succeed. See [BLOB.TCP_SET](#blobtcp_set). |
+| `ERR disk staging buffer pool exhausted; retry later` | `Tiered` mode: no free disk staging buffers for the read. This is a temporary concurrency limit; a retry later can succeed. See [BLOB.TCP_SET](#blobtcp_set). |
 
 `BLOB.TCP_GET` can also return the errors in [Common rules](#common-rules).
 
@@ -420,7 +420,7 @@ The full list, with ranges and validation, is in [`src/configs.rs`](../src/confi
 | `largeobj.worker-threads` | `8` | No | Worker threads for asynchronous I/O. |
 | `largeobj.scaling-shrink-watermark` | `90` | Yes | Percent of `maxmemory` above which the DRAM pool does not grow. In `Tiered` mode, the pool also releases segments above it. |
 | `largeobj.promote-min-hits` | `1` | Yes | `Tiered`: number of disk reads of an object; the read that reaches this number promotes it. `1` promotes on the first read. |
-| `largeobj.fabric-provider` | `EfaDirect` | No | `EfaDirect` or `Emulated` (case-sensitive). See [RDMA overview](#rdma-overview). |
+| `largeobj.fabric-provider` | `EfaDirect` | No | `EfaDirect` or `Emulated`. See [RDMA overview](#rdma-overview). |
 | `largeobj.fabric-interfaces` | `""` | No | Comma-separated fabric domains (network devices as libfabric names them, for example `lo`). Empty uses all domains that the provider finds. |
 | `largeobj.fabric-crc-pool-threads` | `2` | No | Threads that calculate checksums for `BLOB.RDMA_SET`. |
 | `largeobj.max-rdma-registered-bytes` | 380GB | Yes | Maximum bytes of segments registered with the fabric. When a fabric is up, the DRAM pool does not grow past it, as with `maxmemory`. `0` is unlimited. |

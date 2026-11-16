@@ -103,7 +103,6 @@ Set the configurations with their full `largeobj.` names: after `--loadmodule` o
 Memory sizes can have units, such as `64mb`.
 
 - `largeobj.segment-size` must be at least twice `largeobj.chunk-size` (default 1MB).
-- Values such as `Dram`, `Tiered`, `EfaDirect`, and `Emulated` are case-sensitive.
 
 ### Dram mode
 
@@ -529,7 +528,7 @@ Use `largeobj_evictions` instead.
 |---|---|
 | `OOM command not allowed when used memory > 'maxmemory'.` | The DRAM pool is full, and eviction cannot free space. With `maxmemory-policy noeviction` (the default), the module evicts nothing. Use `allkeys-lru` or `volatile-lru`, or raise `maxmemory`. |
 | `OOM command not allowed when used disk space > 'largeobj.disk-maxmemory'.` | `Tiered` mode: the disk limit is reached, and eviction cannot free space. Use a policy that permits eviction, or raise `largeobj.disk-maxmemory`. |
-| `ERR disk staging buffer pool exhausted` | `Tiered` mode: too many concurrent disk operations for the disk staging buffers, not a lack of DRAM for data. A retry later can succeed. See [COMMANDS.md](COMMANDS.md#blobtcp_set). |
+| `ERR disk staging buffer pool exhausted; retry later` | `Tiered` mode: too many concurrent disk operations for the disk staging buffers, not a lack of DRAM for data. A retry later can succeed. See [COMMANDS.md](COMMANDS.md#blobtcp_set). |
 | `ERR max object size exceeded` | The object is larger than `largeobj.max-object-size`. |
 | `ERR failed to set key` | Rare: the server could not store the key after the write. Retry. |
 | `ERR Protocol error: invalid bulk length`, and the connection closes | A `BLOB.TCP_SET` value is larger than the core `proto-max-bulk-len` (default 512MB). Raise `proto-max-bulk-len`, or use `BLOB.RDMA_SET`. |
@@ -545,7 +544,6 @@ Use `largeobj_evictions` instead.
 |---|---|
 | Build fails. Log: `fatal error: fi_collective.h: No such file or directory` | The libfabric that `pkg-config` finds is older than 2.0. Install libfabric 2.0 or later, and set `PKG_CONFIG_PATH` to its `lib/pkgconfig` directory (see [Build](#build)). |
 | Server stops at load, or `./build.sh` or `fabric_target` fails. Log: ``libfabric.so.1: version `FABRIC_1.8' not found`` | An older libfabric is loaded at run time. Set `LD_LIBRARY_PATH` to the `lib` directory of the libfabric that you built with. |
-| Server stops at load. Log: `Enum 'dram' not exists` | Enum values are case-sensitive. Use `Dram`, `Tiered`, `EfaDirect`, or `Emulated`. |
 | Server stops at load. Log: `largeobj.segment-size is insufficient for largeobj.max-object-size` | `Dram` mode: an object of `largeobj.max-object-size` does not fit in one segment (default `largeobj.max-object-size` is 512MB). Make `largeobj.max-object-size` smaller or `largeobj.segment-size` larger (see [Dram mode](#dram-mode)). |
 | Server stops at load. Log: `largeobj.segment-size must be >= 2 * largeobj.chunk-size` | `largeobj.segment-size` is less than twice `largeobj.chunk-size` (default 1MB). Make `largeobj.segment-size` larger, for example 2MB (2097152) or more. |
 | Server stops at load. Log: `largeobj: config validation failed: ERR largeobj.segment-size is insufficient for largeobj.max-promote-size` | `Tiered` mode: an object of `largeobj.max-promote-size` (default 256MB) does not fit in one segment. With 64MB segments, `largeobj.max-promote-size` can be at most 66842624. Make `largeobj.max-promote-size` smaller. |
