@@ -475,21 +475,16 @@ pub fn read_key_hint(oid: ObjectId) -> Option<KeyHint> {
 
 // ─── Disk Length ──────────────────────────────────────────────────────────────
 
-/// O_DIRECT-aligned on-disk size of an object file, computed by iterating
-/// through the ChunkIterator and summing each chunk's aligned I/O length.
-/// This matches what the uring poller actually writes (`align_up(op.len)` per
-/// SQE).
-///
-/// Resets the iterator cursor to 0 before and after iteration so the caller
-/// can continue using it normally.
-pub fn object_disk_len(chunk_iter: &mut super::ChunkIterator) -> u64 {
-    chunk_iter.reset_cursor();
-    let mut chunk_bytes: u64 = 0;
-    while let Some(chunk) = chunk_iter.next_chunk() {
-        chunk_bytes += super::align_up(chunk.user_data_len) as u64;
-    }
-    chunk_iter.reset_cursor();
-    chunk_bytes
+/// O_DIRECT-aligned on-disk size of an object file: the sum of each chunk's
+/// aligned I/O length. This matches what the uring poller actually writes
+/// (`align_up(op.len)` per SQE). Reads chunk geometry only, so no EFA addresses
+/// are mapped and the iterator is left untouched.
+pub fn object_disk_len(chunk_iter: &super::ChunkIterator) -> u64 {
+    chunk_iter
+        .chunks
+        .iter()
+        .map(|chunk| super::align_up(chunk.user_data_len) as u64)
+        .sum()
 }
 
 // ─── NVMe File I/O Helpers ───────────────────────────────────────────────────
@@ -672,8 +667,8 @@ mod tests {
         let base = nvme_disk_usage();
         // chunk_size=4096 (aligned), so each object is one or more chunks.
         for len in [1u64, 4095, 4096, 4097, 1_048_576] {
-            let mut iter = super::super::ChunkIterator::new(len, 4096, 256, None);
-            let disk_len = object_disk_len(&mut iter);
+            let iter = super::super::ChunkIterator::new(len, 4096, 256, None);
+            let disk_len = object_disk_len(&iter);
             increase_nvme_disk_usage(disk_len);
             decrease_nvme_disk_usage(disk_len);
         }
@@ -728,31 +723,31 @@ mod tests {
     #[test]
     fn test_object_disk_len_single_chunk() {
         // 1 byte → 1 chunk, align_up(1) = 4096. Total = 4096.
-        let mut iter = super::super::ChunkIterator::new(1, 4096, 1, None);
-        assert_eq!(object_disk_len(&mut iter), 4096);
+        let iter = super::super::ChunkIterator::new(1, 4096, 1, None);
+        assert_eq!(object_disk_len(&iter), 4096);
     }
 
     #[test]
     fn test_object_disk_len_exact_multiple_aligned_chunk_size() {
         // 8192 bytes, chunk_size=4096 → 2 full chunks. Each align_up(4096)=4096.
-        let mut iter = super::super::ChunkIterator::new(8192, 4096, 2, None);
-        assert_eq!(object_disk_len(&mut iter), 4096 + 4096);
+        let iter = super::super::ChunkIterator::new(8192, 4096, 2, None);
+        assert_eq!(object_disk_len(&iter), 4096 + 4096);
     }
 
     #[test]
     fn test_object_disk_len_partial_last_chunk_aligned_chunk_size() {
         // 10000 bytes, chunk_size=4096 → chunks: 4096, 4096, 1808.
         // align_up: 4096, 4096, 4096. Data total = 12288.
-        let mut iter = super::super::ChunkIterator::new(10000, 4096, 3, None);
-        assert_eq!(object_disk_len(&mut iter), 12288);
+        let iter = super::super::ChunkIterator::new(10000, 4096, 3, None);
+        assert_eq!(object_disk_len(&iter), 12288);
     }
 
     #[test]
     fn test_object_disk_len_unaligned_value_multi_page_chunk_size() {
         // 20000 bytes, chunk_size=8192 → chunks: 8192, 8192, 3616.
         // align_up(3616) = 4096. Data total = 20480.
-        let mut iter = super::super::ChunkIterator::new(20000, 8192, 3, None);
-        assert_eq!(object_disk_len(&mut iter), 8192 + 8192 + 4096);
+        let iter = super::super::ChunkIterator::new(20000, 8192, 3, None);
+        assert_eq!(object_disk_len(&iter), 8192 + 8192 + 4096);
     }
 
     /// COPY sizes its file as `align_up(obj_len)`: what a SET writes for any valid chunk size.
