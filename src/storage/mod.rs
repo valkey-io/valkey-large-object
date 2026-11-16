@@ -23,6 +23,7 @@ pub mod reclaim;
 pub mod scaling;
 pub mod segment;
 pub mod segment_pool;
+pub mod sharded_map;
 pub mod uring;
 
 // Re-exports for convenience.

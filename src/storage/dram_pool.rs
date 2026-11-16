@@ -29,13 +29,14 @@ use std::sync::{Arc, RwLock};
 use std::task::Poll;
 
 use super::cache_policy::{
-    now_minutes, sample_victim, OIDIndexedMap, OIDIndexedSet, TieredCache, RECLAIM_MAX_SEGMENTS,
+    now_minutes, sample_victim, OIDIndexedSet, TieredCache, RECLAIM_MAX_SEGMENTS,
     RECLAIM_MAX_VICTIMS,
 };
 use super::context::{ObjectContext, SegmentBuffer};
 use super::eviction_candidates;
 use super::segment::Segment;
 use super::segment_pool::SegmentPool;
+use super::sharded_map::ShardedMap;
 use crate::data_type::ObjectId;
 
 /// An eviction takes `EVICT_BATCH` victims, then tries the allocation, for at most
@@ -45,9 +46,11 @@ const EVICT_ROUNDS: usize = 2;
 
 /// Cached objects plus a per-segment index of the same OIDs, so reclaim can
 /// sample one segment. Both change together, only through `insert`/`remove`.
+/// `all` holds every cached object (Dram: every object), so it is a `ShardedMap`: its
+/// rehashes run under the server lock.
 #[derive(Default)]
 struct ObjectMaps {
-    all: OIDIndexedMap<Arc<ObjectContext>>,
+    all: ShardedMap<ObjectId, Arc<ObjectContext>>,
     /// `by_segment[s]`: OIDs of the objects in segment `s`. An object never
     /// spans segments, so its first buffer names its segment.
     by_segment: Vec<OIDIndexedSet>,
@@ -65,7 +68,7 @@ impl ObjectMaps {
     }
 
     fn remove(&mut self, oid: &ObjectId) -> Option<Arc<ObjectContext>> {
-        let ctx = self.all.swap_remove(oid)?;
+        let ctx = self.all.remove(oid)?;
         self.by_segment[ctx.buffers[0].segment_idx as usize].swap_remove(oid);
         Some(ctx)
     }
@@ -77,7 +80,7 @@ impl ObjectMaps {
         };
         let ids = std::mem::take(ids);
         for oid in &ids {
-            self.all.swap_remove(oid);
+            self.all.remove(oid);
         }
         ids
     }
@@ -97,7 +100,7 @@ impl ObjectMaps {
             (Arc::strong_count(ctx) == 1).then(|| ctx.stats.decayed_counter(now_min, decay_minutes))
         })?;
         let oid = ids.swap_remove_index(victim)?;
-        Some((oid, self.all.swap_remove(&oid)?))
+        Some((oid, self.all.remove(&oid)?))
     }
 }
 
@@ -705,7 +708,7 @@ mod tests {
     /// the index holds nothing else.
     fn assert_index_consistent(p: &DRAMPool) {
         let m = p.objects.read().unwrap();
-        for (oid, ctx) in &m.all {
+        for (oid, ctx) in m.all.iter() {
             let s = ctx.buffers[0].segment_idx as usize;
             assert!(m.by_segment[s].contains(oid), "{oid:?} not indexed");
         }
