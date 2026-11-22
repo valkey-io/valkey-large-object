@@ -1,6 +1,7 @@
 import os
+import pytest
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, position_pattern
-from valkeytestframework.util.waiters import wait_for_equal
+from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 
 
 class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
@@ -91,3 +92,51 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         assert client.execute_command("BLOB.TCP_SET", "after", position_pattern(4096, "Q")) == b"OK"
         assert len(self._object_files()) == 1
+
+    # A refused load makes Valkey drop its reference to the config data the valkey-module
+    # crate boxed for each config, and nothing frees it, so LeakSanitizer reports it at exit.
+    # That is not a leak in this module's code, so the ASAN job skips this test.
+    @pytest.mark.skip_for_asan
+    @pytest.mark.parametrize('case', ['missing', 'unwritable'])
+    def test_refuses_to_load_when_disk_dir_cannot_be_reset(self, case):
+        """Tiered mode refuses to load when the startup purge cannot run, rather than
+        start on a dirty disk-dir. Two reasons: no disk-dir given, or one that cannot be
+        reset (its parent is read-only, so its entries cannot be unlinked). The log names
+        the reason, and the module args are otherwise identical to the ones that load."""
+        self.server.exit(cleanup=False)
+        # Absolute, as the base fixture does: the server resolves a relative disk-dir
+        # against its own cwd, which is not this directory.
+        testdir = os.path.abspath(os.path.join(self.testdir, f'no-reset-{case}'))
+        os.makedirs(testdir, exist_ok=True)
+        if case == 'missing':
+            disk_dir = ''
+            reason = 'failed to reset disk-dir : disk-dir is required in Tiered operating mode'
+        else:
+            parent = os.path.join(testdir, 'ro')
+            disk_dir = os.path.join(parent, 'nvme')
+            if os.path.exists(parent):  # a previous run's leftover; it may still be read-only
+                os.chmod(parent, 0o755)
+            os.makedirs(disk_dir, exist_ok=True)
+            with open(os.path.join(disk_dir, 'stale.dat'), 'wb') as f:
+                f.write(b'stale')
+            os.chmod(parent, 0o555)
+            # remove_dir_all cannot unlink stale.dat: the message names the dir and EACCES.
+            reason = f'failed to reset disk-dir {disk_dir}: Permission denied'
+        try:
+            module_args = self.get_module_args(disk_dir, 'no')
+            if not disk_dir:
+                # Leave disk-dir out entirely; an empty value would swallow the next token.
+                module_args = module_args.replace(' disk-dir ', ' ', 1)
+            server, _ = self.create_server(
+                testdir=testdir,
+                server_path=self.server_path,
+                args={'loadmodule': f"{os.environ['MODULE_PATH']} {module_args}"},
+                connect_client=False,
+            )
+            wait_for_true(lambda: server.server.poll() is not None)
+            assert server.server.returncode != 0
+            assert server.verify_string_in_logfile('startup failed to reset disk-dir')
+            assert server.verify_string_in_logfile(reason)
+        finally:
+            if case == 'unwritable':
+                os.chmod(parent, 0o755)
