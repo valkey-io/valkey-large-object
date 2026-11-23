@@ -43,6 +43,7 @@ pub fn configuration() -> Configuration {
         progress_deadline: std::time::Duration::from_secs(1),
         // No sentinel read-back after GET writes: the crate's default.
         quiesce_writes: false,
+        liveness_probe: crate::fabric_liveness_probe(),
     }
 }
 
