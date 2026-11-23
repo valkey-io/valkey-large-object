@@ -178,10 +178,9 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     def setup_test(self, setup):
         module_path = os.getenv('MODULE_PATH')
         # Give the module a DEDICATED disk-dir under testdir (not testdir itself).
-        # The module owns this directory outright and deletes everything in it at
-        # startup, so it must not be shared with the server's own files
-        # (logfile, rdb) which live directly in testdir. Absolute path so file
-        # assertions work regardless of cwd.
+        # Tests assert on every file in it, so it must not be shared with the
+        # server's own files (logfile, rdb), which live directly in testdir.
+        # Absolute path so file assertions work regardless of cwd.
         data_dir = os.path.abspath(os.path.join(self.testdir, "nvme"))
         # Disable O_DIRECT in ASAN builds — ASAN tests focus on memory safety,
         # not I/O bypass correctness. Avoids EINVAL from O_DIRECT alignment edge cases.

@@ -1,14 +1,14 @@
+import glob
 import os
+import shutil
 from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, position_pattern
-from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
+from valkeytestframework.util.waiters import wait_for_equal
 
 
-def wait_previous_run_deleted(client, data_dir, timeout=10):
-    """Wait until INFO reports nothing left of the previous run and its dirs are gone."""
+def wait_previous_run_deleted(client, timeout=10):
+    """Wait until the cleanup is done: INFO reaches 0 after its dirs are removed."""
     remaining = lambda: client.info('largeobj_disk')['largeobj_disk_previous_run_remaining_bytes']
     wait_for_equal(remaining, 0, timeout=timeout)
-    wait_for_true(lambda: not [d for d in os.listdir(data_dir) if d.startswith('previous-run-')],
-                  timeout=timeout)
 
 
 class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
@@ -19,12 +19,14 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
     never blocks startup or shutdown:
 
     - graceful shutdown leaves object files in place;
-    - startup moves everything in ``disk-dir`` into a ``previous-run-*`` directory,
-      one rename per entry, charges what it holds against ``disk-maxmemory``, and
+    - startup moves each shard dir in ``disk-dir`` into ``disk-dir/previous-run/``
+      under the next free number (one rename per shard; what earlier runs' unfinished
+      cleanups left there stays), charges what it holds against ``disk-maxmemory``, and
       deletes it in the background — or inline, before any eviction, when a SET needs
       the room.
 
-    Cleanup never touches the parent ``testdir`` (the server's logfile, rdb), nor this
+    Cleanup never touches entries of ``disk-dir`` that are not shard dirs, files in shards
+    that are not object files, the parent ``testdir`` (the server's logfile, rdb), nor this
     run's shards.
     """
 
@@ -46,47 +48,55 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
 
         self.server.start()
         client = self.server.get_new_client()
-        wait_previous_run_deleted(client, self.data_dir)
+        wait_previous_run_deleted(client)
         assert self._object_files() == [], "previous run's files not deleted"
 
     def test_startup_deletes_orphaned_files(self):
-        """Startup deletes everything a crashed run left behind; files outside disk-dir survive.
+        """Startup deletes what crashed runs left in their shards; other files survive.
 
-        Plant files while the server is down: in a shard, in a ``previous-run-*`` directory
-        from a run that crashed mid-cleanup, and loose in disk-dir (one oddly named, to show
-        it is name-agnostic), plus an unrelated file in testdir itself (outside disk-dir).
+        Plant files while the server is down: in a shard, in ``previous-run/`` from two
+        earlier runs that crashed mid-cleanup, and ones that are not the module's (kept):
+        loose in disk-dir, in a dir named like a shard, in a shard, and in testdir.
         """
         self.server.exit(cleanup=False)
         assert self._object_files() == [], "no object files expected before planting"
 
         planted = [
             os.path.join(self.data_dir, "0001", "0000000000000001.dat"),
-            os.path.join(self.data_dir, "previous-run-1", "0002", "0000000000000002.dat"),
-            os.path.join(self.data_dir, "000000000000dead.dat"),
-            os.path.join(self.data_dir, "000000000000beef.dat.tmp"),
-            os.path.join(self.data_dir, "not-a-normal-name"),
+            os.path.join(self.data_dir, "previous-run", "0", "0000000000000002.dat"),
+            os.path.join(self.data_dir, "previous-run", "1", "0000000000000003.dat"),
         ]
-        foreign = os.path.join(self.testdir, "keepme.txt")
-        for path in planted:
+        kept = [
+            os.path.join(self.data_dir, "000000000000dead.dat"),
+            os.path.join(self.data_dir, "not-a-normal-name"),
+            os.path.join(self.data_dir, "deadbeef", "0000000000000004.dat"),
+            os.path.join(self.testdir, "keepme.txt"),
+        ]
+        in_shard = os.path.join(self.data_dir, "0002", "keep.txt")
+        for path in planted + kept + [in_shard]:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(b"stale")
-        with open(foreign, "wb") as f:
-            f.write(b"do not delete")
 
         self.server.start()
         client = self.server.get_new_client()
         # The OID-1 path is free for this run straight away: the old shard was moved out.
         assert client.execute_command("BLOB.TCP_SET", "k", position_pattern(4096, "K")) == b"OK"
-        wait_previous_run_deleted(client, self.data_dir)
+        wait_previous_run_deleted(client)
 
         # planted[0] is OID 1's path: it now holds this run's object, not the orphan.
         with open(planted[0], "rb") as f:
             assert f.read() != b"stale", "new object must not land on the orphan"
         for path in planted[1:]:
             assert not os.path.exists(path), f"orphan not deleted: {path}"
-        assert os.path.exists(foreign), "file outside disk-dir must be preserved"
-        assert len(self._object_files()) == 1, "only this run's object remains"
+        for path in kept:
+            assert os.path.exists(path), f"file the module did not create was deleted: {path}"
+            os.remove(path)  # disk-dir is shared with the tests that follow
+        # The shard holding it was moved, and is all that is left of previous-run/.
+        assert len(glob.glob(os.path.join(self.data_dir, "previous-run", "*", "keep.txt"))) == 1
+        shutil.rmtree(os.path.join(self.data_dir, "previous-run"))
+        os.rmdir(os.path.join(self.data_dir, "deadbeef"))
+        assert self._object_files() == [planted[0]], "only this run's object remains"
         assert client.execute_command("BLOB.TCP_GET", "k") == position_pattern(4096, "K")
 
     def test_restart_leaves_no_object_files(self):
@@ -99,7 +109,7 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         self.server.restart()
 
         client = self.server.get_new_client()
-        wait_previous_run_deleted(client, self.data_dir)
+        wait_previous_run_deleted(client)
         assert self._object_files() == [], "object files lingered across restart"
         # A fresh server can still serve new writes.
         assert client.execute_command("BLOB.TCP_SET", "after", position_pattern(4096, "Q")) == b"OK"
@@ -139,7 +149,7 @@ class TestLargeObjCleanupUnderPressure(ValkeyLargeObjTestCaseBase):
             assert client.execute_command(
                 "BLOB.TCP_SET", f"k{i}", position_pattern(self.VALUE, i)) == b"OK"
 
-        wait_previous_run_deleted(client, self.data_dir, timeout=60)
+        wait_previous_run_deleted(client, timeout=60)
         assert client.info('largeobj')['largeobj_evictions'] == 0, \
             "a live object was evicted to make room for the previous run's files"
         for i in range(32):

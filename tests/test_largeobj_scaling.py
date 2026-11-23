@@ -971,6 +971,8 @@ class TestTieredEviction(EvictionTests, TieredBudget):
         set_objects(client, 'obj_', 3 * self.PER_BUDGET, self.OBJ)
         assert all(os.path.exists(os.path.join(self.data_dir, name)) for name in strays)
         self.settle(client, self.PER_BUDGET)
+        for name in strays:  # startup leaves them in place, and disk-dir is shared
+            os.remove(os.path.join(self.data_dir, name))
 
     # Disabled: test-pause-before-finalize-set-ms is immutable, so paused_set cannot toggle it.
     # @pytest.mark.parametrize('overwrite', [False, True])

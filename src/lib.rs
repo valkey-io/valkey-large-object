@@ -142,15 +142,10 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
-    // Clean up what a previous run left in disk-dir (Tiered mode only): one rename per
-    // shard moves it out of the way, then a background thread deletes it, charged
-    // against disk-maxmemory until then. On failure we can't guarantee a clean slate,
-    // so refuse to load rather than start dirty.
-    match storage::reclaim::clean_previous_run(mode, &dir) {
-        Ok(0) => {}
-        Ok(bytes) => ctx.log_notice(&format!(
-            "largeobj: deleting the previous run's files in {dir} in the background ({bytes} bytes)"
-        )),
+    // Move the previous run's shard dirs out of the way before `storage::init` creates fresh
+    // ones (Tiered mode). If that fails, refuse to load rather than start dirty.
+    let previous_run_bytes = match storage::reclaim::move_previous_run(mode, &dir) {
+        Ok(bytes) => bytes,
         Err(e) => {
             ctx.log_warning(&format!(
                 "largeobj: failed to clean up the previous run in disk-dir {dir}: {e}; \
@@ -158,7 +153,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
             ));
             return Status::Err;
         }
-    }
+    };
 
     // The module only registers host memory. libfabric's default initializes every HMEM
     // interface it finds, so on a GPU node it starts CUDA and holds GPU memory; GPU
@@ -218,6 +213,15 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
     // All init succeeded — commit runtime to OnceLock.
     if RUNTIME.set(rt).is_err() {
         panic!("Runtime already initialized");
+    }
+
+    // Delete them while serving, now that init succeeded.
+    if previous_run_bytes > 0 {
+        ctx.log_notice(&format!(
+            "largeobj: deleting the previous run's files in {dir} in the background \
+             ({previous_run_bytes} bytes)"
+        ));
+        runtime_handle().spawn_blocking(|| while storage::reclaim::delete_previous_run_file() {});
     }
 
     // Cache maxmemory-policy; `CONFIG SET` keeps it current.

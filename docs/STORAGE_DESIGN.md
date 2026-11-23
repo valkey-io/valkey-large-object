@@ -432,20 +432,24 @@ runtime handle is `ObjectFile { object_id }` (held behind
 `Arc<ObjectFile>`); it stores no path and no fd — the path is derived from the OID
 and the fd is managed separately by the FdPool (§6.4).
 
-**Previous-run cleanup (`storage/reclaim.rs`).** Whatever a previous run left in
-`disk-dir` (after any shutdown or crash) is deleted without blocking startup, whose cost
-would otherwise grow with the data on disk; OIDs restart at 1, so its paths would collide
-with this run's. `clean_previous_run` renames every entry in `disk-dir` into
-`disk-dir/previous-run-<nanos>/` (one rename per shard), then one `SCHED_IDLE` thread
-deletes it. Until then the space it holds is charged against
-`disk-maxmemory` (§9.3): what `statvfs` reports used beyond this run's charges, at most
-`disk-maxmemory` (the previous run never charged more), re-read after each file is
-deleted, and only ever lowered. It includes what the filesystem holds for itself (XFS
-reserves metadata space per allocation group and reports it used), so it is zeroed once
-the last file is deleted. A SET that does not fit deletes some of it inline before evicting
-anything. INFO `disk_previous_run_remaining_bytes` counts down to 0. Shutdown
-deletes nothing. One thread is enough: unlink throughput is bound by the filesystem's
-inode inactivation, not by the number of callers.
+**Previous-run cleanup (`storage/reclaim.rs`).** What a previous run left in `disk-dir`
+(after any shutdown or crash) is deleted without blocking startup, whose cost would
+otherwise grow with the data on disk; OIDs restart at 1, so its paths would collide with
+this run's. Before the shards are created, `move_previous_run` renames each shard dir
+(`{shard:04x}`) into `disk-dir/previous-run/` under the next free number: one rename per
+shard. A cleanup cut short by a crash or restart leaves `previous-run/` partly deleted; the
+next startup numbers its shards after what is there, so leftovers of any number of runs are
+in one directory, two levels deep (`previous-run/<n>/<oid>.dat`), and deleted in one walk.
+Entries of `disk-dir` that are not shard dirs are left in place and logged. Once init
+succeeds, one tokio blocking task (`delete_previous_run_file` in a loop) deletes the object
+files (`{oid:016x}.dat`) in `previous-run/`, then removes the emptied dirs: anything else,
+even in a shard dir, is left in place. Until
+then the space it holds is charged against `disk-maxmemory` (§9.3): what `statvfs` reports
+used at startup, before this run writes, at most `disk-maxmemory`; lowered by each deleted
+file's blocks; zeroed when the walk ends, which also drops what the filesystem holds for
+itself (XFS reserves metadata space per allocation group and reports it used). A SET that
+does not fit deletes some of it inline before evicting anything. INFO
+`disk_previous_run_remaining_bytes` counts down to 0. Shutdown deletes nothing.
 
 **File header (in the `user.lobj` extended attribute; the file holds only the
 payload, from offset 0):**
@@ -1427,7 +1431,7 @@ Note: DRAM-only mode has no "miss" — all objects live in DRAMPool. A GET on a 
 | NVMe disk-usage counter | `AtomicU64` (NVME_DISK_USAGE) | lock-free atomic | Tokio (reserve on SET/COPY), any thread (decrement on ObjectFile::Drop / error rollback) |
 | Segment registry | `Mutex<SegmentState { slots: Vec<Option<Segment>> }>` (per pool) | Mutex | All threads take it briefly to reach a segment (alloc picker, free, buffer_ptr, iovec lookup). Slots are mutated by publish (the expand's last step, on any thread) and by release (main thread); the Tiered DRAM ring's poller rewrites `iovecs` and each segment's `iovec_index` during a rebuild (§8.6). Each segment's `refcount`/`allocated_bytes`/`draining` are atomics; its talc is a separate per-segment Mutex. |
 | Reclaim list | `RECLAIM_LIST: LazyLock<ReclaimList>` (`HashSet<ObjectId>` behind a `Mutex`) | Mutex | Main (add on eviction; `contains` on BLOB.TCP_GET/BLOB.RDMA_GET/INFO/COPY; cron scan + remove; INFO), BIO (`lo_free` → `remove_object` removes), tokio (refused EFA commit → `remove_object`). Lock order: reclaim list before `DRAMPool.objects`. All readers run on the main thread, so a RwLock would buy nothing. |
-| Previous-run cleanup | `reclaim::PREVIOUS_RUN_DIRS` (`Mutex<Vec<(PathBuf, ReadDir)>>`, the depth-first walk) + `PREVIOUS_RUN_BYTES: AtomicU64` | Mutex (held only to advance the walk; unlink outside it) | The `lo-prev-cleanup` thread, and any thread whose reserve does not fit (tokio, main on COPY). Each file is handed out once. |
+| Previous-run cleanup | `reclaim::PREVIOUS_RUN_WALK` (`Mutex<Option<(PathBuf, Files)>>`: `previous-run/` and the two-level walk of its files) + `PREVIOUS_RUN_BYTES: AtomicU64` | Mutex (held to take and unlink each file) | The cleanup task (a tokio blocking thread), and any thread whose reserve does not fit (tokio, main on COPY). Each file is handed out once. |
 | Reclaim scan cursor | `thread_local! RECLAIM_SCAN` (db + `KeysCursor`) | none (main thread only) | Scaling cron |
 
 **Why RwLock for DRAMPool HashMap and FdPool:** GET hit is the hot path — main thread reads frequently. RwLock allows parallel reads. Writes (promotion insert from tokio, remove from main on free callback) are infrequent and take exclusive lock briefly.
