@@ -335,6 +335,8 @@ valkey_module! {
              ConfigurationFlags::IMMUTABLE, None, None],
             ["fabric-crc-pool-threads", &*CFG_FABRIC_CRC_POOL_THREADS, DEFAULT_FABRIC_CRC_POOL_THREADS, MIN_FABRIC_CRC_POOL_THREADS, MAX_FABRIC_CRC_POOL_THREADS,
              ConfigurationFlags::IMMUTABLE, None, None],
+            ["fabric-liveness-probe-ms", &*CFG_FABRIC_LIVENESS_PROBE_MS, DEFAULT_FABRIC_LIVENESS_PROBE_MS, MIN_FABRIC_LIVENESS_PROBE_MS, MAX_FABRIC_LIVENESS_PROBE_MS,
+             ConfigurationFlags::IMMUTABLE, None, None],
             ["max-rdma-registered-bytes", &*CFG_MAX_RDMA_REGISTERED_BYTES, DEFAULT_MAX_RDMA_REGISTERED_BYTES, MIN_MAX_RDMA_REGISTERED_BYTES, MAX_MAX_RDMA_REGISTERED_BYTES,
              ConfigurationFlags::MEMORY, None, None],
         ],

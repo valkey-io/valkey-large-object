@@ -148,6 +148,10 @@ pub const MAX_FABRIC_MAX_IN_FLIGHT: i64 = 65_536;
 pub const DEFAULT_FABRIC_CRC_POOL_THREADS: i64 = 2;
 pub const MIN_FABRIC_CRC_POOL_THREADS: i64 = 1;
 pub const MAX_FABRIC_CRC_POOL_THREADS: i64 = 1024;
+// fabric-liveness-probe-ms
+pub const DEFAULT_FABRIC_LIVENESS_PROBE_MS: i64 = 0;
+pub const MIN_FABRIC_LIVENESS_PROBE_MS: i64 = 0;
+pub const MAX_FABRIC_LIVENESS_PROBE_MS: i64 = 60_000;
 
 pub const DEFAULT_MODULE_ENABLED: bool = true;
 // ─── Test Hooks ──────────────────────────────────────────────────────────────
@@ -285,6 +289,13 @@ lazy_static::lazy_static! {
 
     /// Threads hashing checksummed transfers off the fabric workers. Default: one.
     pub static ref CFG_FABRIC_CRC_POOL_THREADS: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_CRC_POOL_THREADS);
+
+    /// Deadline for a new peer to answer its liveness probe before its transfers fail.
+    /// Off by default.
+    /// A client dropping EFA traffic holds module reads around 3 minutes and can stall the server EFA.
+    /// By probing at connection, you can see if the path is valid at least once before you commit to
+    /// real transfers.
+    pub static ref CFG_FABRIC_LIVENESS_PROBE_MS: AtomicI64 = AtomicI64::new(DEFAULT_FABRIC_LIVENESS_PROBE_MS);
 
     /// Cap on segment bytes EFA-registered (DRAM pool + staging), kept under the EFA
     /// device's registration limit. 0 = no limit. Default: 380 GiB.
@@ -553,6 +564,11 @@ pub fn fabric_max_in_flight() -> usize {
 
 pub fn fabric_crc_pool_threads() -> usize {
     CFG_FABRIC_CRC_POOL_THREADS.load(std::sync::atomic::Ordering::Relaxed) as usize
+}
+
+pub fn fabric_liveness_probe() -> Option<std::time::Duration> {
+    let milliseconds = CFG_FABRIC_LIVENESS_PROBE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    (0 < milliseconds).then(|| std::time::Duration::from_millis(milliseconds as u64))
 }
 
 pub fn max_rdma_registered_bytes() -> u64 {
