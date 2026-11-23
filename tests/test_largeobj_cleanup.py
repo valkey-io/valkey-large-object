@@ -1,8 +1,9 @@
 import glob
 import os
 import shutil
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, position_pattern
-from valkeytestframework.util.waiters import wait_for_equal
+import pytest
+from valkey_largeobj_test_case import DISK_DIR_MARKER, ValkeyLargeObjTestCaseBase, position_pattern
+from valkeytestframework.util.waiters import wait_for_equal, wait_for_true
 
 
 def wait_previous_run_deleted(client, timeout=10):
@@ -111,9 +112,34 @@ class TestLargeObjCleanup(ValkeyLargeObjTestCaseBase):
         client = self.server.get_new_client()
         wait_previous_run_deleted(client)
         assert self._object_files() == [], "object files lingered across restart"
+        assert os.path.exists(os.path.join(self.data_dir, DISK_DIR_MARKER))
         # A fresh server can still serve new writes.
         assert client.execute_command("BLOB.TCP_SET", "after", position_pattern(4096, "Q")) == b"OK"
         assert len(self._object_files()) == 1
+
+    # A refused load leaks (see test_unaligned_chunk_size_refuses_to_load in
+    # test_largeobj_tiered.py).
+    @pytest.mark.skip_for_asan
+    def test_refuses_a_disk_dir_it_did_not_create(self):
+        """A non-empty disk-dir without the module's marker is not used, and nothing in it
+        is touched, even files named like the module's."""
+        testdir = os.path.abspath(os.path.join(self.testdir, 'unmarked'))
+        disk_dir = os.path.join(testdir, 'nvme')
+        user_file = os.path.join(disk_dir, '0000', '0000000000000001.dat')
+        os.makedirs(os.path.dirname(user_file), exist_ok=True)
+        with open(user_file, 'wb') as f:
+            f.write(b'user data')
+        server, _ = self.create_server(
+            testdir=testdir,
+            server_path=self.server.valkey_path,
+            args={'loadmodule': f"{os.environ['MODULE_PATH']} {self.get_module_args(disk_dir, 'no')}"},
+            connect_client=False)
+        wait_for_true(lambda: server.server.poll() is not None)
+        assert server.server.returncode != 0
+        assert server.verify_string_in_logfile(f'has no {DISK_DIR_MARKER} file')
+        assert os.listdir(disk_dir) == ['0000']
+        with open(user_file, 'rb') as f:
+            assert f.read() == b'user data'
 
 
 class TestLargeObjCleanupUnderPressure(ValkeyLargeObjTestCaseBase):

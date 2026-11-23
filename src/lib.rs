@@ -148,8 +148,7 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         Ok(bytes) => bytes,
         Err(e) => {
             ctx.log_warning(&format!(
-                "largeobj: failed to clean up the previous run in disk-dir {dir}: {e}; \
-                 aborting module load"
+                "largeobj: cannot use disk-dir {dir}: {e}; aborting module load"
             ));
             return Status::Err;
         }

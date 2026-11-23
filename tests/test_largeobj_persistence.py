@@ -11,7 +11,9 @@ import os
 import pytest
 from valkey import ResponseError
 from valkeytestframework.util.waiters import wait_for_true
-from valkey_largeobj_test_case import ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern
+from valkey_largeobj_test_case import (
+    DISK_DIR_MARKER, ValkeyLargeObjTestCaseBase, info_largeobj, position_pattern,
+)
 
 BLOB_TYPE = 'largeob-k'
 BLOBS = 4
@@ -84,7 +86,8 @@ class PersistenceHelpers:
         info = info_largeobj(client)
         assert info['largeobj_num_objects'] == len(self.blob_keys(client))
         if self.tiered:
-            files = [f for _, _, names in os.walk(data_dir or self.data_dir) for f in names]
+            files = [f for _, _, names in os.walk(data_dir or self.data_dir) for f in names
+                     if f != DISK_DIR_MARKER]
             assert len(files) == info['largeobj_num_objects']
 
     def assert_intact(self, client, blobs):

@@ -440,13 +440,13 @@ this run's. Before the shards are created, `move_previous_run` renames each shar
 shard. A cleanup cut short by a crash or restart leaves `previous-run/` partly deleted; the
 next startup numbers its shards after what is there, so leftovers of any number of runs are
 in one directory, two levels deep (`previous-run/<n>/<oid>.dat`), and deleted in one walk.
-Entries of `disk-dir` that are not shard dirs are left in place and logged. Once init
-succeeds, one tokio blocking task (`delete_previous_run_file` in a loop) deletes the object
-files (`{oid:016x}.dat`) in `previous-run/`, then removes the emptied dirs: anything else,
-even in a shard dir, is left in place. Until
-then the space it holds is charged against `disk-maxmemory` (§9.3): what `statvfs` reports
-used at startup, before this run writes, at most `disk-maxmemory`; lowered by each deleted
-file's blocks; zeroed when the walk ends, which also drops what the filesystem holds for
+Startup refuses a non-empty `disk-dir` without the module's `.valkey-large-object`
+marker, and marks an empty one. Entries of `disk-dir` that are not shard dirs are left in
+place and logged. Once init succeeds, one tokio blocking task (`delete_previous_run_file`
+in a loop) deletes the object files (`{oid:016x}.dat`) in `previous-run/`, then removes the
+emptied dirs: anything else, even in a shard dir, is left in place. Until then the space it
+holds is charged against `disk-maxmemory` (§9.3): what `statvfs` reports used at startup,
+before this run writes, at most `disk-maxmemory`; lowered by each deleted file's blocks; zeroed when the walk ends, which also drops what the filesystem holds for
 itself (XFS reserves metadata space per allocation group and reports it used). A SET that
 does not fit deletes some of it inline before evicting anything. INFO
 `disk_previous_run_remaining_bytes` counts down to 0. Shutdown deletes nothing.

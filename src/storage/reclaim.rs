@@ -377,7 +377,8 @@ fn listed_keys_in_next_bucket(
 //     disk-dir/previous-run/0/     the last run's shard 0000, 1 its 0001, ...
 //     disk-dir/previous-run/1024/  an earlier run's, if its cleanup was cut short
 //
-// Anything else in disk-dir is not the module's and is left in place.
+// The module only uses a disk-dir it created: one with its marker file, or an empty one,
+// which it marks. Anything else in disk-dir is not the module's and is left in place.
 //
 // Until deleted, that space is charged against disk-maxmemory: `statvfs` used at startup (at
 // most disk-maxmemory), lowered by each deleted file's blocks. A reservation that does not
@@ -386,6 +387,9 @@ fn listed_keys_in_next_bucket(
 /// Space the previous runs' files still hold (INFO `disk_previous_run_remaining_bytes`);
 /// 0 once they are all deleted.
 static PREVIOUS_RUN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Marks a disk-dir as the module's; holds the layout's format version.
+const MARKER: &str = ".valkey-large-object";
 
 type Files = Box<dyn Iterator<Item = PathBuf> + Send>;
 
@@ -397,7 +401,8 @@ pub fn previous_run_remaining_bytes() -> u64 {
 }
 
 /// Tiered mode: create disk-dir and move the shard dirs a previous run left in it into
-/// `previous-run/`. Returns the bytes charged; 0 when there is nothing to delete.
+/// `previous-run/`. Returns the bytes charged; 0 when there is nothing to delete. Fails on
+/// a non-empty disk-dir without the marker: it is not the module's, so nothing is touched.
 pub fn move_previous_run(mode: crate::OperatingMode, dir: &str) -> io::Result<u64> {
     if mode != crate::OperatingMode::Tiered {
         return Ok(0);
@@ -407,6 +412,14 @@ pub fn move_previous_run(mode: crate::OperatingMode, dir: &str) -> io::Result<u6
         return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
     }
     fs::create_dir_all(dir)?;
+    let marker = Path::new(dir).join(MARKER);
+    if !marker.exists() {
+        if fs::read_dir(dir)?.next().is_some() {
+            let msg = format!("not empty and has no {MARKER} file, so it is not the module's");
+            return Err(io::Error::other(msg));
+        }
+        fs::write(&marker, "1\n")?;
+    }
     let root = Path::new(dir).join("previous-run");
     // Numbered after what an unfinished cleanup left.
     let numbered = fs::read_dir(&root).into_iter().flatten().flatten();
@@ -418,7 +431,7 @@ pub fn move_previous_run(mode: crate::OperatingMode, dir: &str) -> io::Result<u6
             fs::create_dir_all(&root)?;
             fs::rename(entry.path(), root.join(next.to_string()))?;
             next += 1;
-        } else if entry.path() != root {
+        } else if entry.path() != root && entry.path() != marker {
             log_notice(format!(
                 "largeobj: {:?} in disk-dir is not the module's: left in place",
                 entry.path()

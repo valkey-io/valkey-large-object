@@ -129,9 +129,9 @@ When a fabric is up, `largeobj.max-rdma-registered-bytes` (default 380GB) also l
 
 ### Tiered mode
 
-> **Warning:** In `Tiered` mode, the module deletes the `largeobj.disk-dir` directory and all its contents at startup and at shutdown, then creates it again, empty.
-> Set `largeobj.disk-dir` to a new, empty directory that only this module uses, below the mount point (for example `/mnt/nvme/largeobj`).
-> Never use a directory that has other data, or a mount point.
+> **Note:** In `Tiered` mode, the module only uses a `largeobj.disk-dir` that is new or empty, or that it used before.
+> It writes a `.valkey-large-object` file in it, and does not load if the directory has other files but not that one, so it never deletes data it did not write.
+> Set `largeobj.disk-dir` to a directory that only this module uses (for example `/mnt/nvme/largeobj`).
 
 Each object is stored in a file in `largeobj.disk-dir`, and DRAM is a read cache.
 Put `largeobj.disk-dir` on an XFS file system (see [Requirements](#requirements)).
@@ -557,9 +557,9 @@ Use `largeobj_evictions` instead.
 | Log: `fabric unavailable, RDMA path disabled`. `BLOB.RDMA_HELLO` returns `ERR RDMA provider unavailable on this instance` | The fabric provider did not start. Use the TCP commands, or check the EFA setup. For tests without RDMA hardware, set `largeobj.fabric-provider` to `Emulated`. |
 | Log: `fd-reserve Lenient: open-file limit ... is too low, so fd placement and the fd cache are off; set LimitNOFILE to at least <n> to turn them on` | `Tiered` mode: raise the open-file limit (`ulimit -n` or `LimitNOFILE`) to the value in the message, or set a lower `maxclients`. With `largeobj.fd-reserve` set to `Strict`, the module does not load in this case. |
 | Log: `open-file limit ... is too low for max-cached-fds ...: the fd cache holds <m>; set LimitNOFILE to at least <n> to cache all` | `Tiered` mode: the file descriptor cache is smaller than `largeobj.max-cached-fds`. Raise the open-file limit, or set a lower `largeobj.max-cached-fds`. |
-| Server stops at load. Log: `largeobj: startup failed to reset disk-dir <dir>: Device or resource busy (os error 16); aborting module load` | `Tiered` mode: `largeobj.disk-dir` is a mount point. The module deletes the contents of the mounted file system, then cannot remove the mount point. Use a dedicated subdirectory of the mount for `largeobj.disk-dir`. |
-| Server stops at load. Log: `largeobj: startup failed to reset disk-dir <dir>: <error>; aborting module load`, with an error such as `Permission denied` or `Read-only file system` | `Tiered` mode: the module deletes and creates `largeobj.disk-dir` at startup, and it could not. Make the parent directory of `largeobj.disk-dir` and the file system writable by the server user. |
-| Server stops at load. Log: `largeobj: startup failed to reset disk-dir : disk-dir is required in Tiered operating mode; aborting module load` | `Tiered` mode: `largeobj.disk-dir` is not set. Set `largeobj.disk-dir` to a directory on the disk. |
+| Server stops at load. Log: `largeobj: cannot use disk-dir <dir>: not empty and has no .valkey-large-object file, so it is not the module's; aborting module load` | `Tiered` mode: `largeobj.disk-dir` has files the module did not write, and the module did not change them. Set `largeobj.disk-dir` to a new or empty directory. A directory that an earlier version of the module left after a crash also stops here: empty it. |
+| Server stops at load. Log: `largeobj: cannot use disk-dir <dir>: <error>; aborting module load`, with an error such as `Permission denied` or `Read-only file system` | `Tiered` mode: the module could not create `largeobj.disk-dir` or write in it. Make it, or its parent if it does not exist, writable by the server user. |
+| Server stops at load. Log: `largeobj: cannot use disk-dir : disk-dir is required in Tiered operating mode; aborting module load` | `Tiered` mode: `largeobj.disk-dir` is not set. Set `largeobj.disk-dir` to a directory on the disk. |
 | Server stops at load. Log: `largeobj: storage init failed: failed to create disk-dir shards under <dir>: <error>` | `Tiered` mode: the module could not create the `largeobj.disk-dir-shards` subdirectories, for example because the file system is full or read-only. Free space or fix the mount. |
 | Server stops at load. Log: `largeobj: storage init failed: disk-dir <dir> has a block size of <N> B, which does not divide the 4096 B I/O alignment; ...` | `Tiered` mode: the file system block size does not divide 4096, for example 64KB blocks. The module cannot count disk use exactly, so it does not load. Put `largeobj.disk-dir` on a file system with a block size of 4096 B or less. |
 | Server stops at load. Log: `largeobj: storage init failed: cannot read disk-dir <dir> XFS geometry: <error>`, or `cannot open disk-dir <dir>: <error>`, or `cannot statfs disk-dir <dir>: <error>` | `Tiered` mode: the module could not read the file system geometry that it needs to count disk use, so it does not load. Make sure that the mount is healthy and that the server can read `largeobj.disk-dir`. |
