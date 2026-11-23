@@ -156,7 +156,7 @@ async fn efa_write_to_client(session: Arc<Session>, buf_ptr: usize, len, rkey, r
 |--------|---------|-------------|
 | `operating-mode` | Dram | Enum: `Dram` or `Tiered` |
 | `segment-size` | 64mb | Size of each DRAMPool segment |
-| `disk-dir` | (required if Tiered) | Dedicated, module-owned directory for .dat files. Wiped wholesale on startup and teardown, so it must NOT be shared with other files. |
+| `disk-dir` | (required if Tiered) | Dedicated, module-owned directory for .dat files, kept in shard subdirectories. Must be new or empty on first use: the module marks it with a `.valkey-large-object` file and refuses to load from a non-empty directory without one. At startup the shard subdirectories a previous run left are moved into `disk-dir/previous-run/` and deleted in the background; other entries are left in place (and logged), but the directory should not be shared with other files. |
 | `disk-dir-shards` | 1024 | Subdirectories of `disk-dir` that object files are spread over, by OID. Immutable. |
 | `disk-maxmemory` | 10gb | Max disk usage |
 | `disk-staging-size` | 64mb | Single NVMe staging segment (DRAM) |

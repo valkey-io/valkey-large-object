@@ -398,9 +398,9 @@ Set them when the module loads, with the full names: after `--loadmodule` on the
 Memory sizes can have units, such as `64mb`.
 The configurations with `No` in the Mutable column can be set only when the module loads.
 
-> **Warning:** In `Tiered` mode, the module deletes the `largeobj.disk-dir` directory and all its contents at startup and at shutdown, then creates it again, empty.
-> Set `largeobj.disk-dir` to a new, empty directory that only this module uses, below the mount point (for example `/mnt/nvme/largeobj`).
-> Never use a directory that has other data, or a mount point.
+> **Note:** In `Tiered` mode, the module only uses a `largeobj.disk-dir` that is new or empty, or that it used before.
+> It writes a `.valkey-large-object` file in it, and does not load if the directory has other files but not that one, so it never deletes data it did not write.
+> Set `largeobj.disk-dir` to a directory that only this module uses (for example `/mnt/nvme/largeobj`).
 
 These are the configurations that you are most likely to change.
 The full list, with ranges and validation, is in [`src/configs.rs`](../src/configs.rs) and in the [README](../README.md#configuration).
@@ -408,7 +408,7 @@ The full list, with ranges and validation, is in [`src/configs.rs`](../src/confi
 | Name | Default | Mutable | Description |
 |---|---|---|---|
 | `largeobj.operating-mode` | `Dram` | No | `Dram`: objects in DRAM only. `Tiered`: objects on disk, DRAM is a read cache. |
-| `largeobj.disk-dir` | `""` | No | Required in `Tiered` mode. Directory for object files on XFS (the only supported file system), with `O_DIRECT` and user extended attributes, and a writable parent. **Deleted at startup and shutdown: see the warning in [Configuration](#configuration).** |
+| `largeobj.disk-dir` | `""` | No | Required in `Tiered` mode. Directory for object files on XFS (the only supported file system), with `O_DIRECT` and user extended attributes, and write access. **Must be new or empty on first use: see the note in [Configuration](#configuration).** |
 | `largeobj.disk-dir-shards` | `1024` | No | `Tiered`: number of subdirectories of `largeobj.disk-dir` for object files. |
 | `largeobj.segment-size` | 1GB | No | Size of each DRAM pool segment and disk staging segment. 1MB to 1GB. Must be at least twice `largeobj.chunk-size`. Each pool has at most 16384 segments: the DRAM pool stops at 16384 x `largeobj.segment-size`, and `largeobj.disk-staging-size` / `largeobj.segment-size` must not be more than 16384. |
 | `largeobj.disk-staging-size` | 1GB | No | `Tiered`: total size of the DRAM staging buffers for disk I/O. |

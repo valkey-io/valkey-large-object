@@ -67,7 +67,7 @@ valkey-server --port 6379 \
 
 ### Tiered mode (DRAM cache + NVMe)
 
-> **Warning:** In Tiered mode, the module deletes the `largeobj.disk-dir` directory and all its contents at startup and at shutdown, then creates it again, empty. Set `largeobj.disk-dir` to a new, empty directory that only this module uses, below the mount point (for example `/mnt/nvme/largeobj`). Never use a directory that has other data, or a mount point.
+> **Note:** In Tiered mode, the module only uses a `largeobj.disk-dir` that is new or empty, or that it used before. It writes a `.valkey-large-object` file in it, and does not load if the directory has other files but not that one, so it never deletes data it did not write. Set `largeobj.disk-dir` to a directory that only this module uses (for example `/mnt/nvme/largeobj`).
 
 ```bash
 valkey-server --port 6379 \
@@ -103,7 +103,7 @@ When adding new code: use EFA/NVMe freely in Rust identifiers, doc comments, and
 | Parameter | Default | Mutable | Description |
 |-----------|---------|---------|-------------|
 | `largeobj.operating-mode` | `Dram` | No | `Dram` (DRAM-only) or `Tiered` (DRAM cache + NVMe). |
-| `largeobj.disk-dir` | (empty) | No | Dedicated directory for NVMe object files, on XFS (the only supported file system). Required in Tiered mode. Must support O_DIRECT. Its parent must be writable. **Deleted with all its contents at startup and shutdown: see the [warning](#tiered-mode-dram-cache--nvme).** |
+| `largeobj.disk-dir` | (empty) | No | Dedicated directory for NVMe object files, on XFS (the only supported file system). Required in Tiered mode. Must support O_DIRECT. Must be writable. **Must be new or empty on first use: see the [note](#tiered-mode-dram-cache--nvme).** |
 | `largeobj.disk-dir-shards` | 1024 | No | Tiered: subdirectories of `largeobj.disk-dir` that object files are spread over, by object ID, so creates and unlinks do not all serialize on one directory lock. Min 1, max 65536. |
 | `largeobj.segment-size` | 1GB | No | Size of each DRAM pool segment and disk staging segment. 1MB to 1GB. Must be at least twice `largeobj.chunk-size`. At most 16384 segments per pool (see [Configuration](docs/COMMANDS.md#configuration)). |
 | `largeobj.disk-maxmemory` | 0 (unlimited) | Yes | Max NVMe disk usage. Each file counts as its length rounded up to 4KB, or, on a striped XFS, to the stripe unit for files of at least one stripe unit. On XFS, each file also counts its inode. A file also counts any metadata blocks outside its inode (`largeobj_disk_metadata_spills`). 0 = unlimited. |

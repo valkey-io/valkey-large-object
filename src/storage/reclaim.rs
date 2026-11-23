@@ -20,14 +20,21 @@
 //! thread), marked `KeyState::Deleted` so neither way spends work on it.
 //!
 //! Lock order: `RECLAIM_LIST` before `DRAMPool.objects` when both are held.
+//!
+//! Also the previous run's disk-dir files, reclaimed at startup (below).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use valkey_module::{raw, Context, KeysCursor, ValkeyString};
+use valkey_module::{logging::log_notice, raw, Context, KeysCursor, ValkeyString};
 
 use super::nvme::KeyHint;
 use crate::data_type::{LoValue, ObjectId, LO_TYPE};
@@ -358,6 +365,140 @@ fn listed_keys_in_next_bucket(
         }
     });
     (listed.into_inner(), more)
+}
+
+// ─── Previous-run cleanup ────────────────────────────────────────────────────
+//
+// Tiered mode. OIDs restart at 1 every run, so startup moves each shard dir a previous run
+// left into `previous-run/<n>`, numbered after what an unfinished cleanup left there, and a
+// tokio blocking task deletes their object files while serving:
+//
+//     disk-dir/0000/               this run's shards
+//     disk-dir/previous-run/0/     the last run's shard 0000, 1 its 0001, ...
+//     disk-dir/previous-run/1024/  an earlier run's, if its cleanup was cut short
+//
+// The module only uses a disk-dir it created: one with its marker file, or an empty one,
+// which it marks. Anything else in disk-dir is not the module's and is left in place.
+//
+// Until deleted, that space is charged against disk-maxmemory: `statvfs` used at startup (at
+// most disk-maxmemory), lowered by each deleted file's blocks. A reservation that does not
+// fit deletes some inline before evicting (`try_reserve_nvme_disk_usage`).
+
+/// Space the previous runs' files still hold (INFO `disk_previous_run_remaining_bytes`);
+/// 0 once they are all deleted.
+static PREVIOUS_RUN_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Marks a disk-dir as the module's; holds the layout's format version.
+const MARKER: &str = ".valkey-large-object";
+
+type Files = Box<dyn Iterator<Item = PathBuf> + Send>;
+
+/// `previous-run/` and its files, so each file is handed out once.
+static PREVIOUS_RUN_WALK: Mutex<Option<(PathBuf, Files)>> = Mutex::new(None);
+
+pub fn previous_run_remaining_bytes() -> u64 {
+    PREVIOUS_RUN_BYTES.load(Ordering::Relaxed)
+}
+
+/// Tiered mode: create disk-dir and move the shard dirs a previous run left in it into
+/// `previous-run/`. Returns the bytes charged; 0 when there is nothing to delete. Fails on
+/// a non-empty disk-dir without the marker: it is not the module's, so nothing is touched.
+pub fn move_previous_run(mode: crate::OperatingMode, dir: &str) -> io::Result<u64> {
+    if mode != crate::OperatingMode::Tiered {
+        return Ok(0);
+    }
+    if dir.is_empty() {
+        let msg = "disk-dir is required in Tiered operating mode";
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
+    }
+    fs::create_dir_all(dir)?;
+    let marker = Path::new(dir).join(MARKER);
+    if !marker.exists() {
+        if fs::read_dir(dir)?.next().is_some() {
+            let msg = format!("not empty and has no {MARKER} file, so it is not the module's");
+            return Err(io::Error::other(msg));
+        }
+        fs::write(&marker, "1\n")?;
+    }
+    let root = Path::new(dir).join("previous-run");
+    // Numbered after what an unfinished cleanup left.
+    let numbered = fs::read_dir(&root).into_iter().flatten().flatten();
+    let numbers = numbered.filter_map(|e| e.file_name().to_str()?.parse::<u64>().ok());
+    let mut next = numbers.max().map_or(0, |n| n + 1);
+    for entry in fs::read_dir(dir)?.collect::<io::Result<Vec<_>>>()? {
+        let name = entry.file_name();
+        if name.len() == 4 && is_hex(name.as_encoded_bytes()) && entry.file_type()?.is_dir() {
+            fs::create_dir_all(&root)?;
+            fs::rename(entry.path(), root.join(next.to_string()))?;
+            next += 1;
+        } else if entry.path() != root && entry.path() != marker {
+            log_notice(format!(
+                "largeobj: {:?} in disk-dir is not the module's: left in place",
+                entry.path()
+            ));
+        }
+    }
+    if !root.exists() {
+        return Ok(0);
+    }
+    let files = fs::read_dir(&root)?.flatten().flat_map(|shard| {
+        let files = fs::read_dir(shard.path()).into_iter().flatten();
+        files
+            .flatten()
+            .map(|file| file.path())
+            .filter(|path| is_object_file(path))
+    });
+    // Nothing of this run is on disk yet.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: fstatvfs fills the zeroed POD struct from an open fd.
+    if unsafe { libc::fstatvfs(fs::File::open(dir)?.as_raw_fd(), &mut st) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let used = (st.f_blocks - st.f_bfree) * st.f_frsize;
+    let max = crate::nvme_maxmemory();
+    let bytes = if max > 0 { used.min(max) } else { used }.max(1);
+    PREVIOUS_RUN_BYTES.store(bytes, Ordering::Relaxed);
+    *PREVIOUS_RUN_WALK.lock().unwrap_or_else(|e| e.into_inner()) = Some((root, Box::new(files)));
+    Ok(bytes)
+}
+
+/// Delete the previous runs' next file; false once none is left. Safe from any thread:
+/// the cleanup task, and any reservation that does not fit.
+pub fn delete_previous_run_file() -> bool {
+    if previous_run_remaining_bytes() == 0 {
+        return false;
+    }
+    let mut walk = PREVIOUS_RUN_WALK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(path) = walk.as_mut().and_then(|(_, files)| files.next()) else {
+        if let Some((root, _)) = walk.take() {
+            // Only empty dirs go: what is left in them is not the module's.
+            for shard in fs::read_dir(&root).into_iter().flatten().flatten() {
+                let _ = fs::remove_dir(shard.path());
+            }
+            let left = fs::remove_dir(&root).map_or(", left what is not the module's", |_| "");
+            log_notice(format!("largeobj: previous run cleanup done{left}"));
+        }
+        PREVIOUS_RUN_BYTES.store(0, Ordering::Relaxed);
+        return false;
+    };
+    let freed = fs::symlink_metadata(&path).map_or(0, |m| m.blocks() * 512);
+    if fs::remove_file(&path).is_ok() {
+        // Down to 1 at most: 0 means done.
+        let _ = PREVIOUS_RUN_BYTES.try_update(Ordering::Relaxed, Ordering::Relaxed, |b| {
+            (b > 1).then(|| b.saturating_sub(freed).max(1))
+        });
+    }
+    true
+}
+
+fn is_hex(name: &[u8]) -> bool {
+    name.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// An object file's name: `{oid:016x}.dat` (`ObjectId::file_path`).
+fn is_object_file(path: &Path) -> bool {
+    let name = path.file_name().map_or(&[][..], |n| n.as_encoded_bytes());
+    name.len() == 20 && name.ends_with(b".dat") && is_hex(&name[..16])
 }
 
 #[cfg(test)]

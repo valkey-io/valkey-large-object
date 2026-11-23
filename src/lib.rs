@@ -142,18 +142,17 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         return Status::Err;
     }
 
-    // Reset disk-dir before use (Tiered mode only; a no-op in Dram, which never
-    // touches disk): reclaim any object files a previous run left behind after an
-    // unclean exit — a hard crash / SIGKILL never reaches our shutdown handler.
-    // If the reset fails we can't guarantee a clean slate, so refuse to load
-    // rather than start dirty.
-    if let Err(e) = storage::validate_and_clean_disk_dir(mode, &dir) {
-        ctx.log_warning(&format!(
-            "largeobj: startup failed to reset disk-dir {}: {}; aborting module load",
-            dir, e
-        ));
-        return Status::Err;
-    }
+    // Move the previous run's shard dirs out of the way before `storage::init` creates fresh
+    // ones (Tiered mode). If that fails, refuse to load rather than start dirty.
+    let previous_run_bytes = match storage::reclaim::move_previous_run(mode, &dir) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            ctx.log_warning(&format!(
+                "largeobj: cannot use disk-dir {dir}: {e}; aborting module load"
+            ));
+            return Status::Err;
+        }
+    };
 
     // The module only registers host memory. libfabric's default initializes every HMEM
     // interface it finds, so on a GPU node it starts CUDA and holds GPU memory; GPU
@@ -215,6 +214,15 @@ fn initialize(ctx: &Context, _args: &[ValkeyString]) -> Status {
         panic!("Runtime already initialized");
     }
 
+    // Delete them while serving, now that init succeeded.
+    if previous_run_bytes > 0 {
+        ctx.log_notice(&format!(
+            "largeobj: deleting the previous run's files in {dir} in the background \
+             ({previous_run_bytes} bytes)"
+        ));
+        runtime_handle().spawn_blocking(|| while storage::reclaim::delete_previous_run_file() {});
+    }
+
     // Cache maxmemory-policy; `CONFIG SET` keeps it current.
     storage::eviction_candidates::refresh_policy(ctx);
 
@@ -242,23 +250,13 @@ fn deinitialize(_ctx: &Context) -> Status {
 }
 
 /// Clean up on graceful server shutdown (SIGINT / SIGTERM / SHUTDOWN command):
-/// signal the SMART log poller to stop, drop the fabric services, and — in Tiered
-/// mode — wipe disk-dir so object files don't accumulate across server lifetimes.
+/// signal the SMART log poller to stop and drop the fabric services.
 /// The io_uring engines live in process-lifetime statics and are not torn down here.
 /// Process exit frees all remaining resources (pools, runtime, transport).
-/// A hard crash (SIGKILL / SIGSEGV / power loss) never reaches this handler;
-/// those leftovers are reclaimed by the startup reset in `initialize`.
 #[shutdown_event_handler]
-fn on_server_shutdown(ctx: &Context, _subevent: u64) {
+fn on_server_shutdown(_ctx: &Context, _subevent: u64) {
     smartlog::signal_shutdown();
     transport::shutdown();
-    let dir = storage::disk_dir();
-    if let Err(e) = storage::validate_and_clean_disk_dir(operating_mode(), dir) {
-        ctx.log_warning(&format!(
-            "largeobj: shutdown cleanup failed to reset disk-dir {}: {}",
-            dir, e
-        ));
-    }
 }
 
 valkey_module! {

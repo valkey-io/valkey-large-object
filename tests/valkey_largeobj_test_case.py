@@ -100,6 +100,10 @@ ORDER_OBJECT_LEN = 64 * ORDER_CHUNK_SIZE + 1
 ORDER_SEGMENT_SIZE = 64 * MIB
 
 
+# Written by the module in the disk-dir it uses.
+DISK_DIR_MARKER = ".valkey-large-object"
+
+
 def chunk_order_module_args(data_dir, direct_io, max_promote_size):
     """Tiered module args for chunk-order tests; `max_promote_size` 0 disables promotion.
 
@@ -178,10 +182,9 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
     def setup_test(self, setup):
         module_path = os.getenv('MODULE_PATH')
         # Give the module a DEDICATED disk-dir under testdir (not testdir itself).
-        # The module owns this directory outright and wipes it wholesale on startup
-        # and teardown, so it must not be shared with the server's own files
-        # (logfile, rdb) which live directly in testdir. Absolute path so file
-        # assertions work regardless of cwd.
+        # Tests assert on every file in it, so it must not be shared with the
+        # server's own files (logfile, rdb), which live directly in testdir.
+        # Absolute path so file assertions work regardless of cwd.
         data_dir = os.path.abspath(os.path.join(self.testdir, "nvme"))
         # Disable O_DIRECT in ASAN builds — ASAN tests focus on memory safety,
         # not I/O bypass correctness. Avoids EINVAL from O_DIRECT alignment edge cases.
@@ -212,8 +215,10 @@ class ValkeyLargeObjTestCaseBase(ValkeyTestCase):
                 "Tiered tests can't run with disk-dir on a striped XFS (allocation unit is not 4096 B)"
 
     def _object_files(self):
-        """Every file currently in disk-dir and its shard subdirectories (name-agnostic)."""
-        return sorted(os.path.join(root, name) for root, _, names in os.walk(self.data_dir) for name in names)
+        """Every file currently in disk-dir and its shard subdirectories (name-agnostic),
+        except the marker that makes disk-dir the module's."""
+        return sorted(os.path.join(root, name) for root, _, names in os.walk(self.data_dir)
+                      for name in names if name != DISK_DIR_MARKER)
 
     def subscribe_keyspace_events(self, client):
         """Enable module keyspace events and return a pubsub on the keyevent channels."""
